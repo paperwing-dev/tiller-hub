@@ -1,0 +1,98 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { buildManifestContainers, buildPlainTextBindings } from "./generate-manifest.mjs";
+
+const envKeys = [
+  "CONTAINER_IMAGE_TAG",
+  "SCM_BOOTSTRAP_IMAGE_TAG",
+  "TILLER_MANIFEST_REQUIRE_PINNED_IMAGES",
+];
+
+const previousEnv = new Map<string, string | undefined>();
+
+function rememberEnv() {
+  previousEnv.clear();
+  for (const key of envKeys) {
+    previousEnv.set(key, process.env[key]);
+  }
+}
+
+function restoreEnv() {
+  for (const [key, value] of previousEnv) {
+    if (value == null) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+describe("generate-manifest container images", () => {
+  afterEach(() => {
+    restoreEnv();
+  });
+
+  it("uses the same SHA-pinned image overrides as hub deploy", () => {
+    rememberEnv();
+    process.env.CONTAINER_IMAGE_TAG = "docker.io/jamieatlason/tiller-sandbox:abc123";
+    process.env.SCM_BOOTSTRAP_IMAGE_TAG = "docker.io/jamieatlason/tiller-scm:abc123";
+    process.env.TILLER_MANIFEST_REQUIRE_PINNED_IMAGES = "1";
+
+    expect(buildManifestContainers({
+      name: "tiller-hub",
+      containers: [
+        {
+          class_name: "SandboxDO",
+          name: "tiller-hub-sandbox",
+          image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          max_instances: 2,
+          instance_type: "standard-1",
+        },
+        {
+          class_name: "ScmBootstrapDO",
+          name: "tiller-hub-scm-bootstrap",
+          image: "docker.io/jamieatlason/tiller-scm:stable",
+          max_instances: 2,
+          instance_type: "basic",
+        },
+        {
+          class_name: "ScmOperationDO",
+          name: "tiller-hub-scm-operation",
+          image: "docker.io/jamieatlason/tiller-scm:stable",
+          max_instances: 4,
+          instance_type: "basic",
+        },
+      ],
+    })).toMatchObject([
+      { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123" },
+      { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:abc123" },
+      { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:abc123" },
+    ]);
+  });
+
+  it("fails release manifest generation when a managed container remains stable", () => {
+    rememberEnv();
+    delete process.env.CONTAINER_IMAGE_TAG;
+    delete process.env.SCM_BOOTSTRAP_IMAGE_TAG;
+    process.env.TILLER_MANIFEST_REQUIRE_PINNED_IMAGES = "1";
+
+    expect(() => buildManifestContainers({
+      name: "tiller-hub",
+      containers: [
+        {
+          class_name: "SandboxDO",
+          name: "tiller-hub-sandbox",
+          image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          max_instances: 2,
+          instance_type: "standard-1",
+        },
+      ],
+    })).toThrow(/must use a pinned image ref/);
+  });
+});
+
+describe("generate-manifest plain text bindings", () => {
+  it("does not require default harness enablement to be encoded as Worker config", () => {
+    expect(buildPlainTextBindings({
+      vars: {
+        TILLER_REGION: "wnam",
+      },
+    })).toEqual([]);
+  });
+});
