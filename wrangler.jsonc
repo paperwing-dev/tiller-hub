@@ -1,0 +1,241 @@
+{
+	"name": "tiller-hub",
+	"main": "api/index.ts",
+	"compatibility_date": "2025-01-29",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"assets": {
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"directory": "./dist/client"
+	},
+	"ai": {
+		"binding": "AI"
+	},
+	"worker_loaders": [
+		{
+			"binding": "LOADER"
+		}
+	],
+	"vars": {
+		// Deploy-button region code. Accepted values:
+		// wnam, enam, weur, eeur, apac, oc
+		"TILLER_REGION": "wnam",
+		"ENABLED_ENV_HARNESSES": "claude-code,codex,opencode"
+	},
+	"containers": [
+		{
+			"class_name": "SandboxDO",
+			"image": "docker.io/jamieatlason/tiller-sandbox:stable",
+			"max_instances": 2,
+			"instance_type": "standard-1"
+		},
+		{
+			"class_name": "ScmBootstrapDO",
+			"image": "docker.io/jamieatlason/tiller-scm:stable",
+			"max_instances": 2,
+			"instance_type": "basic"
+		},
+		{
+			"class_name": "ScmOperationDO",
+			"image": "docker.io/jamieatlason/tiller-scm:stable",
+			"max_instances": 4,
+			"instance_type": "basic"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ENV_LIFECYCLE",
+				"class_name": "EnvLifecycleDO"
+			},
+			{
+				"name": "ARTIFACT_STORE",
+				"class_name": "ArtifactStoreDO"
+			},
+			{
+				"name": "HUB",
+				"class_name": "HubDO"
+			},
+			{
+				"name": "SANDBOX",
+				"class_name": "SandboxDO"
+			},
+			{
+				"name": "REPO_MERGE_LOCK",
+				"class_name": "RepoMergeLockDO"
+			},
+			{
+				"name": "TILLER_VOICE",
+				"class_name": "TillerVoice"
+			},
+			{
+				"name": "SCM_BOOTSTRAP",
+				"class_name": "ScmBootstrapDO"
+			},
+			{
+				"name": "SCM_OPERATION",
+				"class_name": "ScmOperationDO"
+			},
+			{
+				"name": "THREAD",
+				"class_name": "ThreadDO"
+			},
+			{
+				"name": "WORKSPACE",
+				"class_name": "WorkspaceDO"
+			},
+			{
+				"name": "CARTOGRAPHER_CHAT",
+				"class_name": "CartographerChatAgent"
+			},
+			{
+				"name": "PLAN_CHAT",
+				"class_name": "PlanChatAgent"
+			},
+			{
+				"name": "PLANNER_CHAT",
+				"class_name": "PlannerChatAgent"
+			},
+			{
+				"name": "RESEARCH_CHAT",
+				"class_name": "ResearchChatAgent"
+			},
+			{
+				"name": "REVIEWER_CHAT",
+				"class_name": "ReviewerChatAgent"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"HubDO"
+			]
+		},
+		{
+			"tag": "v2",
+			"new_classes": [
+				"VoiceDO"
+			]
+		},
+		{
+			"tag": "v3",
+			"deleted_classes": [
+				"VoiceDO"
+			],
+			"new_sqlite_classes": [
+				"HapiVoice"
+			]
+		},
+		{
+			"tag": "v4",
+			"renamed_classes": [
+				{
+					"from": "HapiVoice",
+					"to": "HelmVoice"
+				}
+			]
+		},
+		{
+			"tag": "v5",
+			"new_sqlite_classes": [
+				"SandboxDO"
+			]
+		},
+		{
+			"tag": "v6",
+			"new_sqlite_classes": [
+				"WorkspaceDO"
+			]
+		},
+		{
+			"tag": "v7",
+			"new_sqlite_classes": [
+				"ResearchChatAgent"
+			]
+		},
+		{
+			"tag": "v8",
+			"new_sqlite_classes": [
+				"ReviewerChatAgent"
+			]
+		},
+		{
+			"tag": "v9",
+			"new_sqlite_classes": [
+				"PlannerChatAgent"
+			]
+		},
+		{
+			"tag": "v10",
+			"new_sqlite_classes": [
+				"CartographerChatAgent"
+			]
+		},
+		{
+			"tag": "v11",
+			"new_sqlite_classes": [
+				"PlanChatAgent"
+			]
+		},
+		{
+			"tag": "v12",
+			"renamed_classes": [
+				{
+					"from": "HelmVoice",
+					"to": "TillerVoice"
+				}
+			]
+		},
+		{
+			"tag": "v13",
+			"new_sqlite_classes": [
+				"RepoMergeLockDO"
+			]
+		},
+		{
+			"tag": "v14",
+			"new_sqlite_classes": [
+				"ScmBootstrapDO"
+			]
+		},
+		{
+			"tag": "v15",
+			"new_sqlite_classes": [
+				"EnvLifecycleDO"
+			]
+		},
+		{
+			"tag": "v16",
+			"new_sqlite_classes": [
+				"ArtifactStoreDO"
+			]
+		},
+		{
+			"tag": "v17",
+			"new_sqlite_classes": [
+				"ThreadDO"
+			]
+		},
+		{
+			"tag": "v18",
+			"new_sqlite_classes": [
+				"ScmOperationDO"
+			]
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "ENVS_KV"
+		},
+	],
+	"workers_dev": true,
+	"send_metrics": false,
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	}
+}

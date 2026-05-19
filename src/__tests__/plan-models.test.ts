@@ -1,0 +1,35 @@
+import { describe, expect, it } from "vitest";
+import {
+  PLAN_DEFAULT_MODEL,
+  coercePlanModelSelection,
+  getFallbackPlanModel,
+  isChatGPTPlanModel,
+} from "../plan-models";
+
+describe("plan-models", () => {
+  it("identifies the ChatGPT plan model", () => {
+    expect(isChatGPTPlanModel("gpt-5.4")).toBe(true);
+    expect(isChatGPTPlanModel("@cf/moonshotai/kimi-k2.5")).toBe(false);
+  });
+
+  it("returns a non-ChatGPT fallback model", () => {
+    expect(getFallbackPlanModel()).not.toBe(PLAN_DEFAULT_MODEL);
+    expect(isChatGPTPlanModel(getFallbackPlanModel())).toBe(false);
+  });
+
+  it("coerces stored ChatGPT selections when ChatGPT is unavailable", () => {
+    expect(
+      coercePlanModelSelection("gpt-5.4", {
+        chatgptAvailable: false,
+      }),
+    ).toBe(getFallbackPlanModel());
+  });
+
+  it("preserves non-ChatGPT selections when ChatGPT is unavailable", () => {
+    expect(
+      coercePlanModelSelection("@cf/moonshotai/kimi-k2.5", {
+        chatgptAvailable: false,
+      }),
+    ).toBe("@cf/moonshotai/kimi-k2.5");
+  });
+});
