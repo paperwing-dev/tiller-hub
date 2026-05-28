@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { EnvDefinition } from "../../types";
-import { createInitialRepoScmState } from "../../scm/model";
+import type { EnvDefinition, EnvMeta } from "../../types";
+import { createInitialEnvScmState, createInitialRepoScmState } from "../../scm/model";
 import {
   commitRepoMainState,
   createRepoWorkspaceFromGitHubAppSelection,
@@ -8,6 +8,7 @@ import {
   listEnvDefinitionSlugs,
   listRepos,
   persistEnvDefinition,
+  persistEnvSummary,
   readEnvDefinition,
   readRepoMetaFromWorkspace,
 } from "../store";
@@ -41,6 +42,24 @@ function makeEnvDefinition(overrides: Partial<EnvDefinition> = {}): EnvDefinitio
 
 function makeStoredEnvDefinition(overrides: Partial<EnvDefinition> = {}) {
   return makeEnvDefinition(overrides);
+}
+
+function makeEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
+  return {
+    slug: "env-1",
+    repoId: "123456",
+    repoUrl: "https://github.com/paperwing-dev/example",
+    backend: "cf",
+    harness: "claude-code",
+    createdAt: "2026-03-30T00:00:00.000Z",
+    updatedAt: "2026-03-30T00:05:00.000Z",
+    status: "running",
+    ...createInitialEnvScmState({
+      slug: "env-1",
+      mainCommit: "main-sha",
+    }),
+    ...overrides,
+  };
 }
 
 describe("repo store env metadata helpers", () => {
@@ -109,6 +128,32 @@ describe("repo store env metadata helpers", () => {
       slug: "env-1",
       branchName: "env/env-1",
     });
+  });
+
+  it("strips projected repoUrl from env definition and summary cache storage", async () => {
+    const put = vi.fn().mockResolvedValue(undefined);
+    const env = {
+      ENVS_KV: { put },
+    } as any;
+
+    await persistEnvDefinition(env, {
+      ...makeEnvDefinition(),
+      repoUrl: "https://github.com/paperwing-dev/example",
+    } as EnvDefinition & { repoUrl: string });
+    await persistEnvSummary(env, makeEnvMeta());
+
+    expect(put).toHaveBeenNthCalledWith(
+      1,
+      "envdef:env-1",
+      expect.not.stringContaining("repoUrl"),
+    );
+    expect(put).toHaveBeenNthCalledWith(
+      2,
+      "env-1",
+      expect.not.stringContaining("repoUrl"),
+    );
+    expect(JSON.parse(put.mock.calls[0][1])).not.toHaveProperty("repoUrl");
+    expect(JSON.parse(put.mock.calls[1][1])).not.toHaveProperty("repoUrl");
   });
 
   it("lists env definition slugs even when summary cache rows are missing", async () => {

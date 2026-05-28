@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   projectAndPersistEnvSummary: vi.fn(),
   getScmOperationStore: vi.fn(),
   headScmArtifact: vi.fn(),
+  revokeGitHubBridgesForScmOperation: vi.fn(),
 }));
 
 vi.mock("../../helpers", () => ({
@@ -42,7 +43,12 @@ vi.mock("../artifacts", async () => {
   };
 });
 
+vi.mock("../../github/bridge", () => ({
+  revokeGitHubBridgesForScmOperation: mocks.revokeGitHubBridgesForScmOperation,
+}));
+
 const {
+  handleScmFailedCallback,
   handleScmProgressCallback,
   handleScmResultCallback,
 } = await import("../callbacks");
@@ -88,6 +94,7 @@ describe("scm/callbacks", () => {
     mocks.getWorkspaceStub.mockReturnValue({
       restoreFromTar: vi.fn().mockResolvedValue({ fileCount: 1 }),
     });
+    mocks.revokeGitHubBridgesForScmOperation.mockResolvedValue(undefined);
   });
 
   it("skips stale progress callbacks when the env projection points at a different promote operation", async () => {
@@ -185,6 +192,78 @@ describe("scm/callbacks", () => {
     expect(result.outcome).toMatchObject({
       outcome: "conflicted",
       operationId: "op-merge",
+    });
+  });
+
+  it("fails active operations with projection cleanup, bridge revocation, and lock release", async () => {
+    const lifecycleStub = {
+      setScmProjection: vi.fn().mockResolvedValue(undefined),
+      clearScmProjection: vi.fn().mockResolvedValue(undefined),
+      recordStopWorkspaceSynced: vi.fn().mockResolvedValue(undefined),
+    };
+    const operation = {
+      operationId: "op-merge",
+      type: "merge-into-main",
+      envSlug: "demo-env",
+      status: "pending",
+      mergeLockToken: "lock-token",
+      createdAt: "2026-04-13T00:00:00.000Z",
+    };
+    const meta = makeMeta({
+      scmOperationType: "merge-into-main",
+      scmOperationId: "op-merge",
+      scmOperationPhase: "Merging branch into main",
+      scmOperationStartedAt: "2026-04-13T00:00:00.000Z",
+    });
+    const store = {
+      getOperation: vi.fn()
+        .mockResolvedValueOnce(operation)
+        .mockResolvedValueOnce({
+          ...operation,
+          status: "failed",
+          error: "merge failed",
+        }),
+      failOperation: vi.fn().mockResolvedValue({ status: "failed" }),
+      releaseMergeLock: vi.fn().mockResolvedValue(undefined),
+    };
+    mocks.projectAndPersistEnvSummary.mockResolvedValue(meta);
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    mocks.getScmOperationStore.mockReturnValue(store);
+
+    const result = await handleScmFailedCallback({} as any, "demo-env", "op-merge", {
+      message: "merge failed",
+      durationMs: 123,
+      timings: "timings-json",
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      ok: true,
+      operationId: "op-merge",
+      status: "failed",
+      error: "merge failed",
+    });
+    expect(lifecycleStub.clearScmProjection).toHaveBeenCalledWith({
+      completedAt: expect.any(String),
+      durationMs: 123,
+      timings: "timings-json",
+    });
+    expect(store.failOperation).toHaveBeenCalledWith({
+      operationId: "op-merge",
+      error: "merge failed",
+    });
+    expect(mocks.revokeGitHubBridgesForScmOperation).toHaveBeenCalledWith(
+      {},
+      {
+        repoId: "repo-1",
+        operationId: "op-merge",
+      },
+    );
+    expect(store.releaseMergeLock).toHaveBeenCalledWith("lock-token");
+    expect(result.outcome).toMatchObject({
+      outcome: "failed",
+      operationId: "op-merge",
+      error: "merge failed",
     });
   });
 

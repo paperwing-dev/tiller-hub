@@ -366,7 +366,8 @@ export async function resolveSetupStatus(
   const hostedInfrastructureReady = hostedBlockingReasons.length === 0;
   const hostedModelReady = hostedModelBlockingReasons.length === 0;
   const selfHostReady = selfHostBlockingReasons.length === 0;
-  const selfHostStatus: SetupStatusPayload["selfHostStatus"] = isSelfHostSetupInProgress(selfHostSession)
+  const selfHostSetupInProgress = isSelfHostSetupInProgress(selfHostSession);
+  const selfHostStatus: SetupStatusPayload["selfHostStatus"] = selfHostSetupInProgress
     ? "setup-in-progress"
     : deploymentMode !== "self-host"
       ? "not-enabled"
@@ -401,7 +402,7 @@ export async function resolveSetupStatus(
     hubUrl: protection.hubUrl,
     deploymentMode,
     selfHostStatus,
-    selfHostSetupAttemptId: selfHostSession?.attemptId ?? null,
+    selfHostSetupAttemptId: selfHostSetupInProgress ? selfHostSession?.attemptId ?? null : null,
     workersDevHubUrl,
     routeKind: protection.routeKind,
     hostKind: protection.routeKind,

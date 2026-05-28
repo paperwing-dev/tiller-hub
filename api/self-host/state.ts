@@ -79,6 +79,8 @@ export interface SelfHostSetupProgress {
   updatedAt: string;
 }
 
+export type FailedSelfHostSetupProgress = SelfHostSetupProgress & { step: "failed" };
+
 interface SelfHostStateBase {
   schemaVersion: 2;
   attemptId: string;
@@ -110,10 +112,16 @@ export interface EnabledSelfHostState extends SelfHostStateBase {
   phase: "enabled";
 }
 
+export interface FailedSelfHostState extends SelfHostStateBase {
+  phase: "failed";
+  progress: FailedSelfHostSetupProgress;
+}
+
 export type SelfHostState =
   | PendingSelfHostState
   | PromotedSelfHostState
-  | EnabledSelfHostState;
+  | EnabledSelfHostState
+  | FailedSelfHostState;
 
 export type SelfHostMutationExpected =
   | { state: "absent" }
@@ -129,6 +137,9 @@ export interface SelfHostProgressMutationInput {
   expected: { attemptId: string };
   progress: SelfHostSetupProgress;
 }
+
+export type ExpirableSelfHostState = PendingSelfHostState | PromotedSelfHostState;
+export type TerminalSelfHostFailureState = PendingSelfHostState | PromotedSelfHostState;
 
 type HubConfigStore = {
   getConfig(key: string): Promise<string | undefined> | string | undefined;
@@ -210,6 +221,18 @@ function isSelfHostSetupProgressStep(value: unknown): value is SelfHostSetupProg
 
 function randomSecret(): string {
   return `${crypto.randomUUID()}.${crypto.randomUUID()}`;
+}
+
+export function createSelfHostFailureProgress(
+  message: string,
+  options: { error?: string; updatedAt?: string } = {},
+): FailedSelfHostSetupProgress {
+  return {
+    step: "failed",
+    message,
+    ...(options.error ? { error: options.error } : {}),
+    updatedAt: options.updatedAt ?? new Date().toISOString(),
+  };
 }
 
 export function createSelfHostSetupIds(): {
@@ -458,6 +481,18 @@ export function parseSelfHostState(raw: string | undefined | null): SelfHostStat
       };
     }
 
+    if (phase === "failed") {
+      if (!progress || progress.step !== "failed") return null;
+      return {
+        schemaVersion: 2,
+        phase,
+        attemptId,
+        rollback,
+        resources,
+        progress,
+      };
+    }
+
     return null;
   } catch {
     return null;
@@ -471,7 +506,7 @@ export async function readSelfHostState(env: Env): Promise<SelfHostState | null>
 }
 
 export function isSelfHostStateExpired(
-  state: Pick<PendingSelfHostState | PromotedSelfHostState, "expiresAt">,
+  state: Pick<ExpirableSelfHostState, "expiresAt">,
   at = Date.now(),
 ): boolean {
   const expiresAt = Date.parse(state.expiresAt);
@@ -511,6 +546,20 @@ export function createPendingSelfHostState(input: {
   };
 }
 
+export function createFailedSelfHostState(
+  state: TerminalSelfHostFailureState,
+  progress: FailedSelfHostSetupProgress,
+): FailedSelfHostState {
+  return {
+    schemaVersion: 2,
+    phase: "failed",
+    attemptId: state.attemptId,
+    rollback: state.rollback,
+    resources: state.resources,
+    progress,
+  };
+}
+
 export async function commitSelfHostMutation(
   env: Env,
   input: SelfHostMutationInput,
@@ -537,16 +586,41 @@ export async function commitSelfHostProgress(
   return await hub.commitSelfHostProgress(input);
 }
 
+export async function failSelfHostSetup(
+  env: Env,
+  state: TerminalSelfHostFailureState,
+  progress: FailedSelfHostSetupProgress,
+): Promise<SelfHostState | null> {
+  const failed = createFailedSelfHostState(state, progress);
+  const committed = await commitSelfHostMutation(env, {
+    expected: { attemptId: state.attemptId, phase: state.phase },
+    nextState: failed,
+    configEntries: rollbackConfigEntries(state.rollback),
+  });
+  if (committed) return failed;
+  return readSelfHostState(env);
+}
+
 export async function expireSelfHostStateIfNeeded(env: Env): Promise<SelfHostState | null> {
   const state = await readSelfHostState(env);
   if (!state) return null;
-  if (state.phase === "enabled") return state;
+  if (state.phase === "enabled" || state.phase === "failed") return state;
   if (!isSelfHostStateExpired(state)) return state;
+
+  if (state.phase === "promoted") {
+    return failSelfHostSetup(
+      env,
+      state,
+      createSelfHostFailureProgress("Self Host setup expired before it was enabled.", {
+        error: "Rolled back to Hosted Tiller. Rerun setup from the workers.dev URL.",
+      }),
+    );
+  }
 
   const committed = await commitSelfHostMutation(env, {
     expected: { attemptId: state.attemptId, phase: state.phase },
     nextState: null,
-    configEntries: state.phase === "promoted" ? rollbackConfigEntries(state.rollback) : {},
+    configEntries: {},
   });
   if (!committed) {
     return readSelfHostState(env);

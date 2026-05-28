@@ -171,6 +171,21 @@ function baseState(phase: SelfHostState["phase"] = "pending"): SelfHostState {
       secretMaterial: { enableToken: state.secretMaterial.enableToken },
     };
   }
+  if (phase === "failed") {
+    return {
+      schemaVersion: 2,
+      phase: "failed",
+      attemptId: state.attemptId,
+      rollback: state.rollback,
+      resources: state.resources,
+      progress: {
+        step: "failed",
+        message: "Self Host setup failed.",
+        error: "Docker is not ready.",
+        updatedAt: "2026-05-27T00:00:00.000Z",
+      },
+    };
+  }
   return {
     schemaVersion: 2,
     phase: "enabled",
@@ -388,6 +403,31 @@ describe("Self Host lifecycle routes", () => {
     expect(revokeSelfHostSetupCredentials).toHaveBeenCalledOnce();
   });
 
+  it("reruns prepare over failed state and revokes superseded resources", async () => {
+    const app = createApp();
+    const existing = baseState("failed");
+    const { env, store } = createEnv(existing);
+
+    const res = await app.request(
+      "https://demo.preview.workers.dev/api/setup/self-host/prepare",
+      prepareRequest,
+      env,
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.commitSelfHostMutation).toHaveBeenCalledWith(expect.objectContaining({
+      expected: { attemptId: existing.attemptId, phase: "failed" },
+      configEntries: expect.objectContaining({
+        HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
+        TILLER_DEPLOYMENT_MODE: "hosted",
+      }),
+    }));
+    const storedState = parseSelfHostState(store.config[SELF_HOST_STATE_KEY]);
+    expect(storedState?.phase).toBe("pending");
+    expect(storedState?.attemptId).not.toBe(existing.attemptId);
+    expect(revokeSelfHostSetupCredentials).toHaveBeenCalledOnce();
+  });
+
   it("updates promoted setup progress through the constrained progress helper", async () => {
     const app = createApp();
     const { env, store } = createEnv(baseState("promoted"));
@@ -428,6 +468,58 @@ describe("Self Host lifecycle routes", () => {
     expect(store.config.TILLER_DEPLOYMENT_MODE).toBeUndefined();
     expect(JSON.stringify(storedState)).toContain("enable-token");
     expect(JSON.stringify(storedState)).not.toContain("leaked");
+  });
+
+  it("records failed progress with rollback through the lifecycle mutation", async () => {
+    const app = createApp();
+    const { env, store } = createEnv(baseState("promoted"), {
+      TILLER_DEPLOYMENT_MODE: "self-host",
+      HUB_PUBLIC_URL: "https://tiller.example.com",
+      CF_ACCESS_CLIENT_SECRET: "client-secret",
+      TILLER_GATEWAY_TUNNEL_ID: "tunnel-1",
+    });
+
+    const res = await app.request(
+      "https://tiller.example.com/api/setup/self-host/progress",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "CF-Access-Client-Id": "client-id.access",
+          "CF-Access-Client-Secret": "client-secret",
+        },
+        body: JSON.stringify({
+          setupAttemptId: "attempt-1",
+          setupToken: "enable-token",
+          step: "failed",
+          message: "Self Host setup failed during local checks.",
+          error: "Docker is not ready.",
+        }),
+      },
+      env,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      phase: "failed",
+      progress: {
+        step: "failed",
+        message: "Self Host setup failed during local checks.",
+        error: "Docker is not ready.",
+      },
+    });
+    expect(store.commitSelfHostMutation).toHaveBeenCalledOnce();
+    expect(store.commitSelfHostProgress).not.toHaveBeenCalled();
+    const storedState = parseSelfHostState(store.config[SELF_HOST_STATE_KEY]);
+    expect(storedState?.phase).toBe("failed");
+    expect(storedState?.progress).toMatchObject({ step: "failed", error: "Docker is not ready." });
+    expect(JSON.stringify(storedState)).not.toContain("enable-token");
+    expect(JSON.stringify(storedState)).not.toContain("client-secret");
+    expect(store.config.HUB_PUBLIC_URL).toBe("https://demo.preview.workers.dev");
+    expect(store.config.TILLER_DEPLOYMENT_MODE).toBe("hosted");
+    expect(store.config.CF_ACCESS_CLIENT_SECRET).toBe("");
+    expect(store.config.TILLER_GATEWAY_TUNNEL_ID).toBe("");
   });
 
   it("rejects setup progress with the wrong setup token", async () => {
@@ -484,7 +576,7 @@ describe("Self Host lifecycle routes", () => {
     expect(store.commitSelfHostProgress).not.toHaveBeenCalled();
   });
 
-  it("rejects expired setup progress without rolling back or mutating state", async () => {
+  it("rolls back expired promoted setup progress into failed state", async () => {
     const app = createApp();
     const expired = {
       ...baseState("promoted"),
@@ -492,8 +584,9 @@ describe("Self Host lifecycle routes", () => {
     } satisfies SelfHostState;
     const { env, store } = createEnv(expired, {
       TILLER_DEPLOYMENT_MODE: "self-host",
+      HUB_PUBLIC_URL: "https://tiller.example.com",
+      CF_ACCESS_CLIENT_SECRET: "client-secret",
     });
-    const storedBefore = store.config[SELF_HOST_STATE_KEY];
 
     const res = await app.request(
       "https://tiller.example.com/api/setup/self-host/progress",
@@ -514,11 +607,21 @@ describe("Self Host lifecycle routes", () => {
       env,
     );
 
-    expect(res.status).toBe(409);
-    expect(store.commitSelfHostMutation).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      phase: "failed",
+      progress: {
+        step: "failed",
+        message: "Self Host setup expired before it was enabled.",
+      },
+    });
+    expect(store.commitSelfHostMutation).toHaveBeenCalledOnce();
     expect(store.commitSelfHostProgress).not.toHaveBeenCalled();
-    expect(store.config[SELF_HOST_STATE_KEY]).toBe(storedBefore);
-    expect(store.config.TILLER_DEPLOYMENT_MODE).toBe("self-host");
+    expect(parseSelfHostState(store.config[SELF_HOST_STATE_KEY])?.phase).toBe("failed");
+    expect(store.config.TILLER_DEPLOYMENT_MODE).toBe("hosted");
+    expect(store.config.HUB_PUBLIC_URL).toBe("https://demo.preview.workers.dev");
+    expect(store.config.CF_ACCESS_CLIENT_SECRET).toBe("");
   });
 
   it("enables promoted state without carrying setup secrets forward", async () => {
@@ -592,7 +695,35 @@ describe("Self Host lifecycle routes", () => {
     expect(JSON.stringify(body)).not.toContain("tiller-gateway.example.com");
   });
 
-  it("rejects expired setup lifecycle polling without rolling back or mutating state", async () => {
+  it("returns failed lifecycle state for the failed attempt only", async () => {
+    const app = createApp();
+    const { env } = createEnv(baseState("failed"));
+
+    const res = await app.request(
+      "https://demo.preview.workers.dev/api/setup/self-host/lifecycle?attemptId=attempt-1",
+      { method: "GET", headers: { "Cf-Access-Jwt-Assertion": "jwt" } },
+      env,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({
+      ok: true,
+      attemptId: "attempt-1",
+      phase: "failed",
+      progress: {
+        step: "failed",
+        message: "Self Host setup failed.",
+        error: "Docker is not ready.",
+        updatedAt: "2026-05-27T00:00:00.000Z",
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("enable-token");
+    expect(JSON.stringify(body)).not.toContain("client-secret");
+    expect(JSON.stringify(body)).not.toContain("tiller-gateway.example.com");
+  });
+
+  it("rolls back expired promoted lifecycle polling into failed state", async () => {
     const app = createApp();
     const expired = {
       ...baseState("promoted"),
@@ -600,8 +731,9 @@ describe("Self Host lifecycle routes", () => {
     } satisfies SelfHostState;
     const { env, store } = createEnv(expired, {
       TILLER_DEPLOYMENT_MODE: "self-host",
+      HUB_PUBLIC_URL: "https://tiller.example.com",
+      CF_ACCESS_CLIENT_SECRET: "client-secret",
     });
-    const storedBefore = store.config[SELF_HOST_STATE_KEY];
 
     const res = await app.request(
       "https://tiller.example.com/api/setup/self-host/lifecycle?attemptId=attempt-1",
@@ -609,11 +741,22 @@ describe("Self Host lifecycle routes", () => {
       env,
     );
 
-    expect(res.status).toBe(410);
-    expect(store.commitSelfHostMutation).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      attemptId: "attempt-1",
+      phase: "failed",
+      progress: {
+        step: "failed",
+        message: "Self Host setup expired before it was enabled.",
+      },
+    });
+    expect(store.commitSelfHostMutation).toHaveBeenCalledOnce();
     expect(store.commitSelfHostProgress).not.toHaveBeenCalled();
-    expect(store.config[SELF_HOST_STATE_KEY]).toBe(storedBefore);
-    expect(store.config.TILLER_DEPLOYMENT_MODE).toBe("self-host");
+    expect(parseSelfHostState(store.config[SELF_HOST_STATE_KEY])?.phase).toBe("failed");
+    expect(store.config.TILLER_DEPLOYMENT_MODE).toBe("hosted");
+    expect(store.config.HUB_PUBLIC_URL).toBe("https://demo.preview.workers.dev");
+    expect(store.config.CF_ACCESS_CLIENT_SECRET).toBe("");
   });
 
   it("returns to Hosted Tiller through the destructive endpoint", async () => {

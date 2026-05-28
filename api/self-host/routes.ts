@@ -17,8 +17,10 @@ import {
   accessCertsUrl,
   commitSelfHostProgress,
   commitSelfHostMutation,
+  createSelfHostFailureProgress,
   createPendingSelfHostState,
   expireSelfHostStateIfNeeded,
+  failSelfHostSetup,
   isSelfHostStateExpired,
   readConfigValue,
   readSelfHostState,
@@ -116,6 +118,14 @@ function setupProgress(
     ...(options.error ? { error: options.error } : {}),
     updatedAt: options.updatedAt ?? new Date().toISOString(),
   };
+}
+
+async function commitTerminalFailure(
+  c: Context<HonoEnv>,
+  state: PromotedSelfHostState,
+  progress: SelfHostSetupProgress & { step: "failed" },
+): Promise<SelfHostState | null> {
+  return failSelfHostSetup(c.env, state, progress);
 }
 
 function isCliProgressStep(value: unknown): value is SelfHostSetupProgressStep {
@@ -651,7 +661,14 @@ selfHostRoutes.post("/api/setup/self-host/progress", async (c) => {
     return c.json({ error: "No promoted Self Host setup attempt is waiting for progress." }, 409);
   }
   if (isSelfHostStateExpired(state)) {
-    return c.json({ error: "Self Host setup expired. Rerun setup from the workers.dev URL." }, 409);
+    const progress = createSelfHostFailureProgress("Self Host setup expired before it was enabled.", {
+      error: "Rolled back to Hosted Tiller. Rerun setup from the workers.dev URL.",
+    });
+    const failed = await commitTerminalFailure(c, state, progress);
+    if (!failed || failed.attemptId !== state.attemptId || failed.phase !== "failed") {
+      return c.json({ error: "Self Host setup expiry conflicted with another lifecycle change. Try again." }, 409);
+    }
+    return c.json({ ok: true, phase: "failed", progress: failed.progress });
   }
   if (setupAttemptId !== state.attemptId || setupToken !== state.secretMaterial.enableToken) {
     return c.json({ error: "Invalid Self Host setup progress token." }, 401);
@@ -665,6 +682,14 @@ selfHostRoutes.post("/api/setup/self-host/progress", async (c) => {
     message || (body.step === "failed" ? "Self Host setup failed." : "Self Host setup is running."),
     error ? { error } : {},
   );
+  if (progress.step === "failed") {
+    const failed = await commitTerminalFailure(c, state, progress as SelfHostSetupProgress & { step: "failed" });
+    if (!failed || failed.attemptId !== state.attemptId || failed.phase !== "failed") {
+      return c.json({ error: "Self Host setup failure conflicted with another lifecycle change. Try again." }, 409);
+    }
+    return c.json({ ok: true, phase: "failed", progress: failed.progress });
+  }
+
   const committed = await commitSelfHostProgress(c.env, {
     expected: { attemptId: state.attemptId },
     progress,
@@ -684,8 +709,24 @@ selfHostRoutes.get("/api/setup/self-host/lifecycle", async (c) => {
   if (!state || state.attemptId !== attemptId) {
     return c.json({ error: "Self Host setup attempt was not found." }, 404);
   }
-  if (state.phase !== "enabled" && isSelfHostStateExpired(state)) {
+  if (state.phase === "pending" && isSelfHostStateExpired(state)) {
+    await expireSelfHostStateIfNeeded(c.env);
     return c.json({ error: "Self Host setup expired. Rerun setup from the workers.dev URL." }, 410);
+  }
+  if (state.phase === "promoted" && isSelfHostStateExpired(state)) {
+    const progress = createSelfHostFailureProgress("Self Host setup expired before it was enabled.", {
+      error: "Rolled back to Hosted Tiller. Rerun setup from the workers.dev URL.",
+    });
+    const failed = await commitTerminalFailure(c, state, progress);
+    if (!failed || failed.attemptId !== state.attemptId || failed.phase !== "failed") {
+      return c.json({ error: "Self Host setup expiry conflicted with another lifecycle change. Try again." }, 409);
+    }
+    return c.json({
+      ok: true,
+      attemptId: failed.attemptId,
+      phase: failed.phase,
+      progress: failed.progress,
+    });
   }
 
   return c.json({

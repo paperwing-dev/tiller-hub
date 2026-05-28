@@ -97,11 +97,89 @@ vi.mock("../protection", async () => {
 import setupRoutes from "../setup/routes";
 import { resolveEnabledHarnesses } from "../env/harness";
 import { hasEnabledHarnessModelAuth, resolveProtectionState } from "../protection";
+import { SELF_HOST_STATE_KEY } from "../self-host/state";
 
 function createApp() {
   const app = new Hono<HonoEnv>();
   app.route("/", setupRoutes);
   return app;
+}
+
+function failedSelfHostState() {
+  return {
+    schemaVersion: 2,
+    phase: "failed",
+    attemptId: "attempt-1",
+    rollback: {
+      workersDevHubUrl: "https://demo.preview.workers.dev",
+      workerServiceName: "tiller",
+      workersDevAliasDisabled: "false",
+      cfAccessConfigured: "true",
+      browserAccess: {
+        appId: "workers-app",
+        aud: "workers-aud",
+        issuer: "https://workers.cloudflareaccess.com",
+        jwksUrl: "https://workers.cloudflareaccess.com/cdn-cgi/access/certs",
+        appDomain: "demo.preview.workers.dev",
+        appType: null,
+        overlappingWildcardAppDomain: null,
+        browserPolicyId: "workers-browser-policy",
+      },
+    },
+    resources: {
+      workerCustomDomain: {
+        hostname: "tiller.example.com",
+        hubUrl: "https://tiller.example.com",
+        service: "tiller",
+        zoneName: "example.com",
+        accountId: "acc-1",
+        zoneId: "zone-1",
+        domainId: "domain-1",
+      },
+      hubAccess: {
+        appId: "hub-app",
+        aud: "hub-aud",
+        appDomain: "tiller.example.com",
+        issuer: "https://team.cloudflareaccess.com",
+        jwksUrl: "https://team.cloudflareaccess.com/cdn-cgi/access/certs",
+        accessTeamDomain: "team.cloudflareaccess.com",
+        browserPolicyId: "browser-policy",
+        serviceTokenId: "service-token",
+        serviceTokenPolicyId: "service-policy",
+        clientId: "client-id.access",
+      },
+      gateway: {
+        hostname: "tiller-gateway.example.com",
+        appId: "gateway-app",
+        appDomain: "tiller-gateway.example.com",
+        serviceTokenPolicyId: "gateway-policy",
+        tunnelId: "tunnel-1",
+        tunnelName: "tiller-gateway-abcd1234",
+        tunnelTargetPort: 8788,
+      },
+    },
+    progress: {
+      step: "failed",
+      message: "Self Host setup failed.",
+      error: "Docker is not ready.",
+      updatedAt: "2026-05-27T00:00:00.000Z",
+    },
+  };
+}
+
+function envWithSelfHostState(state: unknown): HonoEnv["Bindings"] {
+  const config: Record<string, string> = {
+    [SELF_HOST_STATE_KEY]: JSON.stringify(state),
+  };
+  return {
+    HUB: {
+      idFromName: vi.fn(() => "hub-id"),
+      get: vi.fn(() => ({
+        getConfig: vi.fn((key: string) => config[key]),
+        getAllConfig: vi.fn(() => config),
+      })),
+    },
+  } as unknown as HonoEnv["Bindings"];
 }
 
 describe("GET /api/setup/status", () => {
@@ -338,6 +416,41 @@ describe("GET /api/setup/status", () => {
       accessConfigured: true,
       githubAppConfigured: false,
       githubAppReady: false,
+    });
+  });
+
+  it("does not expose failed Self Host attempts as active setup status", async () => {
+    vi.mocked(resolveProtectionState).mockResolvedValueOnce({
+      currentOrigin: "https://demo.preview.workers.dev",
+      hubUrl: "https://demo.preview.workers.dev",
+      routeKind: "workers-dev",
+      hostKind: "workers-dev",
+      protectionMode: "cf-access",
+      protectionCanAutomate: false,
+      serviceTokenConfigured: false,
+      unsupportedProtectionConfig: false,
+      workersDevAliasDisabled: false,
+      protectionAppDomain: "demo.preview.workers.dev",
+      accessConfigured: true,
+      accessIssuer: "https://team.cloudflareaccess.com",
+      accessJwksUrl: "https://team.cloudflareaccess.com/cdn-cgi/access/certs",
+    });
+    readRegisteredHostService.mockResolvedValue(null);
+    readRoutableHostService.mockResolvedValue(null);
+
+    const app = createApp();
+    const res = await app.request(
+      "https://demo.preview.workers.dev/api/setup/status",
+      { method: "GET" },
+      envWithSelfHostState(failedSelfHostState()),
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      deploymentMode: "hosted",
+      selfHostStatus: "not-enabled",
+      selfHostSetupAttemptId: null,
+      workersDevHubUrl: "https://demo.preview.workers.dev",
     });
   });
 
