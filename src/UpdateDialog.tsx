@@ -327,6 +327,7 @@ export default function UpdateDialog({
   const visibleUpdateRepoOwners = visibleGitHubOwnersForUpdateRepo(status.hubRepo);
   const showProgress = stage !== 'idle';
   const sameUpdateName = currentUpdateName === latestUpdateName;
+  const isDevelopmentBuild = status.buildDiagnostics.channel === 'development';
 
   return (
     <div className="flex-1 overflow-auto bg-[#f6f8fa]">
@@ -346,6 +347,10 @@ export default function UpdateDialog({
                     This deployment is running <strong>{currentUpdateName}</strong>.
                     {' '}A newer source build is available for the same version.
                   </>
+                ) : isDevelopmentBuild ? (
+                  <>
+                    This deployment is running a development build from <strong>{currentUpdateName}</strong>.
+                  </>
                 ) : (
                   <>
                     This deployment is currently running <strong>{currentUpdateName}</strong>.
@@ -364,62 +369,73 @@ export default function UpdateDialog({
             </a>
           </div>
 
-          <div className="mt-6 grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
-            <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
-              <p className="text-sm font-semibold text-[#24292f]">Self-update repository</p>
-              <p className="mt-1 text-xs text-[#57606a]">
-                {status.hubRepo.status === 'detected'
-                  ? `${status.hubRepo.fullName} · ${status.hubRepo.branch}`
-                  : status.hubRepo.status === 'ambiguous'
-                    ? 'Multiple selected repositories contain Tiller update metadata.'
-                    : 'No generated deploy-button repo is connected yet.'}
+          {isDevelopmentBuild && (
+            <div className="mt-6 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] px-4 py-3">
+              <p className="text-sm font-semibold text-[#24292f]">Development build</p>
+              <p className="mt-1 text-sm text-[#57606a]">
+                Dogfood deployments are updated with <code>npm run deploy</code>. Release self-update is disabled for this build.
               </p>
-              {status.hubRepo.status === 'ambiguous' && (
-                <div className="mt-3 grid gap-2">
-                  {status.hubRepo.candidates.map((candidate) => (
-                    <button
-                      key={`${candidate.repoId}:${candidate.branch}`}
-                      type="button"
-                      onClick={() => void handleSelectCandidate(candidate)}
-                      disabled={isApplying}
-                      className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-left text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
-                    >
-                      {candidate.label}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {status.hubRepo.status === 'missing' && (
-                <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
-                  <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
-                  <p className="mt-1 text-xs leading-5 text-[#57606a]">
-                    Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
-                    {visibleUpdateRepoOwners.length > 0
-                      ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
-                      : ' Tiller cannot currently see any selected GitHub App repositories.'}
-                    {' '}Open Cloudflare Worker Settings &gt; Builds and compare the connected repo owner.
-                  </p>
-                </div>
-              )}
-              {status.hubRepo.status !== 'detected' && (
-                <button
-                  type="button"
-                  onClick={() => void handleDetectRepo()}
-                  disabled={isApplying}
-                  className="mt-3 rounded border border-[#0969da] bg-white px-3 py-1.5 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
-                >
-                  Check GitHub repos
-                </button>
-              )}
             </div>
+          )}
 
-            <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
-              <p className="text-sm font-semibold text-[#24292f]">Update source</p>
-              <p className="mt-1 text-xs leading-5 text-[#57606a]">
-                Tiller updates by committing the latest hub source into the deploy-button repo connected to Cloudflare Builds.
-              </p>
+          {!isDevelopmentBuild && (
+            <div className="mt-6 grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
+              <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
+                <p className="text-sm font-semibold text-[#24292f]">Self-update repository</p>
+                <p className="mt-1 text-xs text-[#57606a]">
+                  {status.hubRepo.status === 'detected'
+                    ? `${status.hubRepo.fullName} · ${status.hubRepo.branch}`
+                    : status.hubRepo.status === 'ambiguous'
+                      ? 'Multiple selected repositories contain Tiller update metadata.'
+                      : 'No generated deploy-button repo is connected yet.'}
+                </p>
+                {status.hubRepo.status === 'ambiguous' && (
+                  <div className="mt-3 grid gap-2">
+                    {status.hubRepo.candidates.map((candidate) => (
+                      <button
+                        key={`${candidate.repoId}:${candidate.branch}`}
+                        type="button"
+                        onClick={() => void handleSelectCandidate(candidate)}
+                        disabled={isApplying}
+                        className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-left text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+                      >
+                        {candidate.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {status.hubRepo.status === 'missing' && (
+                  <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
+                    <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
+                    <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                      Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
+                      {visibleUpdateRepoOwners.length > 0
+                        ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
+                        : ' Tiller cannot currently see any selected GitHub App repositories.'}
+                      {' '}Open Cloudflare Worker Settings &gt; Builds and compare the connected repo owner.
+                    </p>
+                  </div>
+                )}
+                {status.hubRepo.status !== 'detected' && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDetectRepo()}
+                    disabled={isApplying}
+                    className="mt-3 rounded border border-[#0969da] bg-white px-3 py-1.5 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
+                  >
+                    Check GitHub repos
+                  </button>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
+                <p className="text-sm font-semibold text-[#24292f]">Update source</p>
+                <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                  Tiller updates by committing the latest hub source into the deploy-button repo connected to Cloudflare Builds.
+                </p>
+              </div>
             </div>
-          </div>
+          )}
 
           {showProgress && (
             <div className="mt-5 rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
@@ -440,14 +456,16 @@ export default function UpdateDialog({
           )}
 
           <div className="mt-6 flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={() => void handleGitHubRepoUpdate()}
-              disabled={isApplying || stage === 'complete'}
-              className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {isApplying ? 'Updating...' : 'Update'}
-            </button>
+            {!isDevelopmentBuild && (
+              <button
+                type="button"
+                onClick={() => void handleGitHubRepoUpdate()}
+                disabled={isApplying || stage === 'complete'}
+                className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isApplying ? 'Updating...' : 'Update'}
+              </button>
+            )}
             {stage === 'complete' && (
               <button
                 type="button"

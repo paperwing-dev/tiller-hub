@@ -23,6 +23,7 @@ import type {
   HubUpdateRepoState,
   TillerUpdateMetadata,
   UpdateApplyResult,
+  UpdateBuildDiagnostics,
   UpdateCheckResult,
 } from "../api/update/types";
 
@@ -485,6 +486,24 @@ function normalizeHubUpdateRepoState(payload: unknown): HubUpdateRepoState {
   return { status: "not_checked", lastDetectedAt: null };
 }
 
+function normalizeBuildDiagnostics(payload: unknown): UpdateBuildDiagnostics {
+  if (!isRecord(payload)) {
+    return {
+      channel: "release",
+      version: "",
+      workersCiCommitSha: null,
+      workersCiBranch: null,
+    };
+  }
+
+  return {
+    channel: payload.channel === "development" ? "development" : "release",
+    version: readStringOr(payload.version, ""),
+    workersCiCommitSha: readNullableString(payload.workersCiCommitSha),
+    workersCiBranch: readNullableString(payload.workersCiBranch),
+  };
+}
+
 function normalizeUpdateCheckResult(payload: unknown): UpdateCheckResult | null {
   if (!isRecord(payload)) return null;
   const currentUpdate = normalizeUpdateMetadata(payload.currentUpdate);
@@ -498,17 +517,7 @@ function normalizeUpdateCheckResult(payload: unknown): UpdateCheckResult | null 
     updateAvailable: payload.updateAvailable,
     currentUpdate,
     latestUpdate,
-    buildDiagnostics: isRecord(payload.buildDiagnostics)
-      ? {
-          version: readStringOr(payload.buildDiagnostics.version, ""),
-          workersCiCommitSha: readNullableString(payload.buildDiagnostics.workersCiCommitSha),
-          workersCiBranch: readNullableString(payload.buildDiagnostics.workersCiBranch),
-        }
-      : {
-          version: "",
-          workersCiCommitSha: null,
-          workersCiBranch: null,
-        },
+    buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
     hubRepo: normalizeHubUpdateRepoState(payload.hubRepo),
     updateMethod: payload.updateMethod === "github_repo" || payload.updateMethod === "connect_hub_repo" || payload.updateMethod === "advanced_repair"
       ? payload.updateMethod
@@ -545,6 +554,7 @@ export type {
   HubUpdateRepoState,
   TillerUpdateMetadata,
   UpdateApplyResult,
+  UpdateBuildDiagnostics,
   UpdateCheckResult,
 } from "../api/update/types";
 export type { Artifact, ArtifactRef, PlanArtifact, PlanStatus, ReviewerRegistryEntry } from "../api/coordination/types";
@@ -643,6 +653,7 @@ function normalizeSetupStatus(payload: unknown, hubUrl: string): SetupStatus {
       githubAppInstallUrl: null,
       githubAppManageUrl: "https://github.com/settings/installations",
       githubAppPublicHubDisabled: true,
+      buildDiagnostics: normalizeBuildDiagnostics(null),
       selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
     };
   }
@@ -772,6 +783,7 @@ function normalizeSetupStatus(payload: unknown, hubUrl: string): SetupStatus {
     githubAppInstallUrl: readNullableString(payload.githubAppInstallUrl),
     githubAppManageUrl: readStringOr(payload.githubAppManageUrl, "https://github.com/settings/installations"),
     githubAppPublicHubDisabled: readBooleanOr(payload.githubAppPublicHubDisabled),
+    buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
     selfUpdateRepo: normalizeHubUpdateRepoState(payload.selfUpdateRepo),
   };
 }
@@ -1574,6 +1586,7 @@ export interface SetupStatus {
   githubAppInstallUrl: string | null;
   githubAppManageUrl: string;
   githubAppPublicHubDisabled: boolean;
+  buildDiagnostics: UpdateBuildDiagnostics;
   selfUpdateRepo: HubUpdateRepoState;
 }
 

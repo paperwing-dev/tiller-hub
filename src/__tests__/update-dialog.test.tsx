@@ -24,6 +24,7 @@ function makeUpdateStatus(overrides: Partial<UpdateCheckResult> = {}): UpdateChe
     currentUpdate: update,
     latestUpdate: { ...update, sourceId: "source-b", version: "0.2.32", label: "Tiller Hub v0.2.32" },
     buildDiagnostics: {
+      channel: "release",
       version: "0.2.31",
       workersCiCommitSha: null,
       workersCiBranch: "main",
@@ -162,5 +163,35 @@ describe("UpdateDialog", () => {
     );
 
     expect(html).toContain("A newer source build is available for the same version.");
+  });
+
+  it("does not show an update action for development builds", () => {
+    const status = makeUpdateStatus({
+      updateAvailable: false,
+      latestUpdate: makeUpdateStatus().currentUpdate,
+      buildDiagnostics: {
+        channel: "development",
+        version: "0.2.31",
+        workersCiCommitSha: null,
+        workersCiBranch: "main",
+      },
+    });
+
+    const html = renderToString(
+      <UpdateDialog
+        hubUrl="https://example.workers.dev"
+        status={status}
+        issue={null}
+        isChecking={false}
+        onDismiss={vi.fn()}
+        onOpenSettings={vi.fn()}
+        onRetryCheck={vi.fn()}
+        onUpdated={vi.fn()}
+      />,
+    );
+
+    expect(html).toContain("Development build");
+    expect(html).not.toContain(">Update</button>");
+    expect(html).not.toContain("Self-update repository");
   });
 });

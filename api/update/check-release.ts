@@ -2,6 +2,7 @@ import type { Env } from "../types";
 import { readHubUpdateRepoState, resolveHubUpdateRepoState } from "./hub-repo";
 import {
   fetchLatestReleaseUpdateMetadata,
+  getBuildChannel,
   getBuildDiagnostics,
   getCurrentUpdateMetadata,
   UPDATE_CACHE_TTL_SECONDS,
@@ -87,6 +88,7 @@ function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMeta
   const result = value as Partial<UpdateCheckResult>;
   return typeof result.updateAvailable === "boolean" &&
     result.currentUpdate?.sourceId === currentUpdate.sourceId &&
+    result.buildDiagnostics?.channel === getBuildChannel() &&
     typeof result.currentUpdate.version === "string" &&
     typeof result.latestUpdate?.sourceId === "string" &&
     typeof result.latestUpdate.version === "string" &&
@@ -96,6 +98,18 @@ function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMeta
 export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
   try {
     const currentUpdate = getCurrentUpdateMetadata();
+    if (getBuildChannel() === "development") {
+      return {
+        updateAvailable: false,
+        currentUpdate,
+        latestUpdate: currentUpdate,
+        buildDiagnostics: getBuildDiagnostics(),
+        hubRepo: { status: "not_checked", lastDetectedAt: null },
+        updateMethod: "advanced_repair",
+        releaseNotesUrl: `https://github.com/${currentUpdate.sourceRepo}`,
+      };
+    }
+
     const hubRepo = await resolveHubUpdateRepoState(env, { autoDetect: true });
     const cached = await env.ENVS_KV.get(UPDATE_CHECK_CACHE_KEY, "json");
     if (isCacheableUpdateResult(cached, currentUpdate)) {

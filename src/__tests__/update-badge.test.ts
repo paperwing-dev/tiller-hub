@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeUpdateBadgeState } from "../UpdateBadge";
+import { describeUpdateButtonState } from "../UpdateBadge";
 import type { TillerUpdateMetadata, UpdateCheckResult } from "../api";
 
 function updateMarker(sourceId: string, version: string): TillerUpdateMetadata {
@@ -23,6 +23,7 @@ function updateStatus(overrides: Partial<UpdateCheckResult> = {}): UpdateCheckRe
     currentUpdate,
     latestUpdate,
     buildDiagnostics: {
+      channel: "release",
       version: "0.1.0",
       workersCiCommitSha: null,
       workersCiBranch: null,
@@ -34,42 +35,79 @@ function updateStatus(overrides: Partial<UpdateCheckResult> = {}): UpdateCheckRe
   };
 }
 
-describe("describeUpdateBadgeState", () => {
-  it("returns an issue badge when the self-update check fails", () => {
-    expect(describeUpdateBadgeState({
+describe("describeUpdateButtonState", () => {
+  it("disables the button when the self-update check fails", () => {
+    expect(describeUpdateButtonState({
       status: null,
       issue: "Latest tiller-hub release is not accessible.",
       dismissed: false,
+      isChecking: false,
     })).toEqual({
-      title: "Self-update check unavailable: Latest tiller-hub release is not accessible.",
-      accentClassName: "text-[#cf222e] hover:text-[#a40e26]",
-      icon: "!",
+      title: "Update unavailable: Latest tiller-hub release is not accessible.",
+      enabled: false,
     });
   });
 
-  it("returns an update badge when a release is available", () => {
-    expect(describeUpdateBadgeState({
+  it("enables the button when a release update is available", () => {
+    expect(describeUpdateButtonState({
       status: updateStatus(),
       issue: null,
       dismissed: false,
+      isChecking: false,
     })).toEqual({
       title: "Update available: v0.1.0 -> v0.2.0",
-      accentClassName: "text-[#57606a] hover:text-[#24292f]",
-      icon: "↑",
+      enabled: true,
     });
   });
 
-  it("returns null when there is no issue and no visible update", () => {
-    expect(describeUpdateBadgeState({
+  it("disables the button when no update is visible", () => {
+    expect(describeUpdateButtonState({
       status: updateStatus({ updateAvailable: false }),
       issue: null,
       dismissed: false,
-    })).toBeNull();
+      isChecking: false,
+    })).toEqual({
+      title: "No update available",
+      enabled: false,
+    });
 
-    expect(describeUpdateBadgeState({
+    expect(describeUpdateButtonState({
       status: updateStatus(),
       issue: null,
       dismissed: true,
-    })).toBeNull();
+      isChecking: false,
+    })).toEqual({
+      title: "Update dismissed",
+      enabled: false,
+    });
+  });
+
+  it("disables the button while checking and for development builds", () => {
+    expect(describeUpdateButtonState({
+      status: updateStatus(),
+      issue: null,
+      dismissed: false,
+      isChecking: true,
+    })).toEqual({
+      title: "Checking for updates",
+      enabled: false,
+    });
+
+    expect(describeUpdateButtonState({
+      status: updateStatus({
+        buildDiagnostics: {
+          channel: "development",
+          version: "0.1.0",
+          workersCiCommitSha: null,
+          workersCiBranch: null,
+        },
+      }),
+      issue: null,
+      dismissed: false,
+      isChecking: false,
+    })).toEqual({
+      title: "Development build",
+      enabled: false,
+    });
   });
 });

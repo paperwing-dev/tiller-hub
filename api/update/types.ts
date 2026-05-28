@@ -21,6 +21,7 @@ export interface TillerUpdateMetadata {
 }
 
 export interface UpdateBuildDiagnostics {
+  channel: "development" | "release";
   version: string;
   workersCiCommitSha: string | null;
   workersCiBranch: string | null;

@@ -5,6 +5,7 @@ import { clearUpdateCheckCache } from "./check-release";
 import { fetchRepoUpdateMetadata, readHubUpdateRepoState } from "./hub-repo";
 import {
   findRemovedManagedFiles,
+  getBuildChannel,
   getCurrentUpdateMetadata,
   parseTillerUpdateMetadata,
   PUBLIC_HUB_REPO,
@@ -401,6 +402,14 @@ function applyFailureResult(error: unknown): UpdateApplyResult {
 }
 
 async function applyGitHubRepoUpdateInternal(env: Env): Promise<UpdateApplyResult> {
+  if (getBuildChannel() === "development") {
+    return {
+      ok: true,
+      status: "noop",
+      expectedSourceId: getCurrentUpdateMetadata().sourceId,
+    };
+  }
+
   const hubRepo = await readHubUpdateRepoState(env);
   if (hubRepo.status !== "detected") {
     return {

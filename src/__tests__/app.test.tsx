@@ -187,6 +187,7 @@ describe("Dashboard", () => {
         managedFiles: ["package.json"],
       },
       buildDiagnostics: {
+        channel: "release",
         version: "0.1.0",
         workersCiCommitSha: null,
         workersCiBranch: null,

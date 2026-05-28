@@ -2,7 +2,7 @@ import type { GitHubRelease, TillerUpdateMetadata } from "./types";
 
 export const PUBLIC_HUB_REPO = "paperwing-dev/tiller-hub";
 export const UPDATE_METADATA_PATH = "tiller-update.json";
-export const UPDATE_CHECK_CACHE_KEY = "tiller:update-check:v3";
+export const UPDATE_CHECK_CACHE_KEY = "tiller:update-check:v4";
 export const UPDATE_CACHE_TTL_SECONDS = 300;
 
 const LATEST_RELEASE_URL = `https://api.github.com/repos/${PUBLIC_HUB_REPO}/releases/latest`;
@@ -64,11 +64,17 @@ export function getCurrentUpdateMetadata(): TillerUpdateMetadata {
   return parsed;
 }
 
+export function getBuildChannel(): "development" | "release" {
+  const channel = typeof __TILLER_BUILD_CHANNEL__ === "string" ? __TILLER_BUILD_CHANNEL__.trim() : "";
+  return channel === "development" ? "development" : "release";
+}
+
 export function getBuildDiagnostics() {
   const version = typeof __TILLER_VERSION__ === "string" ? __TILLER_VERSION__ : "";
   const workersCiCommitSha = typeof __WORKERS_CI_COMMIT_SHA__ === "string" ? __WORKERS_CI_COMMIT_SHA__ : "";
   const workersCiBranch = typeof __WORKERS_CI_BRANCH__ === "string" ? __WORKERS_CI_BRANCH__ : "";
   return {
+    channel: getBuildChannel(),
     version: version.trim(),
     workersCiCommitSha: workersCiCommitSha.trim() || null,
     workersCiBranch: workersCiBranch.trim() || null,

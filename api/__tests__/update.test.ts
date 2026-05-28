@@ -135,6 +135,58 @@ afterEach(() => {
 });
 
 describe("checkForUpdate", () => {
+  it("returns no update and skips GitHub release lookup for development builds", async () => {
+    vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
+    vi.stubGlobal("__TILLER_BUILD_CHANNEL__", "development");
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const env = {
+      ENVS_KV: {
+        get: vi.fn().mockResolvedValue({
+          updateAvailable: true,
+          currentUpdate: updateMarker("current-source"),
+          latestUpdate: updateMarker("latest-source"),
+          releaseNotesUrl: "https://example.com/stale",
+        }),
+        put: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+
+    const result = await checkForUpdate(env as never);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(env.ENVS_KV.get).not.toHaveBeenCalled();
+    expect(env.ENVS_KV.put).not.toHaveBeenCalled();
+    expect(result.updateAvailable).toBe(false);
+    expect(result.currentUpdate.sourceId).toBe("current-source");
+    expect(result.latestUpdate.sourceId).toBe("current-source");
+    expect(result.buildDiagnostics.channel).toBe("development");
+    expect(result.hubRepo.status).toBe("not_checked");
+    expect(result.issue).toBeUndefined();
+  });
+
+  it("defaults missing build channel to release behavior", async () => {
+    vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
+    const fetchMock = mockLatestReleaseFetch(updateMarker("latest-source"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const env = {
+      ENVS_KV: {
+        get: vi.fn().mockResolvedValue(null),
+        put: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+
+    const result = await checkForUpdate(env as never);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.updateAvailable).toBe(true);
+    expect(result.buildDiagnostics.channel).toBe("release");
+  });
+
   it("ignores cached results from an older deployed source id", async () => {
     vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
     vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
@@ -198,6 +250,7 @@ describe("checkForUpdate", () => {
           currentUpdate: updateMarker("current-source"),
           latestUpdate: updateMarker("latest-source"),
           buildDiagnostics: {
+            channel: "release",
             version: "0.1.1",
             workersCiCommitSha: null,
             workersCiBranch: null,

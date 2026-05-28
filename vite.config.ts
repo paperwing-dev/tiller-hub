@@ -38,11 +38,16 @@ function readUpdateMetadata(): unknown {
   };
 }
 
+function resolveBuildChannel(): "development" | "release" {
+  return process.env.TILLER_BUILD_CHANNEL?.trim() === "development" ? "development" : "release";
+}
+
 export default defineConfig(({ command }) => ({
   define: {
     __TILLER_VERSION__: JSON.stringify(
       process.env.TILLER_BUILD_VERSION || require("./package.json").version,
     ),
+    __TILLER_BUILD_CHANNEL__: JSON.stringify(resolveBuildChannel()),
     __TILLER_CURRENT_UPDATE__: JSON.stringify(readUpdateMetadata()),
     __WORKERS_CI_COMMIT_SHA__: JSON.stringify(process.env.WORKERS_CI_COMMIT_SHA || process.env.GITHUB_SHA || ""),
     __WORKERS_CI_BRANCH__: JSON.stringify(process.env.WORKERS_CI_BRANCH || process.env.GITHUB_REF_NAME || ""),

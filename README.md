@@ -13,6 +13,14 @@ TLDR, it's a wrapper around coding agents like Claude Code/Codex/your own, but f
 
 For more background, check out [paperwing.dev/code/tiller](www.paperwing.dev/code/tiller).
 
+## License
+
+Tiller Coding Hub is source-available under the [PolyForm Perimeter License 1.0.0](LICENSE).
+
+Tiller Coding Hub is the public core. You can use the core personally or inside a company, edit it, fork it, contribute changes, and use it as a tool to build commercial software. You cannot sell, host, distribute, or market the public core, a fork of the public core, or a substantially similar replacement for the public core as a competing product.
+
+Separate add-ons are fair game. You can build and sell add-ons that connect to or extend the public core, including CLIs, harnesses, runners, integrations, deployment tools, and management tools. The license text controls if this summary and the license disagree.
+
 ## Why
 
 Claude Code and Codex just use their models, the UI is constantly changing, and the code is shit anyway. Might as well make and host your own.

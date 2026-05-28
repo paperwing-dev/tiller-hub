@@ -72,6 +72,12 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     githubAppInstallUrl: null,
     githubAppManageUrl: "https://github.com/settings/installations",
     githubAppPublicHubDisabled: false,
+    buildDiagnostics: {
+      channel: "release",
+      version: "0.1.0",
+      workersCiCommitSha: null,
+      workersCiBranch: null,
+    },
     selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
     ...overrides,
   };
@@ -167,6 +173,37 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).toContain("Check the GitHub account");
     expect(html).toContain("Tiller can currently see adam, paperwing-dev.");
     expect(html).toContain("Cloudflare Worker Settings");
+  });
+
+  it("hides release self-update setup for development builds", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          githubAppAvailable: true,
+          githubAppConfigured: true,
+          githubAppReady: true,
+          githubAppInstallUrl: "https://github.com/apps/tiller-test/installations/new",
+          buildDiagnostics: {
+            channel: "development",
+            version: "0.1.0",
+            workersCiCommitSha: null,
+            workersCiBranch: null,
+          },
+          selfUpdateRepo: {
+            status: "missing",
+            lastDetectedAt: "2026-05-28T00:00:00.000Z",
+            visibleGitHubOwners: ["adam"],
+          },
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).not.toContain("Self-update repo");
+    expect(html).not.toContain("Connect self-update repo");
+    expect(html).not.toContain("Check the GitHub account");
   });
 
   it("hides Self Host internals in Hosted mode and shows the setup action", async () => {

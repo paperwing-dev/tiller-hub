@@ -38,7 +38,8 @@ import {
 } from "../github/app";
 import { requiresWorkersDevAccessProtection } from "./protect-hub";
 import { resolveHubUpdateRepoState } from "../update/hub-repo";
-import type { HubUpdateRepoState } from "../update/types";
+import { getBuildDiagnostics } from "../update/metadata";
+import type { HubUpdateRepoState, UpdateBuildDiagnostics } from "../update/types";
 
 export interface SetupStatusPayload {
   needsSetup: boolean;
@@ -105,6 +106,7 @@ export interface SetupStatusPayload {
   githubAppInstallUrl: string | null;
   githubAppManageUrl: string;
   githubAppPublicHubDisabled: boolean;
+  buildDiagnostics: UpdateBuildDiagnostics;
   selfUpdateRepo: HubUpdateRepoState;
 }
 
@@ -329,12 +331,15 @@ export async function resolveSetupStatus(
   const githubAppAllowed = await isGitHubAppAllowedForRequest(env, request);
   const githubAppConfig = githubAppAllowed ? await getGitHubAppConfig(env) : null;
   const githubAppConfigured = githubAppAllowed && Boolean(githubAppConfig);
+  const buildDiagnostics = getBuildDiagnostics();
   const githubAppReady = await resolveGitHubAppReady({
     allowed: githubAppAllowed,
     configured: githubAppConfigured,
     env,
   });
-  const selfUpdateRepo = await resolveHubUpdateRepoState(env, { autoDetect: githubAppConfigured });
+  const selfUpdateRepo = buildDiagnostics.channel === "development"
+    ? { status: "not_checked" as const, lastDetectedAt: null }
+    : await resolveHubUpdateRepoState(env, { autoDetect: githubAppConfigured });
   const workersAiConfigured = hasWorkersAiBinding(env)
     || Boolean(
       (await getSecret(env, "TILLER_WORKERS_AI_ACCOUNT_ID"))?.trim()
@@ -459,6 +464,7 @@ export async function resolveSetupStatus(
     githubAppInstallUrl: githubAppConfig ? getGitHubAppInstallUrl(githubAppConfig.slug) : null,
     githubAppManageUrl: getGitHubAppManageUrl(),
     githubAppPublicHubDisabled: !githubAppAllowed,
+    buildDiagnostics,
     selfUpdateRepo,
   };
 }

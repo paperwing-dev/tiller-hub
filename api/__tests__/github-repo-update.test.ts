@@ -79,6 +79,25 @@ describe("applyGitHubRepoUpdate", () => {
     vi.unstubAllGlobals();
   });
 
+  it("no-ops development builds before reading self-update repo state", async () => {
+    vi.stubGlobal("__TILLER_BUILD_CHANNEL__", "development");
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(applyGitHubRepoUpdate({} as never)).resolves.toEqual({
+      ok: true,
+      status: "noop",
+      expectedSourceId: "current-source",
+    });
+
+    expect(mocks.readHubUpdateRepoState).not.toHaveBeenCalled();
+    expect(mocks.mintGitHubInstallationToken).not.toHaveBeenCalled();
+    expect(mocks.fetchRepoUpdateMetadata).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mocks.clearUpdateCheckCache).not.toHaveBeenCalled();
+  });
+
   it("queues a same-tree commit when the repo already has latest source but the Worker is still behind", async () => {
     vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

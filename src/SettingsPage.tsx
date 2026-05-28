@@ -1020,6 +1020,7 @@ function GitHubAppSettings({
   const loadingRepos = githubRepositories.loading;
   const selectedRepo = repoSelections.find((selection) => githubRepositoryKey(selection) === selectedRepoKey) ?? null;
   const selfUpdateRepo = status.selfUpdateRepo ?? { status: "not_checked" as const, lastDetectedAt: null };
+  const showSelfUpdateRepo = status.buildDiagnostics.channel === "release";
 
   useEffect(() => {
     if (!waitingForCreation || configured) {
@@ -1104,7 +1105,9 @@ function GitHubAppSettings({
       const result = await testGitHubAppAccess(HUB_URL, selectedRepo);
       setLastTest(result);
       if (result.ok) {
-        await detectSelfUpdateRepo(HUB_URL).catch(() => null);
+        if (showSelfUpdateRepo) {
+          await detectSelfUpdateRepo(HUB_URL).catch(() => null);
+        }
         await onRefresh();
         addToast({ title: "GitHub repo access ready", variant: "success" });
       }
@@ -1401,7 +1404,7 @@ function GitHubAppSettings({
         </div>
       )}
 
-      {configured && (
+      {configured && showSelfUpdateRepo && (
         <div className="rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>

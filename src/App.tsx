@@ -32,7 +32,7 @@ import StartPlanDialog from './StartPlanDialog';
 import SettingsPage from './SettingsPage';
 import SetupWizard from './SetupWizard';
 import ConnectionsBadge from './ConnectionsBadge';
-import UpdateBadge from './UpdateBadge';
+import UpdateButton from './UpdateBadge';
 import UpdateDialog from './UpdateDialog';
 import { dismissUpdate, isUpdateDismissed } from './update-storage';
 import { isLoopbackHostname } from '../shared/local-dev';
@@ -107,7 +107,7 @@ export default function Dashboard() {
   const [updateIssue, setUpdateIssue] = useState<string | null>(null);
   const [updateIssueCode, setUpdateIssueCode] = useState<string | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
-  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(true);
   const [hostRefreshNonce, setHostRefreshNonce] = useState(0);
   const addToast = useToast();
   const titleFlashRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -218,6 +218,12 @@ export default function Dashboard() {
         githubAppInstallUrl: null,
         githubAppManageUrl: "https://github.com/settings/installations",
         githubAppPublicHubDisabled: true,
+        buildDiagnostics: {
+          channel: "release",
+          version: "",
+          workersCiCommitSha: null,
+          workersCiBranch: null,
+        },
         selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
       });
     }
@@ -281,6 +287,7 @@ export default function Dashboard() {
         if (cancelled) return;
         setUpdateStatus(next.status);
         setUpdateIssue(next.issue);
+        setUpdateIssueCode(next.issueCode);
         setUpdateDismissed(next.dismissed);
         setIsCheckingUpdate(false);
       });
@@ -703,6 +710,14 @@ export default function Dashboard() {
 
   return (
     <div className="flex h-screen relative">
+      <UpdateButton
+        status={updateStatus}
+        issue={updateIssue}
+        dismissed={updateDismissed}
+        isChecking={isCheckingUpdate}
+        onOpen={() => setSelection({ type: 'update' })}
+      />
+
       {/* Sidebar */}
       <div
         className={`${sidebarOpen ? 'w-80' : 'w-0'} overflow-hidden border-r border-[#d0d7de] flex flex-col bg-[#f6f8fa] transition-all duration-200 flex-shrink-0`}
@@ -713,12 +728,6 @@ export default function Dashboard() {
               TILLER
             </span>
             <div className="flex items-center gap-2">
-              <UpdateBadge
-                status={updateStatus}
-                issue={updateIssue}
-                dismissed={updateDismissed}
-                onOpen={() => setSelection({ type: 'update' })}
-              />
               <button
                 onClick={() => setSelection({ type: 'settings' })}
                 className="text-[#57606a] hover:text-[#24292f] text-sm leading-none"
