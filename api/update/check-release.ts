@@ -1,5 +1,5 @@
 import type { Env } from "../types";
-import { readHubUpdateRepoState } from "./hub-repo";
+import { readHubUpdateRepoState, resolveHubUpdateRepoState } from "./hub-repo";
 import {
   fetchPublicUpdateMetadata,
   getBuildDiagnostics,
@@ -95,7 +95,7 @@ function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMeta
 export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
   try {
     const currentUpdate = getCurrentUpdateMetadata();
-    const hubRepo = await readHubUpdateRepoState(env);
+    const hubRepo = await resolveHubUpdateRepoState(env, { autoDetect: true });
     const cached = await env.ENVS_KV.get(UPDATE_CHECK_CACHE_KEY, "json");
     if (isCacheableUpdateResult(cached, currentUpdate)) {
       const currentIssue = issueForState(cached.updateAvailable, hubRepo);

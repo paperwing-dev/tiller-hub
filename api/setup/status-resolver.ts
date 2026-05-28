@@ -37,7 +37,7 @@ import {
   listGitHubAppRepositories,
 } from "../github/app";
 import { requiresWorkersDevAccessProtection } from "./protect-hub";
-import { readHubUpdateRepoState } from "../update/hub-repo";
+import { resolveHubUpdateRepoState } from "../update/hub-repo";
 import type { HubUpdateRepoState } from "../update/types";
 
 export interface SetupStatusPayload {
@@ -334,7 +334,7 @@ export async function resolveSetupStatus(
     configured: githubAppConfigured,
     env,
   });
-  const selfUpdateRepo = await readHubUpdateRepoState(env);
+  const selfUpdateRepo = await resolveHubUpdateRepoState(env, { autoDetect: githubAppConfigured });
   const workersAiConfigured = hasWorkersAiBinding(env)
     || Boolean(
       (await getSecret(env, "TILLER_WORKERS_AI_ACCOUNT_ID"))?.trim()

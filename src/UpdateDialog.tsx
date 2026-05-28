@@ -137,7 +137,7 @@ export default function UpdateDialog({
           ? result.fullName
           : result.status === 'ambiguous'
             ? 'Multiple selected repositories contain Tiller update metadata.'
-            : 'Install the Tiller GitHub App on the generated deploy-button repo, then retry.',
+            : 'No selected GitHub App repository contains Tiller deploy-button metadata.',
         variant: result.status === 'detected' ? 'success' : 'warning',
       });
       onRetryCheck();

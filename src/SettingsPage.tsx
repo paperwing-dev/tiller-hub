@@ -1128,7 +1128,7 @@ function GitHubAppSettings({
           ? result.fullName
           : result.status === "ambiguous"
             ? "Multiple selected repositories contain Tiller update metadata."
-            : "Install the GitHub App on the generated hub repo, then retry.",
+            : "No selected GitHub App repository contains Tiller deploy-button metadata.",
         variant: result.status === "detected" ? "success" : "warning",
       });
     } catch (err) {
@@ -1400,7 +1400,7 @@ function GitHubAppSettings({
                   ? `${selfUpdateRepo.fullName} · ${selfUpdateRepo.branch}`
                   : selfUpdateRepo.status === "ambiguous"
                     ? "Multiple selected repositories look like Tiller hubs."
-                    : "Recommended for deploy-button self-updates. Private hub repos are supported."}
+                    : "Auto-detected when a selected GitHub App repository contains Tiller deploy-button metadata."}
               </p>
             </div>
             {selfUpdateRepo.status !== "detected" && (

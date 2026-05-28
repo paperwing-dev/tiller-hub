@@ -30,6 +30,8 @@ const CONFIG_KEYS = {
   candidates: "HUB_UPDATE_REPO_CANDIDATES",
 } as const;
 
+const AUTO_DETECT_RETRY_MS = 5 * 60 * 1000;
+
 type ConfigStore = {
   getAllConfig(): Promise<Record<string, string>> | Record<string, string>;
   setConfig(key: string, value: string): Promise<void> | void;
@@ -48,6 +50,15 @@ function getConfigStore(env: Env): ConfigStore {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function shouldAutoDetect(state: HubUpdateRepoState): boolean {
+  if (state.status === "detected") return false;
+  if (state.status === "not_checked") return true;
+
+  const lastDetectedAt = Date.parse(state.lastDetectedAt ?? "");
+  if (!Number.isFinite(lastDetectedAt)) return true;
+  return Date.now() - lastDetectedAt >= AUTO_DETECT_RETRY_MS;
 }
 
 function readPositiveInteger(value: string | undefined): number | null {
@@ -289,6 +300,21 @@ export async function detectHubUpdateRepo(
     return persistMissing(env);
   }
   return persistAmbiguous(env, candidates);
+}
+
+export async function resolveHubUpdateRepoState(
+  env: Env,
+  options: { autoDetect?: boolean } = {},
+): Promise<HubUpdateRepoState> {
+  const current = await readHubUpdateRepoState(env);
+  if (!options.autoDetect || !shouldAutoDetect(current)) return current;
+  if (!(env as unknown as { HUB?: unknown }).HUB) return current;
+
+  try {
+    return await detectHubUpdateRepo(env, { detectedBy: "auto" });
+  } catch {
+    return current;
+  }
 }
 
 export async function selectHubUpdateRepo(
