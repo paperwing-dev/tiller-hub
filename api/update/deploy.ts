@@ -1,6 +1,6 @@
 import type { Env } from "../types";
 import { readTarEntries } from "../workspace/tar";
-import { clearUpdateCheckCache, fetchLatestTillerRelease } from "./check-release";
+import { clearUpdateCheckCache } from "./check-release";
 import {
   buildTillerBindings,
   buildKnownContainerNames,
@@ -20,6 +20,7 @@ import {
   uploadAssetBatch,
   type WorkerModule,
 } from "./cloudflare-deploy";
+import { fetchLatestTillerRelease } from "./legacy-release";
 import type { GitHubReleaseAsset, UpdateManifest, UpdateRelease } from "./types";
 
 function getRequiredAsset(assets: GitHubReleaseAsset[], predicate: (asset: GitHubReleaseAsset) => boolean, label: string): GitHubReleaseAsset {
@@ -237,3 +238,5 @@ export async function applyUpdate(
   await clearUpdateCheckCache(env);
   return { ok: true };
 }
+
+export const applyCloudflareRepairUpdate = applyUpdate;

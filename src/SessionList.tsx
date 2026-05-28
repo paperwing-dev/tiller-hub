@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { StoredSession, EnvMeta, RepoMeta } from "../api/types";
-import { ApiActionError, deleteEnv, deleteRepo, mergeEnvIntoMain, resetEnvToRepo, stopEnv } from "./api";
+import { ApiActionError, deleteEnv, deleteRepo, mergeEnvIntoMain, resetEnvToRepo, stopEnv, updateEnvFromMain } from "./api";
 import { getDisplayEnvBranchStatus } from "./env-state";
 import type { RecoverEntitiesOptions } from "./live-sync-store";
 import {
@@ -25,10 +25,12 @@ interface SessionListProps {
   onRecoverEnv?: (slug: string, status?: string) => void;
   onEnvSelect?: (slug: string) => void;
   selectedEnvSlug?: string | null;
-  onPlanSelect?: (repoId: string, repoUrl: string) => void;
+  onChangesSelect?: (slug: string) => void;
+  selectedChangesEnvSlug?: string | null;
+  onPlanSelect?: (repoId: string) => void;
   planRepoId?: string | null;
   onStartRequest?: (slug: string) => void;
-  onAddEnv?: (repoId: string, repoUrl: string) => void;
+  onAddEnv?: (repoId: string) => void;
   onRetryRepoMain?: (repoId: string) => void;
   onRecoverEntities?: (options?: RecoverEntitiesOptions) => void;
   onRepoDeleted?: (repoId: string, deletedEnvSlugs: string[]) => void;
@@ -45,6 +47,8 @@ export default function SessionList({
   onRecoverEnv,
   onEnvSelect,
   selectedEnvSlug,
+  onChangesSelect,
+  selectedChangesEnvSlug,
   onPlanSelect,
   planRepoId,
   onStartRequest,
@@ -88,7 +92,7 @@ export default function SessionList({
                   <>
                     No environments yet —{" "}
                     <button
-                      onClick={() => onAddEnv?.(repo.repoId, repo.repoUrl)}
+                      onClick={() => onAddEnv?.(repo.repoId)}
                       className="text-[#0969da] hover:underline"
                     >
                       add one
@@ -105,6 +109,7 @@ export default function SessionList({
                 const isSelected =
                   planRepoId === repo.repoId ||
                   (session ? session.id === selectedId : selectedEnvSlug === env.slug);
+                const isChangesSelected = selectedChangesEnvSlug === env.slug;
 
                 return (
                   <EnvCard
@@ -117,7 +122,8 @@ export default function SessionList({
                     onSelect={(slug) => onEnvSelect?.(slug)}
                     onStartRequest={onStartRequest}
                     onRecoverEntities={onRecoverEntities}
-                    selected={isSelected}
+                    selected={isSelected || isChangesSelected}
+                    onChangesSelect={onChangesSelect}
                   />
                 );
               })
@@ -156,6 +162,7 @@ function EnvCard({
   onStartRequest,
   onRecoverEntities,
   selected,
+  onChangesSelect,
 }: {
   env: EnvMeta;
   repo: RepoMeta;
@@ -166,6 +173,7 @@ function EnvCard({
   onStartRequest?: (slug: string) => void;
   onRecoverEntities?: (options?: RecoverEntitiesOptions) => void;
   selected?: boolean;
+  onChangesSelect?: (slug: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<{ message: string; hint: string | null } | null>(null);
@@ -308,7 +316,16 @@ function EnvCard({
             Stop
           </button>
         )}
-        {canRepoAction && branchStatus !== "needs-attention" && (
+        {canRepoAction && branchStatus === "ready-to-merge" && onChangesSelect && (
+          <button
+            onClick={() => onChangesSelect(env.slug)}
+            disabled={busy}
+            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
+          >
+            Promote Preview
+          </button>
+        )}
+        {canRepoAction && branchStatus === "ready-to-merge" && (
           <button
             onClick={() => run(async () => {
               const res = await mergeEnvIntoMain(hubUrl, env.slug);
@@ -323,6 +340,23 @@ function EnvCard({
             className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
           >
             Promote to Main
+          </button>
+        )}
+        {canRepoAction && branchStatus === "behind-main" && (
+          <button
+            onClick={() => run(async () => {
+              const res = await updateEnvFromMain(hubUrl, env.slug);
+              if (res.pending) {
+                onRecoverEntities?.({ slug: env.slug, repoId: repo.repoId });
+                return;
+              }
+              onRecoverEnv?.(env.slug);
+              onRecoverEntities?.({ slug: env.slug, repoId: repo.repoId });
+            })}
+            disabled={busy}
+            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
+          >
+            Update from Main
           </button>
         )}
         {canRepoAction && (branchStatus === "ready-to-merge" || branchStatus === "needs-attention" || branchStatus === "behind-main") && (
@@ -371,8 +405,7 @@ function EnvCard({
 }
 
 function matchesRepo(repo: RepoMeta, env: EnvMeta): boolean {
-  if (env.repoId) return env.repoId === repo.repoId;
-  return normalizeRepoUrl(env.repoUrl) === normalizeRepoUrl(repo.repoUrl);
+  return env.repoId === repo.repoId;
 }
 
 function RepoGroupHeader({
@@ -390,8 +423,8 @@ function RepoGroupHeader({
   planRepoId?: string | null;
   hubUrl: string;
   envCount: number;
-  onPlanSelect?: (repoId: string, repoUrl: string) => void;
-  onAddEnv?: (repoId: string, repoUrl: string) => void;
+  onPlanSelect?: (repoId: string) => void;
+  onAddEnv?: (repoId: string) => void;
   onRetryRepoMain?: (repoId: string) => void;
   onRecoverEntities?: (options?: RecoverEntitiesOptions) => void;
   onRepoDeleted?: (repoId: string, deletedEnvSlugs: string[]) => void;
@@ -424,7 +457,7 @@ function RepoGroupHeader({
       </div>
       <div className="flex items-center gap-2">
         <button
-          onClick={() => onAddEnv?.(repo.repoId, repo.repoUrl)}
+          onClick={() => onAddEnv?.(repo.repoId)}
           disabled={!repoMainReady}
           className="rounded border border-[#d0d7de] bg-white px-2 py-0.5 text-[10px] uppercase tracking-wide text-[#24292f] hover:bg-[#f6f8fa] disabled:cursor-not-allowed disabled:opacity-40"
         >
@@ -440,7 +473,7 @@ function RepoGroupHeader({
           </button>
         )}
         <button
-          onClick={() => onPlanSelect?.(repo.repoId, repo.repoUrl)}
+          onClick={() => onPlanSelect?.(repo.repoId)}
           disabled={!repoMainReady}
           className="rounded border border-[#d8b4fe] bg-white px-2 py-0.5 text-[10px] uppercase tracking-wide text-[#7c3aed] hover:bg-[#faf5ff] disabled:cursor-not-allowed disabled:opacity-40"
         >
@@ -481,10 +514,6 @@ function repoLabel(repoUrl: string): string {
   return repoUrl.replace(/^https?:\/\/(www\.)?github\.com\//, "");
 }
 
-function normalizeRepoUrl(repoUrl: string): string {
-  return repoUrl.trim().replace(/\.git$/, "").replace(/\/+$/, "").toLowerCase();
-}
-
 function formatBranchStatus(status: string): string {
   if (status === "behind-main") return "Behind main";
   if (status === "ready-to-merge") return "Ready to promote";
@@ -494,6 +523,7 @@ function formatBranchStatus(status: string): string {
 
 function formatScmOperationLabel(type?: string | null): string {
   if (type === "merge-into-main") return "Promoting...";
+  if (type === "update-from-main") return "Updating from main...";
   return "Working...";
 }
 
@@ -501,8 +531,8 @@ function syncDetailText(env: EnvMeta, repo: RepoMeta): string | null {
   const branchStatus = getDisplayEnvBranchStatus(env, repo);
   if (branchStatus === "behind-main") {
     return repo.lastCommittedFromEnvSlug
-      ? `Main advanced from ${repo.lastCommittedFromEnvSlug}. Promote will try to reconcile your changes, or reset this env to discard them.`
-      : "Main has advanced. Promote will try to reconcile your changes, or reset this env to discard them.";
+      ? `Main advanced from ${repo.lastCommittedFromEnvSlug}. Update from Main before promoting, or reset this env to discard its work.`
+      : "Main has advanced. Update from Main before promoting, or reset this env to discard its work.";
   }
   if (branchStatus === "needs-attention") {
     return "This env has conflicts or unsupported git state. Reset to Main to discard it.";

@@ -1,10 +1,27 @@
 import { describe, it, expect, vi } from "vitest";
+import { createInitialEnvScmState } from "../scm/model";
+import type { EnvMeta } from "../types";
 
 vi.mock("../setup/config", () => ({
   getSecret: async () => undefined,
 }));
 
 import { destroyEnv } from "../env/service";
+
+function createEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
+  const slug = overrides.slug ?? "test-env";
+  return {
+    slug,
+    repoUrl: "https://github.com/test/repo",
+    backend: "cf",
+    harness: "claude-code",
+    createdAt: "2024-01-01",
+    updatedAt: "2024-01-01",
+    status: "stopped",
+    ...createInitialEnvScmState({ slug, mainCommit: null }),
+    ...overrides,
+  };
+}
 
 describe("destroyEnv", () => {
   it("deletes KV entry even when runner backend destroy fails", async () => {
@@ -32,13 +49,13 @@ describe("destroyEnv", () => {
       // No active host registration — getRunnerBackend will throw for the host backend
     } as any;
 
-    const meta = {
+    const meta = createEnvMeta({
       slug: "test-env",
       repoUrl: "https://github.com/test/repo",
       runnerMachineId: "m-123",
       backend: "host" as const,
       createdAt: "2024-01-01",
-    };
+    });
 
     const hub = { broadcastEnvRemove: broadcast, getAllSessions, deleteSession: vi.fn() };
 
@@ -81,13 +98,13 @@ describe("destroyEnv", () => {
       },
     } as any;
 
-    const meta = {
+    const meta = createEnvMeta({
       slug: "test-env",
       repoUrl: "https://github.com/test/repo",
       runnerMachineId: "m-123",
       backend: "cf" as const,
       createdAt: "2024-01-01",
-    };
+    });
 
     const hub = { broadcastEnvRemove: broadcast, getAllSessions, deleteSession: vi.fn() };
 

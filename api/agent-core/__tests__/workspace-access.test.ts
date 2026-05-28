@@ -16,16 +16,22 @@ function createStub() {
       return Array.from(files.entries())
         .filter(([filePath]) => filePath.startsWith(prefix))
         .map(([filePath, content]) => ({
+          name: filePath.split("/").pop() ?? filePath,
           path: filePath,
           size: content.length,
+          mimeType: "text/plain",
+          createdAt: Date.now(),
           type: "file" as const,
           updatedAt: Date.now(),
         }));
     },
     globWorkspace() {
       return Array.from(files.entries()).map(([path, content]) => ({
+        name: path.split("/").pop() ?? path,
         path,
         size: content.length,
+        mimeType: "text/plain",
+        createdAt: Date.now(),
         type: "file" as const,
         updatedAt: Date.now(),
       }));

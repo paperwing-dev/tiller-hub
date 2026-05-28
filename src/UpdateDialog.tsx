@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
-import { applyUpdate } from './api';
-import type { UpdateCheckResult } from './api';
+import React, { useEffect, useRef, useState } from 'react';
+import { applyCloudflareRepairUpdate, applyUpdate, checkForUpdate, detectSelfUpdateRepo, selectSelfUpdateRepo } from './api';
+import type { HubUpdateRepoCandidate, UpdateCheckResult } from './api';
 import { useToast } from './Toast';
+import { formatUpdateName } from './update-display';
 
 const CLOUDFLARE_TOKEN_URL = 'https://dash.cloudflare.com/profile/api-tokens';
 const REQUIRED_PERMISSIONS = [
@@ -30,8 +31,10 @@ interface UpdateDialogProps {
   hubUrl: string;
   status: UpdateCheckResult | null;
   issue: string | null;
+  issueCode?: string | null;
   isChecking: boolean;
   onDismiss: () => void;
+  onOpenSettings: () => void;
   onRetryCheck: () => void;
   onUpdated: () => void;
 }
@@ -65,8 +68,10 @@ export default function UpdateDialog({
   hubUrl,
   status,
   issue,
+  issueCode,
   isChecking,
   onDismiss,
+  onOpenSettings,
   onRetryCheck,
   onUpdated,
 }: UpdateDialogProps) {
@@ -98,7 +103,7 @@ export default function UpdateDialog({
       window.clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
-  }, [status?.latestVersion]);
+  }, [status?.latestUpdate.sourceId]);
 
   useEffect(() => () => {
     if (intervalRef.current != null) {
@@ -106,13 +111,75 @@ export default function UpdateDialog({
     }
   }, []);
 
+  async function waitForDeployment(expectedSourceId: string) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 3000));
+      const next = await checkForUpdate(hubUrl);
+      if (next.currentUpdate.sourceId === expectedSourceId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function handleDetectRepo() {
+    setIsApplying(true);
+    setError(null);
+    try {
+      const result = await detectSelfUpdateRepo(hubUrl);
+      addToast({
+        title: result.status === 'detected'
+          ? 'Self-update repo connected'
+          : result.status === 'ambiguous'
+            ? 'Choose self-update repo'
+            : 'Self-update repo not found',
+        body: result.status === 'detected'
+          ? result.fullName
+          : result.status === 'ambiguous'
+            ? 'Multiple selected repositories contain Tiller update metadata.'
+            : 'Install the Tiller GitHub App on the generated deploy-button repo, then retry.',
+        variant: result.status === 'detected' ? 'success' : 'warning',
+      });
+      onRetryCheck();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Self-update repo detection failed';
+      setError(message);
+      addToast({ title: 'Detection failed', body: message, variant: 'error' });
+    } finally {
+      setIsApplying(false);
+    }
+  }
+
+  async function handleSelectCandidate(candidate: HubUpdateRepoCandidate) {
+    setIsApplying(true);
+    setError(null);
+    try {
+      const result = await selectSelfUpdateRepo(hubUrl, candidate);
+      if (result.status !== 'detected') {
+        throw new Error('Self-update repo selection did not persist.');
+      }
+      addToast({
+        title: 'Self-update repo connected',
+        body: result.fullName,
+        variant: 'success',
+      });
+      onRetryCheck();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Self-update repo selection failed';
+      setError(message);
+      addToast({ title: 'Selection failed', body: message, variant: 'error' });
+    } finally {
+      setIsApplying(false);
+    }
+  }
+
   async function handleUpdateNow() {
     if (!status) {
       return;
     }
 
-    if (!apiToken.trim()) {
-      setError('Cloudflare API token is required.');
+    if (status.updateMethod !== 'github_repo') {
+      setError(status.issue?.message ?? 'Connect the self-update repo before applying a normal update.');
       setStage('error');
       return;
     }
@@ -130,16 +197,33 @@ export default function UpdateDialog({
     }, 1400);
 
     try {
-      await applyUpdate(hubUrl, apiToken.trim());
+      const result = await applyUpdate(hubUrl);
       if (intervalRef.current != null) {
         window.clearInterval(intervalRef.current);
         intervalRef.current = null;
       }
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
+      if (result.status === 'queued') {
+        setStage('deploying');
+        addToast({
+          title: 'Update queued',
+          body: 'Cloudflare is deploying the committed hub update.',
+          variant: 'success',
+        });
+        const deployed = await waitForDeployment(result.expectedSourceId);
+        if (!deployed) {
+          throw new Error('Update was committed, but this Worker has not reported the new source id yet.');
+        }
+      }
       setStage('complete');
       setIsApplying(false);
       addToast({
-        title: 'Hub updated',
-        body: `Tiller Hub ${status.latestVersion} is ready to reload.`,
+        title: result.status === 'noop' ? 'No update needed' : 'Update deployed',
+        body: result.status === 'noop'
+          ? 'The configured hub repo already matches upstream.'
+          : 'Reload to use the new Tiller Hub build.',
         variant: 'success',
       });
       onUpdated();
@@ -160,7 +244,40 @@ export default function UpdateDialog({
     }
   }
 
+  async function handleAdvancedRepair() {
+    if (!apiToken.trim()) {
+      setError('Cloudflare API token is required for Advanced Repair.');
+      setStage('error');
+      return;
+    }
+    setIsApplying(true);
+    setError(null);
+    setStage(PROGRESS_STAGES[0]);
+    try {
+      await applyCloudflareRepairUpdate(hubUrl, apiToken.trim());
+      setStage('complete');
+      setIsApplying(false);
+      addToast({
+        title: 'Repair deployed',
+        body: 'Reload to use the repaired Tiller Hub build.',
+        variant: 'success',
+      });
+      onUpdated();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Advanced Repair failed';
+      setStage('error');
+      setIsApplying(false);
+      setError(message);
+      addToast({
+        title: 'Repair failed',
+        body: message,
+        variant: 'error',
+      });
+    }
+  }
+
   if (!status) {
+    const accessRequired = issueCode === 'setup_protection_required';
     return (
       <div className="flex-1 overflow-auto bg-[#f6f8fa]">
         <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
@@ -171,11 +288,12 @@ export default function UpdateDialog({
                   Self-Update
                 </p>
                 <h1 className="mt-2 text-2xl font-semibold text-[#24292f]">
-                  Update check unavailable
+                  {accessRequired ? 'Access verification required' : 'Update check unavailable'}
                 </h1>
                 <p className="mt-2 text-sm text-[#57606a]">
-                  Tiller Hub could not determine the latest upstream release, so the update prompt is unavailable.
-                  This does not block normal hub usage.
+                  {accessRequired
+                    ? 'Tiller Hub blocked the self-update check because this workers.dev deployment has not saved its Cloudflare Access configuration yet.'
+                    : 'Tiller Hub could not determine the latest upstream update metadata, so the update prompt is unavailable. This does not block normal hub usage.'}
                 </p>
               </div>
             </div>
@@ -188,19 +306,31 @@ export default function UpdateDialog({
             </div>
 
             <div className="mt-4 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] px-4 py-3">
-              <p className="text-sm font-semibold text-[#24292f]">Likely cause</p>
+              <p className="text-sm font-semibold text-[#24292f]">
+                {accessRequired ? 'What to do' : 'Likely cause'}
+              </p>
               <p className="mt-1 text-sm text-[#57606a]">
-                If <code>paperwing-dev/tiller-hub</code> is private or does not have a published GitHub release yet,
-                this warning is expected.
+                {accessRequired
+                  ? 'Open Settings, reload through Cloudflare Access, then verify Access. After Tiller saves the Access JWT metadata, retry the update check.'
+                  : 'If the public deploy-button repo is temporarily unavailable, this warning is expected.'}
               </p>
             </div>
 
             <div className="mt-6 flex flex-wrap items-center gap-3">
+              {accessRequired && (
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black"
+                >
+                  Open Settings
+                </button>
+              )}
               <button
                 type="button"
                 onClick={onRetryCheck}
                 disabled={isChecking}
-                className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                className={`${accessRequired ? 'border border-[#d0d7de] bg-white text-[#24292f] hover:bg-[#f6f8fa]' : 'bg-[#24292f] text-white hover:bg-black'} rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50`}
               >
                 {isChecking ? 'Checking...' : 'Retry check'}
               </button>
@@ -218,6 +348,9 @@ export default function UpdateDialog({
     );
   }
 
+  const currentUpdateName = formatUpdateName(status.currentUpdate);
+  const latestUpdateName = formatUpdateName(status.latestUpdate);
+
   return (
     <div className="flex-1 overflow-auto bg-[#f6f8fa]">
       <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
@@ -231,8 +364,8 @@ export default function UpdateDialog({
                 Upgrade Tiller Hub
               </h1>
               <p className="mt-2 text-sm text-[#57606a]">
-                This deployment is currently running <strong>{status.currentVersion}</strong>.
-                {' '}The latest upstream release is <strong>{status.latestVersion}</strong>.
+                This deployment is currently running <strong>{currentUpdateName}</strong>.
+                {' '}The latest available version is <strong>{latestUpdateName}</strong>.
               </p>
             </div>
             <a
@@ -241,47 +374,78 @@ export default function UpdateDialog({
               rel="noreferrer"
               className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
             >
-              Release notes
+              Source repo
             </a>
           </div>
 
           <div className="mt-6 grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
             <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
-              <label htmlFor="cf-api-token" className="text-sm font-semibold text-[#24292f]">
-                Cloudflare API token
-              </label>
+              <p className="text-sm font-semibold text-[#24292f]">Self-update repository</p>
               <p className="mt-1 text-xs text-[#57606a]">
-                The token is used once for this update and is not stored by Tiller.
+                {status.hubRepo.status === 'detected'
+                  ? `${status.hubRepo.fullName} · ${status.hubRepo.branch}`
+                  : status.hubRepo.status === 'ambiguous'
+                    ? 'Multiple selected repositories contain Tiller update metadata.'
+                    : 'Connect the generated deploy-button repo to update through GitHub.'}
+              </p>
+              {status.hubRepo.status === 'ambiguous' && (
+                <div className="mt-3 grid gap-2">
+                  {status.hubRepo.candidates.map((candidate) => (
+                    <button
+                      key={`${candidate.repoId}:${candidate.branch}`}
+                      type="button"
+                      onClick={() => void handleSelectCandidate(candidate)}
+                      disabled={isApplying}
+                      className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-left text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+                    >
+                      {candidate.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {status.hubRepo.status !== 'detected' && (
+                <button
+                  type="button"
+                  onClick={() => void handleDetectRepo()}
+                  disabled={isApplying}
+                  className="mt-3 rounded border border-[#0969da] bg-white px-3 py-1.5 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
+                >
+                  Connect self-update repo
+                </button>
+              )}
+            </div>
+
+            <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
+              <p className="text-sm font-semibold text-[#24292f]">Advanced Repair</p>
+              <p className="mt-1 text-xs text-[#57606a]">
+                Repair by redeploying with a temporary Cloudflare API token.
               </p>
               <input
                 id="cf-api-token"
                 type="password"
                 value={apiToken}
                 onChange={(event) => setApiToken(event.target.value)}
-                placeholder="Paste token"
-                autoFocus
+                placeholder="Paste Cloudflare token"
                 className="mt-3 w-full rounded-lg border border-[#d0d7de] bg-white px-3 py-2 text-sm text-[#24292f] outline-none transition-colors focus:border-[#0969da]"
               />
-              <a
-                href={CLOUDFLARE_TOKEN_URL}
-                target="_blank"
-                rel="noreferrer"
-                className="mt-3 inline-flex text-xs font-medium text-[#0969da] hover:underline"
-              >
-                Open Cloudflare API token settings
-              </a>
-            </div>
-
-            <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
-              <p className="text-sm font-semibold text-[#24292f]">Required permissions</p>
-              <ul className="mt-3 space-y-2 text-xs text-[#57606a]">
-                {REQUIRED_PERMISSIONS.map((permission) => (
-                  <li key={permission} className="flex items-start gap-2">
-                    <span className="mt-1 h-1.5 w-1.5 rounded-full bg-[#d4a72c]" />
-                    <span>{permission}</span>
-                  </li>
-                ))}
-              </ul>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleAdvancedRepair()}
+                  disabled={isApplying || !apiToken.trim()}
+                  className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+                >
+                  Advanced Repair
+                </button>
+                <a
+                  href={CLOUDFLARE_TOKEN_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#f6f8fa]"
+                >
+                  Token settings
+                </a>
+              </div>
             </div>
           </div>
 
@@ -299,7 +463,7 @@ export default function UpdateDialog({
             <button
               type="button"
               onClick={() => void handleUpdateNow()}
-              disabled={isApplying || stage === 'complete'}
+              disabled={isApplying || stage === 'complete' || status.updateMethod !== 'github_repo'}
               className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
             >
               {isApplying ? 'Updating...' : 'Update Now'}

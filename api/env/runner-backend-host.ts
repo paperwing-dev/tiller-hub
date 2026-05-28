@@ -37,7 +37,7 @@ function parseHostRunnerStatus(value: unknown): HostRunnerStatus {
   };
 }
 
-function resolveRunnerMachineId(meta: EnvMeta): string | null {
+function resolveRunnerMachineId(meta: Pick<EnvMeta, "runnerMachineId">): string | null {
   const machineId = meta.runnerMachineId?.trim();
   return machineId || null;
 }
@@ -93,7 +93,7 @@ export async function createHostRunnerBackend(env: Env): Promise<RunnerBackend> 
         if (/404/.test(message) || /not found/i.test(message)) {
           return "stopped";
         }
-        throw new Error(`Tiller Host status failed: ${message}`);
+        throw new Error(`Tiller Self Host status failed: ${message}`);
       }
     },
 
@@ -130,7 +130,7 @@ export async function createHostRunnerBackend(env: Env): Promise<RunnerBackend> 
         if (/404/.test(message) || /not found/i.test(message)) {
           return { callbackExpected: false };
         }
-        throw new Error(`Tiller Host stop failed: ${message}`);
+        throw new Error(`Tiller Self Host stop failed: ${message}`);
       }
     },
 
@@ -142,7 +142,7 @@ export async function createHostRunnerBackend(env: Env): Promise<RunnerBackend> 
         if (/404/.test(message) || /not found/i.test(message)) {
           return;
         }
-        throw new Error(`Tiller Host destroy failed: ${message}`);
+        throw new Error(`Tiller Self Host destroy failed: ${message}`);
       }
     },
   };

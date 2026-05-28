@@ -1,4 +1,4 @@
-import type { EnvStatus } from "../types";
+import { isEnvStatus, type EnvStatus } from "../types";
 
 export function normalizeRunnerStatus(status?: string): EnvStatus {
   switch (status) {
@@ -17,6 +17,6 @@ export function normalizeRunnerStatus(status?: string): EnvStatus {
     case "stopped":
       return "stopped";
     default:
-      return status ?? "unknown";
+      return isEnvStatus(status) ? status : "unknown";
   }
 }

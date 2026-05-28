@@ -38,6 +38,7 @@ export interface ThreadMessage {
 }
 
 export type ArtifactType = "plan" | "review" | "decision" | "checkpoint" | "completion";
+export type PlanStatus = "draft" | "todo" | "completed" | "archived";
 
 export interface Artifact<TBody = unknown> {
   id: string;
@@ -46,10 +47,13 @@ export interface Artifact<TBody = unknown> {
   basis: Basis;
   title: string;
   body: TBody;
+  status?: PlanStatus;
   parentArtifactId?: string;
   supersedesArtifactId?: string;
   createdBy?: string;
   createdAt: string;
+  updatedAt?: string;
+  version?: number;
 }
 
 export interface ArtifactRef {
@@ -61,6 +65,10 @@ export interface ArtifactRef {
 }
 
 export interface PlanArtifactBody {
+  markdown: string;
+}
+
+export interface ReviewArtifactBody {
   summary: string;
   findings: string[];
   relevantFiles: string[];
@@ -68,9 +76,6 @@ export interface PlanArtifactBody {
   proposedPlan: string;
   memoryRefs: string[];
   model?: string;
-}
-
-export interface ReviewArtifactBody extends PlanArtifactBody {
   reviewIssues?: PlanReviewIssue[];
   reviewIssueStats?: PlanReviewIssueStats;
   reviewMeta?: PlanReviewMeta;
@@ -86,17 +91,63 @@ export interface CreateArtifactInput<TBody = unknown> {
   basis: Basis;
   title: string;
   body: TBody;
+  status?: PlanStatus;
   parentArtifactId?: string;
   supersedesArtifactId?: string;
   createdBy?: string;
   createdAt?: string;
+  updatedAt?: string;
+  version?: number;
 }
 
 export interface ArtifactListFilter {
   type?: ArtifactType;
+  status?: PlanStatus;
   parentArtifactId?: string | null;
   basisMainCommit?: string | null;
   limit?: number;
+}
+
+export interface SavePlanInput {
+  repoId: string;
+  id: string;
+  expectedVersion: number;
+  markdown: string;
+  title?: string;
+  currentMainCommit: string | null;
+}
+
+export type SavePlanResult =
+  | { status: "ok"; version: number; artifact: Artifact<PlanArtifactBody> }
+  | { status: "conflict"; currentVersion: number; currentTitle?: string; currentMarkdownDigest?: string };
+
+export interface UpdateArtifactStatusInput {
+  repoId: string;
+  id: string;
+  status: PlanStatus;
+  expectedVersion?: number | null;
+}
+
+export interface DiscardPlanInput {
+  repoId: string;
+  id: string;
+  expectedVersion?: number | null;
+}
+
+export interface ReviewerRegistryEntry {
+  threadId: string;
+  planArtifactId: string;
+  repoId: string;
+  reviewerModel: string;
+  removedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpsertReviewerInput {
+  repoId: string;
+  planArtifactId: string;
+  reviewerModel: string;
 }
 
 export interface SetRefInput {

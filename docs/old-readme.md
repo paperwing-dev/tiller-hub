@@ -266,7 +266,7 @@ No hard blockers. The beta risk is reliability/stability regressions, not missin
 | Method   | Endpoint                | Description                        |
 | -------- | ----------------------- | ---------------------------------- |
 | `GET`    | `/api/envs`             | List all environments              |
-| `POST`   | `/api/envs`             | Create environment (`{ repoUrl }`) |
+| `POST`   | `/api/envs`             | Create environment (`{ repoId }`) |
 | `GET`    | `/api/envs/:slug`       | Get environment info + live status |
 | `POST`   | `/api/envs/:slug/start` | Start a stopped container          |
 | `POST`   | `/api/envs/:slug/stop`  | Stop a running container           |
@@ -275,7 +275,7 @@ No hard blockers. The beta risk is reliability/stability regressions, not missin
 
 ### Container lifecycle
 
-1. `POST /api/envs` with a `repoUrl` → creates a container, clones the repo into `/workspace`, starts tiller-harness + ttyd
+1. Add a GitHub App selected repo, then `POST /api/envs` with its `repoId` → creates a container, restores the canonical workspace, starts tiller-harness + ttyd
 2. Container stops when tiller-harness exits or user calls `/api/envs/:slug/stop`
 3. `POST /api/envs/:slug/start` wakes it — backup restore recovers workspace state
 4. `DELETE /api/envs/:slug` destroys the container and cleans up R2 backups + KV

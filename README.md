@@ -32,13 +32,18 @@ __Note:__ It’s technically possible to use subscriptions remotely without usin
 
 1. Deploy using the "Cloudflare Deploy" button.
 2. Open the deployed Tiller UI and finish the setup wizard.
-3. Choose one model-auth path: Claude subscription or Anthropic API key.
+3. Kimi K2.5 works through the included Workers AI binding. Add Anthropic or OpenAI keys only if you also want Claude or Codex API access.
 4. Optionally use the in-app `Publish & Protect` flow to move from `workers.dev` to your own protected custom domain.
 5. Create a new environment. Cloudflare-hosted sandboxes are enabled immediately and selected by default.
 6. Install the `tiller` package if you also want the optional Tiller Host workflow.
 
 The deploy-button flow asks for one region input, `TILLER_REGION`. Use one of:
 `wnam`, `enam`, `weur`, `eeur`, `apac`, or `oc`.
+
+The standalone deploy template intentionally does not include root
+`.env.example` or `.dev.vars.example` files. Cloudflare treats those files as
+deploy-button inputs, and Tiller model credentials are configured later inside
+the protected setup flow instead.
 
 The default deploy-button flow is intended to work in any user's Cloudflare
 account. `workers.dev` is the public bootstrap URL. Custom domains are optional
@@ -108,6 +113,13 @@ domains open a browser sign-in on first run and store the Cloudflare Access
 service token pair for the CLI. `tiller init` still exists as the advanced
 manual fallback.
 
+Repository-backed workflows require the configured Tiller GitHub App. Public
+`workers.dev` hubs cannot add repositories. On localhost or a protected custom
+domain, add repositories from the GitHub repo picker; the list is limited to
+repositories selected in the App installation with `contents:write`,
+`pull_requests:write`, and `metadata:read`. Tiller does not accept arbitrary
+repository URLs for new repos or environments.
+
 The source Wrangler config uses Docker Hub defaults:
 <code>docker.io/jamieatlason/tiller-sandbox:stable</code> and
 <code>docker.io/jamieatlason/tiller-scm:stable</code>.
@@ -119,7 +131,9 @@ container images are already live unless you explicitly override them.
 ## How To Use
 
 1. Explore the Tiller Hub UI wherever you deployed it. You can do everything from there
-2. Run `npm run tiller` locally. This allows starting, stopping, and using any session that you've create in the UI. Both local sessions and remote sessions.
+2. Configure and install the Tiller GitHub App on the repositories you want to use
+3. Add a selected repository from the repo picker, then create environments from that repo
+4. Run `npm run tiller` locally. This allows starting, stopping, and using any session that you've create in the UI. Both local sessions and remote sessions.
 
 ## What Is Supported
 
@@ -226,7 +240,7 @@ is only for deploy-time inputs.
 
 ```bash
 cd <project-root>/packages/hub
-cp .dev.vars.example .dev.vars
+cp docs/examples/local-dev-vars.sample .dev.vars
 ```
 
 Then fill one of:
@@ -404,12 +418,15 @@ container runs. That means:
 - Research works even if the environment is stopped
 - moving execution to `host` does not remove the Research button
 
-### ChatGPT/Codex subscription path
+### Codex subscription path
 
 Research and remote Codex environments can use a home-network Tiller gateway
 for subscription-backed routing. Hosted routes require a routable gateway, and
 host envs use the gateway of their selected `runnerMachineId`. When no usable
-gateway is available, Tiller falls back to `OPENAI_API_KEY`.
+gateway is available, Codex envs set to `auto` can fall back to `OPENAI_API_KEY`
+with a visible warning. Import a Codex login in Tiller Settings with the copyable
+Terminal script, or run `tiller auth import codex` if Tiller is installed on the
+machine that already has a local Codex login.
 
 On protected custom-domain hubs, a headless Pi can still start `tiller` in the
 terminal while the browser sign-in happens on another machine by pasting the
@@ -426,7 +443,7 @@ connection code from the browser back into the Pi terminal.
   - why runner/relay use both Cloudflare Access and bearer-token auth
   - what breaks when named tunnels or secrets drift
 - [codex-relay.md](./docs/codex-relay.md)
-  - Research relay for ChatGPT/Codex subscription egress
+  - Research relay for Codex subscription egress
 
 ## Package commands
 

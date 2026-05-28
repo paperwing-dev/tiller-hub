@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EnvMeta, EnvMutableState } from "../types";
-import { createInitialEnvScmState } from "../scm/model";
+import { createInitialEnvScmState, createInitialRepoScmState } from "../scm/model";
 
 const mocks = vi.hoisted(() => ({
   getEnvLifecycleStub: vi.fn(),
+  getWorkspaceStub: vi.fn(),
 }));
 
 vi.mock("../helpers", async (importOriginal) => {
@@ -12,7 +13,7 @@ vi.mock("../helpers", async (importOriginal) => {
     ...actual,
     getEnvLifecycleStub: mocks.getEnvLifecycleStub,
     getRepoMergeLockStub: vi.fn(),
-    getWorkspaceStub: vi.fn(),
+    getWorkspaceStub: mocks.getWorkspaceStub,
   };
 });
 
@@ -21,7 +22,6 @@ const {
   getEnvDefinitionKey,
   persistEnvDefinition,
   readEnvDefinition,
-  readEnvSummary,
 } = await import("../plan/store");
 
 function createMemoryKV() {
@@ -39,7 +39,40 @@ function createMemoryKV() {
   };
 }
 
-function baseLegacyMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
+beforeEach(() => {
+  mocks.getEnvLifecycleStub.mockReset();
+  mocks.getWorkspaceStub.mockReset();
+});
+
+function toStoredSummary(meta: EnvMeta) {
+  const { repoUrl: _repoUrl, ...stored } = meta;
+  return stored;
+}
+
+function installRepoMetadata(kv: ReturnType<typeof createMemoryKV>) {
+  kv.data.set("repo:repo-1", JSON.stringify({
+    repoId: "repo-1",
+    updatedAt: "2026-04-01T00:00:00.000Z",
+  }));
+  mocks.getWorkspaceStub.mockReturnValue({
+    readWorkspaceFile: vi.fn(async (path: string) => {
+      if (path !== "/.tiller/repo/meta.json") {
+        return null;
+      }
+      return JSON.stringify({
+        repoId: "repo-1",
+        githubInstallationId: 123,
+        githubFullName: "example/repo",
+        ...createInitialRepoScmState(),
+        createdAt: "2026-04-01T00:00:00.000Z",
+        updatedAt: "2026-04-01T00:00:00.000Z",
+        bootstrappedFromRef: "main",
+      });
+    }),
+  });
+}
+
+function baseEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
   return {
     slug: "env-test",
     repoUrl: "https://github.com/example/repo",
@@ -73,7 +106,7 @@ describe("env definition storage", () => {
   });
 
   it("builds definitions from stable env fields only", () => {
-    const definition = buildEnvDefinition(baseLegacyMeta({
+    const definition = buildEnvDefinition(baseEnvMeta({
       startupPlanId: "plan-1",
       branchName: "env-test-branch",
       authMode: "subscription",
@@ -82,7 +115,6 @@ describe("env definition storage", () => {
 
     expect(definition).toEqual({
       slug: "env-test",
-      repoUrl: "https://github.com/example/repo",
       repoId: "repo-1",
       backend: "cf",
       harness: "claude-code",
@@ -104,7 +136,7 @@ describe("env definition storage", () => {
 
     await persistEnvDefinition(env, {
       slug: "env-test",
-      repoUrl: "https://github.com/example/repo",
+      repoId: "repo-1",
       backend: "cf",
       harness: "claude-code",
       startupPlanId: null,
@@ -114,23 +146,11 @@ describe("env definition storage", () => {
 
     await expect(readEnvDefinition(env, "env-test")).resolves.toMatchObject({
       slug: "env-test",
-      repoUrl: "https://github.com/example/repo",
+      repoId: "repo-1",
       branchName: "env/env-test",
     });
     expect(kv.data.has("envdef:env-test")).toBe(true);
-  });
-
-  it("reads summary rows from the slug key", async () => {
-    const kv = createMemoryKV();
-    const meta = baseLegacyMeta();
-    kv.data.set("env-test", JSON.stringify(meta));
-    const env = { ENVS_KV: kv as any } as any;
-
-    await expect(readEnvSummary(env, "env-test")).resolves.toMatchObject({
-      slug: "env-test",
-      repoUrl: "https://github.com/example/repo",
-      workspaceLastSyncedAt: "2026-04-01T00:00:10.000Z",
-    });
+    expect(kv.data.get("envdef:env-test")).not.toContain("repoUrl");
   });
 
   it("rejects definitions that omit explicit environment schema fields", async () => {
@@ -145,27 +165,13 @@ describe("env definition storage", () => {
 
     await expect(readEnvDefinition(env, "env-test")).rejects.toThrow("missing explicit environment schema fields");
   });
-
-  it("rejects summaries that omit explicit environment schema fields", async () => {
-    const kv = createMemoryKV();
-    kv.data.set("env-test", JSON.stringify({
-      slug: "env-test",
-      repoUrl: "https://github.com/example/repo",
-      backend: "cf",
-      createdAt: "2026-04-01T00:00:00.000Z",
-      status: "running",
-    }));
-    const env = { ENVS_KV: kv as any } as any;
-
-    await expect(readEnvSummary(env, "env-test")).rejects.toThrow("missing explicit environment schema fields");
-  });
 });
 
 describe("env summary projection", () => {
   it("does not project envs without a persisted definition", async () => {
     const kv = createMemoryKV();
-    const meta = baseLegacyMeta();
-    kv.data.set("env-test", JSON.stringify(meta));
+    const meta = baseEnvMeta();
+    kv.data.set("env-test", JSON.stringify(toStoredSummary(meta)));
 
     const hub = { broadcastEnvUpsert: vi.fn().mockResolvedValue(undefined) };
     const env = { ENVS_KV: kv as any } as any;
@@ -174,11 +180,11 @@ describe("env summary projection", () => {
     expect(hub.broadcastEnvUpsert).not.toHaveBeenCalled();
   });
 
-  it("hydrates mutable state from the cached summary when the definition exists", async () => {
+  it("projects from existing mutable state when the definition exists", async () => {
     const kv = createMemoryKV();
-    const meta = baseLegacyMeta();
-    kv.data.set("env-test", JSON.stringify(meta));
-    await persistEnvDefinition({ ENVS_KV: kv as any } as any, buildEnvDefinition(baseLegacyMeta()));
+    const meta = baseEnvMeta();
+    installRepoMetadata(kv);
+    await persistEnvDefinition({ ENVS_KV: kv as any } as any, buildEnvDefinition(meta));
 
     const mutableState: EnvMutableState = {
       status: "running",
@@ -218,10 +224,12 @@ describe("env summary projection", () => {
       updatedAt: "2026-04-01T00:10:00.000Z",
     };
 
-    const hydrateFromSummary = vi.fn(async () => mutableState);
+    let currentMutableState: EnvMutableState | null = mutableState;
+    const initializeMutableStateFromMeta = vi.fn();
     mocks.getEnvLifecycleStub.mockReturnValue({
-      getMutableState: vi.fn(async () => null),
-      hydrateFromSummary,
+      getMutableState: vi.fn(async () => currentMutableState),
+      peekMutableState: vi.fn(async () => currentMutableState),
+      initializeMutableStateFromMeta,
     });
 
     const hub = { broadcastEnvUpsert: vi.fn().mockResolvedValue(undefined) };
@@ -237,15 +245,12 @@ describe("env summary projection", () => {
       lifecyclePhase: "running",
       status: "running",
     });
-    expect(hydrateFromSummary).toHaveBeenCalledWith(expect.objectContaining({
-      slug: "env-test",
-      workspaceLastSyncedAt: "2026-04-01T00:00:10.000Z",
-    }));
+    expect(initializeMutableStateFromMeta).not.toHaveBeenCalled();
     expect(kv.data.has("env-test")).toBe(true);
     expect(hub.broadcastEnvUpsert).toHaveBeenCalledTimes(1);
   });
 
-  it("returns null when neither a definition nor a legacy summary exists", async () => {
+  it("returns null when no definition exists", async () => {
     const kv = createMemoryKV();
     mocks.getEnvLifecycleStub.mockReturnValue({});
 

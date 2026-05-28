@@ -9,13 +9,13 @@ const {
   readManagedAccessConfigSnapshot,
   restoreManagedAccessConfigSnapshot,
   cleanupSupersededManagedHubAccess,
-  provisionManagedServiceHosts,
 } = vi.hoisted(() => ({
   prepareManagedExactHostAccess: vi.fn(),
   buildPersistedManagedAccessConfig: vi.fn(() => ({
     appId: "hub-app",
     appAud: "hub-aud",
     appDomain: "tiller.paperwing.dev",
+    accessTeamDomain: "team.cloudflareaccess.com",
     clientId: "client-id",
     clientSecret: "client-secret",
     browserPolicyId: "browser-policy",
@@ -26,6 +26,8 @@ const {
   readManagedAccessConfigSnapshot: vi.fn(async () => ({
     CF_ACCESS_APP_ID: null,
     CF_ACCESS_AUD: null,
+    CF_ACCESS_TEAM_DOMAIN: null,
+    CF_ACCESS_JWKS_URL: null,
     CF_ACCESS_APP_DOMAIN: null,
     CF_ACCESS_APP_TYPE: null,
     CF_ACCESS_OVERLAPPING_WILDCARD_APP_DOMAIN: null,
@@ -41,14 +43,6 @@ const {
   })),
   restoreManagedAccessConfigSnapshot: vi.fn(),
   cleanupSupersededManagedHubAccess: vi.fn(async () => undefined),
-  provisionManagedServiceHosts: vi.fn(async () => ({
-    gateway: {
-      hostname: "tiller-gateway.paperwing.dev",
-      app: { id: "gateway-app" },
-      appDomain: "tiller-gateway.paperwing.dev",
-      serviceTokenPolicy: { id: "gateway-policy" },
-    },
-  })),
 }));
 
 const { resolveSetupStatus } = vi.hoisted(() => ({
@@ -57,17 +51,29 @@ const { resolveSetupStatus } = vi.hoisted(() => ({
     isLocalDev: false,
     currentOrigin: "https://tiller.paperwing.dev",
     hubUrl: "https://tiller.paperwing.dev",
+    deploymentMode: "self-host",
+    routeKind: "custom-domain",
     hostKind: "custom-domain",
     workerServiceName: null,
     modelAuthConfigured: true,
     modelAuthMode: "subscription",
+    hostedInfrastructureReady: true,
+    hostedBlockingReasons: [],
+    hostedModelReady: true,
+    hostedModelBlockingReasons: [],
+    selfHostReady: false,
+    selfHostBlockingReasons: ["The protected Subscription Gateway hostname has not been provisioned yet."],
+    workersAiConfigured: false,
     hasClaudeSubscription: true,
     hasAnthropicKey: false,
     hasChatGPTAuth: false,
+    chatgptAuthStatus: "missing",
     hasOpenAIKey: false,
-    planChatgptConfigured: false,
-    planChatgptAvailable: false,
-    planChatgptReason: null,
+    codexRouteStatus: "unavailable",
+    openaiPlannerConfigured: false,
+    openaiPlannerAvailable: false,
+    openaiPlannerRoute: null,
+    openaiPlannerReason: null,
     hostRegistered: false,
     hostRegisteredMode: "none",
     hostGatewayAvailable: false,
@@ -80,12 +86,16 @@ const { resolveSetupStatus } = vi.hoisted(() => ({
     gatewayHostname: "tiller-gateway.paperwing.dev",
     browserProtected: true,
     gatewayProvisioned: false,
+    gatewayTunnelConfigured: false,
     gatewaySupportAvailable: false,
-    gatewaySupportReason: "The protected Tiller gateway hostname has not been provisioned yet.",
+    gatewaySupportReason: "The protected Subscription Gateway hostname has not been provisioned yet.",
     workersDevCutoverPending: true,
     unsupportedProtectionConfig: false,
     workersDevAliasDisabled: false,
     protectionAppDomain: "tiller.paperwing.dev",
+    accessConfigured: true,
+    accessIssuer: "https://team.cloudflareaccess.com",
+    accessJwksUrl: null,
     hostConnected: false,
     hostConnectionMode: "none",
     idleTimeoutMinutes: 10,
@@ -97,6 +107,7 @@ vi.mock("../protection", () => ({
   resolveProtectionState: vi.fn(async () => ({
     currentOrigin: "https://tiller.paperwing.dev",
     hubUrl: "https://tiller.paperwing.dev",
+    routeKind: "custom-domain",
     hostKind: "custom-domain",
     protectionMode: "public",
     protectionCanAutomate: true,
@@ -104,6 +115,9 @@ vi.mock("../protection", () => ({
     unsupportedProtectionConfig: false,
     workersDevAliasDisabled: false,
     protectionAppDomain: null,
+    accessConfigured: false,
+    accessIssuer: null,
+    accessJwksUrl: null,
   })),
 }));
 
@@ -131,7 +145,6 @@ vi.mock("../access/manage", () => ({
   readManagedAccessConfigSnapshot,
   restoreManagedAccessConfigSnapshot,
   cleanupSupersededManagedHubAccess,
-  provisionManagedServiceHosts,
 }));
 
 import accessRoutes from "../access/routes";
@@ -150,6 +163,7 @@ describe("POST /api/access/setup", () => {
       hostname: "tiller.paperwing.dev",
       app: { id: "hub-app", aud: "hub-aud" },
       appDomain: "tiller.paperwing.dev",
+      accessTeamDomain: "team.cloudflareaccess.com",
       browserPolicy: { id: "browser-policy" },
       serviceToken: {
         id: "service-token",
@@ -192,44 +206,18 @@ describe("POST /api/access/setup", () => {
     expect(prepareManagedExactHostAccess).toHaveBeenCalledOnce();
     expect(persistManagedAccessConfig).toHaveBeenCalledOnce();
     expect(cleanupSupersededManagedHubAccess).toHaveBeenCalledOnce();
-    expect(provisionManagedServiceHosts).not.toHaveBeenCalled();
   });
 });
 
-describe("POST /api/access/provision-machine-hosts", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("provisions the gateway Access app with the shared service token", async () => {
+describe("removed Access gateway provisioning API", () => {
+  it("does not expose the old machine-host provisioning route", async () => {
     const app = createApp();
     const res = await app.request(
       "/api/access/provision-machine-hosts",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          apiToken: "cfat_test",
-        }),
-      },
-      {
-        CF_ACCESS_SERVICE_TOKEN_ID: "service-token",
-      } as any,
+      { method: "POST" },
+      {} as any,
     );
 
-    expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toMatchObject({
-      ok: true,
-      hostname: "tiller.paperwing.dev",
-      gatewayHostname: "tiller-gateway.paperwing.dev",
-      status: {
-        browserProtected: true,
-      },
-    });
-
-    expect(provisionManagedServiceHosts).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      gatewayHostname: "tiller-gateway.paperwing.dev",
-      serviceTokenId: "service-token",
-    }));
+    expect(res.status).toBe(404);
   });
 });

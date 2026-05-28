@@ -1,11 +1,9 @@
 import { getEnvLifecycleStub, getLocationHintOptions, getWorkspaceStub } from "../helpers";
 import type { HubDO } from "../hub";
-import type { EnvDefinition, EnvLifecycleState, Env, EnvMeta, EnvMutableState } from "../types";
+import type { EnvDefinition, EnvLifecycleState, Env, EnvMeta } from "../types";
 import {
   getEnvDefinitionKey,
-  persistEnvDefinition,
-  readEnvDefinition,
-  readEnvSummary,
+  persistEnvSummary,
 } from "../plan/store";
 import { getRunnerBackend } from "./runner-backends";
 import { normalizeRunnerStatus } from "./status";
@@ -19,7 +17,16 @@ import {
   projectEnvSummary,
 } from "../sync/projectors";
 import { listManagedSessionIdsForEnv } from "../session-attachment";
-import { reconcileEnvScmOperationState as reconcileEnvScmOperationStateInternal } from "../scm/env-state";
+import {
+  reconcileEnvScmOperationState as reconcileEnvScmOperationStateInternal,
+  reconcileEnvScmOperationStateForRead,
+} from "../scm/env-state";
+import { revokeCodexGatewaySessionsForEnv } from "../gateway-session";
+import { revokeGitHubBridgesForInteractiveEnv } from "../github/bridge";
+import { envExists, loadEnvView } from "./view";
+
+export { buildEnvMetaFromLayers } from "./state";
+export { envExists, listEnvViews, loadEnvView } from "./view";
 
 export function getHub(
   env: Env,
@@ -66,12 +73,12 @@ export function parseEnvMeta(raw: string): EnvMeta {
 export function buildEnvDefinition(meta: EnvMeta): EnvDefinition {
   return {
     slug: meta.slug,
-    repoUrl: meta.repoUrl,
-    ...(meta.repoId ? { repoId: meta.repoId } : {}),
+    repoId: meta.repoId,
     backend: meta.backend,
     harness: meta.harness,
     ...(meta.authMode ? { authMode: meta.authMode } : {}),
     ...(meta.resolvedAuthMode ? { resolvedAuthMode: meta.resolvedAuthMode } : {}),
+    ...(meta.codexAuthPreference ? { codexAuthPreference: meta.codexAuthPreference } : {}),
     ...(meta.codexAuthMode ? { codexAuthMode: meta.codexAuthMode } : {}),
     ...(meta.opencodeProvider ? { opencodeProvider: meta.opencodeProvider } : {}),
     ...(meta.opencodeModel ? { opencodeModel: meta.opencodeModel } : {}),
@@ -80,139 +87,6 @@ export function buildEnvDefinition(meta: EnvMeta): EnvDefinition {
     branchName: meta.branchName,
     createdAt: meta.createdAt,
   };
-}
-
-function createFallbackMutableState(definition: EnvDefinition): EnvMutableState {
-  return {
-    status: "unknown",
-    lifecyclePhase: null,
-    lifecycleOpId: null,
-    lifecycleOperation: null,
-    lifecycleDesiredState: null,
-    lifecycleLastRunnerState: null,
-    lifecycleLastWorkspaceSyncedAckOpId: null,
-    lifecycleInfraState: "unknown",
-    lifecycleRuntimeReady: false,
-    lifecycleUpdatedAt: null,
-    runnerId: null,
-    runnerMachineId: null,
-    bootMessage: null,
-    bootStepId: null,
-    authWarning: null,
-    branchStatus: null,
-    workspaceDirty: null,
-    workspaceNeedsAttention: null,
-    workspaceLastSyncedAt: null,
-    baseMainCommit: null,
-    lastKnownMainCommit: null,
-    scmOperationType: null,
-    scmOperationId: null,
-    scmOperationPhase: null,
-    scmOperationStartedAt: null,
-    scmOperationUpdatedAt: null,
-    scmLastCompletedAt: null,
-    scmLastDurationMs: null,
-    scmLastTimings: null,
-    leadHarnessStatus: null,
-    leadHarnessError: null,
-    leadHarnessUpdatedAt: null,
-    error: null,
-    errorAt: null,
-    updatedAt: definition.createdAt,
-  };
-}
-
-function buildEnvMetaFromLayers(
-  definition: EnvDefinition,
-  mutableState: EnvMutableState,
-): EnvMeta {
-  const next: EnvMeta = {
-    slug: definition.slug,
-    repoUrl: definition.repoUrl,
-    ...(definition.repoId ? { repoId: definition.repoId } : {}),
-    backend: definition.backend,
-    ...(mutableState.runnerId ? { runnerId: mutableState.runnerId } : {}),
-    ...(mutableState.runnerMachineId ? { runnerMachineId: mutableState.runnerMachineId } : {}),
-    harness: definition.harness,
-    ...(definition.authMode ? { authMode: definition.authMode } : {}),
-    ...(definition.resolvedAuthMode ? { resolvedAuthMode: definition.resolvedAuthMode } : {}),
-    ...(definition.codexAuthMode ? { codexAuthMode: definition.codexAuthMode } : {}),
-    ...(definition.opencodeProvider ? { opencodeProvider: definition.opencodeProvider } : {}),
-    ...(definition.opencodeModel ? { opencodeModel: definition.opencodeModel } : {}),
-    ...(definition.modelRoute ? { modelRoute: definition.modelRoute } : {}),
-    ...(mutableState.authWarning ? { authWarning: mutableState.authWarning } : {}),
-    createdAt: definition.createdAt,
-    updatedAt: mutableState.updatedAt,
-    status: mutableState.status,
-    ...(mutableState.bootMessage ? { bootMessage: mutableState.bootMessage } : {}),
-    bootStepId: mutableState.bootStepId,
-    startupPlanId: definition.startupPlanId,
-    branchName: definition.branchName,
-    branchStatus: mutableState.branchStatus,
-    workspaceDirty: mutableState.workspaceDirty,
-    workspaceNeedsAttention: mutableState.workspaceNeedsAttention,
-    workspaceLastSyncedAt: mutableState.workspaceLastSyncedAt,
-    baseMainCommit: mutableState.baseMainCommit,
-    lastKnownMainCommit: mutableState.lastKnownMainCommit,
-    scmOperationType: mutableState.scmOperationType,
-    scmOperationId: mutableState.scmOperationId,
-    scmOperationPhase: mutableState.scmOperationPhase,
-    scmOperationStartedAt: mutableState.scmOperationStartedAt,
-    scmOperationUpdatedAt: mutableState.scmOperationUpdatedAt,
-    scmLastCompletedAt: mutableState.scmLastCompletedAt,
-    scmLastDurationMs: mutableState.scmLastDurationMs,
-    scmLastTimings: mutableState.scmLastTimings,
-    lifecyclePhase: mutableState.lifecyclePhase,
-    lifecycleOpId: mutableState.lifecycleOpId,
-    lifecycleOperation: mutableState.lifecycleOperation,
-    lifecycleDesiredState: mutableState.lifecycleDesiredState,
-    lifecycleInfraState: mutableState.lifecycleInfraState,
-    lifecycleRuntimeReady: mutableState.lifecycleRuntimeReady,
-    lifecycleUpdatedAt: mutableState.lifecycleUpdatedAt,
-    leadHarnessStatus: mutableState.leadHarnessStatus,
-    leadHarnessError: mutableState.leadHarnessError,
-    leadHarnessUpdatedAt: mutableState.leadHarnessUpdatedAt,
-    ...(mutableState.error ? { error: mutableState.error } : {}),
-    ...(mutableState.errorAt ? { errorAt: mutableState.errorAt } : {}),
-  };
-
-  return projectEnvSummary(next);
-}
-
-async function ensureEnvAuthority(
-  env: Env,
-  slug: string,
-  options?: { summaryMeta?: EnvMeta | null },
-): Promise<{ definition: EnvDefinition; mutableState: EnvMutableState } | null> {
-  const lifecycleStub = getEnvLifecycleStub(env, slug);
-  const definition = await readEnvDefinition(env, slug);
-  if (!definition) {
-    return null;
-  }
-
-  const existingMutableState = await lifecycleStub.getMutableState();
-  if (existingMutableState) {
-    return { definition, mutableState: existingMutableState };
-  }
-
-  const summaryMeta = options?.summaryMeta ?? await readEnvSummary(env, slug);
-  const mutableState = summaryMeta
-    ? await lifecycleStub.hydrateFromSummary(summaryMeta)
-    : createFallbackMutableState(definition);
-  return { definition, mutableState };
-}
-
-async function composeCurrentEnvMeta(
-  env: Env,
-  slug: string,
-  options?: { summaryMeta?: EnvMeta | null },
-): Promise<EnvMeta | null> {
-  const authority = await ensureEnvAuthority(env, slug, options);
-  if (!authority) {
-    return null;
-  }
-
-  return buildEnvMetaFromLayers(authority.definition, authority.mutableState);
 }
 
 export async function deleteEnvSnapshotArtifacts(
@@ -248,7 +122,6 @@ export async function readLifecycleState(
   env: Env,
   meta: EnvMeta,
 ): Promise<EnvLifecycleState | null> {
-  await ensureEnvAuthority(env, meta.slug, { summaryMeta: meta });
   const stub = getEnvLifecycleStub(env, meta.slug);
   return await stub.getState();
 }
@@ -259,17 +132,17 @@ export async function projectAndPersistEnvSummary(
   slug: string,
   options?: {
     broadcast?: boolean;
-    summaryMeta?: EnvMeta | null;
   },
 ): Promise<EnvMeta | null> {
-  const meta = await composeCurrentEnvMeta(env, slug, {
-    summaryMeta: options?.summaryMeta ?? null,
-  });
+  if (!(await envExists(env, slug))) {
+    return null;
+  }
+  const meta = await loadEnvView(env, slug);
   if (!meta) {
     return null;
   }
 
-  await env.ENVS_KV.put(meta.slug, JSON.stringify(meta));
+  await persistEnvSummary(env, meta);
   if (options?.broadcast !== false) {
     await hub.broadcastEnvUpsert(projectEnvSummary(meta));
   }
@@ -283,7 +156,6 @@ export async function projectEnvMetaWithLifecycle(
   return (
     await projectAndPersistEnvSummary(env, getHub(env), meta.slug, {
       broadcast: false,
-      summaryMeta: meta,
     })
   ) ?? meta;
 }
@@ -293,10 +165,9 @@ export async function reconcileEnvScmOperationState(
   meta: EnvMeta,
   _options?: { persist?: boolean },
 ): Promise<EnvMeta> {
-  return await reconcileEnvScmOperationStateInternal(env, meta, async (summaryMeta) => {
-    return await projectAndPersistEnvSummary(env, getHub(env), summaryMeta.slug, {
+  return await reconcileEnvScmOperationStateInternal(env, meta, async (projectedMeta) => {
+    return await projectAndPersistEnvSummary(env, getHub(env), projectedMeta.slug, {
       broadcast: false,
-      summaryMeta,
     });
   });
 }
@@ -320,10 +191,7 @@ export async function projectEnvMetaForRead(
   env: Env,
   meta: EnvMeta,
 ): Promise<EnvMeta> {
-  return await reconcileEnvScmOperationState(
-    env,
-    await projectEnvMetaWithLifecycle(env, meta),
-  );
+  return await reconcileEnvScmOperationStateForRead(env, meta);
 }
 
 /**
@@ -336,6 +204,12 @@ export async function destroyEnv(
   hub: Pick<HubDO, "broadcastEnvRemove" | "getAllSessions" | "deleteSession">,
   options?: { broadcast?: boolean },
 ): Promise<void> {
+  await revokeCodexGatewaySessionsForEnv(env, meta.slug).catch((err) => {
+    console.error(`[envs] Failed to revoke Codex gateway sessions for ${meta.slug}:`, err instanceof Error ? err.message : String(err));
+  });
+  await revokeGitHubBridgesForInteractiveEnv(env, meta.slug).catch((err) => {
+    console.error(`[envs] Failed to revoke GitHub bridge records for ${meta.slug}:`, err instanceof Error ? err.message : String(err));
+  });
   const workspaceStub = getWorkspaceStub(env, meta.slug);
   await workspaceStub.destroyWorkspace();
   try {

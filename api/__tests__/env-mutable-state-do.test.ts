@@ -56,7 +56,7 @@ async function readMutableState(subject: EnvLifecycleDO): Promise<EnvMutableStat
   return state;
 }
 
-function baseLegacyMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
+function baseEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
   return {
     slug: "env-test",
     repoUrl: "https://github.com/example/repo",
@@ -98,7 +98,7 @@ describe("EnvLifecycleDO mutable state", () => {
   it("hydrates mutable state from summary metadata", async () => {
     const subject = createSubject();
 
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
     const state = await readMutableState(subject);
 
     expect(state).toMatchObject({
@@ -112,7 +112,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("boot-progress update preserves workspace fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setBootProgress("next step");
     const state = await readMutableState(subject);
@@ -124,7 +124,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("lead harness failure preserves workspace fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setLeadHarnessFailed("runtime crash");
     const state = await readMutableState(subject);
@@ -137,7 +137,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("SCM projection change preserves workspace fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setScmProjection({
       type: "merge-into-main",
@@ -153,7 +153,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("clearing SCM projection preserves workspace fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
     await subject.setScmProjection({
       type: "merge-into-main",
       operationId: "op-1",
@@ -175,7 +175,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("recordStopWorkspaceSynced updates workspace fields without touching SCM state", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
     await subject.setScmProjection({
       type: "merge-into-main",
       operationId: "op-1",
@@ -201,7 +201,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("interleaving boot-progress and workspace-sync updates preserves last write of each", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setBootProgress("starting harness");
     await subject.recordStopWorkspaceSynced({
@@ -223,7 +223,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("setRunnerBinding updates binding without touching other fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setRunnerBinding({
       runnerId: "runner-42",
@@ -239,7 +239,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("setError sets error and errorAt", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setError("something broke");
     const state = await readMutableState(subject);
@@ -250,7 +250,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("clearError removes error state only", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
     await subject.setError("something broke");
 
     await subject.clearError();
@@ -263,7 +263,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("clearMutableState removes the mutable row entirely", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.clearMutableState();
     await expect(subject.getMutableState()).resolves.toBeNull();
@@ -271,7 +271,7 @@ describe("EnvLifecycleDO mutable state", () => {
 
   it("setStatus updates status without erasing workspace fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(baseLegacyMeta());
+    await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setStatus("failed");
     const state = await readMutableState(subject);

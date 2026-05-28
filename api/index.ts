@@ -6,20 +6,23 @@ import type { HonoEnv, Env, StoredSession } from "./types";
 import type { HubDO } from "./hub";
 import { parseRpcError } from "./errors";
 import { getLocationHintOptions } from "./helpers";
-import { authMiddleware } from "./auth";
+import { authMiddleware, dynamicEntrypointAuthResponse } from "./auth";
 import { DEFAULT_OPENAI_MODEL, listHostedAgentMetadata } from "./agent-core";
-import { getStatus as getOpenAIStatus, seedTokens } from "./openai-auth";
+import { getStatus as getOpenAIStatus, validateAndSeedTokens } from "./openai-auth";
+import { exchangeCodexGatewaySessionToken } from "./gateway-session";
 import setupRoutes from "./setup/routes";
 import accessRoutes from "./access/routes";
+import selfHostRoutes from "./self-host/routes";
 import cliRoutes from "./cli/routes";
 import hostRoutes from "./host/routes";
 import opencodeRoutes from "./opencode/routes";
 import voiceRoutes from "./voice/routes";
 import envRoutes from "./env/routes";
 import repoRoutes from "./repo/routes";
+import githubRoutes from "./github/routes";
 import workspaceRoutes from "./workspace/routes";
 import updateRoutes from "./update/routes";
-import { readEnvDefinition, readEnvSummary } from "./plan/store";
+import { envExists } from "./env/view";
 import {
   partitionManagedSessionsByLookup,
   readManagedEnvSlugFromMetadata,
@@ -80,8 +83,10 @@ app.use("/api/*", authMiddleware);
 // Setup routes (auth skips these when unconfigured — see auth.ts)
 app.route("/", setupRoutes);
 app.route("/", accessRoutes);
+app.route("/", selfHostRoutes);
 app.route("/", cliRoutes);
 app.route("/", hostRoutes);
+app.route("/", githubRoutes);
 app.route("/", opencodeRoutes);
 app.route("/", updateRoutes);
 
@@ -92,7 +97,7 @@ app.get("/health", (c) => c.json({ ok: true }));
 // ── Sessions ────────────────────────────────────────────────────────
 
 async function managedEnvExists(env: Env, slug: string): Promise<boolean> {
-  return !!((await readEnvDefinition(env, slug)) || (await readEnvSummary(env, slug)));
+  return await envExists(env, slug);
 }
 
 async function pruneOrphanSession(hub: HubStub, sessionId: string): Promise<void> {
@@ -152,7 +157,7 @@ app.post("/api/sessions", async (c) => {
   if (!role) {
     return c.json({ error: "sessions must include metadata.role" }, 400);
   }
-  if (!(await readEnvDefinition(c.env, envSlug)) && !(await readEnvSummary(c.env, envSlug))) {
+  if (!(await envExists(c.env, envSlug))) {
     return c.json({ error: `Environment not found for session envSlug: ${envSlug}` }, 404);
   }
 
@@ -461,12 +466,20 @@ app.post("/api/auth/openai/seed", async (c) => {
     return c.json({ error: "access_token and refresh_token are required" }, 400);
   }
 
-  const stored = await seedTokens(c.env, {
-    access_token: body.access_token,
-    refresh_token: body.refresh_token,
-    id_token: body.id_token,
-    expires_in: body.expires_in,
-  });
+  let stored;
+  try {
+    stored = await validateAndSeedTokens(c.env, {
+      access_token: body.access_token,
+      refresh_token: body.refresh_token,
+      id_token: body.id_token,
+      expires_in: body.expires_in,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({
+      error: `Imported Codex login could not be refreshed. Re-run \`codex login\` locally, then import again. ${message}`,
+    }, 400);
+  }
 
   return c.json({
     authenticated: true,
@@ -482,6 +495,38 @@ app.get("/api/auth/openai/status", async (c) => {
     ...status,
     model: c.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL,
   });
+});
+
+app.post("/api/auth/openai/gateway-access", async (c) => {
+  const body = await c.req.json<{
+    gateway_session_token?: string;
+  }>().catch((): { gateway_session_token?: string } => ({}));
+  const gatewayMachineId = c.req.header("X-Tiller-Gateway-Machine-Id")?.trim() || null;
+  const gatewayServiceToken = c.req.header("X-Tiller-Gateway-Service-Token")?.trim() || null;
+  const gatewaySessionToken = body.gateway_session_token?.trim() ?? "";
+
+  if (!gatewaySessionToken) {
+    return c.json({ error: "gateway_session_token is required" }, 400);
+  }
+
+  try {
+    const exchanged = await exchangeCodexGatewaySessionToken(c.env, {
+      token: gatewaySessionToken,
+      gatewayMachineId,
+      gatewayServiceToken,
+    });
+    return c.json({
+      access_token: exchanged.accessToken,
+      account_id: exchanged.accountId,
+      expires_at: exchanged.expiresAt,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/auth|refresh|reconnect|seeded/i.test(message)) {
+      return c.json({ error: "Codex subscription login needs re-import", code: "needs_reconnect" }, 409);
+    }
+    return c.json({ error: message }, 401);
+  }
 });
 
 app.get("/api/agents", (c) => {
@@ -502,10 +547,13 @@ app.route("/", voiceRoutes);
 // ── WebSocket upgrade via partyserver ───────────────────────────────
 
 app.use("/parties/*", (c, next) => {
-  const middleware = partyserverMiddleware({
-    options: getLocationHintOptions(c.env),
+  return dynamicEntrypointAuthResponse(c.req.raw, c.env).then((blocked) => {
+    if (blocked) return blocked;
+    const middleware = partyserverMiddleware({
+      options: getLocationHintOptions(c.env),
+    });
+    return middleware(c as never, next as never);
   });
-  return middleware(c as never, next as never);
 });
 
 // ── SPA fallback ────────────────────────────────────────────────────
@@ -522,6 +570,8 @@ export default {
   ): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname.startsWith("/agents/")) {
+      const blocked = await dynamicEntrypointAuthResponse(req, env);
+      if (blocked) return blocked;
       const agentResp = await routeAgentRequest(req, env);
       if (agentResp) return agentResp;
     }
@@ -541,11 +591,8 @@ export default {
 };
 
 // Export Durable Object classes for wrangler
-export { CartographerChatAgent } from "./agents/cartographer-chat-agent";
 export { HubDO } from "./hub";
 export { PlanChatAgent } from "./agents/plan-chat-agent";
-export { PlannerChatAgent } from "./agents/planner-chat-agent";
-export { ResearchChatAgent } from "./agents/research-chat-agent";
 export { ReviewerChatAgent } from "./agents/reviewer-chat-agent";
 export { ArtifactStoreDO as RepoArtifactStoreDO, ThreadDO } from "./coordination";
 export { RepoMergeLockDO } from "./scm/repo-merge-lock-do";

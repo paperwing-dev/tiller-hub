@@ -1,14 +1,32 @@
 import { describe, expect, it } from "vitest";
-import type { Workspace, FileInfo } from "agents/experimental/workspace";
-import type { Artifact } from "../../coordination";
+import type { Workspace, FileInfo } from "@cloudflare/shell";
+import type { Artifact, CreateArtifactInput } from "../../coordination";
 import {
   createHostedToolRegistry,
   executeHostedTool,
   getHostedToolsForAgent,
   toAiSdkTools,
-  toResponseToolDefinitions,
 } from "../tools";
-import { PLAN_AGENT_SPEC, RESEARCH_AGENT_SPEC } from "../specs";
+import { PLAN_AGENT_SPEC } from "../specs";
+import type { AgentSpec } from "../types";
+
+const MEMORY_TOOL_TEST_SPEC: AgentSpec = {
+  name: "memory-tool-test",
+  runtime: "direct-tools",
+  modelTarget: {
+    provider: "workers-ai",
+    defaultModel: "@cf/test",
+  },
+  toolNames: [
+    "read_file",
+    "write_file",
+    "list_files",
+    "glob",
+    "save_memory",
+    "recall_memory",
+  ],
+  baseInstructions: "Exercise shared hosted workspace and memory tools.",
+};
 
 class FakeWorkspace {
   private files = new Map<string, string>();
@@ -64,17 +82,8 @@ function createArtifactStoreStub() {
   const artifacts = new Map<string, Artifact>();
 
   return {
-    createArtifact(input: {
-      repoId: string;
-      type: string;
-      basis: { repoId: string; mainCommit: string | null };
-      title: string;
-      body: unknown;
-      parentArtifactId?: string;
-      supersedesArtifactId?: string;
-      createdBy?: string;
-    }) {
-      const artifact: Artifact = {
+    createArtifact<TBody = unknown>(input: CreateArtifactInput<TBody>): Artifact<TBody> {
+      const artifact: Artifact<TBody> = {
         id: crypto.randomUUID(),
         repoId: input.repoId,
         type: input.type as Artifact["type"],
@@ -85,6 +94,9 @@ function createArtifactStoreStub() {
         ...(input.supersedesArtifactId ? { supersedesArtifactId: input.supersedesArtifactId } : {}),
         ...(input.createdBy ? { createdBy: input.createdBy } : {}),
         createdAt: "2026-04-12T00:00:00.000Z",
+        updatedAt: input.updatedAt ?? input.createdAt ?? "2026-04-12T00:00:00.000Z",
+        status: input.status ?? "draft",
+        version: input.version ?? 1,
       };
       artifacts.set(artifact.id, artifact);
       return artifact;
@@ -95,18 +107,44 @@ function createArtifactStoreStub() {
     listArtifacts() {
       return Array.from(artifacts.values());
     },
+    savePlan(input: {
+      id: string;
+      repoId: string;
+      expectedVersion: number;
+      markdown: string;
+      title?: string;
+      currentMainCommit: string | null;
+    }) {
+      const existing = artifacts.get(input.id);
+      if (!existing || existing.repoId !== input.repoId || existing.type !== "plan") {
+        throw new Error("Plan artifact not found");
+      }
+      if ((existing.version ?? 1) !== input.expectedVersion) {
+        return { status: "conflict" as const, currentVersion: existing.version ?? 1 };
+      }
+      const next: Artifact = {
+        ...existing,
+        title: input.title ?? existing.title,
+        body: { markdown: input.markdown },
+        basis: { ...existing.basis, mainCommit: input.currentMainCommit },
+        version: (existing.version ?? 1) + 1,
+        updatedAt: "2026-04-12T00:01:00.000Z",
+      };
+      artifacts.set(next.id, next);
+      return { status: "ok" as const, version: next.version ?? 1, artifact: next };
+    },
   };
 }
 
 describe("hosted tools", () => {
-  it("includes the research tools and can save memory", async () => {
+  it("includes shared workspace tools and can save memory", async () => {
     const workspace = new FakeWorkspace({
       "/package.json": '{"name":"tiller-hub"}',
     }) as unknown as Workspace;
     const registry = createHostedToolRegistry(workspace);
-    const tools = getHostedToolsForAgent(registry, RESEARCH_AGENT_SPEC);
+    const tools = getHostedToolsForAgent(registry, MEMORY_TOOL_TEST_SPEC);
 
-    expect(toResponseToolDefinitions(tools).map((tool) => tool.name)).toEqual([
+    expect(tools.map((tool) => tool.definition.name)).toEqual([
       "read_file",
       "write_file",
       "list_files",
@@ -167,16 +205,10 @@ describe("hosted tools", () => {
     });
     const tools = getHostedToolsForAgent(registry, PLAN_AGENT_SPEC);
 
-    expect(toResponseToolDefinitions(tools).map((tool) => tool.name)).toEqual([
-      "read_file",
-      "write_file",
-      "list_files",
-      "glob",
-      "save_memory",
-      "recall_memory",
-      "save_artifact",
+    expect(tools.map((tool) => tool.definition.name)).toEqual([
       "read_artifact",
       "list_artifacts",
+      "save_plan",
     ]);
 
     const saveResult = await executeHostedTool(registry, "save_artifact", {
@@ -184,7 +216,7 @@ describe("hosted tools", () => {
       title: "Review the monorepo",
       summary: "Saved a repo-scoped draft.",
       proposedPlan: "Inspect packages and propose changes.",
-      model: "gpt-5.4",
+      model: "gpt-5.5",
     });
 
     expect(saveResult.ok).toBe(true);
@@ -202,6 +234,90 @@ describe("hosted tools", () => {
     expect(listResult.ok).toBe(true);
     if (!listResult.ok) throw new Error("expected list_artifacts success");
     expect(String(listResult.output)).toContain("Review the monorepo");
+  });
+
+  it("saves a mutable plan and updates expected version within the turn", async () => {
+    const workspace = new FakeWorkspace({}) as unknown as Workspace;
+    const artifactStore = createArtifactStoreStub();
+    const plan = artifactStore.createArtifact({
+      repoId: "repo-123",
+      type: "plan",
+      basis: { repoId: "repo-123", mainCommit: "abc123" },
+      title: "Mutable plan",
+      body: { markdown: "Initial" },
+      status: "draft",
+      version: 1,
+    });
+    const registry = createHostedToolRegistry(workspace, {
+      artifactDefaults: {
+        repoId: "repo-123",
+        mainCommit: "abc123",
+      },
+      artifactStore,
+      savePlanDefaults: {
+        repoId: "repo-123",
+        planArtifactId: plan.id,
+        expectedVersion: 1,
+        currentMainCommit: "def456",
+      },
+    });
+
+    const saveResult = await executeHostedTool(registry, "save_plan", {
+      title: "Updated plan",
+      markdown: "Updated body",
+    });
+    expect(saveResult.ok).toBe(true);
+    if (!saveResult.ok) throw new Error("expected save_plan success");
+    expect(saveResult.output).toEqual({ status: "ok", version: 2 });
+
+    const conflict = await executeHostedTool(registry, "save_plan", {
+      markdown: "Second update in the same turn",
+    });
+    expect(conflict.ok).toBe(true);
+    if (!conflict.ok) throw new Error("expected second save_plan success");
+    expect(conflict.output).toEqual({ status: "ok", version: 3 });
+  });
+
+  it("returns save_plan conflicts as ok tool results", async () => {
+    const workspace = new FakeWorkspace({}) as unknown as Workspace;
+    const artifactStore = createArtifactStoreStub();
+    const plan = artifactStore.createArtifact({
+      repoId: "repo-123",
+      type: "plan",
+      basis: { repoId: "repo-123", mainCommit: "abc123" },
+      title: "Mutable plan",
+      body: { markdown: "Initial" },
+      status: "draft",
+      version: 2,
+    });
+    const registry = createHostedToolRegistry(workspace, {
+      artifactDefaults: {
+        repoId: "repo-123",
+        mainCommit: "abc123",
+      },
+      artifactStore,
+      savePlanDefaults: {
+        repoId: "repo-123",
+        planArtifactId: plan.id,
+        expectedVersion: 1,
+        currentMainCommit: "abc123",
+      },
+    });
+
+    const result = await executeHostedTool(registry, "save_plan", {
+      markdown: "Stale update",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected conflict result to stay ok");
+    expect(result.output).toMatchObject({ status: "conflict", currentVersion: 2 });
+
+    const retry = await executeHostedTool(registry, "save_plan", {
+      markdown: "Retry with stale update",
+    });
+    expect(retry.ok).toBe(true);
+    if (!retry.ok) throw new Error("expected retry conflict result to stay ok");
+    expect(retry.output).toMatchObject({ status: "conflict", currentVersion: 2 });
+    expect(artifactStore.getArtifact(plan.id)?.body).toEqual({ markdown: "Initial" });
   });
 
   it("rejects unsupported artifact types", async () => {
@@ -252,7 +368,7 @@ describe("hosted tools", () => {
   it("surfaces hosted tool failures through the shared AI SDK adapter", async () => {
     const workspace = new FakeWorkspace({}) as unknown as Workspace;
     const registry = createHostedToolRegistry(workspace);
-    const tools = getHostedToolsForAgent(registry, RESEARCH_AGENT_SPEC);
+    const tools = getHostedToolsForAgent(registry, MEMORY_TOOL_TEST_SPEC);
     const aiTools = toAiSdkTools(tools) as Record<string, { execute?: (input: unknown) => Promise<unknown> }>;
 
     await expect(aiTools.read_file.execute?.({ path: "/missing.txt" })).rejects.toThrow(

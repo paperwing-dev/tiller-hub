@@ -1,23 +1,26 @@
-import type { Env, EnvHarness } from "./types";
+import type { ChatGPTAuthStatus, Env, EnvHarness } from "./types";
 import { getStatus as getOpenAIAuthStatus } from "./openai-auth";
 import { getSecret } from "./setup/config";
 import { isEnabledFlag, isLocalDevMode } from "../shared/local-dev";
 
 export type HostKind = "workers-dev" | "custom-domain";
+export type RouteKind = HostKind;
 export type ProtectionMode = "public" | "cf-access";
 
 export interface ModelAuthState {
   hasClaudeSubscription: boolean;
   hasAnthropicKey: boolean;
   hasChatGPTAuth: boolean;
+  chatgptAuthStatus: ChatGPTAuthStatus;
   hasOpenAIKey: boolean;
   configured: boolean;
-  mode: "subscription" | "api" | "chatgpt" | "openai-api" | null;
+  mode: "subscription" | "api" | "api-key" | null;
 }
 
 export interface ProtectionState {
   currentOrigin: string;
   hubUrl: string;
+  routeKind: RouteKind;
   hostKind: HostKind;
   protectionMode: ProtectionMode;
   protectionCanAutomate: boolean;
@@ -25,6 +28,9 @@ export interface ProtectionState {
   unsupportedProtectionConfig: boolean;
   workersDevAliasDisabled: boolean;
   protectionAppDomain: string | null;
+  accessConfigured: boolean;
+  accessIssuer: string | null;
+  accessJwksUrl: string | null;
 }
 
 function normalizeConfiguredUrl(value: string | undefined): string | null {
@@ -41,6 +47,8 @@ export function getHostKind(url: string): HostKind {
   return new URL(url).hostname.endsWith(".workers.dev") ? "workers-dev" : "custom-domain";
 }
 
+export const getRouteKind = getHostKind;
+
 export function isLocalDevRequest(
   env: Pick<Env, "LOCAL_DEV_ONLY_BACKEND">,
   request: Request,
@@ -54,13 +62,15 @@ export function isLocalDevRequest(
 export async function resolveModelAuthState(env: Env): Promise<ModelAuthState> {
   const hasClaudeSubscription = Boolean((await getSecret(env, "CLAUDE_CODE_OAUTH_TOKEN"))?.trim());
   const hasAnthropicKey = Boolean((await getSecret(env, "ANTHROPIC_API_KEY"))?.trim());
-  const hasChatGPTAuth = (await getOpenAIAuthStatus(env)).authenticated;
+  const openAIAuthStatus = await getOpenAIAuthStatus(env);
+  const hasChatGPTAuth = openAIAuthStatus.authenticated;
   const hasOpenAIKey = Boolean((await getSecret(env, "OPENAI_API_KEY"))?.trim());
 
   return {
     hasClaudeSubscription,
     hasAnthropicKey,
     hasChatGPTAuth,
+    chatgptAuthStatus: openAIAuthStatus.status,
     hasOpenAIKey,
     configured: hasClaudeSubscription || hasAnthropicKey || hasChatGPTAuth || hasOpenAIKey,
     mode: hasClaudeSubscription
@@ -68,9 +78,9 @@ export async function resolveModelAuthState(env: Env): Promise<ModelAuthState> {
       : hasAnthropicKey
         ? "api"
         : hasChatGPTAuth
-          ? "chatgpt"
+          ? "subscription"
           : hasOpenAIKey
-            ? "openai-api"
+            ? "api-key"
             : null,
   };
 }
@@ -82,7 +92,7 @@ export function hasEnabledHarnessModelAuth(
 ): boolean {
   return (
     (enabledHarnesses.includes("claude-code") && (modelAuth.hasClaudeSubscription || modelAuth.hasAnthropicKey))
-    || (enabledHarnesses.includes("codex") && (modelAuth.hasChatGPTAuth || modelAuth.hasOpenAIKey || Boolean(modelAuth.hasLocalCodexAuth)))
+    || (enabledHarnesses.includes("codex") && (modelAuth.hasChatGPTAuth || modelAuth.hasOpenAIKey))
     || enabledHarnesses.includes("opencode")
   );
 }
@@ -90,38 +100,35 @@ export function hasEnabledHarnessModelAuth(
 export async function resolveProtectionState(env: Env, requestUrl: string): Promise<ProtectionState> {
   const currentOrigin = new URL(requestUrl).origin.replace(/\/+$/, "");
   const hubUrl = normalizeConfiguredUrl(await getSecret(env, "HUB_PUBLIC_URL")) ?? currentOrigin;
-  const hostKind = getHostKind(hubUrl);
+  const routeKind = getRouteKind(hubUrl);
   const hasCfAccessAud = Boolean((await getSecret(env, "CF_ACCESS_AUD"))?.trim());
   const hasCfAccessClientId = Boolean((await getSecret(env, "CF_ACCESS_CLIENT_ID"))?.trim());
   const hasCfAccessClientSecret = Boolean((await getSecret(env, "CF_ACCESS_CLIENT_SECRET"))?.trim());
-  const hasAnyAccessConfig = hasCfAccessAud || hasCfAccessClientId || hasCfAccessClientSecret;
+  const accessIssuer = normalizeConfiguredUrl(await getSecret(env, "CF_ACCESS_TEAM_DOMAIN"));
+  const accessJwksUrl = normalizeConfiguredUrl(await getSecret(env, "CF_ACCESS_JWKS_URL"));
+  const accessConfiguredFlag = parseStoredBoolean(await getSecret(env, "CF_ACCESS_CONFIGURED"));
   const workersDevAliasDisabled = parseStoredBoolean(await getSecret(env, "WORKERS_DEV_ALIAS_DISABLED"));
   const protectionAppDomain = normalizeConfiguredUrl(await getSecret(env, "CF_ACCESS_APP_DOMAIN"));
-  const unsupportedProtectionConfig = hostKind === "workers-dev" && hasAnyAccessConfig;
-
-  if (hostKind === "workers-dev") {
-    return {
-      currentOrigin,
-      hubUrl,
-      hostKind,
-      protectionMode: "public",
-      protectionCanAutomate: false,
-      serviceTokenConfigured: false,
-      unsupportedProtectionConfig,
-      workersDevAliasDisabled: false,
-      protectionAppDomain: null,
-    };
-  }
+  const hasVerifiableAccessJwtConfig = Boolean(accessIssuer || accessJwksUrl);
+  const accessConfigured = Boolean(
+    hasCfAccessAud
+      && hasVerifiableAccessJwtConfig
+      && (routeKind === "custom-domain" || accessConfiguredFlag),
+  );
 
   return {
     currentOrigin,
     hubUrl,
-    hostKind,
-    protectionMode: hasCfAccessAud ? "cf-access" : "public",
-    protectionCanAutomate: true,
+    routeKind,
+    hostKind: routeKind,
+    protectionMode: accessConfigured ? "cf-access" : "public",
+    protectionCanAutomate: routeKind === "custom-domain",
     serviceTokenConfigured: hasCfAccessClientId && hasCfAccessClientSecret,
-    unsupportedProtectionConfig: false,
-    workersDevAliasDisabled,
+    unsupportedProtectionConfig: hasCfAccessAud && !hasVerifiableAccessJwtConfig,
+    workersDevAliasDisabled: routeKind === "custom-domain" ? workersDevAliasDisabled : false,
     protectionAppDomain,
+    accessConfigured,
+    accessIssuer,
+    accessJwksUrl,
   };
 }

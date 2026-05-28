@@ -1,28 +1,29 @@
 import { Hono } from "hono";
-import {
-  getPlanArtifactById,
-  getApprovedPlanArtifact,
-  loadRepoArtifacts,
-} from "../coordination";
+import { loadRepoArtifacts } from "../coordination";
+import type { PlanStatus } from "../coordination";
 import type { HubDO } from "../hub";
-import type { HonoEnv, Env, RepoMeta, EnvMeta } from "../types";
-import type { WorkspaceDO } from "../workspace/do";
+import type { HonoEnv, Env, RepoMeta, EnvMeta, EnvDefinition } from "../types";
 import {
   deleteRepoIndex,
-  deriveRepoId,
-  ensureRepoWorkspaceFromRepoUrl,
-  getRepoPlanStoreKey,
-  getRepoWorkspaceForRepoId,
-  listEnvMetas,
+  getEnvDefinitionKey,
+  listEnvDefinitionSlugs,
   listRepos,
-  normalizeRepoUrl,
   persistRepoMeta,
-  readRepoIndexEntry,
+  readEnvDefinition,
 } from "../plan/store";
-import { getArtifactStoreStub, getLocationHintOptions, getScmBootstrapStub, getWorkspaceStub } from "../helpers";
+import {
+  createOrRefreshRepoFromSelectionClaimForRequest,
+  githubAppPublicHubDisabledBody,
+  loadRepoForRequest,
+  loadRepoProjection,
+  loadStoredRepoForDeletion,
+  type RepoWorkspace,
+} from "./access";
+import { getArtifactStoreStub, getEnvLifecycleStub, getLocationHintOptions, getScmBootstrapStub } from "../helpers";
 import { destroyEnv } from "../env/service";
+import { buildEnvMetaFromLayers, createFallbackMutableState } from "../env/state";
 import { resolveContainerHubUrl } from "../env/hub-url";
-import { integratePlanReviews, runPlanReviewRound } from "../plan/review-service";
+import { PLAN_REVIEW_MODELS } from "../plan/workflow";
 import { getCanonicalMainBootstrapDepth, getSecret } from "../setup/config";
 import { resolveProtectionState } from "../protection";
 import { isLocalOnlyRunnerBackendMode, resolveScmRunnerBackendKind } from "../env/runner-backend";
@@ -40,9 +41,26 @@ import {
 import { SCM_ARTIFACT_CONTENT_TYPE } from "../scm/constants";
 import { createInitialEnvScmState } from "../scm/model";
 import { projectRepoSummary } from "../sync/projectors";
+import { isGitHubAppAllowedForRequest } from "../github/app";
+import {
+  bridgeCredentialsToEnvVars,
+  createGitHubBridgeRecord,
+  revokeGitHubBridgesForRepoBootstrap,
+} from "../github/bridge";
 
 const repoRoutes = new Hono<HonoEnv>();
-type RepoWorkspaceHandle = { workspace: WorkspaceDO; meta: RepoMeta };
+type RepoWorkspaceHandle = RepoWorkspace;
+type RepoRouteContext =
+  | { ok: true; repo: RepoWorkspaceHandle }
+  | { ok: false; response: Response };
+type RepoHub = Pick<
+  HubDO,
+  | "broadcastEnvRemove"
+  | "broadcastRepoMainChange"
+  | "broadcastRepoRemove"
+  | "getAllSessions"
+  | "deleteSession"
+>;
 
 function buildRepoGitArtifactUrl(baseUrl: string, repoId: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/api/repos/${encodeURIComponent(repoId)}/git-artifact`;
@@ -101,7 +119,16 @@ async function buildRepoGitBootstrapEnvVars(
   const backend = resolveScmRunnerBackendKind(env);
   const hubPublicUrl = await resolveContainerHubUrl(env, requestUrl, backend);
   const protection = await resolveProtectionState(env, requestUrl);
-  const githubToken = await getSecret(env, "GITHUB_TOKEN");
+  const githubBridge = await isGitHubAppAllowedForRequest(env, new Request(requestUrl))
+    ? await createGitHubBridgeRecord(env, {
+        subject: {
+          type: "repo-bootstrap",
+          bootstrapSlug: buildRepoGitBootstrapSlug(repo.repoId),
+          repoId: repo.repoId,
+        },
+        githubFullName: repo.githubFullName,
+      })
+    : null;
   const bootstrapDepth = await getCanonicalMainBootstrapDepth(env);
   const cfClientId =
     protection.protectionMode === "cf-access"
@@ -115,14 +142,15 @@ async function buildRepoGitBootstrapEnvVars(
   return {
     TILLER_BOOTSTRAP_MODE: "repo-git",
     TILLER_REPO_ID: repo.repoId,
+    HUB_URL: hubPublicUrl,
     TILLER_REPO_GIT_ARTIFACT_URL: buildRepoGitArtifactUrl(hubPublicUrl, repo.repoId),
     TILLER_REPO_GIT_FAILURE_URL: `${hubPublicUrl.replace(/\/+$/, "")}/api/repos/${encodeURIComponent(repo.repoId)}/git-artifact/bootstrap-failed`,
     TILLER_REPO_GIT_PROGRESS_URL: `${hubPublicUrl.replace(/\/+$/, "")}/api/repos/${encodeURIComponent(repo.repoId)}/git-artifact/bootstrap-progress`,
     TILLER_REPO_GIT_BOOTSTRAP_REF: repo.bootstrappedFromRef ?? "HEAD",
     TILLER_REPO_GIT_BOOTSTRAP_DEPTH: String(bootstrapDepth),
-    NODE_OPTIONS: "--dns-result-order=ipv4first --no-network-family-autoselection",
+    NODE_OPTIONS: "--dns-result-order=ipv4first",
     REPO_URL: repo.repoUrl,
-    ...(githubToken ? { GITHUB_TOKEN: githubToken } : {}),
+    ...(githubBridge ? bridgeCredentialsToEnvVars(githubBridge) : {}),
     ...(cfClientId ? { CF_ACCESS_CLIENT_ID: cfClientId } : {}),
     ...(cfClientSecret ? { CF_ACCESS_CLIENT_SECRET: cfClientSecret } : {}),
   };
@@ -216,25 +244,20 @@ async function startRepoGitBootstrapJob(
   await stub.startBootstrapJob(repo.meta.repoId, envVars);
 }
 
-function repoMatchesEnv(repo: RepoMeta, env: EnvMeta): boolean {
-  if (env.repoId && repo.repoId) {
-    return env.repoId === repo.repoId;
+async function readValidatedRepoRouteContext(c: any): Promise<RepoRouteContext> {
+  const loaded = await loadRepoForRequest(c.env, c.req.raw, c.req.param("repoId"), "selected-write");
+  if (!loaded.ok) {
+    return { ok: false, response: c.json(loaded.body, loaded.status as any) };
   }
-  return normalizeRepoUrl(env.repoUrl) === normalizeRepoUrl(repo.repoUrl);
+  return { ok: true, repo: loaded.repo };
 }
 
-function ensureDraftIsCurrent(repo: RepoMeta, draft: { mainCommit?: string | null }): string | null {
-  if (!draft.mainCommit) {
-    return "Draft is missing its canonical main commit. Start a new draft on the current main.";
-  }
-  if (draft.mainCommit !== repo.mainCommit) {
-    return `Draft is outdated for main (${draft.mainCommit} vs ${repo.mainCommit ?? "unknown"})`;
-  }
-  return null;
+function isPlanStatus(value: unknown): value is PlanStatus {
+  return value === "draft" || value === "todo" || value === "completed" || value === "archived";
 }
 
-function ensureArtifactIsCurrent(repo: RepoMeta, artifact: { basis: { mainCommit: string | null } }): string | null {
-  return ensureDraftIsCurrent(repo, { mainCommit: artifact.basis.mainCommit });
+function isReviewerModel(value: unknown): value is (typeof PLAN_REVIEW_MODELS)[number] {
+  return typeof value === "string" && (PLAN_REVIEW_MODELS as readonly string[]).includes(value);
 }
 
 async function getRepoArtifactState(
@@ -255,31 +278,47 @@ async function getRepoArtifactState(
 }
 
 repoRoutes.get("/api/repos", async (c) => {
+  if (!(await isGitHubAppAllowedForRequest(c.env, c.req.raw))) {
+    return c.json(githubAppPublicHubDisabledBody(), 403);
+  }
   return c.json((await listRepos(c.env)).map((repo) => projectRepoSummary(repo)));
 });
 
 repoRoutes.get("/api/repos/:repoId", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
+  if (!(await isGitHubAppAllowedForRequest(c.env, c.req.raw))) {
+    return c.json(githubAppPublicHubDisabledBody(), 403);
   }
-  return c.json(projectRepoSummary(repo.meta));
+  const loadedRepo = await loadRepoProjection(c.env, c.req.param("repoId"));
+  if (!loadedRepo.ok) return c.json(loadedRepo.body, loadedRepo.status as any);
+  return c.json(projectRepoSummary(loadedRepo.repo));
 });
 
 repoRoutes.post("/api/repos", async (c) => {
-  const body = await c.req.json<{ repoUrl: string }>();
-  if (!body.repoUrl?.trim()) {
-    return c.json({ error: "repoUrl is required" }, 400);
+  const body: {
+    repositoryId?: unknown;
+    installationId?: unknown;
+    fullName?: unknown;
+  } = await c.req.json<{
+    repositoryId?: unknown;
+    installationId?: unknown;
+    fullName?: unknown;
+  }>().catch(() => ({}));
+  const repositoryId = body.repositoryId;
+  const installationId = body.installationId;
+  const fullName = body.fullName;
+  if (!Number.isInteger(repositoryId) || !Number.isInteger(installationId) || typeof fullName !== "string" || !fullName.trim()) {
+    return c.json({ error: "repositoryId, installationId, and fullName are required" }, 400);
   }
-  try {
-    const normalized = normalizeRepoUrl(body.repoUrl);
-    const repoId = await deriveRepoId(normalized);
-    const existing = await readRepoIndexEntry(c.env, repoId);
-    if (existing) {
-      const repo = await ensureRepoWorkspaceFromRepoUrl(c.env, body.repoUrl);
-      return c.json(projectRepoSummary(repo.meta), 200);
-    }
-    const repo = await ensureRepoWorkspaceFromRepoUrl(c.env, body.repoUrl);
+  const loaded = await createOrRefreshRepoFromSelectionClaimForRequest(c.env, c.req.raw, {
+    repositoryId,
+    installationId,
+    fullName,
+  });
+  if (!loaded.ok) {
+    return c.json(loaded.body, loaded.status as any);
+  }
+  const repo = loaded.repo;
+  if (repo.created) {
     await broadcastRepoSummary(c.env, repo.meta);
     c.executionCtx.waitUntil(
       startRepoGitBootstrapJob(c.env, c.req.url, repo).catch(async (error) => {
@@ -299,18 +338,14 @@ repoRoutes.post("/api/repos", async (c) => {
         }
       }),
     );
-    return c.json(projectRepoSummary(repo.meta), 201);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return c.json({ error: message }, 502);
   }
+  return c.json(projectRepoSummary(repo.meta), repo.created ? 201 : 200);
 });
 
 repoRoutes.get("/api/repos/:repoId/git-artifact", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   const requestedArtifactId = c.req.query("artifactId")?.trim() || null;
   const artifactId = requestedArtifactId ?? repo.meta.gitArtifactId ?? null;
   if (!artifactId) {
@@ -338,10 +373,9 @@ repoRoutes.get("/api/repos/:repoId/git-artifact", async (c) => {
 });
 
 repoRoutes.post("/api/repos/:repoId/git-artifact", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   if (!c.req.raw.body) {
     return c.json({ error: "Git artifact body is required" }, 400);
   }
@@ -387,6 +421,9 @@ repoRoutes.post("/api/repos/:repoId/git-artifact", async (c) => {
     updatedAt: savedAt,
   };
   await persistRepoMeta(c.env, repo.workspace, nextMeta);
+  await revokeGitHubBridgesForRepoBootstrap(c.env, repo.meta.repoId).catch((error) => {
+    console.warn(`[repos] Failed to revoke bootstrap GitHub bridge for ${repo.meta.repoId}:`, error);
+  });
   await broadcastRepoSummary(c.env, nextMeta);
   if (previousMainCommit !== nextMeta.mainCommit) {
     c.executionCtx.waitUntil((async () => {
@@ -415,10 +452,9 @@ repoRoutes.post("/api/repos/:repoId/git-artifact", async (c) => {
 });
 
 repoRoutes.post("/api/repos/:repoId/git-artifact/bootstrap-failed", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   if (repo.meta.gitStatus === "ready" && repo.meta.gitArtifactId) {
     return c.json({
       ok: true,
@@ -433,6 +469,9 @@ repoRoutes.post("/api/repos/:repoId/git-artifact/bootstrap-failed", async (c) =>
     "Canonical main bootstrap failed.";
 
   const nextMeta = await markRepoGitBootstrapFailure(c.env, repo, message || "Canonical main bootstrap failed.");
+  await revokeGitHubBridgesForRepoBootstrap(c.env, repo.meta.repoId).catch((error) => {
+    console.warn(`[repos] Failed to revoke bootstrap GitHub bridge for ${repo.meta.repoId}:`, error);
+  });
   await broadcastRepoSummary(c.env, nextMeta);
   return c.json({
     ok: true,
@@ -443,15 +482,15 @@ repoRoutes.post("/api/repos/:repoId/git-artifact/bootstrap-failed", async (c) =>
 });
 
 repoRoutes.post("/api/repos/:repoId/git-artifact/bootstrap-progress", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   if (repo.meta.gitStatus === "ready" && repo.meta.gitArtifactId) {
     return c.json({ ok: true, repoId: repo.meta.repoId, gitStatus: repo.meta.gitStatus });
   }
 
-  const body = await c.req.json<{ phase?: string; elapsedMs?: number | null }>().catch(() => ({}));
+  const body = await c.req.json<{ phase?: string; elapsedMs?: number | null }>()
+    .catch((): { phase?: string; elapsedMs?: number | null } => ({}));
   const phase = body.phase?.trim();
   if (!phase) {
     return c.json({ error: "phase is required" }, 400);
@@ -475,10 +514,9 @@ repoRoutes.post("/api/repos/:repoId/git-artifact/bootstrap-progress", async (c) 
 });
 
 repoRoutes.post("/api/repos/:repoId/scm-operations/:operationId/git-artifact", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   if (!c.req.raw.body) {
     return c.json({ error: "Git artifact body is required" }, 400);
   }
@@ -519,10 +557,9 @@ repoRoutes.post("/api/repos/:repoId/scm-operations/:operationId/git-artifact", a
 });
 
 repoRoutes.post("/api/repos/:repoId/git-artifact/bootstrap", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   if (repo.meta.gitStatus === "ready" && repo.meta.gitArtifactId) {
     return c.json({
       ok: true,
@@ -558,19 +595,17 @@ repoRoutes.post("/api/repos/:repoId/git-artifact/bootstrap", async (c) => {
 });
 
 repoRoutes.get("/api/repos/:repoId/artifacts", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   const { artifacts, refs } = await getRepoArtifactState(c.env, repo);
   return c.json({ artifacts, refs });
 });
 
 repoRoutes.get("/api/repos/:repoId/artifacts/:id", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   const { artifacts, refs } = await getRepoArtifactState(c.env, repo);
   const artifact = artifacts.find((candidate) => candidate.id === c.req.param("id")) ?? null;
   if (!artifact) {
@@ -579,15 +614,131 @@ repoRoutes.get("/api/repos/:repoId/artifacts/:id", async (c) => {
   return c.json({ artifact, refs });
 });
 
-repoRoutes.post("/api/repos/:repoId/artifacts", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
+repoRoutes.post("/api/repos/:repoId/plans", async (c) => {
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
+  if (!repo.meta.mainCommit) {
+    return c.json({ error: "Canonical main commit is not ready yet for this repository." }, 409);
   }
+  const body = await c.req.json<{ title?: unknown }>().catch((): { title?: unknown } => ({}));
+  const title = typeof body.title === "string" && body.title.trim() ? body.title.trim() : "";
+  const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
+  const artifact = await artifactStore.createArtifact({
+    repoId: repo.meta.repoId,
+    type: "plan",
+    basis: {
+      repoId: repo.meta.repoId,
+      mainCommit: repo.meta.mainCommit,
+    },
+    title,
+    body: { markdown: "" },
+    status: "draft",
+    createdBy: "user",
+  });
+  return c.json({ ok: true, artifact }, 201);
+});
+
+repoRoutes.patch("/api/repos/:repoId/artifacts/:id/status", async (c) => {
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
+  const body = await c.req.json<{ status?: unknown; expectedVersion?: unknown }>().catch(() => ({}));
+  if (!isPlanStatus(body.status)) {
+    return c.json({ error: "status must be one of draft, todo, completed, or archived" }, 400);
+  }
+  const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
+  try {
+    const artifact = await artifactStore.updateArtifactStatus({
+      repoId: repo.meta.repoId,
+      id: c.req.param("id"),
+      status: body.status,
+      expectedVersion: typeof body.expectedVersion === "number" ? body.expectedVersion : null,
+    });
+    return c.json({ ok: true, artifact });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to update artifact status";
+    return c.json({ error: message }, /version mismatch/i.test(message) ? 409 : 404);
+  }
+});
+
+repoRoutes.delete("/api/repos/:repoId/plans/:artifactId", async (c) => {
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
+  const body = await c.req.json<{ expectedVersion?: unknown }>().catch(() => ({}));
+  const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
+  try {
+    const artifact = await artifactStore.discardPlan({
+      repoId: repo.meta.repoId,
+      id: c.req.param("artifactId"),
+      expectedVersion: typeof body.expectedVersion === "number" ? body.expectedVersion : null,
+    });
+    return c.json({ ok: true, artifact });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to discard plan";
+    return c.json({ error: message }, /version mismatch|only draft/i.test(message) ? 409 : 404);
+  }
+});
+
+repoRoutes.get("/api/repos/:repoId/plans/:artifactId/reviewers", async (c) => {
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
+  const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
+  const plan = await artifactStore.getArtifact(c.req.param("artifactId"));
+  if (!plan || plan.repoId !== repo.meta.repoId || plan.type !== "plan") {
+    return c.json({ error: "Plan artifact not found" }, 404);
+  }
+  return c.json({ reviewers: await artifactStore.listReviewers(repo.meta.repoId, plan.id) });
+});
+
+repoRoutes.post("/api/repos/:repoId/plans/:artifactId/reviewers", async (c) => {
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
+  const body = await c.req.json<{ reviewerModel?: unknown }>().catch(() => ({}));
+  if (!isReviewerModel(body.reviewerModel)) {
+    return c.json({ error: "Unsupported reviewer model" }, 400);
+  }
+  const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
+  const plan = await artifactStore.getArtifact(c.req.param("artifactId"));
+  if (!plan || plan.repoId !== repo.meta.repoId || plan.type !== "plan") {
+    return c.json({ error: "Plan artifact not found" }, 404);
+  }
+  const reviewer = await artifactStore.upsertReviewer({
+    repoId: repo.meta.repoId,
+    planArtifactId: plan.id,
+    reviewerModel: body.reviewerModel,
+  });
+  return c.json({ ok: true, reviewer }, 201);
+});
+
+repoRoutes.delete("/api/repos/:repoId/plans/:artifactId/reviewers/:threadId", async (c) => {
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
+  const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
+  try {
+    const reviewer = await artifactStore.removeReviewer(
+      repo.meta.repoId,
+      c.req.param("artifactId"),
+      c.req.param("threadId"),
+    );
+    return c.json({ ok: true, reviewer });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Reviewer not found" }, 404);
+  }
+});
+
+repoRoutes.post("/api/repos/:repoId/artifacts", async (c) => {
+  const loadedRepo = await readValidatedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const repo = loadedRepo.repo;
   const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
   const body = await c.req.json<Record<string, unknown>>();
   try {
-    const artifact = artifactStore.createArtifact({
+    const artifact = await artifactStore.createArtifact({
       ...(body as any),
       repoId: repo.meta.repoId,
     });
@@ -597,139 +748,53 @@ repoRoutes.post("/api/repos/:repoId/artifacts", async (c) => {
   }
 });
 
-repoRoutes.get("/api/repos/:repoId/refs", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
-  const { artifactStore } = await getRepoArtifactState(c.env, repo);
-  return c.json(artifactStore.listRefs());
-});
-
-repoRoutes.post("/api/repos/:repoId/refs/:name", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
-  const { artifactStore, artifacts } = await getRepoArtifactState(c.env, repo);
-  const body = await c.req.json<{ artifactId?: string; expectedVersion?: number | null }>().catch(() => ({}));
-  const artifactId = body.artifactId?.trim();
-  if (!artifactId) {
-    return c.json({ error: "artifactId is required" }, 400);
-  }
-  const artifact = artifacts.find((candidate) => candidate.id === artifactId) ?? null;
-  if (!artifact) {
-    return c.json({ error: "Artifact not found" }, 404);
-  }
-  try {
-    const ref = artifactStore.setRef({
-      repoId: repo.meta.repoId,
-      name: c.req.param("name"),
-      artifactId,
-      expectedVersion: body.expectedVersion,
-    });
-    return c.json({ ok: true, ref, artifact });
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "Failed to update ref" }, 409);
-  }
-});
-
-repoRoutes.post("/api/repos/:repoId/artifacts/:id/review-round", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
-  const { artifactStore, artifacts } = await getRepoArtifactState(c.env, repo);
-  const draft = getPlanArtifactById(artifacts, c.req.param("id"));
-  if (!draft) {
-    return c.json({ error: "Plan artifact not found" }, 404);
-  }
-  const revisionError = ensureArtifactIsCurrent(repo.meta, draft);
-  if (revisionError) {
-    return c.json({ error: revisionError }, 409);
-  }
-  try {
-    return c.json(
-      await runPlanReviewRound({
-        env: c.env,
-        repoPlan: {
-          meta: repo.meta,
-          planWorkspace: repo.workspace,
-          artifactStore,
-        },
-        draft,
-      }),
-    );
-  } catch (error) {
-    return c.json(
-      { error: error instanceof Error ? error.message : "Failed to run plan review round" },
-      502,
-    );
-  }
-});
-
-repoRoutes.post("/api/repos/:repoId/artifacts/:id/integrate", async (c) => {
-  const repo = await getRepoWorkspaceForRepoId(c.env, c.req.param("repoId"));
-  if (!repo) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
-  const { artifactStore, artifacts } = await getRepoArtifactState(c.env, repo);
-  const draft = getPlanArtifactById(artifacts, c.req.param("id"));
-  if (!draft) {
-    return c.json({ error: "Plan artifact not found" }, 404);
-  }
-  const revisionError = ensureArtifactIsCurrent(repo.meta, draft);
-  if (revisionError) {
-    return c.json({ error: revisionError }, 409);
-  }
-  const body = await c.req.json<{ selectedModel?: unknown }>().catch(() => ({}));
-  try {
-    return c.json(
-      await integratePlanReviews({
-        env: c.env,
-        repoPlan: {
-          meta: repo.meta,
-          planWorkspace: repo.workspace,
-          artifactStore,
-        },
-        draft,
-        selectedModel: body.selectedModel,
-      }),
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to integrate reviews";
-    const status = message === "No review artifacts found for this draft" ? 400 : 502;
-    return c.json({ error: message }, status);
-  }
-});
-
-function getHub(
-  env: Env,
-): Pick<HubDO, "broadcastEnvRemove" | "broadcastRepoMainChange" | "broadcastRepoRemove"> {
+function getHub(env: Env): RepoHub {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as Pick<
-    HubDO,
-    "broadcastEnvRemove" | "broadcastRepoMainChange" | "broadcastRepoRemove"
-  >;
+  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as RepoHub;
 }
 
 repoRoutes.delete("/api/repos/:repoId", async (c) => {
   const repoId = c.req.param("repoId");
-  const indexEntry = await readRepoIndexEntry(c.env, repoId);
-  if (!indexEntry) {
-    return c.json({ error: "Repo not found" }, 404);
-  }
-  const repo = await getRepoWorkspaceForRepoId(c.env, repoId);
-  const gitArtifactId = repo?.meta.gitArtifactId ?? null;
+  const loaded = await loadStoredRepoForDeletion(c.env, c.req.raw, repoId);
+  if (!loaded.ok) return c.json(loaded.body, loaded.status as any);
+  const repo = loaded.repo;
+  const gitArtifactId = repo.meta.gitArtifactId ?? null;
 
-  // Find all attached environments
-  const allEnvs = await listEnvMetas(c.env);
-  const attachedEnvs = allEnvs.filter((env) => repoMatchesEnv({ repoId, repoUrl: indexEntry.repoUrl } as RepoMeta, env));
+  const envDefinitionSlugs = await listEnvDefinitionSlugs(c.env);
+  const attachedEnvDefinitions: EnvDefinition[] = [];
+  for (const slug of envDefinitionSlugs) {
+    const definition = await readEnvDefinition(c.env, slug).catch((error) => {
+      console.warn(
+        `[repos] Skipping invalid env definition ${slug} during repo deletion:`,
+        error instanceof Error ? error.message : String(error),
+      );
+      return null;
+    });
+    if (definition?.repoId === repoId) {
+      attachedEnvDefinitions.push(definition);
+    }
+  }
+  const attachedEnvSlugs = attachedEnvDefinitions.map((definition) => definition.slug);
+  const attachedEnvs = await Promise.all(attachedEnvDefinitions.map(async (definition) => {
+    const mutableState = await getEnvLifecycleStub(c.env, definition.slug).peekMutableState().catch((error) => {
+      console.warn(
+        `[repos] Falling back to definition-only env metadata for ${definition.slug} during repo deletion cleanup:`,
+        error instanceof Error ? error.message : String(error),
+      );
+      return null;
+    });
+    return buildEnvMetaFromLayers(
+      definition,
+      mutableState ?? createFallbackMutableState(definition),
+      repo.meta.repoUrl,
+    );
+  }));
 
   const hub = getHub(c.env);
-  for (const env of attachedEnvs) {
-    await c.env.ENVS_KV.delete(env.slug);
-    await hub.broadcastEnvRemove(env.slug);
+  for (const slug of attachedEnvSlugs) {
+    await c.env.ENVS_KV.delete(slug);
+    await c.env.ENVS_KV.delete(getEnvDefinitionKey(slug));
+    await hub.broadcastEnvRemove(slug);
   }
   await deleteRepoIndex(c.env, repoId);
   await hub.broadcastRepoRemove(repoId);
@@ -745,8 +810,7 @@ repoRoutes.delete("/api/repos/:repoId", async (c) => {
         }
       }
       try {
-        const workspaceStub = getWorkspaceStub(c.env, getRepoPlanStoreKey(indexEntry.repoUrl));
-        await workspaceStub.destroyWorkspace();
+        await repo.workspace.destroyWorkspace();
       } catch (err) {
         console.error(`[repos] Failed to destroy repo workspace for ${repoId}:`, err);
       }
@@ -772,7 +836,7 @@ repoRoutes.delete("/api/repos/:repoId", async (c) => {
   return c.json({
     ok: true,
     repoId,
-    deletedEnvSlugs: attachedEnvs.map((e) => e.slug),
+    deletedEnvSlugs: attachedEnvSlugs,
   });
 });
 

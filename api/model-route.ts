@@ -1,36 +1,38 @@
-import { getValidOpenAIAuth } from "./openai-auth";
-import { getSecret } from "./setup/config";
+import { getSecret, resolveDeploymentModeForRuntime } from "./setup/config";
 import {
   readRegisteredHostService,
   readRoutableHostService,
 } from "./service-registry";
-import type { Env } from "./types";
+import type { CodexRouteStatus, Env, HostServiceRegistration } from "./types";
 
 const DEFAULT_HOST_GATEWAY_HOSTNAME = "host.docker.internal";
+const REQUIRED_CODEX_GATEWAY_AUTH = "session-token";
 
 export type ResolvedCodexModelRoute =
   | {
       kind: "gateway-subscription";
       gatewayUrl: string;
+      machineId: string;
       providerBaseUrl: string;
       responsesUrl: string;
-      accessToken: string;
-      accountId: string | null;
+      codexRouteStatus: "available";
     }
   | {
       kind: "host-gateway";
+      machineId: string;
       providerBaseUrl: string;
       responsesUrl: string;
-      accessToken: string;
-      accountId: string | null;
+      codexRouteStatus: "available";
     }
   | {
       kind: "api-fallback";
       openaiApiKey: string;
+      codexRouteStatus: "api_fallback";
     }
   | {
       kind: "unavailable";
       reason: string;
+      codexRouteStatus: Exclude<CodexRouteStatus, "available" | "api_fallback">;
     };
 
 export type AvailableCodexModelRoute = Exclude<ResolvedCodexModelRoute, { kind: "unavailable" }>;
@@ -65,136 +67,223 @@ async function buildGatewayAccessHeaders(env: Env): Promise<Headers> {
   return headers;
 }
 
-async function isGatewayHealthy(env: Env, gatewayUrl: string): Promise<boolean> {
-  try {
-    const response = await fetch(gatewayHealthUrl(gatewayUrl), {
-      headers: await buildGatewayAccessHeaders(env),
-      signal: AbortSignal.timeout(2500),
-    });
-    return response.ok;
-  } catch {
-    return false;
-  }
+interface GatewayHealth {
+  ok: boolean;
+  supportsSessionTokenAuth: boolean;
 }
 
-async function resolveHostedGatewayRoute(
-  env: Env,
-): Promise<ResolvedCodexModelRoute | null> {
-  const host = await readRoutableHostService(env);
-  const gatewayUrl = host?.gatewayUrl?.trim() ?? "";
-  if (!gatewayUrl || host?.codexSubscription !== true) {
-    return null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function readCodexGatewayAuth(payload: unknown): string | null {
+  if (!isRecord(payload)) return null;
+
+  if (payload.codexGatewayAuth === REQUIRED_CODEX_GATEWAY_AUTH) {
+    return REQUIRED_CODEX_GATEWAY_AUTH;
   }
 
-  try {
-    const auth = await getValidOpenAIAuth(env);
-    if (await isGatewayHealthy(env, gatewayUrl)) {
-      return {
-        kind: "gateway-subscription",
-        gatewayUrl,
-        providerBaseUrl: gatewayCodexProviderBaseUrl(gatewayUrl),
-        responsesUrl: gatewayCodexResponsesUrl(gatewayUrl),
-        accessToken: auth.access_token,
-        accountId: auth.account_id ?? null,
-      };
-    }
-  } catch {
-    // Fall through to API fallback when ChatGPT auth is not available.
+  const capabilities = payload.capabilities;
+  if (isRecord(capabilities) && capabilities.codexGatewayAuth === REQUIRED_CODEX_GATEWAY_AUTH) {
+    return REQUIRED_CODEX_GATEWAY_AUTH;
   }
 
   return null;
 }
 
+async function checkGatewayHealth(env: Env, gatewayUrl: string): Promise<GatewayHealth> {
+  try {
+    const response = await fetch(gatewayHealthUrl(gatewayUrl), {
+      headers: await buildGatewayAccessHeaders(env),
+      signal: AbortSignal.timeout(2500),
+    });
+    const payload = await response.json().catch(() => null);
+    return {
+      ok: response.ok,
+      supportsSessionTokenAuth: readCodexGatewayAuth(payload) === REQUIRED_CODEX_GATEWAY_AUTH,
+    };
+  } catch {
+    return { ok: false, supportsSessionTokenAuth: false };
+  }
+}
+
+function supportsSessionTokenGateway(host: HostServiceRegistration): boolean {
+  return host.codexGatewayAuth === REQUIRED_CODEX_GATEWAY_AUTH;
+}
+
+interface UnavailableCodexModelRoute {
+  kind: "unavailable";
+  reason: string;
+  codexRouteStatus: Exclude<CodexRouteStatus, "available" | "api_fallback">;
+}
+
+function unavailableCodexRoute(
+  reason: string,
+  codexRouteStatus: UnavailableCodexModelRoute["codexRouteStatus"],
+): UnavailableCodexModelRoute {
+  return {
+    kind: "unavailable",
+    reason,
+    codexRouteStatus,
+  };
+}
+
+function withoutApiFallbackReason(route: UnavailableCodexModelRoute): UnavailableCodexModelRoute {
+  return {
+    ...route,
+    reason: route.reason.replace(/ or an API key/g, ""),
+  };
+}
+
+async function resolveHostedGatewayRoute(
+  env: Env,
+): Promise<Exclude<ResolvedCodexModelRoute, { kind: "api-fallback" }> | null> {
+  const registeredHost = await readRegisteredHostService(env);
+  const host = await readRoutableHostService(env);
+  const deploymentMode = await resolveDeploymentModeForRuntime(env, {
+    hostRegistered: Boolean(registeredHost?.machineId?.trim()),
+    hostGatewayConfigured: Boolean(registeredHost?.gatewayUrl?.trim()),
+  });
+  if (deploymentMode !== "self-host") {
+    return unavailableCodexRoute(
+      "Codex subscription gateway routing is only available in Tiller Self Host mode.",
+      "unavailable",
+    );
+  }
+
+  const gatewayUrl = host?.gatewayUrl?.trim() ?? "";
+  if (!host) {
+    return unavailableCodexRoute(
+      registeredHost?.machineId?.trim()
+        ? "Codex requires a connected Tiller Self Host or an API key."
+        : "Codex requires a running Subscription Gateway or an API key.",
+      "host_offline",
+    );
+  }
+
+  if (!gatewayUrl) {
+    return unavailableCodexRoute(
+      "Codex requires a running Subscription Gateway or an API key.",
+      "gateway_offline",
+    );
+  }
+
+  if (host.codexSubscription !== true) {
+    return unavailableCodexRoute(
+      "Codex requires a Subscription Gateway with subscription support or an API key.",
+      "unavailable",
+    );
+  }
+
+  if (!supportsSessionTokenGateway(host)) {
+    return unavailableCodexRoute(
+      "Codex requires an updated Subscription Gateway with subscription session-token support.",
+      "unavailable",
+    );
+  }
+
+  const gatewayHealth = await checkGatewayHealth(env, gatewayUrl);
+  if (!gatewayHealth.ok) {
+    return unavailableCodexRoute(
+      "Codex requires a healthy Subscription Gateway or an API key.",
+      "gateway_offline",
+    );
+  }
+
+  if (!gatewayHealth.supportsSessionTokenAuth) {
+    return unavailableCodexRoute(
+      "Codex requires an updated Subscription Gateway with subscription session-token support.",
+      "unavailable",
+    );
+  }
+
+  return {
+    kind: "gateway-subscription",
+    gatewayUrl,
+    machineId: host.machineId,
+    providerBaseUrl: gatewayCodexProviderBaseUrl(gatewayUrl),
+    responsesUrl: gatewayCodexResponsesUrl(gatewayUrl),
+    codexRouteStatus: "available",
+  };
+}
+
 async function resolveHostGatewayRoute(
   env: Env,
   machineId?: string | null,
-): Promise<ResolvedCodexModelRoute | null> {
-  const host = await readRoutableHostService(env, machineId ?? null);
-  if (!host || host.codexSubscription !== true || !host.gatewayPort) {
-    return null;
-  }
-
-  try {
-    const auth = await getValidOpenAIAuth(env);
-    const gatewayUrl = hostGatewayOrigin(host.gatewayPort);
-    return {
-      kind: "host-gateway",
-      providerBaseUrl: gatewayCodexProviderBaseUrl(gatewayUrl),
-      responsesUrl: gatewayCodexResponsesUrl(gatewayUrl),
-      accessToken: auth.access_token,
-      accountId: auth.account_id ?? null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function resolveHostUnavailableReason(
-  env: Env,
-  machineId?: string | null,
-): Promise<string> {
+): Promise<Exclude<ResolvedCodexModelRoute, { kind: "api-fallback" }> | null> {
   const registeredHost = await readRegisteredHostService(env, machineId ?? null);
-  const routableHost = await readRoutableHostService(env, machineId ?? null);
-
-  if (!routableHost) {
-    return machineId?.trim()
-      ? "Codex requires the selected Tiller Host to be connected or an OpenAI API key."
-      : "Codex requires a connected Tiller Host or an OpenAI API key.";
+  const host = await readRoutableHostService(env, machineId ?? null);
+  if (!host) {
+    return unavailableCodexRoute(
+      machineId?.trim() || registeredHost?.machineId?.trim()
+        ? "Codex requires the selected Tiller Self Host to be connected or an API key."
+        : "Codex requires a connected Tiller Self Host or an API key.",
+      "host_offline",
+    );
   }
 
-  if (!routableHost.gatewayPort) {
-    return "Codex requires a connected Tiller Host gateway or an OpenAI API key.";
+  if (!host.gatewayPort) {
+    return unavailableCodexRoute(
+      "Codex requires a connected Subscription Gateway or an API key.",
+      "gateway_offline",
+    );
   }
 
-  if (routableHost.codexSubscription === true || registeredHost?.codexSubscription === true) {
-    return "Codex requires ChatGPT auth in Tiller or an OpenAI API key.";
+  if (host.codexSubscription !== true) {
+    return unavailableCodexRoute(
+      "Codex requires a Subscription Gateway with subscription support or an API key.",
+      "unavailable",
+    );
   }
 
-  return "Codex requires a connected Tiller Host gateway or an OpenAI API key.";
-}
-
-async function resolveHostedUnavailableReason(env: Env): Promise<string> {
-  const registeredHost = await readRegisteredHostService(env);
-  const routableHost = await readRoutableHostService(env);
-
-  if (!routableHost?.gatewayUrl) {
-    return "Codex requires a running Tiller Host gateway or an OpenAI API key.";
+  if (!supportsSessionTokenGateway(host)) {
+    return unavailableCodexRoute(
+      "Codex requires an updated Subscription Gateway with subscription session-token support.",
+      "unavailable",
+    );
   }
 
-  if (routableHost.codexSubscription === true || registeredHost?.codexSubscription === true) {
-    return "Codex requires a running Tiller Host gateway to use the connected subscription, or an OpenAI API key.";
-  }
-
-  return "Codex requires a running Tiller Host gateway or an OpenAI API key.";
+  const gatewayUrl = hostGatewayOrigin(host.gatewayPort);
+  return {
+    kind: "host-gateway",
+    machineId: host.machineId,
+    providerBaseUrl: gatewayCodexProviderBaseUrl(gatewayUrl),
+    responsesUrl: gatewayCodexResponsesUrl(gatewayUrl),
+    codexRouteStatus: "available",
+  };
 }
 
 export async function resolveCodexModelRoute(
   env: Env,
-  options?: { target?: CodexModelRouteTarget; machineId?: string | null },
+  options?: { target?: CodexModelRouteTarget; machineId?: string | null; allowApiFallback?: boolean },
 ): Promise<ResolvedCodexModelRoute> {
   const target = options?.target ?? "hosted";
   const gatewayRoute = target === "host"
     ? await resolveHostGatewayRoute(env, options?.machineId ?? null)
     : await resolveHostedGatewayRoute(env);
 
-  if (gatewayRoute) {
+  if (gatewayRoute && gatewayRoute.kind !== "unavailable") {
     return gatewayRoute;
   }
 
-  const apiKey = (await getSecret(env, "OPENAI_API_KEY"))?.trim();
-  if (apiKey) {
-    return {
-      kind: "api-fallback",
-      openaiApiKey: apiKey,
-    };
+  if (options?.allowApiFallback !== false) {
+    const apiKey = (await getSecret(env, "OPENAI_API_KEY"))?.trim();
+    if (apiKey) {
+      return {
+        kind: "api-fallback",
+        openaiApiKey: apiKey,
+        codexRouteStatus: "api_fallback",
+      };
+    }
   }
 
-  return {
-    kind: "unavailable",
-    reason: target === "host"
-      ? await resolveHostUnavailableReason(env, options?.machineId ?? null)
-      : await resolveHostedUnavailableReason(env),
-  };
+  const unavailableRoute = gatewayRoute ?? unavailableCodexRoute(
+    target === "host"
+      ? "Codex requires a connected Subscription Gateway or an API key."
+      : "Codex requires a running Subscription Gateway or an API key.",
+    target === "host" ? "host_offline" : "gateway_offline",
+  );
+  return options?.allowApiFallback === false ? withoutApiFallbackReason(unavailableRoute) : unavailableRoute;
 }
 
 export async function getGatewayAccessHeaders(env: Env): Promise<Record<string, string>> {

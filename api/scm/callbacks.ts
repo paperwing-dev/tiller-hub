@@ -1,10 +1,14 @@
-import { getEnvLifecycleStub } from "../helpers";
+import { getEnvLifecycleStub, getWorkspaceStub } from "../helpers";
 import {
   commitRepoMainState,
-  ensureRepoWorkspaceFromRepoUrl,
   persistRepoMeta,
 } from "../plan/store";
 import type { Env, EnvMeta, RepoMeta } from "../types";
+import {
+  loadRepo,
+  shouldFailPendingOperationForRepoAccessCode,
+  type RepoWorkspace,
+} from "../repo/access";
 import { buildEnvScmMetaPatch } from "../env-lifecycle";
 import { TREE_HASH_EXCLUDES } from "../env/launch-config";
 import { getHub, projectAndPersistEnvSummary } from "../env/service";
@@ -18,11 +22,23 @@ import {
   type ScmCallbackOutcome,
 } from "./contracts";
 import { isActivePendingScmOperationForEnv } from "./env-state";
-import { getScmOperationStore } from "./operation-store";
+import { getScmOperationStore, type ScmOperationStore } from "./operation-store";
+import type { RepoScmOperationResult } from "./repo-merge-lock-do";
+import { revokeGitHubBridgesForScmOperation } from "../github/bridge";
 
 export type ScmCallbackResult = ScmServiceResult<Record<string, unknown>, ScmCallbackOutcome> & {
   mergedRepoBroadcast?: ScmMergedRepoBroadcast;
 };
+
+type RepoForEnvMetaResult =
+  | { ok: true; repo: RepoWorkspace }
+  | {
+      ok: false;
+      status: number;
+      body: Record<string, unknown>;
+      failOperation: boolean;
+      error: string;
+    };
 
 export type ScmFailureInput = {
   message: string;
@@ -76,6 +92,120 @@ async function clearProjectionAndPersist(
   await projectAndPersistEnvSummary(env, getHub(env), slug).catch(() => {});
 }
 
+type ScmProjectionCleanupOptions = {
+  completedAt?: string;
+  durationMs?: number | null;
+  timings?: string | null;
+};
+
+async function failScmOperationAndCleanup(args: {
+  env: Env;
+  slug: string;
+  store: ScmOperationStore;
+  repoId: string;
+  operationId: string;
+  error: string;
+  projection: ScmProjectionCleanupOptions;
+  mergeLockToken?: string | null;
+  result?: RepoScmOperationResult | null;
+}): Promise<void> {
+  await clearProjectionAndPersist(args.env, args.slug, args.projection);
+  await args.store.failOperation({
+    operationId: args.operationId,
+    error: args.error,
+    ...(args.result !== undefined ? { result: args.result } : {}),
+  }).catch(() => {});
+  await revokeGitHubBridgesForScmOperation(args.env, {
+    repoId: args.repoId,
+    operationId: args.operationId,
+  }).catch(() => {});
+  if (args.mergeLockToken) {
+    await args.store.releaseMergeLock(args.mergeLockToken).catch(() => {});
+  }
+}
+
+async function completeScmOperationAndCleanup(args: {
+  env: Env;
+  slug: string;
+  store: ScmOperationStore;
+  repoId: string;
+  operationId: string;
+  result: RepoScmOperationResult;
+  projection: ScmProjectionCleanupOptions;
+  mergeLockToken?: string | null;
+}): Promise<void> {
+  await clearProjectionAndPersist(args.env, args.slug, args.projection);
+  await args.store.completeOperation({
+    operationId: args.operationId,
+    result: args.result,
+  });
+  await revokeGitHubBridgesForScmOperation(args.env, {
+    repoId: args.repoId,
+    operationId: args.operationId,
+  }).catch(() => {});
+  if (args.mergeLockToken) {
+    await args.store.releaseMergeLock(args.mergeLockToken).catch(() => {});
+  }
+}
+
+async function readRepoForEnvMeta(env: Env, meta: EnvMeta): Promise<RepoForEnvMetaResult> {
+  const loadedRepo = await loadRepo(env, meta.repoId, "selected-write");
+  if (loadedRepo.ok) {
+    return loadedRepo;
+  }
+  const code = typeof loadedRepo.body.code === "string" ? loadedRepo.body.code : "";
+  const message = typeof loadedRepo.body.error === "string" ? loadedRepo.body.error : "Repo is unavailable.";
+  return {
+    ...loadedRepo,
+    failOperation: shouldFailPendingOperationForRepoAccessCode(code),
+    error: message,
+  };
+}
+
+async function failPendingOperationForUnavailableRepo(
+  env: Env,
+  slug: string,
+  meta: EnvMeta,
+  operationId: string,
+  error: string,
+): Promise<void> {
+  if (!meta.repoId) return;
+  const store = getScmOperationStore(env, meta.repoId);
+  const operation = await store.getOperation(operationId).catch(() => null);
+  if (!operation || operation.envSlug !== slug || operation.status !== "pending") return;
+  await failScmOperationAndCleanup({
+    env,
+    slug,
+    store,
+    repoId: meta.repoId,
+    operationId,
+    error,
+    projection: {
+      completedAt: new Date().toISOString(),
+    },
+  });
+}
+
+async function repoUnavailableResult(
+  env: Env,
+  slug: string,
+  meta: EnvMeta,
+  operationId: string,
+  kind: "progress" | "result" | "failed" | "heartbeat",
+  unavailable: Extract<RepoForEnvMetaResult, { ok: false }>,
+): Promise<ScmCallbackResult> {
+  if (unavailable.failOperation) {
+    await failPendingOperationForUnavailableRepo(env, slug, meta, operationId, unavailable.error);
+  }
+  return {
+    status: unavailable.status,
+    body: unavailable.body,
+    outcome: unavailable.failOperation
+      ? { outcome: "failed", operationId, error: unavailable.error }
+      : skippedOutcome(operationId, kind, "not-found"),
+  };
+}
+
 export async function handleScmProgressCallback(
   env: Env,
   slug: string,
@@ -91,7 +221,9 @@ export async function handleScmProgressCallback(
     };
   }
 
-  const repo = await ensureRepoWorkspaceFromRepoUrl(env, meta.repoUrl);
+  const loadedRepo = await readRepoForEnvMeta(env, meta);
+  if (!loadedRepo.ok) return await repoUnavailableResult(env, slug, meta, operationId, "progress", loadedRepo);
+  const repo = loadedRepo.repo;
   const store = getScmOperationStore(env, repo.meta.repoId);
   const operation = await store.getOperation(operationId);
   if (!operation || operation.envSlug !== slug) {
@@ -146,7 +278,9 @@ export async function handleScmFailedCallback(
     };
   }
 
-  const repo = await ensureRepoWorkspaceFromRepoUrl(env, meta.repoUrl);
+  const loadedRepo = await readRepoForEnvMeta(env, meta);
+  if (!loadedRepo.ok) return await repoUnavailableResult(env, slug, meta, operationId, "failed", loadedRepo);
+  const repo = loadedRepo.repo;
   const store = getScmOperationStore(env, repo.meta.repoId);
   const operation = await store.getOperation(operationId);
   if (!operation || operation.envSlug !== slug) {
@@ -167,19 +301,23 @@ export async function handleScmFailedCallback(
   }
 
   const completedAt = new Date().toISOString();
-  await clearProjectionAndPersist(env, slug, {
-    completedAt,
-    durationMs: input.durationMs,
-    timings: input.timings,
-  });
-
-  await store.failOperation({
+  await failScmOperationAndCleanup({
+    env,
+    slug,
+    store,
+    repoId: repo.meta.repoId,
     operationId,
     error: input.message || "SCM operation failed before reporting a result.",
-  }).catch(() => {});
-  if (operation.type === "merge-into-main" && operation.mergeLockToken) {
-    await store.releaseMergeLock(operation.mergeLockToken).catch(() => {});
-  }
+    projection: {
+      completedAt,
+      durationMs: input.durationMs,
+      timings: input.timings,
+    },
+    mergeLockToken:
+      operation.type === "merge-into-main" || operation.type === "update-from-main"
+        ? operation.mergeLockToken
+        : null,
+  });
 
   const latestOperation = await store.getOperation(operationId);
   const error = latestOperation?.error ?? operation.error ?? input.message;
@@ -210,7 +348,9 @@ export async function handleScmResultCallback(
     };
   }
 
-  const repo = await ensureRepoWorkspaceFromRepoUrl(env, meta.repoUrl);
+  const loadedRepo = await readRepoForEnvMeta(env, meta);
+  if (!loadedRepo.ok) return await repoUnavailableResult(env, slug, meta, operationId, "result", loadedRepo);
+  const repo = loadedRepo.repo;
   const store = getScmOperationStore(env, repo.meta.repoId);
   const operation = await store.getOperation(operationId);
   if (!operation || operation.envSlug !== slug) {
@@ -235,19 +375,180 @@ export async function handleScmResultCallback(
 
   const currentLock = await store.getMergeLock();
   if (!currentLock || currentLock.token !== operation.mergeLockToken || currentLock.operationId !== operationId) {
-    await clearProjectionAndPersist(env, slug, {
-      completedAt,
-      durationMs: input.durationMs,
-      timings: input.timings,
-    });
-    await store.failOperation({
+    await failScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
       operationId,
-      error: "Merge lock expired before the merge result could be committed.",
-    }).catch(() => {});
+      error: "SCM lock expired before the operation result could be committed.",
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+    });
     return {
       status: 409,
-      body: { error: "Merge lock expired before commit" },
-      outcome: { outcome: "failed", operationId, error: "Merge lock expired before commit" },
+      body: { error: "SCM lock expired before commit" },
+      outcome: { outcome: "failed", operationId, error: "SCM lock expired before commit" },
+    };
+  }
+
+  if (operation.type === "update-from-main") {
+    const currentMainCommit = input.gitHead ?? repo.meta.mainCommit ?? null;
+
+    if (input.action === "updated-from-main") {
+      const sourceEnvMatchesMain = input.sourceEnvMatchesMain === true;
+      try {
+        await getEnvLifecycleStub(env, slug).setScmProjection({
+          type: "update-from-main",
+          operationId,
+          phase: "Saving updated environment",
+          startedAt: latestMeta.scmOperationStartedAt ?? operation.createdAt,
+        });
+        await projectAndPersistEnvSummary(env, hub, slug);
+
+        await getWorkspaceStub(env, slug).restoreFromTar(input.mergedTar, {
+          clearFirst: true,
+          preservePrefixes: TREE_HASH_EXCLUDES,
+        });
+
+        await getEnvLifecycleStub(env, slug).recordStopWorkspaceSynced(
+          buildEnvScmMetaPatch(latestMeta, {
+            workspaceDirty: !sourceEnvMatchesMain,
+            workspaceNeedsAttention: false,
+            baseMainCommit: currentMainCommit,
+            lastKnownMainCommit: currentMainCommit,
+            branchStatus: sourceEnvMatchesMain ? "up-to-date" : "ready-to-merge",
+          }),
+          { clearError: true },
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to save updated environment.";
+        await failScmOperationAndCleanup({
+          env,
+          slug,
+          store,
+          repoId: repo.meta.repoId,
+          operationId,
+          error: message,
+          projection: {
+            completedAt,
+            durationMs: input.durationMs,
+            timings: input.timings,
+          },
+          mergeLockToken: currentLock.token,
+        });
+        return {
+          status: 502,
+          body: { error: "Failed to save updated environment" },
+          outcome: { outcome: "failed", operationId, error: message },
+        };
+      }
+      await completeScmOperationAndCleanup({
+        env,
+        slug,
+        store,
+        repoId: repo.meta.repoId,
+        operationId,
+        result: {
+          action: "updated-from-main",
+          repoId: repo.meta.repoId,
+          currentMainCommit,
+        },
+        projection: {
+          completedAt,
+          durationMs: input.durationMs,
+          timings: input.timings,
+        },
+        mergeLockToken: currentLock.token,
+      });
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          operationId,
+          action: "updated-from-main",
+          currentMainCommit,
+          branchStatus: sourceEnvMatchesMain ? "up-to-date" : "ready-to-merge",
+        },
+        outcome: { outcome: "updated", operationId },
+      };
+    }
+
+    if (input.action === "up-to-date") {
+      await getEnvLifecycleStub(env, slug).recordStopWorkspaceSynced(
+        buildEnvScmMetaPatch(latestMeta, {
+          workspaceDirty: false,
+          workspaceNeedsAttention: false,
+          baseMainCommit: currentMainCommit,
+          lastKnownMainCommit: currentMainCommit,
+          branchStatus: "up-to-date",
+        }),
+        { clearError: true },
+      );
+      await completeScmOperationAndCleanup({
+        env,
+        slug,
+        store,
+        repoId: repo.meta.repoId,
+        operationId,
+        result: {
+          action: "up-to-date",
+          repoId: repo.meta.repoId,
+          currentMainCommit,
+        },
+        projection: {
+          completedAt,
+          durationMs: input.durationMs,
+          timings: input.timings,
+        },
+        mergeLockToken: currentLock.token,
+      });
+      return {
+        status: 200,
+        body: { ok: true, operationId, action: "up-to-date", currentMainCommit },
+        outcome: { outcome: "updated", operationId },
+      };
+    }
+
+    await getEnvLifecycleStub(env, slug).recordStopWorkspaceSynced(
+      buildEnvScmMetaPatch(latestMeta, {
+        workspaceDirty: true,
+        workspaceNeedsAttention: true,
+        lastKnownMainCommit: currentMainCommit,
+        branchStatus: "needs-attention",
+      }),
+    );
+    await completeScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
+      operationId,
+      result: {
+        action: input.action ?? "conflicted",
+        message: input.message,
+        conflictCount: input.conflictCount,
+        currentMainCommit,
+      },
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+      mergeLockToken: currentLock.token,
+    });
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        operationId,
+        action: input.action ?? "conflicted",
+        currentMainCommit,
+      },
+      outcome: { outcome: "conflicted", operationId },
     };
   }
 
@@ -255,38 +556,45 @@ export async function handleScmResultCallback(
     const currentMainCommit = input.gitHead ?? repo.meta.mainCommit ?? null;
     const sourceEnvMatchesMain = input.sourceEnvMatchesMain === true;
     await getEnvLifecycleStub(env, slug).recordStopWorkspaceSynced(
-      buildEnvScmMetaPatch(latestMeta, sourceEnvMatchesMain
-        ? {
-            workspaceDirty: false,
-            workspaceNeedsAttention: false,
-            baseMainCommit: currentMainCommit,
-            lastKnownMainCommit: currentMainCommit,
-            branchStatus: "up-to-date",
-          }
-        : {
-            workspaceDirty: false,
-            workspaceNeedsAttention: false,
-            lastKnownMainCommit: currentMainCommit,
-            branchStatus:
-              latestMeta.baseMainCommit && currentMainCommit && latestMeta.baseMainCommit !== currentMainCommit
-                ? "behind-main"
-                : "up-to-date",
-          }),
+      buildEnvScmMetaPatch(
+        latestMeta,
+        sourceEnvMatchesMain
+          ? {
+              workspaceDirty: false,
+              workspaceNeedsAttention: false,
+              baseMainCommit: currentMainCommit,
+              lastKnownMainCommit: currentMainCommit,
+              branchStatus: "up-to-date",
+            }
+          : {
+              workspaceDirty: false,
+              workspaceNeedsAttention: false,
+              lastKnownMainCommit: currentMainCommit,
+              branchStatus:
+                latestMeta.baseMainCommit && currentMainCommit && latestMeta.baseMainCommit !== currentMainCommit
+                  ? "behind-main"
+                  : "up-to-date",
+            },
+      ),
       { clearError: true },
     );
-    await clearProjectionAndPersist(env, slug, {
-      completedAt,
-      durationMs: input.durationMs,
-      timings: input.timings,
-    });
-    await store.completeOperation({
+    await completeScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
       operationId,
       result: {
         action: "already-current",
         currentMainCommit,
       },
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+      mergeLockToken: currentLock.token,
     });
-    await store.releaseMergeLock(currentLock.token).catch(() => {});
     return {
       status: 200,
       body: {
@@ -300,20 +608,24 @@ export async function handleScmResultCallback(
   }
 
   if (input.action !== "merged") {
-    await clearProjectionAndPersist(env, slug, {
-      completedAt,
-      durationMs: input.durationMs,
-      timings: input.timings,
-    });
-    await store.completeOperation({
+    await completeScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
       operationId,
       result: {
         action: input.action ?? "conflicted",
         message: input.message,
         conflictCount: input.conflictCount,
       },
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+      mergeLockToken: currentLock.token,
     });
-    await store.releaseMergeLock(currentLock.token).catch(() => {});
     return {
       status: 200,
       body: { ok: true, operationId, action: input.action ?? "conflicted" },
@@ -322,16 +634,20 @@ export async function handleScmResultCallback(
   }
 
   if (!operation.gitArtifactId || !input.gitHead) {
-    await clearProjectionAndPersist(env, slug, {
-      completedAt,
-      durationMs: input.durationMs,
-      timings: input.timings,
-    });
-    await store.failOperation({
+    await failScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
       operationId,
       error: "Merge result is missing the staged git artifact or git head.",
-    }).catch(() => {});
-    await store.releaseMergeLock(currentLock.token).catch(() => {});
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+      mergeLockToken: currentLock.token,
+    });
     return {
       status: 400,
       body: { error: "Missing staged git artifact or git head" },
@@ -347,16 +663,20 @@ export async function handleScmResultCallback(
     }),
   );
   if (!stagedArtifact) {
-    await clearProjectionAndPersist(env, slug, {
-      completedAt,
-      durationMs: input.durationMs,
-      timings: input.timings,
-    });
-    await store.failOperation({
+    await failScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
       operationId,
       error: "Merge result is missing the staged canonical git artifact.",
-    }).catch(() => {});
-    await store.releaseMergeLock(currentLock.token).catch(() => {});
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+      mergeLockToken: currentLock.token,
+    });
     return {
       status: 409,
       body: { error: "Missing staged canonical git artifact" },
@@ -364,16 +684,20 @@ export async function handleScmResultCallback(
     };
   }
   if (stagedArtifact.customMetadata?.operationId !== operationId) {
-    await clearProjectionAndPersist(env, slug, {
-      completedAt,
-      durationMs: input.durationMs,
-      timings: input.timings,
-    });
-    await store.failOperation({
+    await failScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
       operationId,
       error: "Staged canonical git artifact did not match the active merge operation.",
-    }).catch(() => {});
-    await store.releaseMergeLock(currentLock.token).catch(() => {});
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+      mergeLockToken: currentLock.token,
+    });
     return {
       status: 409,
       body: { error: "Staged canonical git artifact did not match the active merge operation" },
@@ -427,17 +751,21 @@ export async function handleScmResultCallback(
         console.error(`[envs] Failed to roll back canonical repo state for ${slug}:`, rollbackError);
       }
     }
-    await clearProjectionAndPersist(env, slug, {
-      completedAt,
-      durationMs: input.durationMs,
-      timings: input.timings,
-    });
     const message = error instanceof Error ? error.message : "Failed to commit merged main state.";
-    await store.failOperation({
+    await failScmOperationAndCleanup({
+      env,
+      slug,
+      store,
+      repoId: repo.meta.repoId,
       operationId,
       error: message,
-    }).catch(() => {});
-    await store.releaseMergeLock(currentLock.token).catch(() => {});
+      projection: {
+        completedAt,
+        durationMs: input.durationMs,
+        timings: input.timings,
+      },
+      mergeLockToken: currentLock.token,
+    });
     return {
       status: 502,
       body: { error: "Failed to commit merged main state" },
@@ -447,29 +775,31 @@ export async function handleScmResultCallback(
 
   const sourceEnvMatchesMain = input.sourceEnvMatchesMain === true;
   await getEnvLifecycleStub(env, slug).recordStopWorkspaceSynced(
-    buildEnvScmMetaPatch(latestMeta, sourceEnvMatchesMain
-      ? {
-          workspaceDirty: false,
-          workspaceNeedsAttention: false,
-          baseMainCommit: nextRepoMeta.mainCommit,
-          lastKnownMainCommit: nextRepoMeta.mainCommit,
-          branchStatus: "up-to-date",
-        }
-      : {
-          workspaceDirty: true,
-          workspaceNeedsAttention: false,
-          baseMainCommit: latestMeta.baseMainCommit ?? latestMeta.lastKnownMainCommit ?? previousMainCommit ?? null,
-          lastKnownMainCommit: nextRepoMeta.mainCommit,
-          branchStatus: "behind-main",
-        }),
+    buildEnvScmMetaPatch(
+      latestMeta,
+      sourceEnvMatchesMain
+        ? {
+            workspaceDirty: false,
+            workspaceNeedsAttention: false,
+            baseMainCommit: nextRepoMeta.mainCommit,
+            lastKnownMainCommit: nextRepoMeta.mainCommit,
+            branchStatus: "up-to-date",
+          }
+        : {
+            workspaceDirty: true,
+            workspaceNeedsAttention: false,
+            baseMainCommit: latestMeta.baseMainCommit ?? latestMeta.lastKnownMainCommit ?? previousMainCommit ?? null,
+            lastKnownMainCommit: nextRepoMeta.mainCommit,
+            branchStatus: "behind-main",
+          },
+    ),
     { clearError: true },
   );
-  await clearProjectionAndPersist(env, slug, {
-    completedAt,
-    durationMs: input.durationMs,
-    timings: input.timings,
-  });
-  await store.completeOperation({
+  await completeScmOperationAndCleanup({
+    env,
+    slug,
+    store,
+    repoId: repo.meta.repoId,
     operationId,
     result: {
       action: "merged",
@@ -477,8 +807,13 @@ export async function handleScmResultCallback(
       previousMainCommit,
       currentMainCommit: nextRepoMeta.mainCommit,
     },
+    projection: {
+      completedAt,
+      durationMs: input.durationMs,
+      timings: input.timings,
+    },
+    mergeLockToken: currentLock.token,
   });
-  await store.releaseMergeLock(currentLock.token).catch(() => {});
 
   return {
     status: 200,
@@ -507,7 +842,9 @@ export async function handleScmHeartbeatCallback(
     };
   }
 
-  const repo = await ensureRepoWorkspaceFromRepoUrl(env, meta.repoUrl);
+  const loadedRepo = await readRepoForEnvMeta(env, meta);
+  if (!loadedRepo.ok) return await repoUnavailableResult(env, slug, meta, operationId, "heartbeat", loadedRepo);
+  const repo = loadedRepo.repo;
   const store = getScmOperationStore(env, repo.meta.repoId);
   const operation = await store.getOperation(operationId);
   if (!operation || operation.envSlug !== slug) {
@@ -517,14 +854,17 @@ export async function handleScmHeartbeatCallback(
       outcome: skippedOutcome(operationId, "heartbeat", "not-found"),
     };
   }
-  if (operation.type !== "merge-into-main" || !operation.mergeLockToken) {
+  if (
+    (operation.type !== "merge-into-main" && operation.type !== "update-from-main") ||
+    !operation.mergeLockToken
+  ) {
     return {
       status: 409,
-      body: { error: "Heartbeat is only available for merge operations" },
+      body: { error: "Heartbeat is only available for locked SCM operations" },
       outcome: {
         outcome: "failed",
         operationId,
-        error: "Heartbeat is only available for merge operations",
+        error: "Heartbeat is only available for locked SCM operations",
       },
     };
   }

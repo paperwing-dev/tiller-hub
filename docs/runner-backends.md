@@ -84,7 +84,7 @@ only changes where the container runs.
 - It stores history in `WorkspaceDO`.
 - It still works when no container is running.
 
-If you are using the ChatGPT/Codex subscription path, the outbound network
+If you are using the Codex subscription path, the outbound network
 origin is handled by the separate gateway role, not the runner. Hosted
 Plan/Research use a routable host gateway, and host envs use the gateway of
 their selected host machine. If no usable gateway is available, Tiller falls
@@ -108,7 +108,7 @@ local-only world:
 
 ### 0. Add local model auth
 
-Copy `.dev.vars.example` to `.dev.vars`, then set at least one of:
+Copy `docs/examples/local-dev-vars.sample` to `.dev.vars`, then set at least one of:
 
 - `CLAUDE_CODE_OAUTH_TOKEN`
 - `ANTHROPIC_API_KEY`

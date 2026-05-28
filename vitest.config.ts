@@ -12,8 +12,13 @@ function resolveModule(specifier: string): string {
 export default defineConfig({
   resolve: {
     alias: {
+      "@cloudflare/ai-chat/react": resolveModule("@cloudflare/ai-chat/react"),
+      "agents/react": resolveModule("agents/react"),
       agents: resolveModule("agents"),
-      "cloudflare:workers": path.resolve(packageRoot, "test-support/cloudflare-workers.ts"),
+      "cloudflare:workers": path.resolve(
+        packageRoot,
+        "test-support/cloudflare-workers.ts",
+      ),
       zod: resolveModule("zod"),
       "zod/v4": resolveModule("zod/v4"),
       "zod/v3": resolveModule("zod/v3"),

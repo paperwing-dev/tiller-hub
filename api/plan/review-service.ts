@@ -2,26 +2,23 @@ import { generateText, stepCountIs } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import {
   buildSystemPrompt,
+  createCodexResponsesProviderOptions,
   createHostedToolRegistry,
   createWorkspaceAccess,
   getAgentSpec,
   getHostedToolsForAgent,
-  resolveAgentAuth,
+  resolveCodexLanguageModel,
   resolveAgentModel,
-  runDirectToolsRuntime,
   toAiSdkTools,
 } from "../agent-core";
-import { requireChatGPTAvailability } from "../chatgpt-availability";
 import type {
   AgentSpec,
-  HostedTool,
   HostedToolName,
   PlanReviewIssueStats,
   PlanReviewMeta,
   WorkspaceContextAccess,
 } from "../agent-core/types";
 import {
-  createPlanArtifactInput,
   createReviewArtifactInput,
   type ArtifactStoreDO,
   type PlanArtifact,
@@ -30,17 +27,12 @@ import {
 import type { Env, RepoMeta } from "../types";
 import type { WorkspaceDO } from "../workspace/do";
 import {
-  buildPlanIntegrationPrompt,
-  buildPlanIntegrationRepairPrompt,
-  buildPlanIntegrationReply,
   buildPlanReviewPrompt,
   buildPlanReviewRepairPrompt,
   filterPlanReviewIssues,
   isWorkersAIPlanModel,
-  parsePlanIntegrationResponse,
   parsePlanReviewResponse,
   PLAN_REVIEW_MODELS,
-  resolvePlanModel,
   summarizeFilteredReview,
 } from "./workflow";
 import { createScopedReviewWorkspace } from "./scoped-review-workspace";
@@ -182,68 +174,22 @@ async function generateIsolatedPlannerText(options: {
   }
 
   const spec = getAgentSpec("plan");
-  const availability = await requireChatGPTAvailability(options.env, "ChatGPT planning");
-  const auth = await resolveAgentAuth(options.env, spec, availability.codexRoute);
-
-  let text = "";
-  await runDirectToolsRuntime({
-    env: options.env,
-    spec: {
-      ...spec,
-      maxSteps: 1,
-    },
-    accessToken: auth.accessToken ?? "",
-    accountId: auth.accountId,
+  const { model, promptCacheKey } = await resolveCodexLanguageModel(options.env, {
+    chatSessionId: `plan-review:${crypto.randomUUID()}`,
     model: resolveAgentModel(options.env, spec, options.selectedModel),
-    systemPrompt: options.systemPrompt,
-    codexRoute: auth.codexRoute,
-    responseTools: [],
-    toolRegistry: new Map<HostedToolName, HostedTool>(),
-    initialInput: [
-      {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: options.prompt }],
-      },
-    ],
-    hooks: {
-      onTextDelta: (delta) => {
-        text += delta;
-      },
-    },
   });
-
-  return text.trim();
-}
-
-async function generateIsolatedPlannerIntegration(options: {
-  env: Env;
-  selectedModel: string;
-  prompt: string;
-}): Promise<string> {
-  const systemPrompt =
-    "You are the primary planning assistant revising an implementation plan after a review round. Work only from the current draft and the filtered review issues provided in the user message. Do not rely on previous chat history or unrelated repo context.";
-  const integrationText = await generateIsolatedPlannerText({
-    env: options.env,
-    selectedModel: options.selectedModel,
-    systemPrompt,
+  const result = await generateText({
+    model,
+    system: options.systemPrompt,
     prompt: options.prompt,
+    providerOptions: createCodexResponsesProviderOptions(promptCacheKey),
   });
 
-  if (parsePlanIntegrationResponse(integrationText)) {
-    return integrationText;
-  }
-
-  return generateIsolatedPlannerText({
-    env: options.env,
-    selectedModel: options.selectedModel,
-    systemPrompt: "Repair malformed planner output into valid JSON. Return JSON only with no markdown fences.",
-    prompt: buildPlanIntegrationRepairPrompt(integrationText),
-  });
+  return result.text.trim();
 }
 
 function createReviewWorkspace(planWorkspace: WorkspaceDO, draft: PlanArtifact): WorkspaceContextAccess {
-  return createScopedReviewWorkspace(createWorkspaceAccess(planWorkspace), draft.body.relevantFiles);
+  return createScopedReviewWorkspace(createWorkspaceAccess(planWorkspace), []);
 }
 
 function summarizeReviewText(text: string): string {
@@ -315,7 +261,7 @@ export async function runPlanReviewRound(options: {
             filteredReview.kept.length > 0
               ? filteredReview.kept.map((issue) => issue.issue)
               : extractFindings(rawReviewText),
-          relevantFiles: options.draft.body.relevantFiles,
+          relevantFiles: [],
           openQuestions: [],
           proposedPlan: rawReviewText,
           memoryRefs: [],
@@ -338,7 +284,7 @@ export async function runPlanReviewRound(options: {
 
   const savedReviews: ReviewArtifact[] = [];
   for (const pendingReview of pendingReviews) {
-    const saved = options.repoPlan.artifactStore.createArtifact(pendingReview.artifact);
+    const saved = await options.repoPlan.artifactStore.createArtifact(pendingReview.artifact);
     const reviewArtifact = saved.type === "review"
       ? saved as ReviewArtifact
       : null;
@@ -367,135 +313,5 @@ export async function integratePlanReviews(options: {
   draft: PlanArtifact;
   selectedModel: unknown;
 }): Promise<IntegrationResult> {
-  const selectedModel = resolvePlanModel(options.selectedModel);
-  const allArtifacts = options.repoPlan.artifactStore.listArtifacts({ limit: 500 });
-  const reviews = allArtifacts
-    .filter((artifact): artifact is ReviewArtifact => artifact.type === "review")
-    .filter(
-      (artifact) =>
-        artifact.parentArtifactId === options.draft.id &&
-        artifact.basis.mainCommit === options.draft.basis.mainCommit,
-    );
-
-  if (reviews.length === 0) {
-    throw new Error("No review artifacts found for this draft");
-  }
-
-  const groundedIssues = reviews.flatMap((review) => {
-    const parsedIssues =
-      review.body.reviewIssues ??
-      filterPlanReviewIssues({
-        draft: options.draft,
-        sourceReviewId: review.id,
-        sourceModel: review.body.model,
-        issues: parsePlanReviewResponse(review.body.proposedPlan).issues,
-      }).kept.map(({ sourceReviewId: _sourceReviewId, sourceModel: _sourceModel, ...issue }) => issue);
-
-    return parsedIssues.map((issue) => ({
-      ...issue,
-      sourceReviewId: review.id,
-      sourceModel: review.body.model,
-    }));
-  });
-
-  const droppedIssueCount = reviews.reduce(
-    (total, review) => total + (review.body.reviewIssueStats?.dropped ?? 0),
-    0,
-  );
-
-  if (groundedIssues.length === 0) {
-    return {
-      ok: true,
-      skipped: true,
-      groundedIssueCount: 0,
-      droppedIssueCount,
-      reply: buildPlanIntegrationReply({
-        reviews,
-        accepted: [],
-        rejected: reviews.map((review) => ({
-          sourceReviewId: review.id,
-          issue: "All review items were filtered out before synthesis",
-          reason:
-            "No grounded review issue survived deterministic filtering, so the draft was left unchanged.",
-        })),
-        updatedSummary:
-          "No revised draft was saved because none of the review feedback was grounded enough to integrate.",
-        groundedIssueCount: 0,
-        droppedIssueCount,
-      }),
-    };
-  }
-
-  const integrationText = await generateIsolatedPlannerIntegration({
-    env: options.env,
-    selectedModel,
-    prompt: buildPlanIntegrationPrompt({
-      draft: options.draft,
-      filteredIssues: groundedIssues,
-      selectedModel,
-    }),
-  });
-  const integration = parsePlanIntegrationResponse(integrationText);
-
-  if (!integration) {
-    throw new Error("Planner returned an invalid integration response");
-  }
-
-  const draftChanged =
-    integration.revisedPlan.trim() !== options.draft.body.proposedPlan.trim() ||
-    integration.updatedSummary.trim() !== options.draft.body.summary.trim();
-
-  if (!draftChanged) {
-    return {
-      ok: true,
-      skipped: true,
-      groundedIssueCount: groundedIssues.length,
-      droppedIssueCount,
-      reply: buildPlanIntegrationReply({
-        reviews,
-        accepted: integration.accepted,
-        rejected: integration.rejected,
-        updatedSummary:
-          "The planner kept the draft materially unchanged after reviewing the grounded feedback.",
-        groundedIssueCount: groundedIssues.length,
-        droppedIssueCount,
-      }),
-    };
-  }
-
-  const revisedDraft = options.repoPlan.artifactStore.createArtifact(
-    createPlanArtifactInput({
-      repo: options.repoPlan.meta,
-      title: options.draft.title,
-      body: {
-        summary: integration.updatedSummary,
-        findings: integration.accepted.map((item) => item.change),
-        relevantFiles: options.draft.body.relevantFiles,
-        openQuestions: options.draft.body.openQuestions,
-        proposedPlan: integration.revisedPlan,
-        memoryRefs: options.draft.body.memoryRefs,
-        model: selectedModel,
-      },
-      createdBy: "plan-integrator",
-      parentArtifactId: options.draft.id,
-      supersedesArtifactId: options.draft.id,
-    }),
-  ) as PlanArtifact;
-
-  return {
-    ok: true,
-    skipped: false,
-    groundedIssueCount: groundedIssues.length,
-    droppedIssueCount,
-    artifact: revisedDraft,
-    reply: buildPlanIntegrationReply({
-      reviews,
-      accepted: integration.accepted,
-      rejected: integration.rejected,
-      updatedSummary: integration.updatedSummary,
-      savedDraftId: revisedDraft.id,
-      groundedIssueCount: groundedIssues.length,
-      droppedIssueCount,
-    }),
-  };
+  throw new Error("Legacy plan review integration has been removed. Use reviewer tabs and save_plan.");
 }

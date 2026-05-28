@@ -34,6 +34,8 @@ function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
   return {
     repoId: "repo-1",
     repoUrl: "https://github.com/user/repo",
+    githubInstallationId: 98765,
+    githubFullName: "user/repo",
     ...createInitialRepoScmState(),
     mainCommit: "main-a",
     gitArtifactId: "artifact-1",

@@ -7,8 +7,7 @@ const mocks = vi.hoisted(() => ({
   getArtifactStoreStub: vi.fn(),
   getWorkspaceStub: vi.fn(),
   getEnvLifecycleStub: vi.fn(),
-  ensureRepoWorkspaceFromRepoUrl: vi.fn(),
-  listEnvMetas: vi.fn(),
+  getRepoWorkspaceForRepoId: vi.fn(),
   getRunnerBackend: vi.fn(),
   getSecret: vi.fn(),
   getOrCreateSecret: vi.fn(),
@@ -29,8 +28,8 @@ vi.mock("../plan/store", async () => {
   const actual = await vi.importActual<typeof import("../plan/store")>("../plan/store");
   return {
     ...actual,
-    ensureRepoWorkspaceFromRepoUrl: mocks.ensureRepoWorkspaceFromRepoUrl,
-    listEnvMetas: mocks.listEnvMetas,
+    getRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
+    getSelectedRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
   };
 });
 
@@ -41,6 +40,7 @@ vi.mock("../env/runner-backends", () => ({
 vi.mock("../setup/config", () => ({
   getSecret: mocks.getSecret,
   getOrCreateSecret: mocks.getOrCreateSecret,
+  resolveDeploymentModeForRuntime: vi.fn(async () => "hosted"),
 }));
 
 vi.mock("../protection", async () => {
@@ -84,6 +84,9 @@ function buildStoredEnvRecord(record: Record<string, unknown>) {
       branchName,
       mainCommit,
     }),
+    slug,
+    repoUrl: typeof record.repoUrl === "string" ? record.repoUrl : "https://github.com/test/repo",
+    repoId: typeof record.repoId === "string" ? record.repoId : "repo-1",
     createdAt,
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : createdAt,
     status: typeof record.status === "string" ? record.status : "unknown",
@@ -166,7 +169,7 @@ function createLifecycleState(overrides: Record<string, unknown> = {}) {
 
 function createLifecycleStub() {
   let hydrated = false;
-  let current = {
+  let current: any = {
     status: "starting",
     lifecyclePhase: "starting",
     lifecycleOpId: "start-op-1",
@@ -207,7 +210,8 @@ function createLifecycleStub() {
     clearState: vi.fn().mockResolvedValue(null),
     getState: vi.fn().mockResolvedValue(null),
     getMutableState: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
-    hydrateFromSummary: vi.fn().mockImplementation(async (meta: Record<string, unknown>) => {
+    peekMutableState: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
+    initializeMutableStateFromMeta: vi.fn().mockImplementation(async (meta: Record<string, unknown>) => {
       const status = typeof meta.status === "string" ? meta.status : current.status;
       const updatedAt =
         typeof meta.updatedAt === "string"
@@ -338,15 +342,16 @@ describe("OpenCode environment routes", () => {
     vi.resetAllMocks();
     mocks.getArtifactStoreStub.mockReturnValue({
       migrateLegacyHandoffs: vi.fn(),
+      getArtifact: vi.fn().mockReturnValue(null),
       listArtifacts: vi.fn().mockReturnValue([]),
+      listLatestTodoPlansForMain: vi.fn().mockReturnValue([]),
       listRefs: vi.fn().mockReturnValue([]),
     });
     mocks.getEnvLifecycleStub.mockReturnValue(createLifecycleStub());
-    mocks.listEnvMetas.mockResolvedValue([]);
     mocks.getSecret.mockImplementation(async (env: Record<string, unknown>, key: string) => env[key] ?? undefined);
     mocks.getOrCreateSecret.mockImplementation(async (env: Record<string, unknown>, key: string, createValue: () => string) => env[key] ?? createValue());
-    mocks.resolveProtectionState.mockResolvedValue({ protectionMode: "public" });
-    mocks.ensureRepoWorkspaceFromRepoUrl.mockResolvedValue({
+    mocks.resolveProtectionState.mockResolvedValue({ protectionMode: "cf-access" });
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
       meta: {
         repoId: "repo-1",
         repoUrl: "https://github.com/test/repo",
@@ -376,13 +381,14 @@ describe("OpenCode environment routes", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
           slug: "opencode-env",
           backend: "cf",
           harness: "opencode",
         }),
       },
       {
+        ENABLED_ENV_HARNESSES: "claude-code,codex",
         ENVS_KV: {
           get: vi.fn().mockResolvedValue(null),
           put: vi.fn().mockResolvedValue(undefined),
@@ -457,7 +463,7 @@ describe("OpenCode environment routes", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
           slug: "opencode-env",
           backend: "cf",
           harness: "opencode",

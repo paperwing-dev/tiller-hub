@@ -9,8 +9,14 @@ const CACHE_TTL_MS = 60_000;
 type HubConfigStore = {
   getAllConfig(): Promise<Record<string, string>> | Record<string, string>;
   getConfig(key: string): Promise<string | undefined> | string | undefined;
+  setConfig(key: string, value: string): Promise<void> | void;
   getOrCreateConfig(key: string, value: string): Promise<string> | string;
 };
+
+export type DeploymentMode = "hosted" | "self-host";
+export type RouteKind = "workers-dev" | "custom-domain";
+
+const DEPLOYMENT_MODE_KEY = "TILLER_DEPLOYMENT_MODE";
 
 export function invalidateConfigCache(): void {
   cached = null;
@@ -19,6 +25,10 @@ export function invalidateConfigCache(): void {
 function getHubConfigStore(env: Env): HubConfigStore {
   const id = env.HUB.idFromName("hub");
   return env.HUB.get(id, getLocationHintOptions(env)) as unknown as HubConfigStore;
+}
+
+function hasHubConfigStore(env: Env): boolean {
+  return Boolean((env as unknown as { HUB?: unknown }).HUB);
 }
 
 function getEnvSecretValue(env: Env, key: string): string | undefined {
@@ -79,6 +89,72 @@ export async function getOrCreateSecret(
     };
   }
   return value;
+}
+
+function normalizeDeploymentMode(value: string | undefined): DeploymentMode | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "hosted" || normalized === "self-host" ? normalized : null;
+}
+
+function updateCachedConfig(key: string, value: string): void {
+  if (!cached) return;
+  cached = {
+    config: {
+      ...cached.config,
+      [key]: value,
+    },
+    ts: Date.now(),
+  };
+}
+
+export function routeKindFromUrl(url: string | undefined): RouteKind {
+  if (!url?.trim()) return "workers-dev";
+  try {
+    return new URL(url).hostname.endsWith(".workers.dev") ? "workers-dev" : "custom-domain";
+  } catch {
+    return "workers-dev";
+  }
+}
+
+export async function setDeploymentMode(env: Env, mode: DeploymentMode): Promise<void> {
+  if (!hasHubConfigStore(env)) return;
+  const hub = getHubConfigStore(env);
+  await hub.setConfig(DEPLOYMENT_MODE_KEY, mode);
+  updateCachedConfig(DEPLOYMENT_MODE_KEY, mode);
+}
+
+export async function resolveDeploymentMode(
+  env: Env,
+  _options: {
+    routeKind: RouteKind;
+    hostRegistered: boolean;
+    hostGatewayConfigured: boolean;
+    gatewayProvisioned: boolean;
+  },
+): Promise<DeploymentMode> {
+  if (!hasHubConfigStore(env)) {
+    return normalizeDeploymentMode(getEnvSecretValue(env, DEPLOYMENT_MODE_KEY)) ?? "hosted";
+  }
+  const configured = normalizeDeploymentMode(await getSecret(env, DEPLOYMENT_MODE_KEY, { fresh: true }));
+  return configured ?? "hosted";
+}
+
+export async function resolveDeploymentModeForRuntime(
+  env: Env,
+  options: {
+    hubUrl?: string | null;
+    hostRegistered?: boolean;
+    hostGatewayConfigured?: boolean;
+    gatewayProvisioned?: boolean;
+  } = {},
+): Promise<DeploymentMode> {
+  const hubUrl = options.hubUrl ?? await getSecret(env, "HUB_PUBLIC_URL");
+  return resolveDeploymentMode(env, {
+    routeKind: routeKindFromUrl(hubUrl ?? undefined),
+    hostRegistered: options.hostRegistered ?? false,
+    hostGatewayConfigured: options.hostGatewayConfigured ?? false,
+    gatewayProvisioned: options.gatewayProvisioned ?? false,
+  });
 }
 
 /**

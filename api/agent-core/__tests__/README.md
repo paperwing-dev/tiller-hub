@@ -9,7 +9,7 @@ These tests cover the reusable pieces in `agent-core/`, such as:
 - tool definitions
 - context building
 - specs
-- Codex/request helpers
+- Codex language model resolution
 
 ## Why this folder exists
 

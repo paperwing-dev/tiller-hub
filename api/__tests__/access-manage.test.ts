@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   allocateAccessPolicyPrecedence,
   assertNoUnsupportedWildcardCoverage,
   cleanupSupersededManagedHubAccess,
   findExactAndWildcardApps,
+  provisionWorkersDevBrowserAccess,
 } from "../access/manage";
 
 vi.mock("../access/cloudflare-api", () => ({
@@ -16,9 +17,26 @@ vi.mock("../access/cloudflare-api", () => ({
   createAccessEmailPolicy: vi.fn(),
   createAccessServiceTokenPolicy: vi.fn(),
   createServiceToken: vi.fn(),
+  getAccessOrganization: vi.fn(async () => ({ auth_domain: "team.cloudflareaccess.com" })),
+  updateAccessEmailPolicy: vi.fn(),
 }));
 
-import { deleteAccessPolicy } from "../access/cloudflare-api";
+import {
+  createAccessApp,
+  createAccessEmailPolicy,
+  deleteAccessApp,
+  deleteAccessPolicy,
+  listAccessApps,
+  listAccessPolicies,
+  updateAccessEmailPolicy,
+} from "../access/cloudflare-api";
+
+const mockedCreateAccessApp = vi.mocked(createAccessApp);
+const mockedCreateAccessEmailPolicy = vi.mocked(createAccessEmailPolicy);
+const mockedDeleteAccessApp = vi.mocked(deleteAccessApp);
+const mockedListAccessApps = vi.mocked(listAccessApps);
+const mockedListAccessPolicies = vi.mocked(listAccessPolicies);
+const mockedUpdateAccessEmailPolicy = vi.mocked(updateAccessEmailPolicy);
 
 describe("findExactAndWildcardApps", () => {
   it("reports both the exact-host app and the covering wildcard", () => {
@@ -94,6 +112,143 @@ describe("allocateAccessPolicyPrecedence", () => {
         100,
       ),
     ).toBe(102);
+  });
+});
+
+describe("provisionWorkersDevBrowserAccess", () => {
+  beforeEach(() => {
+    mockedCreateAccessApp.mockReset();
+    mockedCreateAccessEmailPolicy.mockReset();
+    mockedDeleteAccessApp.mockReset();
+    mockedListAccessApps.mockReset();
+    mockedListAccessPolicies.mockReset();
+    mockedUpdateAccessEmailPolicy.mockReset();
+    mockedDeleteAccessApp.mockResolvedValue(undefined);
+  });
+
+  it("creates an exact workers.dev Access app and browser policy without service tokens", async () => {
+    mockedListAccessApps.mockResolvedValue([]);
+    mockedCreateAccessApp.mockResolvedValue({
+      id: "app-123",
+      aud: "aud-123",
+      domain: "demo.preview.workers.dev",
+    });
+    mockedListAccessPolicies.mockResolvedValue([]);
+    mockedCreateAccessEmailPolicy.mockResolvedValue({
+      id: "policy-123",
+      name: "Allow hub users",
+      precedence: 100,
+      decision: "allow",
+    });
+
+    const result = await provisionWorkersDevBrowserAccess({
+      apiToken: "token",
+      accountId: "account-123",
+      hostname: "demo.preview.workers.dev",
+      emails: ["user@example.com"],
+    });
+
+    expect(mockedCreateAccessApp).toHaveBeenCalledWith("token", "account-123", {
+      domain: "demo.preview.workers.dev",
+      name: "Tiller Hub (demo.preview.workers.dev)",
+    });
+    expect(mockedCreateAccessEmailPolicy).toHaveBeenCalledWith("token", "account-123", "app-123", {
+      name: "Allow hub users",
+      emails: ["user@example.com"],
+      precedence: 100,
+    });
+    expect(result).toMatchObject({
+      accountId: "account-123",
+      hostname: "demo.preview.workers.dev",
+      app: { id: "app-123", aud: "aud-123" },
+      browserPolicy: { id: "policy-123" },
+    });
+  });
+
+  it("updates the existing managed browser policy instead of creating duplicates", async () => {
+    mockedListAccessApps.mockResolvedValue([
+      { id: "app-123", aud: "aud-123", domain: "demo.preview.workers.dev" },
+    ]);
+    mockedListAccessPolicies.mockResolvedValue([
+      {
+        id: "policy-123",
+        name: "Allow hub users",
+        precedence: 104,
+        decision: "allow",
+      },
+    ]);
+    mockedUpdateAccessEmailPolicy.mockResolvedValue({
+      id: "policy-123",
+      name: "Allow hub users",
+      precedence: 104,
+      decision: "allow",
+    });
+
+    await provisionWorkersDevBrowserAccess({
+      apiToken: "token",
+      accountId: "account-123",
+      hostname: "demo.preview.workers.dev",
+      emails: ["new@example.com"],
+    });
+
+    expect(mockedCreateAccessApp).not.toHaveBeenCalled();
+    expect(mockedCreateAccessEmailPolicy).not.toHaveBeenCalled();
+    expect(mockedUpdateAccessEmailPolicy).toHaveBeenCalledWith(
+      "token",
+      "account-123",
+      "app-123",
+      "policy-123",
+      {
+        name: "Allow hub users",
+        emails: ["new@example.com"],
+        precedence: 104,
+      },
+    );
+  });
+
+  it("does not modify an existing wildcard app that covers the route", async () => {
+    mockedListAccessApps.mockResolvedValue([
+      { id: "wild", aud: "wild-aud", domain: "*.preview.workers.dev" },
+    ]);
+
+    const result = await provisionWorkersDevBrowserAccess({
+      apiToken: "token",
+      accountId: "account-123",
+      hostname: "demo.preview.workers.dev",
+      emails: ["user@example.com"],
+    });
+
+    expect(mockedCreateAccessApp).not.toHaveBeenCalled();
+    expect(mockedCreateAccessEmailPolicy).not.toHaveBeenCalled();
+    expect(mockedUpdateAccessEmailPolicy).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      app: { id: "wild" },
+      appDomain: "*.preview.workers.dev",
+      browserPolicy: null,
+      overlappingWildcardApp: { id: "wild" },
+    });
+  });
+
+  it("deletes a newly created Access app when policy creation fails", async () => {
+    mockedListAccessApps.mockResolvedValue([]);
+    mockedCreateAccessApp.mockResolvedValue({
+      id: "app-123",
+      aud: "aud-123",
+      domain: "demo.preview.workers.dev",
+    });
+    mockedListAccessPolicies.mockResolvedValue([]);
+    mockedCreateAccessEmailPolicy.mockRejectedValue(new Error("policy failed"));
+
+    await expect(
+      provisionWorkersDevBrowserAccess({
+        apiToken: "token",
+        accountId: "account-123",
+        hostname: "demo.preview.workers.dev",
+        emails: ["user@example.com"],
+      }),
+    ).rejects.toThrow("policy failed");
+
+    expect(mockedDeleteAccessApp).toHaveBeenCalledWith("token", "account-123", "app-123");
   });
 });
 

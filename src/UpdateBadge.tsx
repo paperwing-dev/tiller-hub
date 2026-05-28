@@ -1,4 +1,5 @@
 import type { UpdateCheckResult } from './api';
+import { formatUpdateName } from './update-display';
 
 interface UpdateBadgeProps {
   status: UpdateCheckResult | null;
@@ -33,7 +34,7 @@ export function describeUpdateBadgeState({
   }
 
   return {
-    title: `Update available: ${status.currentVersion} -> ${status.latestVersion}`,
+    title: `Update available: ${formatUpdateName(status.currentUpdate)} -> ${formatUpdateName(status.latestUpdate)}`,
     accentClassName: 'text-[#57606a] hover:text-[#24292f]',
     icon: '↑',
   };

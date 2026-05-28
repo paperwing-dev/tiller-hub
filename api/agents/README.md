@@ -1,31 +1,23 @@
 # Agents
 
-This folder contains the user-facing hosted chat agents for Tiller.
+This folder contains the live hosted chat agents for Tiller.
 
-## Purpose
+## Live Agents
 
-- Keep each concrete agent entry point in one place.
-- Separate agent personalities and transport bindings from shared harness code.
-- Make it easy to scan which agents actually exist in the product.
+- `plan-chat-agent.ts` is the Plan Writer. It uses Cloudflare Think, the hosted Codex/OpenAI Responses route, read-only repo tools, artifact tools, and the versioned `save_plan` workflow.
+- `reviewer-chat-agent.ts` is the Plan Reviewer. It uses Workers AI models to inspect a specific plan and produce reviewer feedback without modifying the plan or workspace.
 
-Current agents include:
+## PlanChat Support
 
-- `cartographer-chat-agent.ts`
-- `research-chat-agent.ts`
-- `planner-chat-agent.ts`
-- `reviewer-chat-agent.ts`
+- `plan-chat-support.ts` owns the PlanChat V2 policy, `get_plan_context`, active tool lists, server-side tool gating, and bounded repo search helpers.
+- `plan-chat-workspace.ts` is the read-only workspace proxy used by PlanChat. Workspace mutation must stay unavailable; plan changes go through `save_plan`.
 
-## Why this folder exists
+## Boundaries
 
-These files were originally mixed into the `api/` root. That made it harder to distinguish:
+- `agent-core/` contains shared model, prompt, workspace, and hosted-tool helpers.
+- `agents/` contains product-facing Durable Object agent classes plus PlanChat-specific support modules.
+- Wrangler bindings should exist only for live agent classes exported from `api/index.ts`.
 
-- shared harness logic
-- route wiring
-- concrete agent implementations
+## Removed Agents
 
-The `agents/` folder makes the boundary explicit:
-
-- `agent-core/` contains reusable harness pieces
-- `agents/` contains the specific agents built on top of that core
-
-That split matters because the long-term goal is a reusable hosted-agent harness, not a pile of one-off chat endpoints.
+The older `planner-chat`, `research-chat`, and `cartographer-chat` agents were removed because the product UI no longer uses them. Their historical Durable Object class names remain only in Wrangler migrations so Cloudflare can delete the old classes safely during deploy.

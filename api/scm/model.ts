@@ -88,6 +88,28 @@ export function buildScmContainerEnvVars(
   };
 }
 
+export type StartupPlanSelection =
+  | { mode: "todo" }
+  | { mode: "specific"; artifactId: string }
+  | { mode: "none" };
+
+export function normalizeStartupPlanSelection(value: unknown, fallback: StartupPlanSelection): StartupPlanSelection {
+  if (!value || typeof value !== "object") return fallback;
+  const record = value as Record<string, unknown>;
+  if (record.mode === "todo") return { mode: "todo" };
+  if (record.mode === "none") return { mode: "none" };
+  if (record.mode === "specific" && typeof record.artifactId === "string" && record.artifactId.trim()) {
+    return { mode: "specific", artifactId: record.artifactId.trim() };
+  }
+  return fallback;
+}
+
+export function legacyPlanIdToSelection(planId: string | null | undefined, fallback: StartupPlanSelection): StartupPlanSelection {
+  if (planId === undefined) return fallback;
+  if (planId === null) return { mode: "none" };
+  return planId.trim() ? { mode: "specific", artifactId: planId.trim() } : { mode: "none" };
+}
+
 export function deriveBranchBackedEnvStatus(
   meta: Pick<
     EnvMeta,
@@ -143,6 +165,13 @@ export function getEffectiveEnvBranchStatus(
   return deriveBranchBackedEnvStatus(meta, {
     mainCommit: repo?.mainCommit ?? null,
   });
+}
+
+export function hasCurrentMainBase(
+  meta: Pick<EnvMeta, "baseMainCommit">,
+  repo: Pick<RepoMeta, "mainCommit">,
+): boolean {
+  return !!meta.baseMainCommit && !!repo.mainCommit && meta.baseMainCommit === repo.mainCommit;
 }
 
 export function isEnvTransitioning(

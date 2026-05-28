@@ -29,7 +29,8 @@ describe("resolveChatGPTAvailability", () => {
     getOpenAIAuthStatus.mockResolvedValue({ authenticated: false });
     resolveCodexModelRoute.mockResolvedValue({
       kind: "unavailable",
-      reason: "Codex requires a running Tiller gateway or an OpenAI API key.",
+      reason: "Codex requires a running Subscription Gateway or an API key.",
+      codexRouteStatus: "gateway_offline",
     });
     global.fetch = vi.fn(async () => new Response("ok", { status: 200 })) as typeof fetch;
   });
@@ -38,11 +39,12 @@ describe("resolveChatGPTAvailability", () => {
     global.fetch = originalFetch;
   });
 
-  it("reports unavailable when ChatGPT auth is not seeded", async () => {
+  it("reports unavailable when a Codex subscription login is not imported", async () => {
     await expect(resolveChatGPTAvailability(mockEnv())).resolves.toEqual({
       configured: false,
       available: false,
-      unavailableReason: "Connect ChatGPT in Tiller and keep a Tiller Host gateway online to use hosted ChatGPT planning.",
+      unavailableReason: "Import a Codex subscription login in Tiller Self Host and keep the Subscription Gateway online to use the subscription-backed OpenAI planner.",
+      codexRouteStatus: "gateway_offline",
       gatewayUrl: null,
       route: null,
       codexRoute: null,
@@ -55,7 +57,8 @@ describe("resolveChatGPTAvailability", () => {
     await expect(resolveChatGPTAvailability(mockEnv())).resolves.toEqual({
       configured: true,
       available: false,
-      unavailableReason: "Codex requires a running Tiller gateway or an OpenAI API key.",
+      unavailableReason: "Codex requires a running Subscription Gateway or an API key.",
+      codexRouteStatus: "gateway_offline",
       gatewayUrl: null,
       route: null,
       codexRoute: null,
@@ -67,38 +70,49 @@ describe("resolveChatGPTAvailability", () => {
     resolveCodexModelRoute.mockResolvedValue({
       kind: "gateway-subscription",
       gatewayUrl: "https://gateway.example.com",
-      accessToken: "access-token",
-      accountId: "acct_123",
+      machineId: "machine-123",
+      providerBaseUrl: "https://gateway.example.com/v1",
+      responsesUrl: "https://gateway.example.com/codex/responses",
+      codexRouteStatus: "available",
     });
 
     await expect(resolveChatGPTAvailability(mockEnv())).resolves.toEqual({
       configured: true,
       available: true,
       unavailableReason: null,
+      codexRouteStatus: "available",
       gatewayUrl: "https://gateway.example.com",
       route: "gateway-subscription",
       codexRoute: {
         kind: "gateway-subscription",
         gatewayUrl: "https://gateway.example.com",
-        accessToken: "access-token",
-        accountId: "acct_123",
+        machineId: "machine-123",
+        providerBaseUrl: "https://gateway.example.com/v1",
+        responsesUrl: "https://gateway.example.com/codex/responses",
+        codexRouteStatus: "available",
       },
     });
   });
 
-  it("does not expose hosted plan chatgpt availability through OPENAI_API_KEY fallback", async () => {
+  it("reports available through OPENAI_API_KEY fallback", async () => {
     resolveCodexModelRoute.mockResolvedValue({
       kind: "api-fallback",
       openaiApiKey: "openai-key",
+      codexRouteStatus: "api_fallback",
     });
 
     await expect(resolveChatGPTAvailability(mockEnv())).resolves.toEqual({
-      configured: false,
-      available: false,
-      unavailableReason: "Connect ChatGPT in Tiller and keep a Tiller Host gateway online to use hosted ChatGPT planning.",
+      configured: true,
+      available: true,
+      unavailableReason: null,
+      codexRouteStatus: "api_fallback",
       gatewayUrl: null,
-      route: null,
-      codexRoute: null,
+      route: "api-fallback",
+      codexRoute: {
+        kind: "api-fallback",
+        openaiApiKey: "openai-key",
+        codexRouteStatus: "api_fallback",
+      },
     });
   });
 });

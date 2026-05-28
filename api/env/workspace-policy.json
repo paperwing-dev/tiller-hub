@@ -1,0 +1,6 @@
+{
+  "envOnlyCanonicalExcludes": [
+    "/.tiller",
+    "/.claude/settings.local.json"
+  ]
+}

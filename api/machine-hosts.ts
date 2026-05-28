@@ -43,17 +43,21 @@ export async function resolveManagedMachineHostStatus(
   env: Env,
   protection: Pick<
     ProtectionState,
-    "hubUrl" | "hostKind" | "protectionMode" | "serviceTokenConfigured" | "workersDevAliasDisabled"
+    "hubUrl" | "routeKind" | "protectionMode" | "serviceTokenConfigured" | "workersDevAliasDisabled"
   >,
 ): Promise<ManagedMachineHostStatus> {
   const derived = deriveManagedMachineHostnames(protection.hubUrl);
   const gatewayHostname = trimOptional(await getSecret(env, "TILLER_GATEWAY_HOSTNAME")) ?? derived.gatewayHostname;
   const browserProtected = Boolean(
-    protection.hostKind === "custom-domain"
-      && protection.protectionMode === "cf-access"
-      && trimOptional(await getSecret(env, "CF_ACCESS_APP_ID"))
-      && trimOptional(await getSecret(env, "CF_ACCESS_AUD"))
-      && trimOptional(await getSecret(env, "CF_ACCESS_BROWSER_POLICY_ID")),
+    protection.protectionMode === "cf-access"
+      && (
+        protection.routeKind === "workers-dev"
+        || (
+          trimOptional(await getSecret(env, "CF_ACCESS_APP_ID"))
+          && trimOptional(await getSecret(env, "CF_ACCESS_AUD"))
+          && trimOptional(await getSecret(env, "CF_ACCESS_BROWSER_POLICY_ID"))
+        )
+      ),
   );
   const gatewayConfigured = Boolean(
     gatewayHostname
@@ -62,23 +66,22 @@ export async function resolveManagedMachineHostStatus(
   );
   const gatewayTunnelConfigured = Boolean(
     gatewayHostname
-      && trimOptional(await getSecret(env, "TILLER_GATEWAY_TUNNEL_ID"))
-      && trimOptional(await getSecret(env, "TILLER_GATEWAY_TUNNEL_TOKEN")),
+      && trimOptional(await getSecret(env, "TILLER_GATEWAY_TUNNEL_ID")),
   );
   const gatewayProvisioned = gatewayConfigured && gatewayTunnelConfigured;
-  const workersDevCutoverPending = protection.hostKind === "custom-domain" && !protection.workersDevAliasDisabled;
+  const workersDevCutoverPending = protection.routeKind === "custom-domain" && !protection.workersDevAliasDisabled;
 
   let gatewaySupportReason: string | null = null;
-  if (protection.hostKind === "workers-dev") {
-    gatewaySupportReason = "Publish & Protect a custom domain before using the Tiller gateway.";
+  if (protection.routeKind === "workers-dev") {
+    gatewaySupportReason = "Switch to Tiller Self Host on a protected custom domain before using the Subscription Gateway.";
   } else if (!browserProtected) {
-    gatewaySupportReason = "Enable Cloudflare Access on the custom hub domain before using the Tiller gateway.";
+    gatewaySupportReason = "Enable Cloudflare Access on the custom hub domain before using the Subscription Gateway.";
   } else if (!protection.serviceTokenConfigured) {
-    gatewaySupportReason = "Reissue the Tiller machine service token before using the Tiller gateway.";
+    gatewaySupportReason = "Reissue the Tiller Self Host service token before using the Subscription Gateway.";
   } else if (!gatewayConfigured) {
-    gatewaySupportReason = "The protected Tiller gateway hostname has not been provisioned yet.";
+    gatewaySupportReason = "The protected Subscription Gateway hostname has not been provisioned yet.";
   } else if (!gatewayTunnelConfigured) {
-    gatewaySupportReason = "The protected Tiller gateway tunnel has not been provisioned yet.";
+    gatewaySupportReason = "The protected Subscription Gateway tunnel has not been provisioned yet.";
   }
 
   return {

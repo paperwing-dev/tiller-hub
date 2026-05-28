@@ -52,23 +52,3 @@ export function getRepoMergeLockStub(env: Env, repoId: string): RepoMergeLockDO 
   const id = env.REPO_MERGE_LOCK.idFromName(repoId);
   return env.REPO_MERGE_LOCK.get(id, getLocationHintOptions(env)) as unknown as RepoMergeLockDO;
 }
-
-/** Convert a GitHub repo URL to a tarball API URL */
-export function repoToTarballUrl(
-  repoUrl: string,
-  ref = "HEAD",
-  githubToken?: string,
-): { tarballUrl: string; headers: Record<string, string> } | null {
-  const match = repoUrl.replace(/\.git$/, "").match(/github\.com\/([^/]+)\/([^/]+)/);
-  if (!match) return null;
-  const [, owner, repo] = match;
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "User-Agent": "tiller-hub",
-  };
-  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
-  return {
-    tarballUrl: `https://api.github.com/repos/${owner}/${repo}/tarball/${ref}`,
-    headers,
-  };
-}

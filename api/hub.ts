@@ -1,11 +1,20 @@
 import { Server, type Connection, type ConnectionContext, type WSMessage } from "partyserver";
 import { ensureSchema } from "./schema";
 import { maybeVerifyCfAccessRequest } from "./auth";
+import { ACCESS_CONFIG_CLAIM_KEYS } from "./access/config-keys";
 import * as Q from "./queries";
 import type { ThreadDO, ThreadMessage } from "./coordination";
 import { clearMachineServiceKeys, getMachineServiceKeys, parseMachineServiceState } from "./machine-service-state";
 import { readOptionalConfigValue } from "./config-row";
 import { getLocationHintOptions } from "./helpers";
+import {
+  LEGACY_GATEWAY_TUNNEL_TOKEN_KEY,
+  SELF_HOST_SETUP_SESSION_KEY,
+  SELF_HOST_STATE_KEY,
+  parseSelfHostState,
+  type SelfHostMutationInput,
+  type SelfHostProgressMutationInput,
+} from "./self-host/state";
 import {
   VALID_PHASES,
   VALID_ACTIVITIES,
@@ -553,6 +562,10 @@ export class HubDO extends Server<Env> {
         ...service,
         machineId: normalizedMachineId,
         ...(service.gatewayUrl?.trim() ? { gatewayUrl: service.gatewayUrl.trim() } : {}),
+        ...(service.gatewayServiceTokenHash?.trim()
+          ? { gatewayServiceTokenHash: service.gatewayServiceTokenHash.trim() }
+          : {}),
+        ...(service.codexGatewayAuth === "session-token" ? { codexGatewayAuth: service.codexGatewayAuth } : {}),
       };
 
       if (preferredMachineId) {
@@ -815,7 +828,7 @@ export class HubDO extends Server<Env> {
     }
 
     if (preferred && options?.allowFallbackToActive === false) {
-      throw new Error("Tiller Host is offline. Start `tiller host` on your host machine to manage host environments.");
+      throw new Error("Tiller Self Host is offline. Start `tiller host` on your self-host machine to manage host environments.");
     }
 
     const activeHost = this.getActiveHostService();
@@ -824,7 +837,7 @@ export class HubDO extends Server<Env> {
       return activeMachineId;
     }
 
-    throw new Error("Tiller Host is offline. Start `tiller host` on your host machine to manage host environments.");
+    throw new Error("Tiller Self Host is offline. Start `tiller host` on your self-host machine to manage host environments.");
   }
 
   private requestRunnerControl(
@@ -841,14 +854,14 @@ export class HubDO extends Server<Env> {
   ): Promise<unknown> {
     const connection = this.getRunnerConnection(machineId);
     if (!connection) {
-      throw new Error("Tiller Host is offline. Start `tiller host` on your host machine to manage host environments.");
+      throw new Error("Tiller Self Host is offline. Start `tiller host` on your self-host machine to manage host environments.");
     }
 
     const requestId = crypto.randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRunnerRequests.delete(requestId);
-        reject(new Error("Timed out waiting for Tiller Host."));
+        reject(new Error("Timed out waiting for Tiller Self Host."));
       }, timeoutMs);
 
       this.pendingRunnerRequests.set(requestId, { resolve, reject, timer });
@@ -986,6 +999,59 @@ export class HubDO extends Server<Env> {
     );
   }
 
+  compareAndSetConfig(key: string, expectedValue: string, nextValue: string): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const currentValue = readOptionalConfigValue(this.db, key) ?? "";
+      if (currentValue !== expectedValue) {
+        return false;
+      }
+      this.setConfig(key, nextValue);
+      return true;
+    });
+  }
+
+  commitSelfHostMutation(input: SelfHostMutationInput): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const currentState = parseSelfHostState(readOptionalConfigValue(this.db, SELF_HOST_STATE_KEY));
+      if ("state" in input.expected) {
+        if (currentState) return false;
+      } else if (
+        !currentState
+        || currentState.attemptId !== input.expected.attemptId
+        || currentState.phase !== input.expected.phase
+      ) {
+        return false;
+      }
+
+      this.setConfig(SELF_HOST_STATE_KEY, input.nextState ? JSON.stringify(input.nextState) : "");
+      this.setConfig(SELF_HOST_SETUP_SESSION_KEY, "");
+      this.setConfig(LEGACY_GATEWAY_TUNNEL_TOKEN_KEY, "");
+      for (const [key, value] of Object.entries(input.configEntries ?? {})) {
+        this.setConfig(key, value ?? "");
+      }
+      return true;
+    });
+  }
+
+  commitSelfHostProgress(input: SelfHostProgressMutationInput): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const currentState = parseSelfHostState(readOptionalConfigValue(this.db, SELF_HOST_STATE_KEY));
+      if (
+        !currentState
+        || currentState.phase !== "promoted"
+        || currentState.attemptId !== input.expected.attemptId
+      ) {
+        return false;
+      }
+
+      this.setConfig(SELF_HOST_STATE_KEY, JSON.stringify({
+        ...currentState,
+        progress: input.progress,
+      }));
+      return true;
+    });
+  }
+
   getOrCreateConfig(key: string, value: string): string {
     const existingValue = readOptionalConfigValue(this.db, key);
     if (existingValue) {
@@ -994,6 +1060,40 @@ export class HubDO extends Server<Env> {
 
     this.setConfig(key, value);
     return value;
+  }
+
+  claimWorkersDevAccessConfig(input: {
+    audience: string;
+    teamDomain: string;
+  }): {
+    claimed: boolean;
+    audience: string | null;
+    teamDomain: string | null;
+  } {
+    return this.ctx.storage.transactionSync(() => {
+      const existingAudience = readOptionalConfigValue(this.db, "CF_ACCESS_AUD");
+      const existingTeamDomain = readOptionalConfigValue(this.db, "CF_ACCESS_TEAM_DOMAIN");
+      if (ACCESS_CONFIG_CLAIM_KEYS.some((key) => readOptionalConfigValue(this.db, key)?.trim())) {
+        return {
+          claimed: false,
+          audience: existingAudience?.trim() || null,
+          teamDomain: existingTeamDomain?.trim() || null,
+        };
+      }
+
+      this.setConfig("CF_ACCESS_AUD", input.audience);
+      this.setConfig("CF_ACCESS_TEAM_DOMAIN", input.teamDomain);
+      this.setConfig("CF_ACCESS_JWKS_URL", "");
+      this.setConfig("CF_ACCESS_CLIENT_ID", "");
+      this.setConfig("CF_ACCESS_CLIENT_SECRET", "");
+      this.setConfig("CF_ACCESS_CONFIGURED", "true");
+
+      return {
+        claimed: true,
+        audience: input.audience,
+        teamDomain: input.teamDomain,
+      };
+    });
   }
 
   deleteConfig(key: string): void {

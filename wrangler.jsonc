@@ -21,8 +21,7 @@
 	"vars": {
 		// Deploy-button region code. Accepted values:
 		// wnam, enam, weur, eeur, apac, oc
-		"TILLER_REGION": "wnam",
-		"ENABLED_ENV_HARNESSES": "claude-code,codex,opencode"
+		"TILLER_REGION": "wnam"
 	},
 	"containers": [
 		{
@@ -87,20 +86,8 @@
 				"class_name": "WorkspaceDO"
 			},
 			{
-				"name": "CARTOGRAPHER_CHAT",
-				"class_name": "CartographerChatAgent"
-			},
-			{
 				"name": "PLAN_CHAT",
 				"class_name": "PlanChatAgent"
-			},
-			{
-				"name": "PLANNER_CHAT",
-				"class_name": "PlannerChatAgent"
-			},
-			{
-				"name": "RESEARCH_CHAT",
-				"class_name": "ResearchChatAgent"
 			},
 			{
 				"name": "REVIEWER_CHAT",
@@ -225,6 +212,19 @@
 			"new_sqlite_classes": [
 				"ScmOperationDO"
 			]
+		},
+		{
+			"tag": "v19",
+			"deleted_classes": [
+				"PlannerChatAgent"
+			]
+		},
+		{
+			"tag": "v20",
+			"deleted_classes": [
+				"ResearchChatAgent",
+				"CartographerChatAgent"
+			]
 		}
 	],
 	"kv_namespaces": [
@@ -233,6 +233,7 @@
 		},
 	],
 	"workers_dev": true,
+	"preview_urls": false,
 	"send_metrics": false,
 	"observability": {
 		"enabled": true,

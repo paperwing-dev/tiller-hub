@@ -1,19 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { Artifact, ArtifactRef } from "../../api/coordination/types";
+import type { Artifact } from "../../api/coordination/types";
 import {
-  getApprovedPlanRef,
+  groupPlansByStatus,
   listCurrentPlanDraftArtifacts,
   listReviewArtifactsForDraft,
 } from "../plan-artifacts";
 
 const BASE_BODY = {
-  summary: "Summary",
-  findings: [],
-  relevantFiles: [],
-  openQuestions: [],
-  proposedPlan: "{}",
-  memoryRefs: [],
-  model: "gpt-5.4",
+  markdown: "## Summary\n\n{}",
 };
 
 function createArtifact(overrides: Partial<Artifact> & Pick<Artifact, "id" | "type" | "createdAt">): Artifact {
@@ -28,6 +22,9 @@ function createArtifact(overrides: Partial<Artifact> & Pick<Artifact, "id" | "ty
     title: overrides.title ?? "Artifact",
     body: overrides.body ?? BASE_BODY,
     createdAt: overrides.createdAt,
+    ...(overrides.status ? { status: overrides.status } : {}),
+    ...(overrides.updatedAt ? { updatedAt: overrides.updatedAt } : {}),
+    ...(overrides.version ? { version: overrides.version } : {}),
     ...(overrides.parentArtifactId ? { parentArtifactId: overrides.parentArtifactId } : {}),
     ...(overrides.supersedesArtifactId ? { supersedesArtifactId: overrides.supersedesArtifactId } : {}),
   };
@@ -97,17 +94,32 @@ describe("plan artifact selectors", () => {
     ]);
   });
 
-  it("tracks approval through the approved-plan ref", () => {
-    const refs: ArtifactRef[] = [
-      {
-        repoId: "repo-1",
-        name: "approved-plan",
-        artifactId: "approved-current",
-        version: 2,
+  it("groups plans by mutable status newest first", () => {
+    const artifacts: Artifact[] = [
+      createArtifact({
+        id: "todo-old",
+        type: "plan",
+        status: "todo",
+        updatedAt: "2026-03-29T00:00:00.000Z",
+        createdAt: "2026-03-29T00:00:00.000Z",
+      }),
+      createArtifact({
+        id: "todo-new",
+        type: "plan",
+        status: "todo",
         updatedAt: "2026-03-29T00:02:00.000Z",
-      },
+        createdAt: "2026-03-29T00:01:00.000Z",
+      }),
+      createArtifact({
+        id: "archived",
+        type: "plan",
+        status: "archived",
+        createdAt: "2026-03-29T00:03:00.000Z",
+      }),
     ];
 
-    expect(getApprovedPlanRef(refs)?.artifactId).toBe("approved-current");
+    const grouped = groupPlansByStatus(artifacts);
+    expect(grouped.todo.map((artifact) => artifact.id)).toEqual(["todo-new", "todo-old"]);
+    expect(grouped.archived.map((artifact) => artifact.id)).toEqual(["archived"]);
   });
 });

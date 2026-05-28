@@ -22,6 +22,10 @@ vi.mock("../PlanView", () => ({
   default: () => null,
 }));
 
+vi.mock("../ChangesView", () => ({
+  default: () => null,
+}));
+
 vi.mock("../NewEnvDialog", () => ({
   NewRepoDialog: () => null,
   NewEnvDialog: () => null,
@@ -48,6 +52,22 @@ vi.mock("../UpdateDialog", () => ({
 }));
 
 vi.mock("../api", () => ({
+  ApiActionError: class ApiActionError extends Error {
+    readonly code?: string;
+    readonly hint?: string;
+    readonly missingPermissions: string[];
+
+    constructor(
+      body: { error?: string; code?: string; hint?: string; missingPermissions?: string[] },
+      fallback: string,
+    ) {
+      super(body.error || fallback);
+      this.name = "ApiActionError";
+      this.code = body.code;
+      this.hint = body.hint;
+      this.missingPermissions = Array.isArray(body.missingPermissions) ? body.missingPermissions : [];
+    }
+  },
   fetchSessions: vi.fn(async () => []),
   fetchMessages: vi.fn(async () => []),
   fetchPendingPermissions: vi.fn(async () => []),
@@ -140,5 +160,58 @@ describe("Dashboard", () => {
     expect(refreshEnvs).toHaveBeenCalledTimes(1);
     expect(refreshRepos).toHaveBeenCalledTimes(1);
     expect(refreshSetupStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces update-check failures returned as typed update issues", async () => {
+    const { getTopLevelUpdateIssue } = await import("../App");
+    expect(getTopLevelUpdateIssue({
+      updateAvailable: false,
+      currentUpdate: {
+        schemaVersion: 1,
+        channel: "deploy-button",
+        updateMode: "full-source",
+        sourceRepo: "paperwing-dev/tiller-hub",
+        sourceId: "current-source",
+        version: "0.2.27",
+        label: "Current",
+        managedFiles: ["package.json"],
+      },
+      latestUpdate: {
+        schemaVersion: 1,
+        channel: "deploy-button",
+        updateMode: "full-source",
+        sourceRepo: "paperwing-dev/tiller-hub",
+        sourceId: "current-source",
+        version: "0.2.27",
+        label: "Current",
+        managedFiles: ["package.json"],
+      },
+      buildDiagnostics: {
+        version: "0.1.0",
+        workersCiCommitSha: null,
+        workersCiBranch: null,
+      },
+      hubRepo: { status: "not_checked", lastDetectedAt: null },
+      updateMethod: "advanced_repair",
+      issue: {
+        code: "update_check_failed",
+        message: "Self-update check failed",
+      },
+      releaseNotesUrl: "https://github.com/paperwing-dev/tiller-hub",
+    })).toBe("Self-update check failed");
+  });
+
+  it("preserves setup-protection update-check error codes", async () => {
+    const { getUpdateCheckFailure } = await import("../App");
+    const { ApiActionError } = await import("../api");
+    const failure = getUpdateCheckFailure(new ApiActionError({
+      error: "Protect this hub with Cloudflare Access before using the API.",
+      code: "setup_protection_required",
+    }, "Failed to check for updates"));
+
+    expect(failure).toEqual({
+      message: "Protect this hub with Cloudflare Access before using the API.",
+      code: "setup_protection_required",
+    });
   });
 });

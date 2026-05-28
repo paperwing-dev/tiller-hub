@@ -7,7 +7,7 @@ const OPERATION_KEY_PREFIX = "repo-scm-operation:";
 const COMPLETED_OPERATION_RETENTION_MS = 10 * 60_000;
 const PENDING_OPERATION_TIMEOUT_MS = 15 * 60_000;
 
-export type RepoScmOperationType = "merge-into-main";
+export type RepoScmOperationType = "merge-into-main" | "update-from-main";
 export type RepoScmOperationStatus = "pending" | "succeeded" | "failed";
 
 export interface RepoScmOperationResult {

@@ -52,10 +52,10 @@ The realistic tight UX is:
 1. Click Deploy to Cloudflare for the hosted Worker.
 2. Enter one `TILLER_REGION` value: `wnam`, `enam`, `weur`, `eeur`, `apac`, or `oc`.
 3. Open the deployed app and finish the setup wizard.
-4. Choose one model-auth path: Claude subscription or Anthropic API key.
+4. Use the included Workers AI model, or add Anthropic/OpenAI keys if you want those providers.
 5. Start using Cloudflare-hosted sandboxes immediately.
 6. Optionally use the in-app `Publish & Protect` flow to move to your own protected custom domain.
-8. Optionally install `tiller` and run it locally if you want execution on your own machine.
+7. Optionally install `tiller` and run it locally if you want execution on your own machine.
 
 ## Naming
 
@@ -64,6 +64,16 @@ flow supports either:
 
 - a custom domain, such as `https://tiller.example.com`
 - a `workers.dev` URL, such as `https://my-tiller-control-plane.<subdomain>.workers.dev`
+
+Cloudflare's deploy setup page lets users customize the Worker name. Workers
+Builds passes that selected name to Wrangler as `WRANGLER_CI_OVERRIDE_NAME`.
+The Tiller deploy script uses that selected name when it derives generated
+resources such as the R2 bucket and container applications, so the Worker,
+bucket, and container names stay together.
+
+For local power-user deploys outside Workers Builds, set
+`TILLER_WORKER_NAME=tiller-hub-maple` before running `npm run deploy` if you
+want the same explicit name override.
 
 If you use `workers.dev`, local execution now relies on quick tunnels rather
 than derived sibling hostnames. `workers.dev` is also the public bootstrap URL.
@@ -98,10 +108,15 @@ it to create or reuse the R2 bucket in that location and to inject
 `DO_LOCATION_HINT` into the generated deploy config before `wrangler deploy`
 runs.
 
+Do not put root `.env.example` or `.dev.vars.example` files in the standalone
+deploy template. Cloudflare's deploy button treats those files as deploy inputs,
+but model credentials are configured later inside the protected app setup flow.
+
 For power users, `npm run deploy` also supports direct protected custom-domain
-deploys via `.env`:
+deploys via `.env`. Start from `docs/examples/deploy-env.sample`:
 
 ```bash
+cp docs/examples/deploy-env.sample .env
 TILLER_CUSTOM_DOMAIN=tiller.example.com
 CLOUDFLARE_API_TOKEN=<cloudflare-api-token>
 TILLER_ACCESS_EMAILS=you@example.com,teammate@example.com
@@ -150,7 +165,7 @@ the first `tiller` run, and `tiller init` remains the advanced manual fallback.
 For local development, use [wrangler.dev.jsonc](../wrangler.dev.jsonc) through
 `npm run dev`. That local config is intentionally Tiller-Host-only: it sets the
 default backend to `host`, points the hub at `http://127.0.0.1:8789`, and does
-not configure Cloudflare Containers for localhost startup. Local model auth must
-go in `.dev.vars`, not `.env`; set at least one of `CLAUDE_CODE_OAUTH_TOKEN`,
-`ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` or localhost will stay on the
-"Required setup" page.
+not configure Cloudflare Containers for localhost startup. Start from
+`docs/examples/local-dev-vars.sample`; local model auth must go in `.dev.vars`,
+not `.env`. Set at least one of `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+or `OPENAI_API_KEY` or localhost will stay on the "Required setup" page.

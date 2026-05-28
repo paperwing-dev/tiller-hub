@@ -281,6 +281,9 @@ export async function ensureWorkerCustomDomain(
     attachedDomain = await attachWorkerDomain(token, accountId, serviceName, hostname);
     attachedNow = true;
   }
+  if (!attachedDomain) {
+    throw new Error(`Cloudflare did not return a Worker domain for ${hostname}`);
+  }
 
   return {
     hostname,

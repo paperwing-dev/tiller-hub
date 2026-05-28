@@ -1,18 +1,25 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { Hono } from "hono";
 import type { HonoEnv } from "../types";
-import { createInitialEnvScmState } from "../scm/model";
+import { createInitialEnvScmState, createInitialRepoScmState } from "../scm/model";
 import { projectEnvSummary } from "../sync/projectors";
 import { applyLifecycleProjectionToMeta } from "../env-lifecycle";
 
 const mocks = vi.hoisted(() => ({
   getEnvLifecycleStub: vi.fn(),
+  getWorkspaceStub: vi.fn(),
+  destroyEnv: vi.fn(),
+  revokeCodexGatewaySessionsForEnv: vi.fn(),
+  revokeGitHubBridgesForInteractiveEnv: vi.fn(),
 }));
 
 vi.mock("../setup/config", () => ({
   getSecret: async (env: Record<string, unknown>, key: string) => {
     return env[key] || undefined;
   },
+  resolveDeploymentModeForRuntime: async (env: Record<string, unknown>) => (
+    env.TILLER_DEPLOYMENT_MODE === "self-host" ? "self-host" : "hosted"
+  ),
 }));
 
 vi.mock("../helpers", async () => {
@@ -20,8 +27,25 @@ vi.mock("../helpers", async () => {
   return {
     ...actual,
     getEnvLifecycleStub: mocks.getEnvLifecycleStub,
+    getWorkspaceStub: mocks.getWorkspaceStub,
   };
 });
+
+vi.mock("../env/service", async () => {
+  const actual = await vi.importActual<typeof import("../env/service")>("../env/service");
+  return {
+    ...actual,
+    destroyEnv: mocks.destroyEnv,
+  };
+});
+
+vi.mock("../gateway-session", () => ({
+  revokeCodexGatewaySessionsForEnv: mocks.revokeCodexGatewaySessionsForEnv,
+}));
+
+vi.mock("../github/bridge", () => ({
+  revokeGitHubBridgesForInteractiveEnv: mocks.revokeGitHubBridgesForInteractiveEnv,
+}));
 
 import envRoutes from "../env/routes";
 import { resolveContainerHubUrl, resolveHubPublicUrl, rewriteLoopbackHubUrlForDocker } from "../env/hub-url";
@@ -33,6 +57,13 @@ function createTestApp() {
   });
   app.route("/", envRoutes);
   return app;
+}
+
+function createExecutionCtx() {
+  return {
+    waitUntil: vi.fn(),
+    passThroughOnException: vi.fn(),
+  };
 }
 
 function buildStoredEnvRecord(record: Record<string, unknown>) {
@@ -53,6 +84,9 @@ function buildStoredEnvRecord(record: Record<string, unknown>) {
       branchName,
       mainCommit,
     }),
+    slug,
+    repoUrl: typeof record.repoUrl === "string" ? record.repoUrl : "https://github.com/test/repo",
+    repoId: typeof record.repoId === "string" ? record.repoId : "repo-1",
     createdAt,
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : createdAt,
     status: typeof record.status === "string" ? record.status : "unknown",
@@ -63,6 +97,28 @@ function buildStoredEnvRecord(record: Record<string, unknown>) {
     ...record,
     backend: record.backend === "host" ? "host" : "cf",
   };
+}
+
+function buildStoredRepoRecord(repoId = "repo-1") {
+  return {
+    repoId,
+    githubInstallationId: 98765,
+    githubFullName: "test/repo",
+    ...createInitialRepoScmState(),
+    mainCommit: "main-sha",
+    gitArtifactId: "artifact-1",
+    gitStatus: "ready",
+    createdAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+    bootstrappedFromRef: "HEAD",
+  };
+}
+
+function addRepoIndex(store: Map<string, string>, repoId = "repo-1") {
+  store.set(`repo:${repoId}`, JSON.stringify({
+    repoId,
+    updatedAt: "2024-01-01T00:00:00.000Z",
+  }));
 }
 
 const ENV_META = JSON.stringify(buildStoredEnvRecord({
@@ -92,11 +148,12 @@ function createKvStore(
           ) {
             const explicit = buildStoredEnvRecord(parsed);
             store.set(key, JSON.stringify(explicit));
+            addRepoIndex(store, explicit.repoId);
             if (typeof parsed.slug === "string") {
               store.set(`envdef:${parsed.slug}`, JSON.stringify({
                 slug: explicit.slug,
                 repoUrl: explicit.repoUrl,
-                ...(typeof explicit.repoId === "string" ? { repoId: explicit.repoId } : {}),
+                repoId: explicit.repoId,
                 backend: explicit.backend,
                 ...(typeof explicit.harness === "string" ? { harness: explicit.harness } : {}),
                 startupPlanId: explicit.startupPlanId,
@@ -111,15 +168,26 @@ function createKvStore(
         }
       }
       store.set(key, value);
+      if (key.startsWith("envdef:")) {
+        try {
+          const parsed = JSON.parse(value) as Record<string, unknown>;
+          if (typeof parsed.repoId === "string") {
+            addRepoIndex(store, parsed.repoId);
+          }
+        } catch {
+          // ignore non-env rows
+        }
+      }
       if (!key.startsWith("envdef:")) {
         try {
           const parsed = JSON.parse(value) as Record<string, unknown>;
           if (typeof parsed.slug === "string" && typeof parsed.repoUrl === "string" && typeof parsed.createdAt === "string") {
             const explicit = buildStoredEnvRecord(parsed);
+            addRepoIndex(store, explicit.repoId);
             store.set(`envdef:${parsed.slug}`, JSON.stringify({
               slug: explicit.slug,
               repoUrl: explicit.repoUrl,
-              ...(typeof explicit.repoId === "string" ? { repoId: explicit.repoId } : {}),
+              repoId: explicit.repoId,
               backend: explicit.backend,
               ...(typeof explicit.harness === "string" ? { harness: explicit.harness } : {}),
               startupPlanId: explicit.startupPlanId,
@@ -196,7 +264,7 @@ function createHubBinding(
 
 function createLifecycleStub() {
   let hydrated = false;
-  let current = {
+  let current: any = {
     status: "starting",
     lifecyclePhase: "starting",
     lifecycleOpId: null,
@@ -238,7 +306,8 @@ function createLifecycleStub() {
     clearState: vi.fn().mockResolvedValue(null),
     getState: vi.fn().mockResolvedValue(null),
     getMutableState: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
-    hydrateFromSummary: vi.fn().mockImplementation(async (meta: Record<string, unknown>) => {
+    peekMutableState: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
+    initializeMutableStateFromMeta: vi.fn().mockImplementation(async (meta: Record<string, unknown>) => {
       const status = typeof meta.status === "string" ? meta.status : current.status;
       const updatedAt =
         typeof meta.updatedAt === "string"
@@ -309,7 +378,16 @@ function createLifecycleStub() {
       };
       return current;
     }),
-    setLeadHarnessFailed: vi.fn().mockResolvedValue(current),
+    setLeadHarnessFailed: vi.fn().mockImplementation(async (message: string) => {
+      hydrated = true;
+      current = {
+        ...current,
+        leadHarnessStatus: "failed",
+        leadHarnessError: message,
+        leadHarnessUpdatedAt: new Date().toISOString(),
+      };
+      return current;
+    }),
     setRunnerBinding: vi.fn().mockResolvedValue(current),
     reportStartupEvent: vi.fn().mockResolvedValue(null),
     reportStartupFailure: vi.fn().mockResolvedValue(current),
@@ -318,23 +396,60 @@ function createLifecycleStub() {
     setScmProjection: vi.fn().mockResolvedValue(current),
     clearScmProjection: vi.fn().mockResolvedValue(current),
     setStatus: vi.fn().mockImplementation(async (status: string) => {
+      hydrated = true;
       current = { ...current, status };
       return current;
     }),
-    setError: vi.fn().mockResolvedValue(current),
+    clearError: vi.fn().mockImplementation(async () => {
+      hydrated = true;
+      current = { ...current, error: null, errorAt: null };
+      return current;
+    }),
+    setError: vi.fn().mockImplementation(async (message: string) => {
+      hydrated = true;
+      current = {
+        ...current,
+        error: message,
+        errorAt: new Date().toISOString(),
+      };
+      return current;
+    }),
     noteInfraReady: vi.fn().mockResolvedValue(null),
     noteRunnerStarted: vi.fn().mockResolvedValue(null),
-    noteRunnerStartFailed: vi.fn().mockResolvedValue(null),
+    noteRunnerStartFailed: vi.fn().mockImplementation(async (_opId: string | null, message: string) => {
+      hydrated = true;
+      current = {
+        ...current,
+        status: "failed",
+        lifecyclePhase: "failed",
+        lifecycleDesiredState: "running",
+        error: message,
+        errorAt: new Date().toISOString(),
+      };
+      return current;
+    }),
     noteRunnerStopped: vi.fn().mockResolvedValue(null),
     noteStopWorkspaceSynced: vi.fn().mockResolvedValue(null),
     noteWorkspaceSyncFailed: vi.fn().mockResolvedValue(null),
     noteStopDispatchFailed: vi.fn().mockResolvedValue(null),
+    clearStopWorkspaceSyncedMeta: vi.fn().mockResolvedValue(undefined),
   };
 }
 
 beforeEach(() => {
   vi.resetAllMocks();
+  mocks.destroyEnv.mockResolvedValue(undefined);
+  mocks.revokeCodexGatewaySessionsForEnv.mockResolvedValue(undefined);
+  mocks.revokeGitHubBridgesForInteractiveEnv.mockResolvedValue(undefined);
   mocks.getEnvLifecycleStub.mockReturnValue(createLifecycleStub());
+  mocks.getWorkspaceStub.mockImplementation((_env: unknown, name: string) => ({
+    readWorkspaceFile: vi.fn(async (path: string) => {
+      if (name !== "plan-store:repo-1" || path !== "/.tiller/repo/meta.json") {
+        return null;
+      }
+      return JSON.stringify(buildStoredRepoRecord("repo-1"));
+    }),
+  }));
 });
 
 describe("POST /api/envs/:slug/boot-progress", () => {
@@ -414,7 +529,7 @@ describe("POST /api/envs/:slug/boot-progress", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockPut.mock.calls.filter(([key]) => key === "my-env")).toHaveLength(2);
+    expect(mockPut.mock.calls.filter(([key]) => key === "my-env")).toHaveLength(1);
     expect(mockBroadcast).toHaveBeenCalledWith(
       expect.objectContaining({
         slug: "my-env",
@@ -483,7 +598,7 @@ describe("POST /api/envs/:slug/boot-progress", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockPut.mock.calls.filter(([key]) => key === "my-env")).toHaveLength(2);
+    expect(mockPut.mock.calls.filter(([key]) => key === "my-env")).toHaveLength(1);
     expect(broadcastCompleted).toBe(true);
   });
 });
@@ -567,6 +682,97 @@ describe("startup diagnostics routes", () => {
     });
   });
 
+  it("records startup diagnostic failures and re-projects the env", async () => {
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      backend: "cf",
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "starting",
+      lifecyclePhase: "starting",
+      lifecycleDesiredState: "running",
+    }));
+    lifecycleStub.reportStartupFailure.mockImplementation(async (failure: { message: string }) => {
+      await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+        slug: "my-env",
+        repoUrl: "https://github.com/test/repo",
+        repoId: "repo-1",
+        backend: "cf",
+        harness: "claude-code",
+        createdAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:05.000Z",
+        status: "failed",
+        lifecyclePhase: "failed",
+        lifecycleDesiredState: "running",
+        lifecycleInfraState: "stopped",
+        lifecycleRuntimeReady: false,
+        error: failure.message,
+        errorAt: "2024-01-01T00:00:05.000Z",
+      }));
+      return null;
+    });
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+
+    const put = vi.fn().mockResolvedValue(undefined);
+    const broadcast = vi.fn().mockResolvedValue(undefined);
+    const env = {
+      ENVS_KV: createKvStore({ "my-env": ENV_META }, put),
+      HUB: createHubBinding(broadcast),
+    };
+    const app = createTestApp();
+    const res = await app.request(
+      "/api/envs/my-env/startup-diagnostics",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Tiller-Lifecycle-Op-Id": "start-op-1",
+        },
+        body: JSON.stringify({
+          type: "failure",
+          stepId: "harness-launch",
+          message: "Harness exited before connecting",
+          detail: "exit code 1",
+          exitCode: 1,
+          signal: "SIGTERM",
+          logTails: { harness: "last lines" },
+        }),
+      },
+      env as any,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      slug: "my-env",
+      status: "failed",
+      error: "Harness exited before connecting",
+    });
+    expect(lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
+      opId: "start-op-1",
+      stepId: "harness-launch",
+      message: "Harness exited before connecting",
+      detail: "exit code 1",
+      at: null,
+      exitCode: 1,
+      signal: "SIGTERM",
+      logTails: { harness: "last lines" },
+    });
+    expect(put).toHaveBeenCalledWith(
+      "my-env",
+      expect.stringContaining("\"status\":\"failed\""),
+    );
+    expect(broadcast).toHaveBeenCalledWith(expect.objectContaining({
+      slug: "my-env",
+      status: "failed",
+      error: "Harness exited before connecting",
+    }));
+  });
+
   it("does not expose the deleted terminal route", async () => {
     const env = {
       ENVS_KV: createKvStore({ "my-env": ENV_META }),
@@ -583,7 +789,7 @@ describe("runner lifecycle callbacks", () => {
   it("marks a starting env infra-ready without completing startup", async () => {
     const lifecycleStub = createLifecycleStub();
     const noteInfraReady = vi.fn().mockImplementation(async () => {
-      await lifecycleStub.hydrateFromSummary({
+      await lifecycleStub.initializeMutableStateFromMeta({
         status: "starting",
         lifecyclePhase: "starting",
         lifecycleDesiredState: "running",
@@ -651,7 +857,7 @@ describe("runner lifecycle callbacks", () => {
   it("marks a starting env as running when runner-ready arrives", async () => {
     const lifecycleStub = createLifecycleStub();
     const noteRunnerStarted = vi.fn().mockImplementation(async () => {
-      await lifecycleStub.hydrateFromSummary({
+      await lifecycleStub.initializeMutableStateFromMeta({
         status: "running",
         lifecyclePhase: "running",
         lifecycleDesiredState: "running",
@@ -718,7 +924,7 @@ describe("runner lifecycle callbacks", () => {
   it("fails a starting env immediately when runner-stopped arrives", async () => {
     const lifecycleStub = createLifecycleStub();
     const noteRunnerStopped = vi.fn().mockImplementation(async () => {
-      await lifecycleStub.hydrateFromSummary({
+      await lifecycleStub.initializeMutableStateFromMeta({
         status: "failed",
         lifecyclePhase: "failed",
         lifecycleDesiredState: "running",
@@ -788,6 +994,113 @@ describe("runner lifecycle callbacks", () => {
     expect(put.mock.lastCall?.[1]).toContain("\"status\":\"failed\"");
     expect(put.mock.lastCall?.[1]).toContain("container exited with code 1");
   });
+
+  it("finalizes stopped runners by revoking interactive credentials and clearing stop sync metadata", async () => {
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      backend: "cf",
+      harness: "codex",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "stopping",
+      lifecyclePhase: "stopping",
+      lifecycleOpId: "stop-op-1",
+      lifecycleOperation: "stop",
+      lifecycleDesiredState: "stopped",
+      lifecycleInfraState: "ready",
+      lifecycleRuntimeReady: false,
+      workspaceDirty: true,
+      workspaceLastSyncedAt: "2024-01-01T00:00:03.000Z",
+    }));
+    const noteRunnerStopped = vi.fn().mockImplementation(async () => {
+      await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+        slug: "my-env",
+        repoUrl: "https://github.com/test/repo",
+        repoId: "repo-1",
+        backend: "cf",
+        harness: "codex",
+        createdAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:05.000Z",
+        status: "stopped",
+        lifecyclePhase: "stopped",
+        lifecycleOpId: "stop-op-1",
+        lifecycleOperation: "stop",
+        lifecycleDesiredState: "stopped",
+        lifecycleInfraState: "stopped",
+        lifecycleRuntimeReady: false,
+        workspaceDirty: true,
+        workspaceLastSyncedAt: "2024-01-01T00:00:03.000Z",
+      }));
+      return {
+        phase: "stopped",
+        activeOpId: "stop-op-1",
+        activeOperation: "stop",
+        desiredState: "stopped",
+        lastRunnerState: "stopped",
+        lastWorkspaceSyncedAckOpId: "stop-op-1",
+        infraState: "stopped",
+        runtimeReady: false,
+        lastError: null,
+        lastErrorAt: null,
+        updatedAt: "2024-01-01T00:00:05.000Z",
+      };
+    });
+    lifecycleStub.noteRunnerStopped = noteRunnerStopped;
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+
+    const put = vi.fn().mockResolvedValue(undefined);
+    const env = {
+      ENVS_KV: createKvStore({
+        "my-env": JSON.stringify(buildStoredEnvRecord({
+          slug: "my-env",
+          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
+          backend: "cf",
+          harness: "codex",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          status: "stopping",
+          lifecyclePhase: "stopping",
+          lifecycleOpId: "stop-op-1",
+          lifecycleOperation: "stop",
+          lifecycleDesiredState: "stopped",
+        })),
+      }, put),
+      HUB: createHubBinding(),
+    };
+    const app = createTestApp();
+    const res = await app.request(
+      "/api/envs/my-env/runner-stopped",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain",
+          "X-Tiller-Lifecycle-Op-Id": "stop-op-1",
+        },
+        body: "exit",
+      },
+      env as any,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      slug: "my-env",
+      status: "stopped",
+      error: "exit",
+    });
+    expect(noteRunnerStopped).toHaveBeenCalledWith("stop-op-1", "exit");
+    expect(mocks.revokeCodexGatewaySessionsForEnv).toHaveBeenCalledWith(env, "my-env");
+    expect(mocks.revokeGitHubBridgesForInteractiveEnv).toHaveBeenCalledWith(env, "my-env");
+    expect(lifecycleStub.clearStopWorkspaceSyncedMeta).toHaveBeenCalledTimes(1);
+    expect(put).toHaveBeenCalledWith(
+      "my-env",
+      expect.stringContaining("\"status\":\"stopped\""),
+    );
+  });
 });
 
 describe("resolveHubPublicUrl", () => {
@@ -810,10 +1123,10 @@ describe("resolveHubPublicUrl", () => {
   });
 });
 
-describe("env summary projection", () => {
-  it("GET /api/envs backfills definition-backed envs when the summary cache row is missing", async () => {
+describe("env authoritative reads", () => {
+  it("GET /api/envs reads definition-backed envs when the summary cache row is missing", async () => {
     mocks.getEnvLifecycleStub.mockReturnValue({
-      getMutableState: vi.fn().mockResolvedValue({
+      peekMutableState: vi.fn().mockResolvedValue({
         status: "running",
         lifecyclePhase: "running",
         lifecycleOpId: null,
@@ -848,7 +1161,7 @@ describe("env summary projection", () => {
         errorAt: null,
         updatedAt: "2024-01-01T00:00:01.000Z",
       }),
-      hydrateFromSummary: vi.fn(),
+      initializeMutableStateFromMeta: vi.fn(),
     });
 
     const app = createTestApp();
@@ -860,6 +1173,7 @@ describe("env summary projection", () => {
           "envdef:ghost-env": JSON.stringify({
             slug: "ghost-env",
             repoUrl: "https://github.com/test/repo",
+            repoId: "repo-1",
             backend: "cf",
             harness: "claude-code",
             startupPlanId: null,
@@ -883,10 +1197,10 @@ describe("env summary projection", () => {
     ]);
   });
 
-  it("GET /api/envs recovers definition-backed envs even when a stale summary cache row is malformed", async () => {
+  it("GET /api/envs ignores malformed summary cache rows", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     mocks.getEnvLifecycleStub.mockReturnValue({
-      getMutableState: vi.fn().mockResolvedValue({
+      peekMutableState: vi.fn().mockResolvedValue({
         status: "running",
         lifecyclePhase: "running",
         lifecycleOpId: null,
@@ -921,13 +1235,14 @@ describe("env summary projection", () => {
         errorAt: null,
         updatedAt: "2024-01-01T00:00:01.000Z",
       }),
-      hydrateFromSummary: vi.fn(),
+      initializeMutableStateFromMeta: vi.fn(),
     });
 
     const kvData = new Map<string, string>([
       ["ghost-env", JSON.stringify({
         slug: "ghost-env",
         repoUrl: "https://github.com/test/repo",
+        repoId: "repo-1",
         backend: "cf",
         harness: "claude-code",
         createdAt: "2024-01-01T00:00:00.000Z",
@@ -937,11 +1252,16 @@ describe("env summary projection", () => {
       ["envdef:ghost-env", JSON.stringify({
         slug: "ghost-env",
         repoUrl: "https://github.com/test/repo",
+        repoId: "repo-1",
         backend: "cf",
         harness: "claude-code",
         startupPlanId: null,
         branchName: "env/ghost-env",
         createdAt: "2024-01-01T00:00:00.000Z",
+      })],
+      ["repo:repo-1", JSON.stringify({
+        repoId: "repo-1",
+        updatedAt: "2024-01-01T00:00:00.000Z",
       })],
     ]);
 
@@ -952,11 +1272,14 @@ describe("env summary projection", () => {
       {
         ENVS_KV: {
           get: vi.fn().mockImplementation(async (key: string) => kvData.get(key) ?? null),
-          list: vi.fn().mockResolvedValue({
-            keys: [{ name: "ghost-env" }, { name: "envdef:ghost-env" }],
+          list: vi.fn().mockImplementation(async ({ prefix }: { prefix?: string } = {}) => ({
+            keys: Array.from(kvData.keys())
+              .filter((key) => key.startsWith(prefix ?? ""))
+              .sort()
+              .map((name) => ({ name })),
             list_complete: true,
             cursor: undefined,
-          }),
+          })),
           put: vi.fn().mockImplementation(async (key: string, value: string) => {
             kvData.set(key, value);
           }),
@@ -978,16 +1301,14 @@ describe("env summary projection", () => {
         branchName: "env/ghost-env",
       }),
     ]);
-    expect(warn).toHaveBeenCalledWith(
-      "[repo-store] Skipping invalid env summary cache row ghost-env:",
-      expect.stringContaining("missing explicit environment schema fields"),
-    );
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it("GET /api/envs returns healthy envs even when another env's definition is malformed", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     mocks.getEnvLifecycleStub.mockReturnValue({
-      getMutableState: vi.fn().mockResolvedValue({
+      peekMutableState: vi.fn().mockResolvedValue({
         status: "running",
         lifecyclePhase: "running",
         lifecycleOpId: null,
@@ -1022,13 +1343,14 @@ describe("env summary projection", () => {
         errorAt: null,
         updatedAt: "2024-01-01T00:00:01.000Z",
       }),
-      hydrateFromSummary: vi.fn(),
+      initializeMutableStateFromMeta: vi.fn(),
     });
 
     const kvData = new Map<string, string>([
       ["envdef:good-env", JSON.stringify({
         slug: "good-env",
         repoUrl: "https://github.com/test/repo",
+        repoId: "repo-1",
         backend: "cf",
         harness: "claude-code",
         startupPlanId: null,
@@ -1042,6 +1364,10 @@ describe("env summary projection", () => {
         backend: "cf",
         harness: "claude-code",
         createdAt: "2024-01-01T00:00:00.000Z",
+      })],
+      ["repo:repo-1", JSON.stringify({
+        repoId: "repo-1",
+        updatedAt: "2024-01-01T00:00:00.000Z",
       })],
     ]);
 
@@ -1075,9 +1401,10 @@ describe("env summary projection", () => {
     const body = await res.json() as Array<{ slug: string }>;
     expect(body.map((entry) => entry.slug)).toEqual(["good-env"]);
     expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining("[envs] Skipping env bad-env during backfill:"),
+      "[envs] Skipping invalid env bad-env:",
       expect.stringContaining("missing explicit environment schema fields"),
     );
+    warn.mockRestore();
   });
 
   it("GET /api/envs/:slug returns the same shape used for websocket env upserts", async () => {
@@ -1091,6 +1418,9 @@ describe("env summary projection", () => {
       updatedAt: "2024-01-01T00:00:00.000Z",
       status: "running",
     };
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord(storedMeta));
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
     const env = {
       LOCAL_DEV_ONLY_BACKEND: undefined,
       ENVS_KV: createKvStore({ "my-env": JSON.stringify(storedMeta) }),
@@ -1188,7 +1518,7 @@ describe("host development helpers", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
           backend: "cf",
           harness: "claude-code",
         }),
@@ -1204,6 +1534,134 @@ describe("host development helpers", () => {
 
 });
 
+describe("DELETE /api/envs/:slug", () => {
+  it("marks the env deleting, revokes interactive credentials, and schedules destroy", async () => {
+    const put = vi.fn().mockResolvedValue(undefined);
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      backend: "cf",
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "running",
+      error: "old failure",
+      errorAt: "2024-01-01T00:00:00.000Z",
+    }));
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const env = {
+      ENVS_KV: createKvStore({
+        "my-env": JSON.stringify(buildStoredEnvRecord({
+          slug: "my-env",
+          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
+          backend: "cf",
+          harness: "claude-code",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          status: "running",
+          error: "old failure",
+          errorAt: "2024-01-01T00:00:00.000Z",
+        })),
+      }, put),
+      HUB: createHubBinding(),
+    };
+    const app = createTestApp();
+    const executionCtx = createExecutionCtx();
+
+    const res = await app.request(
+      "/api/envs/my-env",
+      { method: "DELETE" },
+      env as any,
+      executionCtx as any,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      slug: "my-env",
+      status: "deleting",
+      message: "Environment deletion started",
+    });
+    expect(mocks.revokeCodexGatewaySessionsForEnv).toHaveBeenCalledWith(env, "my-env");
+    expect(mocks.revokeGitHubBridgesForInteractiveEnv).toHaveBeenCalledWith(env, "my-env");
+    expect(lifecycleStub.clearError).toHaveBeenCalledTimes(1);
+    expect(lifecycleStub.setStatus).toHaveBeenCalledWith("deleting", { clearLifecycle: true });
+    expect(put).toHaveBeenCalledWith(
+      "my-env",
+      expect.stringContaining("\"status\":\"deleting\""),
+    );
+    const deletingProjectionCall = put.mock.calls.find(([, value]) =>
+      typeof value === "string" && value.includes("\"status\":\"deleting\"")
+    );
+    expect(deletingProjectionCall?.[1]).not.toContain("old failure");
+    expect(executionCtx.waitUntil).toHaveBeenCalledTimes(1);
+    await executionCtx.waitUntil.mock.calls[0][0];
+    expect(mocks.destroyEnv).toHaveBeenCalledWith(
+      env,
+      expect.objectContaining({ slug: "my-env" }),
+      expect.objectContaining({
+        broadcastEnvRemove: expect.any(Function),
+      }),
+    );
+    expect(put.mock.invocationCallOrder[0]).toBeLessThan(mocks.destroyEnv.mock.invocationCallOrder[0]);
+  });
+
+  it("marks lifecycle failed and re-projects when background destroy fails", async () => {
+    const put = vi.fn().mockResolvedValue(undefined);
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      backend: "cf",
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "running",
+    }));
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    mocks.destroyEnv.mockRejectedValueOnce(new Error("destroy failed"));
+    const env = {
+      ENVS_KV: createKvStore({
+        "my-env": JSON.stringify(buildStoredEnvRecord({
+          slug: "my-env",
+          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
+          backend: "cf",
+          harness: "claude-code",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          status: "running",
+        })),
+      }, put),
+      HUB: createHubBinding(),
+    };
+    const app = createTestApp();
+    const executionCtx = createExecutionCtx();
+
+    const res = await app.request(
+      "/api/envs/my-env",
+      { method: "DELETE" },
+      env as any,
+      executionCtx as any,
+    );
+
+    expect(res.status).toBe(200);
+    expect(executionCtx.waitUntil).toHaveBeenCalledTimes(1);
+    await executionCtx.waitUntil.mock.calls[0][0];
+    expect(lifecycleStub.setStatus).toHaveBeenCalledWith("failed", { clearLifecycle: true });
+    expect(lifecycleStub.setError).toHaveBeenCalledWith("destroy failed");
+    expect(put).toHaveBeenCalledWith(
+      "my-env",
+      expect.stringContaining("\"status\":\"failed\""),
+    );
+    expect(put.mock.lastCall?.[1]).toContain("destroy failed");
+  });
+});
+
 describe("host backend offline handling", () => {
   it("rejects env creation requests that omit backend", async () => {
     const app = createTestApp();
@@ -1213,7 +1671,7 @@ describe("host backend offline handling", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
         }),
       },
       {} as any,
@@ -1233,7 +1691,7 @@ describe("host backend offline handling", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
           backend: "cf",
         }),
       },
@@ -1254,7 +1712,7 @@ describe("host backend offline handling", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
           backend: "host",
           harness: "claude-code",
         }),
@@ -1264,7 +1722,7 @@ describe("host backend offline handling", () => {
 
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining("Tiller Host is offline"),
+      error: expect.stringContaining("Tiller Self Host is offline"),
     });
   });
 
@@ -1276,7 +1734,7 @@ describe("host backend offline handling", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: "https://github.com/test/repo",
+          repoId: "repo-1",
           backend: "host",
           harness: "claude-code",
         }),
@@ -1298,7 +1756,7 @@ describe("host backend offline handling", () => {
 
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining("Tiller Host is offline"),
+      error: expect.stringContaining("Tiller Self Host is offline"),
     });
   });
 
@@ -1326,11 +1784,23 @@ describe("host backend offline handling", () => {
 
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining("Tiller Host is offline"),
+      error: expect.stringContaining("Tiller Self Host is offline"),
     });
   });
 
   it("rejects starting a host env when its assigned host is offline, even if another host is registered", async () => {
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      runnerMachineId: "host-1",
+      backend: "host",
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "stopped",
+    }));
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
     const app = createTestApp();
     const res = await app.request(
       "/api/envs/my-env/start",
@@ -1385,7 +1855,7 @@ describe("host backend offline handling", () => {
 
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining("Tiller Host is offline"),
+      error: expect.stringContaining("Tiller Self Host is offline"),
     });
   });
 
@@ -1413,7 +1883,7 @@ describe("host backend offline handling", () => {
 
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining("Tiller Host is offline"),
+      error: expect.stringContaining("Tiller Self Host is offline"),
     });
   });
 
@@ -1441,7 +1911,7 @@ describe("host backend offline handling", () => {
 
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining("Tiller Host is offline"),
+      error: expect.stringContaining("Tiller Self Host is offline"),
     });
   });
 });
@@ -1449,7 +1919,24 @@ describe("host backend offline handling", () => {
 describe("POST /api/envs/:slug/harness-failed", () => {
   it("fails a start in progress when the lead harness crashes", async () => {
     const lifecycleStub = createLifecycleStub();
-    const noteRunnerStartFailed = vi.fn().mockResolvedValue({
+    await lifecycleStub.initializeMutableStateFromMeta({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      runnerMachineId: "my-env",
+      backend: "host",
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "starting",
+      lifecyclePhase: "starting",
+      lifecycleDesiredState: "running",
+      ...createInitialEnvScmState({ slug: "my-env" }),
+    });
+    const noteRunnerStartFailed = vi.fn().mockImplementation(async (_opId: string | null, message: string) => {
+      await lifecycleStub.setStatus("failed");
+      await lifecycleStub.setError(message);
+      return {
       phase: "failed",
       activeOpId: "start-op-1",
       activeOperation: "start",
@@ -1459,6 +1946,7 @@ describe("POST /api/envs/:slug/harness-failed", () => {
       lastError: "tiller-harness exited with code 1",
       lastErrorAt: "2026-04-12T00:00:00.000Z",
       updatedAt: "2026-04-12T00:00:00.000Z",
+      };
     });
     lifecycleStub.noteRunnerStartFailed = noteRunnerStartFailed;
     mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
@@ -1507,11 +1995,22 @@ describe("POST /api/envs/:slug/harness-failed", () => {
 
   it("replaces the generic startup-exit error when the harness failure arrives late", async () => {
     const lifecycleStub = createLifecycleStub();
-    const setError = vi.fn().mockResolvedValue({
-      ...lifecycleStub.getMutableState(),
-      error: "tiller-harness exited with code 1",
+    await lifecycleStub.initializeMutableStateFromMeta({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      runnerMachineId: "my-env",
+      backend: "host",
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "failed",
+      lifecyclePhase: "failed",
+      lifecycleDesiredState: "running",
+      error: "Container exited before the environment finished starting.",
+      ...createInitialEnvScmState({ slug: "my-env" }),
     });
-    lifecycleStub.setError = setError;
+    const setError = lifecycleStub.setError;
     mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
 
     const kv = createKvStore({

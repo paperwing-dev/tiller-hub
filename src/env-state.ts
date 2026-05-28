@@ -16,8 +16,15 @@ function assertExplicitEnvSummary(env: Pick<EnvMeta, "slug" | "status" | "update
   }
 }
 
-function assertExplicitRepoSummary(repo: Pick<RepoMeta, "repoId" | "gitStatus" | "updatedAt">): void {
-  if (!isRepoGitStatus(repo.gitStatus) || typeof repo.updatedAt !== "string") {
+function assertExplicitRepoSummary(repo: Pick<RepoMeta, "repoId" | "gitStatus" | "updatedAt" | "githubInstallationId" | "githubFullName">): void {
+  if (
+    !isRepoGitStatus(repo.gitStatus) ||
+    typeof repo.updatedAt !== "string" ||
+    !Number.isInteger(repo.githubInstallationId) ||
+    repo.githubInstallationId <= 0 ||
+    typeof repo.githubFullName !== "string" ||
+    !repo.githubFullName
+  ) {
     throw new Error(`Repo summary is missing explicit core fields for ${repo.repoId}`);
   }
 }

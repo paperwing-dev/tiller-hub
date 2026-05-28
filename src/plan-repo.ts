@@ -1,5 +1,9 @@
-export function getPlanChatName(repoId: string): string {
-  return `plan:${repoId}`;
+export function getPlanChatName(repoId: string, planArtifactId: string): string {
+  return `plan-writer:${repoId}:${planArtifactId}`;
+}
+
+export function getReviewerChatName(repoId: string, threadId: string): string {
+  return `reviewer-chat:${repoId}:${threadId}`;
 }
 
 export function getRepoLabel(repoUrl: string): string {

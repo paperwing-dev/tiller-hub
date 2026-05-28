@@ -8,10 +8,11 @@ import {
 } from "../env/container-auth";
 import type { Env } from "../types";
 
-const { getOrCreateSecret } = vi.hoisted(() => ({
+const { getOrCreateSecret, getValidOpenAIAuth } = vi.hoisted(() => ({
   getOrCreateSecret: vi.fn(async (env: Record<string, unknown>, key: string, createValue: () => string) => {
     return env[key] || createValue();
   }),
+  getValidOpenAIAuth: vi.fn(),
 }));
 
 // Mock the config module so getSecret falls through to env values
@@ -23,6 +24,10 @@ vi.mock("../setup/config", () => ({
   getOrCreateSecret,
 }));
 
+vi.mock("../openai-auth", () => ({
+  getValidOpenAIAuth,
+}));
+
 function mockEnv(overrides: Record<string, unknown>): Env {
   return overrides as unknown as Env;
 }
@@ -32,6 +37,11 @@ let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   fetchMock = vi.fn(async () => new Response("{}", { status: 401 }));
   vi.stubGlobal("fetch", fetchMock);
+  getValidOpenAIAuth.mockResolvedValue({
+    access_token: "chatgpt-access",
+    account_id: "acct-123",
+    expires_at: Date.now() + 3600_000,
+  });
 });
 
 afterEach(() => {
@@ -200,25 +210,26 @@ describe("resolveCodexContainerAuth", () => {
         gatewayRoute: {
           kind: "gateway-subscription",
           gatewayUrl: "https://tiller-gateway.example.com",
+          machineId: "machine-123",
           providerBaseUrl: "https://tiller-gateway.example.com/v1",
           responsesUrl: "https://tiller-gateway.example.com/codex/responses",
-          accessToken: "gateway-token",
-          accountId: "acct-123",
+          codexRouteStatus: "available",
         },
+        gatewaySessionToken: "session-token",
       }),
     ).resolves.toEqual({
-      resolvedAuthMode: "chatgpt",
+      authPreference: "auto",
+      resolvedAuthMode: "subscription",
       modelRoute: "gateway-subscription",
       envVars: {
         TILLER_CODEX_GATEWAY_BASE_URL: "https://tiller-gateway.example.com/v1",
-        TILLER_CODEX_GATEWAY_ACCESS_TOKEN: "gateway-token",
-        TILLER_CODEX_GATEWAY_ACCOUNT_ID: "acct-123",
+        TILLER_CODEX_GATEWAY_SESSION_TOKEN: "session-token",
       },
     });
   });
 
   it("requires OPENAI_API_KEY for Cloudflare containers", async () => {
-    await expect(resolveCodexContainerAuth(mockEnv({}))).rejects.toThrow("OpenAI API key");
+    await expect(resolveCodexContainerAuth(mockEnv({}))).rejects.toThrow("API key");
   });
 
   it("returns host gateway env vars when a host route is available", async () => {
@@ -227,19 +238,20 @@ describe("resolveCodexContainerAuth", () => {
         backend: "host",
         gatewayRoute: {
           kind: "host-gateway",
+          machineId: "machine-123",
           providerBaseUrl: "http://host.docker.internal:8788/v1",
           responsesUrl: "http://host.docker.internal:8788/codex/responses",
-          accessToken: "gateway-token",
-          accountId: "acct-123",
+          codexRouteStatus: "available",
         },
+        gatewaySessionToken: "session-token",
       }),
     ).resolves.toEqual({
-      resolvedAuthMode: "chatgpt",
+      authPreference: "auto",
+      resolvedAuthMode: "subscription",
       modelRoute: "host-gateway",
       envVars: {
         TILLER_CODEX_GATEWAY_BASE_URL: "http://host.docker.internal:8788/v1",
-        TILLER_CODEX_GATEWAY_ACCESS_TOKEN: "gateway-token",
-        TILLER_CODEX_GATEWAY_ACCOUNT_ID: "acct-123",
+        TILLER_CODEX_GATEWAY_SESSION_TOKEN: "session-token",
       },
     });
   });
@@ -249,13 +261,15 @@ describe("resolveCodexContainerAuth", () => {
       resolveCodexContainerAuth(mockEnv({}), {
         backend: "host",
       }),
-    ).rejects.toThrow("connected Tiller Host gateway");
+    ).rejects.toThrow("connected Subscription Gateway");
   });
 
   it("returns OPENAI_API_KEY when configured", async () => {
     await expect(resolveCodexContainerAuth(mockEnv({ OPENAI_API_KEY: "openai-key" }))).resolves.toEqual({
-      resolvedAuthMode: "openai-api",
+      authPreference: "auto",
+      resolvedAuthMode: "api-key",
       modelRoute: "api-fallback",
+      authWarning: "Subscription gateway route is unavailable; using the API key.",
       envVars: { OPENAI_API_KEY: "openai-key" },
     });
   });
@@ -268,21 +282,89 @@ describe("resolveCodexContainerAuth", () => {
           backend: "host",
           gatewayRoute: {
             kind: "host-gateway",
+            machineId: "machine-123",
             providerBaseUrl: "http://host.docker.internal:8788/v1",
             responsesUrl: "http://host.docker.internal:8788/codex/responses",
-            accessToken: "gateway-token",
-            accountId: "acct-123",
+            codexRouteStatus: "available",
           },
+          gatewaySessionToken: "session-token",
         },
       ),
     ).resolves.toEqual({
-      resolvedAuthMode: "chatgpt",
+      authPreference: "auto",
+      resolvedAuthMode: "subscription",
       modelRoute: "host-gateway",
       envVars: {
         TILLER_CODEX_GATEWAY_BASE_URL: "http://host.docker.internal:8788/v1",
-        TILLER_CODEX_GATEWAY_ACCESS_TOKEN: "gateway-token",
-        TILLER_CODEX_GATEWAY_ACCOUNT_ID: "acct-123",
+        TILLER_CODEX_GATEWAY_SESSION_TOKEN: "session-token",
       },
+    });
+  });
+
+  it("falls back to OPENAI_API_KEY in auto mode when the imported Codex login needs re-import", async () => {
+    getValidOpenAIAuth.mockRejectedValueOnce(new Error("refresh failed"));
+
+    await expect(
+      resolveCodexContainerAuth(
+        mockEnv({ OPENAI_API_KEY: "openai-key" }),
+        {
+          gatewayRoute: {
+            kind: "gateway-subscription",
+            gatewayUrl: "https://tiller-gateway.example.com",
+            machineId: "machine-123",
+            providerBaseUrl: "https://tiller-gateway.example.com/v1",
+            responsesUrl: "https://tiller-gateway.example.com/codex/responses",
+            codexRouteStatus: "available",
+          },
+          gatewaySessionToken: "session-token",
+        },
+      ),
+    ).resolves.toEqual({
+      authPreference: "auto",
+      resolvedAuthMode: "api-key",
+      modelRoute: "api-fallback",
+      authWarning: "Subscription auth needs reconnect; using the API key.",
+      envVars: { OPENAI_API_KEY: "openai-key" },
+    });
+  });
+
+  it("fails subscription preference instead of falling back to OPENAI_API_KEY", async () => {
+    await expect(
+      resolveCodexContainerAuth(
+        mockEnv({ OPENAI_API_KEY: "openai-key" }),
+        {
+          authPreference: "subscription",
+          gatewayRoute: {
+            kind: "unavailable",
+            reason: "gateway offline",
+            codexRouteStatus: "gateway_offline",
+          },
+        },
+      ),
+    ).rejects.toThrow("Codex subscription auth requested");
+  });
+
+  it("uses only OPENAI_API_KEY in explicit api-key preference", async () => {
+    await expect(
+      resolveCodexContainerAuth(
+        mockEnv({ OPENAI_API_KEY: "openai-key" }),
+        {
+          authPreference: "api-key",
+          gatewayRoute: {
+            kind: "host-gateway",
+            machineId: "machine-123",
+            providerBaseUrl: "http://host.docker.internal:8788/v1",
+            responsesUrl: "http://host.docker.internal:8788/codex/responses",
+            codexRouteStatus: "available",
+          },
+          gatewaySessionToken: "session-token",
+        },
+      ),
+    ).resolves.toEqual({
+      authPreference: "api-key",
+      resolvedAuthMode: "api-key",
+      modelRoute: "api-fallback",
+      envVars: { OPENAI_API_KEY: "openai-key" },
     });
   });
 });

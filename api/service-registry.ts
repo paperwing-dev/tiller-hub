@@ -29,12 +29,16 @@ function normalizeHostService(service: HostServiceRegistration | null | undefine
   const gatewayPort = Number.isFinite(service.gatewayPort) ? Number(service.gatewayPort) : 0;
   if (!machineId) return null;
   const gatewayUrl = normalizeServiceUrl(service.gatewayUrl);
+  const gatewayServiceTokenHash = service.gatewayServiceTokenHash?.trim();
+  const codexGatewayAuth = service.codexGatewayAuth === "session-token" ? service.codexGatewayAuth : undefined;
 
   return {
     ...(service as HostServiceRegistration),
     machineId,
     ...(gatewayPort > 0 ? { gatewayPort } : {}),
     ...(gatewayUrl ? { gatewayUrl } : {}),
+    ...(gatewayServiceTokenHash ? { gatewayServiceTokenHash } : {}),
+    ...(codexGatewayAuth ? { codexGatewayAuth } : {}),
   };
 }
 

@@ -159,7 +159,7 @@ export class ThreadDO extends DurableObject<Env> {
   }
 
   getThread(): Thread | null {
-    const row = this.db.exec("SELECT * FROM threads LIMIT 1").toArray()[0] as ThreadRow | undefined;
+    const row = this.db.exec("SELECT * FROM threads LIMIT 1").toArray()[0] as unknown as ThreadRow | undefined;
     return row ? this.parseThreadRow(row) : null;
   }
 
@@ -188,7 +188,7 @@ export class ThreadDO extends DurableObject<Env> {
       createdAt,
     );
 
-    const row = this.db.exec("SELECT * FROM messages WHERE id = ?", id).toArray()[0] as ThreadMessageRow | undefined;
+    const row = this.db.exec("SELECT * FROM messages WHERE id = ?", id).toArray()[0] as unknown as ThreadMessageRow | undefined;
     if (!row) {
       throw new Error(`Failed to append message ${id}`);
     }
@@ -206,7 +206,7 @@ export class ThreadDO extends DurableObject<Env> {
         thread.id,
         filter.afterSeq,
         limit,
-      ).toArray() as ThreadMessageRow[];
+      ).toArray() as unknown as ThreadMessageRow[];
       return rows.map((row) => this.parseMessageRow(row));
     }
 
@@ -216,7 +216,7 @@ export class ThreadDO extends DurableObject<Env> {
         thread.id,
         filter.beforeSeq,
         limit,
-      ).toArray() as ThreadMessageRow[];
+      ).toArray() as unknown as ThreadMessageRow[];
       return rows.map((row) => this.parseMessageRow(row));
     }
 
@@ -224,7 +224,7 @@ export class ThreadDO extends DurableObject<Env> {
       `SELECT * FROM messages WHERE thread_id = ? ORDER BY seq DESC LIMIT ?`,
       thread.id,
       limit,
-    ).toArray() as ThreadMessageRow[];
+    ).toArray() as unknown as ThreadMessageRow[];
     return rows.map((row) => this.parseMessageRow(row));
   }
 }

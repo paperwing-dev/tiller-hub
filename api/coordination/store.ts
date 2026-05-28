@@ -1,6 +1,6 @@
 import type { RepoMeta } from "../types";
 import type { ArtifactStoreDO } from "./artifact-store-do";
-import { asPlanArtifact, asReviewArtifact, getApprovedPlanRef } from "./planning";
+import { asPlanArtifact, asReviewArtifact } from "./planning";
 import type {
   Artifact,
   ArtifactRef,
@@ -15,9 +15,13 @@ export async function loadRepoArtifacts(
   repo: Pick<RepoMeta, "repoId">,
   artifactStore: Pick<ArtifactStoreDO, "listArtifacts" | "listRefs">,
 ): Promise<{ artifacts: Artifact[]; refs: ArtifactRef[] }> {
+  const [artifacts, refs] = await Promise.all([
+    artifactStore.listArtifacts({ limit: 500 }),
+    artifactStore.listRefs(),
+  ]);
   return {
-    artifacts: artifactStore.listArtifacts({ limit: 500 }),
-    refs: artifactStore.listRefs(),
+    artifacts,
+    refs,
   };
 }
 
@@ -75,10 +79,4 @@ export function getPlanArtifactById(artifacts: Artifact[], id: string): PlanArti
 
 export function getReviewArtifactById(artifacts: Artifact[], id: string): ReviewArtifact | null {
   return asReviewArtifact(artifacts.find((artifact) => artifact.id === id) ?? null);
-}
-
-export function getApprovedPlanArtifact(artifacts: Artifact[], refs: ArtifactRef[]): PlanArtifact | null {
-  const approvedRef = getApprovedPlanRef(refs);
-  if (!approvedRef) return null;
-  return getPlanArtifactById(artifacts, approvedRef.artifactId);
 }

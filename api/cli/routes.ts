@@ -1,21 +1,9 @@
 import { Hono, type Context } from "hono";
 import { resolveManagedMachineHostStatus } from "../machine-hosts";
-import { getSecret } from "../setup/config";
 import { resolveProtectionState } from "../protection";
 import type { HonoEnv } from "../types";
 
 const NO_STORE_HEADER = "no-store";
-const DEFAULT_GATEWAY_TARGET_PORT = 8788;
-
-function trimOptional(value: string | undefined): string | null {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : null;
-}
-
-function parseTargetPort(value: string | undefined): number {
-  const parsed = Number.parseInt(value?.trim() ?? "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_GATEWAY_TARGET_PORT;
-}
 
 function setNoStore(c: Context<HonoEnv>): void {
   c.header("Cache-Control", NO_STORE_HEADER);
@@ -270,7 +258,7 @@ function renderCliBootstrapPage(): string {
             setState(
               "error",
               body.error || "Hub connection setup failed",
-              body.hint || "Open Settings → Publish & Protect, then retry from the CLI.",
+              body.hint || "Use Protect Hub or rerun Self Host setup from the protected workers.dev hub URL, then retry from the CLI.",
             );
             return;
           }
@@ -344,70 +332,17 @@ cliRoutes.get("/api/cli/bootstrap-config", async (c) => {
     });
   }
 
-  const clientId = (await getSecret(c.env, "CF_ACCESS_CLIENT_ID"))?.trim() ?? "";
-  const clientSecret = (await getSecret(c.env, "CF_ACCESS_CLIENT_SECRET"))?.trim() ?? "";
-
-  if (!clientId || !clientSecret) {
-    return c.json(
-      {
-        error: "This protected hub does not currently have a stored CLI service token.",
-        code: "missing_service_token" as const,
-        hint: "Open Settings → Publish & Protect and reissue the service token, then run `tiller` again.",
-      },
-      409,
-    );
-  }
-
-  return c.json({
-    hubUrl: protection.hubUrl,
-    protectionMode: "cf-access" as const,
-    clientId,
-    clientSecret,
-    gatewayHostname: managedMachineHosts.gatewayHostname,
-  });
-});
-
-cliRoutes.get("/api/cli/host-bootstrap", async (c) => {
-  const protection = await resolveProtectionState(c.env, c.req.url);
-  const managedMachineHosts = await resolveManagedMachineHostStatus(c.env, protection);
-  setNoStore(c);
-
-  if (!managedMachineHosts.gatewaySupportAvailable || !managedMachineHosts.gatewayHostname) {
-    return c.json(
-      {
-        error: managedMachineHosts.gatewaySupportReason
-          ?? "The protected Tiller gateway is not provisioned yet.",
-        code: "gateway_unavailable" as const,
-        hint: "Open Settings → Publish & Protect and finish gateway provisioning, then run `tiller host setup` again.",
-      },
-      409,
-    );
-  }
-
-  const tunnelId = trimOptional(await getSecret(c.env, "TILLER_GATEWAY_TUNNEL_ID"));
-  const tunnelToken = trimOptional(await getSecret(c.env, "TILLER_GATEWAY_TUNNEL_TOKEN"));
-  const tunnelName =
-    trimOptional(await getSecret(c.env, "TILLER_GATEWAY_TUNNEL_NAME")) ?? "tiller-gateway";
-  const gatewayTargetPort = parseTargetPort(await getSecret(c.env, "TILLER_GATEWAY_TUNNEL_TARGET_PORT"));
-
-  if (!tunnelId || !tunnelToken) {
-    return c.json(
-      {
-        error: "This protected hub does not currently have a stored gateway tunnel bootstrap token.",
-        code: "missing_gateway_tunnel" as const,
-        hint: "Open Settings → Publish & Protect and re-run protected machine-host provisioning, then retry from the CLI.",
-      },
-      409,
-    );
-  }
-
-  return c.json({
-    gatewayHostname: managedMachineHosts.gatewayHostname,
-    gatewayTunnelId: tunnelId,
-    gatewayTunnelName: tunnelName,
-    gatewayTunnelToken: tunnelToken,
-    gatewayTargetPort,
-  });
+  return c.json(
+    {
+      error: "Protected hubs no longer expose Cloudflare Access service-token secrets through generic CLI bootstrap.",
+      code: "generic_secret_bootstrap_disabled" as const,
+      hint: "Use `tiller host setup --hub-url <workersDevHubUrl>` for the one-time Self Host handoff, or initialize CLI Access credentials explicitly.",
+      hubUrl: protection.hubUrl,
+      protectionMode: "cf-access" as const,
+      gatewayHostname: managedMachineHosts.gatewayHostname,
+    },
+    410,
+  );
 });
 
 cliRoutes.get("/cli/bootstrap", (c) => {

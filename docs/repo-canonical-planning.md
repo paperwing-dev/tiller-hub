@@ -41,7 +41,8 @@ That is intentional. Uncommitted env work is private to the env until it is expl
 
 ## Authoritative state
 
-The canonical source of truth is the repo workspace Durable Object keyed by normalized repo URL.
+The canonical source of truth is the repo workspace Durable Object keyed by the
+GitHub repository id selected through the configured Tiller GitHub App.
 
 We reuse the existing repo plan workspace rather than creating a second repo-level file tree. The canonical repo workspace now contains both:
 
@@ -66,6 +67,13 @@ Each repo has:
 - `currentRevisionId`
 - timestamps
 - last commit-back provenance
+
+Repos are created only from `GET /api/github/repositories` selections. The hub
+revalidates `repositoryId`, `installationId`, and `fullName` against the
+configured App installation before it writes metadata or initializes the
+workspace. `POST /api/envs` accepts `repoId`; legacy URL-only env definitions
+fail closed for repository-backed flows until recreated from a selected App
+repo.
 
 Each revision records:
 

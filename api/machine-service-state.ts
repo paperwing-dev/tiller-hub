@@ -14,15 +14,21 @@ function parseHostServiceState(value: Record<string, unknown>): MachineServiceSt
   const gatewayTunnelType = value.gatewayTunnelType === "quick" || value.gatewayTunnelType === "named"
     ? value.gatewayTunnelType
     : undefined;
+  const gatewayServiceTokenHash = typeof value.gatewayServiceTokenHash === "string" && value.gatewayServiceTokenHash.trim()
+    ? value.gatewayServiceTokenHash.trim()
+    : undefined;
+  const codexGatewayAuth = value.codexGatewayAuth === "session-token" ? value.codexGatewayAuth : undefined;
 
   return {
     machineId: typeof value.machineId === "string" ? value.machineId : "",
     connectedAt: typeof value.connectedAt === "string" ? value.connectedAt : "",
     dockerAvailable: value.dockerAvailable === true,
     codexSubscription: value.codexSubscription === true,
+    ...(codexGatewayAuth ? { codexGatewayAuth } : {}),
     claudeSubscription: value.claudeSubscription === true,
     ...(gatewayPort !== undefined ? { gatewayPort } : {}),
     ...(gatewayUrl ? { gatewayUrl } : {}),
+    ...(gatewayServiceTokenHash ? { gatewayServiceTokenHash } : {}),
     ...(gatewayTunnelType ? { gatewayTunnelType } : {}),
     transport: "session",
   };

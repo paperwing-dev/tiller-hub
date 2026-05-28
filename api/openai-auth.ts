@@ -1,5 +1,5 @@
 import { rpcError } from "./errors";
-import type { Env } from "./types";
+import type { ChatGPTAuthStatus, Env } from "./types";
 
 const OPENAI_TOKENS_KEY = "openai:oauth:tokens";
 const OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -117,6 +117,11 @@ export async function seedTokens(env: Env, input: SeedOpenAIAuthInput): Promise<
   return stored;
 }
 
+export async function validateAndSeedTokens(env: Env, input: SeedOpenAIAuthInput): Promise<StoredOpenAIAuth> {
+  const candidate = buildStoredTokens(input);
+  return await refreshAccessToken(env, candidate);
+}
+
 export async function refreshAccessToken(
   env: Env,
   currentAuth?: StoredOpenAIAuth,
@@ -180,12 +185,41 @@ export async function getValidOpenAIAuth(env: Env): Promise<StoredOpenAIAuth> {
 
 export async function getStatus(
   env: Env,
-): Promise<{ authenticated: boolean; expires_at?: number; account_id?: string }> {
+): Promise<{ authenticated: boolean; status: ChatGPTAuthStatus; expires_at?: number; account_id?: string }> {
   const stored = await readStoredTokens(env);
-  if (!stored) return { authenticated: false };
+  if (!stored) return { authenticated: false, status: "missing" };
+
+  if (stored.expires_at <= Date.now() + REFRESH_BUFFER_MS) {
+    if (refreshPromise) {
+      return {
+        authenticated: true,
+        status: "refreshing",
+        expires_at: stored.expires_at,
+        account_id: stored.account_id,
+      };
+    }
+
+    try {
+      const refreshed = await refreshAccessToken(env, stored);
+      return {
+        authenticated: true,
+        status: "connected",
+        expires_at: refreshed.expires_at,
+        account_id: refreshed.account_id,
+      };
+    } catch {
+      return {
+        authenticated: false,
+        status: "needs_reconnect",
+        expires_at: stored.expires_at,
+        account_id: stored.account_id,
+      };
+    }
+  }
 
   return {
     authenticated: true,
+    status: "connected",
     expires_at: stored.expires_at,
     account_id: stored.account_id,
   };

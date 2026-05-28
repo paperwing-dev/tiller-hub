@@ -16,15 +16,15 @@ const repo = {
 
 describe("getInitialEnvBackendSelection", () => {
   it("defaults to host when local development is pinned to the host backend", () => {
-    expect(getInitialEnvBackendSelection({ isLocalDev: true, hostConnected: false })).toBe("host");
+    expect(getInitialEnvBackendSelection({ isLocalDev: true, deploymentMode: "hosted", hostConnected: false })).toBe("host");
   });
 
-  it("defaults to host when a Tiller Host is currently connected", () => {
-    expect(getInitialEnvBackendSelection({ isLocalDev: false, hostConnected: true })).toBe("host");
+  it("defaults to host when Tiller Self Host mode has a connected machine", () => {
+    expect(getInitialEnvBackendSelection({ isLocalDev: false, deploymentMode: "self-host", hostConnected: true })).toBe("host");
   });
 
-  it("defaults to cloudflare when no host is currently connected", () => {
-    expect(getInitialEnvBackendSelection({ isLocalDev: false, hostConnected: false })).toBe("cf");
+  it("defaults to cloudflare in Hosted Tiller even if a stale host is connected", () => {
+    expect(getInitialEnvBackendSelection({ isLocalDev: false, deploymentMode: "hosted", hostConnected: true })).toBe("cf");
   });
 });
 
@@ -34,6 +34,7 @@ describe("NewEnvDialog", () => {
       <NewEnvDialog
         onClose={vi.fn()}
         isLocalDev={false}
+        deploymentMode="self-host"
         hostConnected={false}
         enabledHarnesses={["codex", "claude-code", "opencode"]}
         repo={repo}
@@ -42,6 +43,7 @@ describe("NewEnvDialog", () => {
     );
 
     expect(markup).toContain('<option value="cf" selected="">Cloudflare Containers</option>');
-    expect(markup).toContain('<option value="host">Tiller Host</option>');
+    expect(markup).toContain('<option value="host" disabled="">Tiller Self Host</option>');
+    expect(markup).toContain("Start `tiller host` to use Tiller Self Host.");
   });
 });

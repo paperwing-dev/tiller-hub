@@ -23,8 +23,8 @@ export function getEnvAuthBadge(
 
   if (harness === "codex") {
     return {
-      label: env.codexAuthMode === "chatgpt" ? "ChatGPT" : "OpenAI API key",
-      className: env.codexAuthMode === "chatgpt"
+      label: env.codexAuthMode === "subscription" ? "Subscription" : "API key",
+      className: env.codexAuthMode === "subscription"
         ? "border-emerald-200 bg-emerald-50 text-emerald-700"
         : "border-sky-200 bg-sky-50 text-sky-700",
     };

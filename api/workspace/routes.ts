@@ -1,9 +1,9 @@
 import { Hono } from "hono";
-import { getArtifactStoreStub, getWorkspaceStub, repoToTarballUrl } from "../helpers";
-import { getPlanArtifactById, loadRepoArtifacts, renderArtifactPlanMarkdown } from "../coordination";
+import { getArtifactStoreStub, getWorkspaceStub } from "../helpers";
+import { getPlanArtifactById, loadRepoArtifacts, renderArtifactBodyMarkdown } from "../coordination";
 import type { HonoEnv } from "../types";
-import { getRepoWorkspaceForEnvSlug } from "../plan/store";
-import { getSecret } from "../setup/config";
+import { loadEnvView } from "../env/view";
+import { loadRepoForRequest } from "../repo/access";
 import { isSafePath, areSafePaths } from "./validate";
 
 const workspaceRoutes = new Hono<HonoEnv>();
@@ -114,25 +114,21 @@ workspaceRoutes.get("/api/workspace/:slug/download", async (c) => {
 });
 
 workspaceRoutes.post("/api/workspace/:slug/init", async (c) => {
-  const body = await c.req.json<{ repoUrl: string; ref?: string }>();
-  if (!body.repoUrl) return c.json({ error: "repoUrl is required" }, 400);
-
-  const githubToken = await getSecret(c.env, "GITHUB_TOKEN");
-  const tarball = repoToTarballUrl(body.repoUrl, body.ref, githubToken);
-  if (!tarball) return c.json({ error: "Only GitHub repos are supported" }, 400);
-
-  const stub = getWorkspaceStub(c.env, c.req.param("slug"));
-  const result = await stub.initFromTarball(tarball.tarballUrl, tarball.headers);
-
-  return c.json(result, 201);
+  return c.json({
+    error: "Workspace initialization by repository URL is no longer supported. Add a GitHub App selected repository, then create an environment from its repoId.",
+    code: "workspace_init_removed",
+  }, 410);
 });
 
 async function materializePlanArtifact(c: any, id: string) {
   const slug = c.req.param("slug");
-  const repo = await getRepoWorkspaceForEnvSlug(c.env, slug);
-  if (!repo) {
+  const envMeta = await loadEnvView(c.env, slug);
+  if (!envMeta) {
     return c.json({ error: "Workspace not found" }, 404);
   }
+  const loadedRepo = await loadRepoForRequest(c.env, c.req.raw, envMeta.repoId, "selected-write");
+  if (!loadedRepo.ok) return c.json(loadedRepo.body, loadedRepo.status as any);
+  const repo = loadedRepo.repo;
   const targetWorkspace = getWorkspaceStub(c.env, slug);
   const artifactStore = getArtifactStoreStub(c.env, repo.meta.repoId);
 
@@ -147,7 +143,7 @@ async function materializePlanArtifact(c: any, id: string) {
     }
 
     const path = "/.tiller/plan.md";
-    await targetWorkspace.writeWorkspaceFile(path, renderArtifactPlanMarkdown(artifact));
+    await targetWorkspace.writeWorkspaceFile(path, renderArtifactBodyMarkdown(artifact.body));
     return c.json({
       ok: true,
       path,

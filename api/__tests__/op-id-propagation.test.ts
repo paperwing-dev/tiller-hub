@@ -27,6 +27,7 @@ vi.mock("../setup/config", () => ({
 
 import { createCloudflareRunnerBackend } from "../env/runner-backend-cf";
 import { createHostRunnerBackend } from "../env/runner-backend-host";
+import { createInitialEnvScmState } from "../scm/model";
 import type { EnvMeta } from "../types";
 
 function createMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
@@ -34,13 +35,12 @@ function createMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
     slug: "demo-env",
     repoUrl: "https://github.com/test/repo",
     repoId: "repo-1",
-    runnerId: null,
-    runnerMachineId: null,
     backend: "host",
     harness: "codex",
     createdAt: "2026-04-10T00:00:00.000Z",
     updatedAt: "2026-04-10T00:00:00.000Z",
     status: "stopped",
+    ...createInitialEnvScmState({ slug: "demo-env", mainCommit: null }),
     ...overrides,
   };
 }

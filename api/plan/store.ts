@@ -1,18 +1,21 @@
-import { getWorkspaceStub, repoToTarballUrl } from "../helpers";
+import { getWorkspaceStub } from "../helpers";
 import {
   hasExplicitEnvDefinitionScmFields,
-  hasExplicitEnvScmFields,
   hasExplicitRepoScmFields,
   isEnvHarness,
-  isEnvStatus,
   type Env,
   type EnvDefinition,
   type EnvMeta,
   type RepoMeta,
+  type StoredEnvMeta,
 } from "../types";
 import type { WorkspaceDO } from "../workspace/do";
-import { getSecret } from "../setup/config";
 import { createInitialRepoScmState } from "../scm/model";
+import {
+  mintGitHubInstallationToken,
+  resolveGitHubAppRepositorySelection,
+} from "../github/app";
+import { buildGitHubTarballRequest, canonicalizeGitHubRepo, githubRepoUrlFromFullName } from "../github/repo";
 
 const PLAN_STORE_PREFIX = "plan-store:";
 const REPO_INDEX_PREFIX = "repo:";
@@ -21,9 +24,10 @@ const REPO_META_PATH = "/.tiller/repo/meta.json";
 
 interface RepoIndexEntry {
   repoId: string;
-  repoUrl: string;
   updatedAt: string;
 }
+
+type StoredRepoMeta = Omit<RepoMeta, "repoUrl">;
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -33,25 +37,24 @@ function isNullableString(value: unknown): value is string | null {
   return typeof value === "string" || value === null;
 }
 
-function isEnvMetaRecord(value: unknown): value is EnvMeta {
-  return (
-    isObjectRecord(value) &&
-    typeof value.slug === "string" &&
-    typeof value.repoUrl === "string" &&
-    (value.backend === "cf" || value.backend === "host") &&
-    isEnvHarness(typeof value.harness === "string" ? value.harness : null) &&
-    typeof value.createdAt === "string" &&
-    typeof value.updatedAt === "string" &&
-    isEnvStatus(typeof value.status === "string" ? value.status : null) &&
-    hasExplicitEnvScmFields(value)
-  );
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isInteger(value) && value > 0;
+}
+
+function isCanonicalGitHubFullName(value: unknown): value is string {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    return canonicalizeGitHubRepo(value, { allowOwnerRepo: true }).fullName === value;
+  } catch {
+    return false;
+  }
 }
 
 function isEnvDefinitionRecord(value: unknown): value is EnvDefinition {
   return (
     isObjectRecord(value) &&
     typeof value.slug === "string" &&
-    typeof value.repoUrl === "string" &&
+    typeof value.repoId === "string" &&
     (value.backend === "cf" || value.backend === "host") &&
     isEnvHarness(typeof value.harness === "string" ? value.harness : null) &&
     typeof value.createdAt === "string" &&
@@ -59,11 +62,13 @@ function isEnvDefinitionRecord(value: unknown): value is EnvDefinition {
   );
 }
 
-function isRepoMetaRecord(value: unknown): value is RepoMeta {
+function isRepoMetaRecord(value: unknown): value is StoredRepoMeta {
   return (
     isObjectRecord(value) &&
+    !("repoUrl" in value) &&
     typeof value.repoId === "string" &&
-    typeof value.repoUrl === "string" &&
+    isPositiveInteger(value.githubInstallationId) &&
+    isCanonicalGitHubFullName(value.githubFullName) &&
     typeof value.createdAt === "string" &&
     typeof value.updatedAt === "string" &&
     isNullableString(value.bootstrappedFromRef) &&
@@ -71,22 +76,8 @@ function isRepoMetaRecord(value: unknown): value is RepoMeta {
   );
 }
 
-export function normalizeRepoUrl(repoUrl: string): string {
-  return repoUrl.trim().replace(/\.git$/, "").replace(/\/+$/, "").toLowerCase();
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  const bytes = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-export async function deriveRepoId(repoUrl: string): Promise<string> {
-  return sha256Hex(normalizeRepoUrl(repoUrl));
-}
-
-export function getRepoPlanStoreKey(repoUrl: string): string {
-  return `${PLAN_STORE_PREFIX}${normalizeRepoUrl(repoUrl)}`;
+export function getRepoPlanStoreKey(repoId: string): string {
+  return `${PLAN_STORE_PREFIX}${repoId.trim()}`;
 }
 
 function getRepoIndexKey(repoId: string): string {
@@ -97,22 +88,15 @@ export function getEnvDefinitionKey(slug: string): string {
   return `${ENV_DEFINITION_PREFIX}${slug}`;
 }
 
-export function getRepoWorkspaceStubFromRepoUrl(
+export function getRepoWorkspaceStubForRepoId(
   env: Env,
-  repoUrl: string,
+  repoId: string,
 ): WorkspaceDO {
-  return getWorkspaceStub(env, getRepoPlanStoreKey(repoUrl));
+  return getWorkspaceStub(env, getRepoPlanStoreKey(repoId));
 }
-
-export const getRepoPlanWorkspaceStubFromRepoUrl = getRepoWorkspaceStubFromRepoUrl;
 
 async function writeJsonFile(workspace: WorkspaceDO, path: string, value: unknown): Promise<void> {
   await workspace.writeWorkspaceFile(path, JSON.stringify(value, null, 2));
-}
-
-async function hasRepoSnapshot(workspace: WorkspaceDO): Promise<boolean> {
-  const rootEntries = await workspace.readWorkspaceDir("/");
-  return rootEntries.some((entry) => entry.path !== "/.tiller");
 }
 
 export async function readRepoMetaFromWorkspace(workspace: WorkspaceDO): Promise<RepoMeta | null> {
@@ -130,11 +114,27 @@ export async function readRepoMetaFromWorkspace(workspace: WorkspaceDO): Promise
     throw new Error(`Repo metadata at ${REPO_META_PATH} is missing explicit repository schema fields.`);
   }
 
-  return meta;
+  return {
+    ...meta,
+    repoUrl: githubRepoUrlFromFullName(meta.githubFullName),
+  };
 }
 
 export async function writeRepoMetaToWorkspace(workspace: WorkspaceDO, meta: RepoMeta): Promise<void> {
-  await writeJsonFile(workspace, REPO_META_PATH, meta);
+  const { repoUrl: _repoUrl, ...storedMeta } = meta;
+  await writeJsonFile(workspace, REPO_META_PATH, storedMeta);
+}
+
+export function toStoredEnvMeta(meta: EnvMeta): StoredEnvMeta {
+  const { repoUrl: _repoUrl, ...storedMeta } = meta;
+  return storedMeta;
+}
+
+export async function persistEnvSummary(
+  env: Pick<Env, "ENVS_KV">,
+  meta: EnvMeta,
+): Promise<void> {
+  await env.ENVS_KV.put(meta.slug, JSON.stringify(toStoredEnvMeta(meta)));
 }
 
 async function writeRepoIndex(env: Pick<Env, "ENVS_KV">, entry: RepoIndexEntry): Promise<void> {
@@ -172,38 +172,6 @@ async function listRepoIndexEntries(env: Pick<Env, "ENVS_KV">): Promise<RepoInde
   });
 }
 
-export async function readEnvMeta(
-  env: Pick<Env, "ENVS_KV">,
-  slug: string,
-): Promise<EnvMeta | null> {
-  return readEnvSummary(env, slug);
-}
-
-export async function readEnvSummary(
-  env: Pick<Env, "ENVS_KV">,
-  slug: string,
-): Promise<EnvMeta | null> {
-  if (slug.startsWith(REPO_INDEX_PREFIX) || slug.startsWith(ENV_DEFINITION_PREFIX)) {
-    return null;
-  }
-
-  const raw = await env.ENVS_KV.get(slug);
-  if (!raw) return null;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw) as unknown;
-  } catch {
-    throw new Error(`Env summary for ${slug} is not valid JSON.`);
-  }
-
-  if (!isEnvMetaRecord(parsed)) {
-    throw new Error(`Env summary for ${slug} is missing explicit environment schema fields.`);
-  }
-
-  return parsed;
-}
-
 export async function readEnvDefinition(
   env: Pick<Env, "ENVS_KV">,
   slug: string,
@@ -221,6 +189,9 @@ export async function readEnvDefinition(
   if (!isEnvDefinitionRecord(parsed)) {
     throw new Error(`Env definition for ${slug} is missing explicit environment schema fields.`);
   }
+  if (parsed.slug !== slug) {
+    throw new Error(`Env definition for ${slug} has mismatched slug ${parsed.slug}.`);
+  }
 
   return parsed;
 }
@@ -229,7 +200,8 @@ export async function persistEnvDefinition(
   env: Pick<Env, "ENVS_KV">,
   definition: EnvDefinition,
 ): Promise<EnvDefinition> {
-  await env.ENVS_KV.put(getEnvDefinitionKey(definition.slug), JSON.stringify(definition));
+  const { repoUrl: _repoUrl, ...storedDefinition } = definition as EnvDefinition & { repoUrl?: string };
+  await env.ENVS_KV.put(getEnvDefinitionKey(definition.slug), JSON.stringify(storedDefinition));
   return definition;
 }
 
@@ -253,37 +225,18 @@ export async function listEnvDefinitionSlugs(
   return Array.from(slugs);
 }
 
-export async function listEnvMetas(
-  env: Pick<Env, "ENVS_KV">,
-): Promise<EnvMeta[]> {
-  // Drive from envdef: slugs so unrelated keys in the shared ENVS_KV namespace
-  // (e.g. openai:oauth:tokens, tiller:update-check) never masquerade as env summaries.
-  const slugs = await listEnvDefinitionSlugs(env);
-  const entries = await Promise.all(
-    slugs.map(async (slug) => {
-      try {
-        return await readEnvSummary(env, slug);
-      } catch (error) {
-        console.warn(
-          `[repo-store] Skipping invalid env summary cache row ${slug}:`,
-          error instanceof Error ? error.message : String(error),
-        );
-        return null;
-      }
-    }),
-  );
-  return entries.filter((entry): entry is EnvMeta => !!entry);
-}
-
 function buildInitialRepoMeta(args: {
   repoId: string;
-  repoUrl: string;
+  githubInstallationId: number;
+  githubFullName: string;
   createdAt: string;
   bootstrappedFromRef: string | null;
 }): RepoMeta {
   return {
     repoId: args.repoId,
-    repoUrl: args.repoUrl,
+    repoUrl: githubRepoUrlFromFullName(args.githubFullName),
+    githubInstallationId: args.githubInstallationId,
+    githubFullName: args.githubFullName,
     ...createInitialRepoScmState(),
     createdAt: args.createdAt,
     updatedAt: args.createdAt,
@@ -296,7 +249,6 @@ function buildInitialRepoMeta(args: {
 async function ensureRepoIndex(env: Pick<Env, "ENVS_KV">, meta: RepoMeta): Promise<void> {
   await writeRepoIndex(env, {
     repoId: meta.repoId,
-    repoUrl: meta.repoUrl,
     updatedAt: meta.updatedAt,
   });
 }
@@ -310,46 +262,66 @@ export async function persistRepoMeta(
   await ensureRepoIndex(env, meta);
 }
 
-export async function ensureRepoWorkspaceFromRepoUrl(
+async function initWorkspaceFromGitHubAppTarball(
   env: Env,
-  repoUrl: string,
-): Promise<{ workspace: WorkspaceDO; meta: RepoMeta }> {
-  const normalizedRepoUrl = normalizeRepoUrl(repoUrl);
-  const workspace = getRepoWorkspaceStubFromRepoUrl(env, normalizedRepoUrl);
+  workspace: WorkspaceDO,
+  selection: {
+    fullName: string;
+    defaultBranch: string | null;
+  },
+): Promise<void> {
+  const token = (await mintGitHubInstallationToken(
+    env,
+    canonicalizeGitHubRepo(selection.fullName, { allowOwnerRepo: true }),
+    { access: "write" },
+  )).token;
+  const repo = canonicalizeGitHubRepo(selection.fullName, { allowOwnerRepo: true });
+  const authedTarball = buildGitHubTarballRequest(repo, selection.defaultBranch ?? "HEAD", token);
+  await workspace.initFromTarball(authedTarball.tarballUrl, authedTarball.headers);
+}
+
+export async function createRepoWorkspaceFromGitHubAppSelection(
+  env: Env,
+  claim: {
+    repositoryId: number;
+    installationId: number;
+    fullName: string;
+  },
+): Promise<{ workspace: WorkspaceDO; meta: RepoMeta; created: boolean }> {
+  const selection = await resolveGitHubAppRepositorySelection(env, claim);
+  const repoId = String(selection.repositoryId);
+  const workspace = getRepoWorkspaceStubForRepoId(env, repoId);
   const existingMeta = await readRepoMetaFromWorkspace(workspace);
   if (existingMeta) {
-    await ensureRepoIndex(env, existingMeta);
-    return { workspace, meta: existingMeta };
-  }
-
-  if (await hasRepoSnapshot(workspace)) {
-    throw new Error(`Repo workspace for ${normalizedRepoUrl} is missing explicit repo metadata.`);
+    const nextMeta: RepoMeta = {
+      ...existingMeta,
+      repoId,
+      repoUrl: githubRepoUrlFromFullName(selection.fullName),
+      githubInstallationId: selection.installationId,
+      githubFullName: selection.fullName,
+      updatedAt: new Date().toISOString(),
+    };
+    await persistRepoMeta(env, workspace, nextMeta);
+    return { workspace, meta: nextMeta, created: false };
   }
 
   const now = new Date().toISOString();
-  const repoId = await deriveRepoId(normalizedRepoUrl);
-
-  const githubToken = await getSecret(env, "GITHUB_TOKEN");
-  const tarball = repoToTarballUrl(normalizedRepoUrl, "HEAD", githubToken);
-  if (!tarball) {
-    throw new Error(`Unsupported repo URL: ${normalizedRepoUrl}`);
-  }
-  await workspace.initFromTarball(tarball.tarballUrl, tarball.headers);
+  await initWorkspaceFromGitHubAppTarball(
+    env,
+    workspace,
+    selection,
+  );
 
   const meta = buildInitialRepoMeta({
     repoId,
-    repoUrl: normalizedRepoUrl,
+    githubInstallationId: selection.installationId,
+    githubFullName: selection.fullName,
     createdAt: now,
-    bootstrappedFromRef: "HEAD",
+    bootstrappedFromRef: selection.defaultBranch ?? "HEAD",
   });
   await persistRepoMeta(env, workspace, meta);
 
-  return { workspace, meta };
-}
-
-export async function ensureRepoPlanWorkspaceFromRepoUrl(env: Env, repoUrl: string): Promise<WorkspaceDO> {
-  const repo = await ensureRepoWorkspaceFromRepoUrl(env, repoUrl);
-  return repo.workspace;
+  return { workspace, meta, created: true };
 }
 
 export async function getRepoWorkspaceForRepoId(
@@ -358,29 +330,32 @@ export async function getRepoWorkspaceForRepoId(
 ): Promise<{ workspace: WorkspaceDO; meta: RepoMeta } | null> {
   const indexEntry = await readRepoIndexEntry(env, repoId);
   if (!indexEntry) return null;
-  return ensureRepoWorkspaceFromRepoUrl(env, indexEntry.repoUrl);
+  const workspace = getRepoWorkspaceStubForRepoId(env, indexEntry.repoId);
+  const meta = await readRepoMetaFromWorkspace(workspace);
+  return meta ? { workspace, meta } : null;
 }
 
-export async function getRepoWorkspaceForEnvSlug(
+async function assertRepoStillSelectedInGitHubApp(
   env: Env,
-  slug: string,
-): Promise<{ envMeta: EnvMeta; workspace: WorkspaceDO; meta: RepoMeta } | null> {
-  const envMeta = await readEnvMeta(env, slug);
-  if (!envMeta) return null;
-  const repo = await ensureRepoWorkspaceFromRepoUrl(env, envMeta.repoUrl);
-  return { envMeta, ...repo };
+  meta: RepoMeta,
+): Promise<void> {
+  await resolveGitHubAppRepositorySelection(env, {
+    repositoryId: Number(meta.repoId),
+    installationId: meta.githubInstallationId,
+    fullName: meta.githubFullName,
+  });
 }
 
-export async function getRepoPlanWorkspaceStub(
+export type SelectedRepoWorkspace = { workspace: WorkspaceDO; meta: RepoMeta };
+
+export async function getSelectedRepoWorkspaceForRepoId(
   env: Env,
-  slug: string,
-): Promise<{ meta: EnvMeta; planWorkspace: WorkspaceDO } | null> {
-  const repo = await getRepoWorkspaceForEnvSlug(env, slug);
+  repoId: string,
+): Promise<SelectedRepoWorkspace | null> {
+  const repo = await getRepoWorkspaceForRepoId(env, repoId);
   if (!repo) return null;
-  return {
-    meta: repo.envMeta,
-    planWorkspace: repo.workspace,
-  };
+  await assertRepoStillSelectedInGitHubApp(env, repo.meta);
+  return repo;
 }
 
 export async function listRepos(env: Env): Promise<RepoMeta[]> {
@@ -389,10 +364,9 @@ export async function listRepos(env: Env): Promise<RepoMeta[]> {
     await Promise.all(
       entries.map(async (entry) => {
         try {
-          const repo = await ensureRepoWorkspaceFromRepoUrl(env, entry.repoUrl);
-          return repo.meta;
+          return (await getRepoWorkspaceForRepoId(env, entry.repoId))?.meta ?? null;
         } catch (error) {
-          console.warn(`[repo-store] Failed to load repo ${entry.repoUrl}:`, error);
+          console.warn(`[repo-store] Failed to load repo ${entry.repoId}:`, error);
           return null;
         }
       }),

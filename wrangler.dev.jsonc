@@ -20,7 +20,6 @@
 	],
 		"vars": {
 			"DO_LOCATION_HINT": "wnam",
-			"ENABLED_ENV_HARNESSES": "claude-code,codex,opencode",
 			"LOCAL_DEV_ONLY_BACKEND": "true"
 		},
 	"durable_objects": {
@@ -62,20 +61,8 @@
 				"class_name": "WorkspaceDO"
 			},
 			{
-				"name": "CARTOGRAPHER_CHAT",
-				"class_name": "CartographerChatAgent"
-			},
-			{
 				"name": "PLAN_CHAT",
 				"class_name": "PlanChatAgent"
-			},
-			{
-				"name": "PLANNER_CHAT",
-				"class_name": "PlannerChatAgent"
-			},
-			{
-				"name": "RESEARCH_CHAT",
-				"class_name": "ResearchChatAgent"
 			},
 			{
 				"name": "REVIEWER_CHAT",
@@ -193,6 +180,19 @@
 			"tag": "v17",
 			"new_sqlite_classes": [
 				"ScmOperationDO"
+			]
+		},
+		{
+			"tag": "v18",
+			"deleted_classes": [
+				"PlannerChatAgent"
+			]
+		},
+		{
+			"tag": "v19",
+			"deleted_classes": [
+				"ResearchChatAgent",
+				"CartographerChatAgent"
 			]
 		}
 	],

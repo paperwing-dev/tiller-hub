@@ -24,7 +24,7 @@ describe("resolveManagedMachineHostStatus", () => {
   it("reports named tunnel support as unavailable on workers.dev hubs", async () => {
     await expect(resolveManagedMachineHostStatus({} as any, {
       hubUrl: "https://demo.preview.workers.dev",
-      hostKind: "workers-dev",
+      routeKind: "workers-dev",
       protectionMode: "public",
       serviceTokenConfigured: false,
       workersDevAliasDisabled: false,
@@ -34,7 +34,7 @@ describe("resolveManagedMachineHostStatus", () => {
       gatewayProvisioned: false,
       workersDevCutoverPending: false,
       gatewaySupportAvailable: false,
-      gatewaySupportReason: "Publish & Protect a custom domain before using the Tiller gateway.",
+      gatewaySupportReason: "Switch to Tiller Self Host on a protected custom domain before using the Subscription Gateway.",
     });
   });
 
@@ -45,7 +45,7 @@ describe("resolveManagedMachineHostStatus", () => {
       CF_ACCESS_BROWSER_POLICY_ID: "browser-policy",
     } as any, {
       hubUrl: "https://tiller.paperwing.dev",
-      hostKind: "custom-domain",
+      routeKind: "custom-domain",
       protectionMode: "cf-access",
       serviceTokenConfigured: true,
       workersDevAliasDisabled: false,
@@ -56,11 +56,11 @@ describe("resolveManagedMachineHostStatus", () => {
       gatewayTunnelConfigured: false,
       workersDevCutoverPending: true,
       gatewaySupportAvailable: false,
-      gatewaySupportReason: "The protected Tiller gateway hostname has not been provisioned yet.",
+      gatewaySupportReason: "The protected Subscription Gateway hostname has not been provisioned yet.",
     });
   });
 
-  it("keeps support inactive until the gateway tunnel bootstrap is persisted", async () => {
+  it("keeps support inactive until gateway tunnel metadata is persisted", async () => {
     const env = {
       CF_ACCESS_APP_ID: "hub-app",
       CF_ACCESS_AUD: "hub-aud",
@@ -72,7 +72,7 @@ describe("resolveManagedMachineHostStatus", () => {
 
     await expect(resolveManagedMachineHostStatus(env as any, {
       hubUrl: "https://tiller.paperwing.dev",
-      hostKind: "custom-domain",
+      routeKind: "custom-domain",
       protectionMode: "cf-access",
       serviceTokenConfigured: true,
       workersDevAliasDisabled: true,
@@ -83,11 +83,11 @@ describe("resolveManagedMachineHostStatus", () => {
       gatewayTunnelConfigured: false,
       workersDevCutoverPending: false,
       gatewaySupportAvailable: false,
-      gatewaySupportReason: "The protected Tiller gateway tunnel has not been provisioned yet.",
+      gatewaySupportReason: "The protected Subscription Gateway tunnel has not been provisioned yet.",
     });
   });
 
-  it("reports named tunnel support once the gateway Access app and tunnel bootstrap are persisted", async () => {
+  it("reports named tunnel support once the gateway Access app and tunnel metadata are persisted", async () => {
     const env = {
       CF_ACCESS_APP_ID: "hub-app",
       CF_ACCESS_AUD: "hub-aud",
@@ -96,12 +96,11 @@ describe("resolveManagedMachineHostStatus", () => {
       CF_ACCESS_GATEWAY_APP_ID: "gateway-app",
       CF_ACCESS_GATEWAY_SERVICE_TOKEN_POLICY_ID: "gateway-policy",
       TILLER_GATEWAY_TUNNEL_ID: "tunnel-123",
-      TILLER_GATEWAY_TUNNEL_TOKEN: "tunnel-token",
     };
 
     await expect(resolveManagedMachineHostStatus(env as any, {
       hubUrl: "https://tiller.paperwing.dev",
-      hostKind: "custom-domain",
+      routeKind: "custom-domain",
       protectionMode: "cf-access",
       serviceTokenConfigured: true,
       workersDevAliasDisabled: true,

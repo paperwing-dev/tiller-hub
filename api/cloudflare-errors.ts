@@ -1,3 +1,5 @@
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+
 export interface CloudflareApiMessage {
   code?: number;
   message: string;
@@ -30,7 +32,11 @@ export interface CloudflareUiError {
   error: string;
   hint?: string;
   missingPermissions?: string[];
-  status: number;
+  status: ContentfulStatusCode;
+}
+
+function toCloudflareUiStatus(status: number): ContentfulStatusCode {
+  return status >= 400 && status <= 599 ? status as ContentfulStatusCode : 500;
 }
 
 function buildTokenHelp(hostname?: string): string {
@@ -70,6 +76,10 @@ function isHostnameOutOfScopeMessage(message: string): boolean {
 
 function isAccountLookupMessage(message: string): boolean {
   return /could not determine the cloudflare account for that zone/i.test(message);
+}
+
+function isWorkersDevAccountLookupMessage(message: string): boolean {
+  return /cannot find the cloudflare account that owns .*\.workers\.dev/i.test(message);
 }
 
 function isWorkersAliasDisableMessage(message: string): boolean {
@@ -148,6 +158,16 @@ export function normalizeCloudflareUiError(error: unknown, hostname?: string): C
     };
   }
 
+  if (isWorkersDevAccountLookupMessage(message)) {
+    return {
+      code: "workers_dev_account_not_found",
+      error: message,
+      hint: "Create a temporary Cloudflare API token from the `Edit Cloudflare Workers` template, then add Scope `Account`, Permission `Access: Apps and Policies`, Access `Edit`. Scope the token to the account that owns this Worker.",
+      missingPermissions: ["Account -> Account Settings -> Read", "Account -> Workers Scripts -> Edit", "Account -> Access: Apps and Policies -> Edit"],
+      status: 403,
+    };
+  }
+
   if (isWildcardUnsupportedMessage(message)) {
     const details = extractWildcardUnsupportedDetails(message, hostname);
     const resolvedHostname = details.hostname ?? hostname;
@@ -186,7 +206,7 @@ export function normalizeCloudflareUiError(error: unknown, hostname?: string): C
     return {
       code: "workers_alias_disable_failed",
       error: "Cloudflare attached the custom domain, but did not fully disable the old workers.dev alias and preview URLs.",
-      hint: "Retry once. If it keeps failing, disable the Worker subdomain in the Cloudflare dashboard and run Publish & Protect again.",
+      hint: "Retry once. If it keeps failing, disable the Worker subdomain in the Cloudflare dashboard and rerun Self Host setup from the protected workers.dev hub URL.",
       status: 409,
     };
   }
@@ -224,7 +244,11 @@ export function normalizeCloudflareUiError(error: unknown, hostname?: string): C
         );
       }
 
-      if (error.path.includes("/workers/domains") || error.path.includes("/workers/scripts/")) {
+      if (
+        error.path.includes("/workers/domains")
+        || error.path.includes("/workers/scripts/")
+        || error.path.includes("/workers/subdomain")
+      ) {
         return buildCloudflarePermissionError(
           "workers_permission_missing",
           hostname
@@ -232,6 +256,15 @@ export function normalizeCloudflareUiError(error: unknown, hostname?: string): C
             : "This token cannot manage the Worker domain for that hostname.",
           workersHint(hostname),
           ["Zone -> Workers Routes -> Edit", "Account -> Workers Scripts -> Edit"],
+        );
+      }
+
+      if (error.path.startsWith("/accounts?") || error.path === "/accounts") {
+        return buildCloudflarePermissionError(
+          "account_access_missing",
+          "This token cannot list the Cloudflare accounts available to it.",
+          "Create the token from the `Edit Cloudflare Workers` template and scope it to the account that owns this Worker.",
+          ["Account -> Account Settings -> Read"],
         );
       }
 
@@ -272,6 +305,6 @@ export function normalizeCloudflareUiError(error: unknown, hostname?: string): C
     code: "cloudflare_request_failed",
     error: message,
     hint: buildTokenHelp(hostname),
-    status: error instanceof CloudflareApiError ? Math.max(400, error.status) : 500,
+    status: error instanceof CloudflareApiError ? toCloudflareUiStatus(error.status) : 500,
   };
 }

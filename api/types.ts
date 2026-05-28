@@ -4,7 +4,6 @@ import type { Server } from "partyserver";
 
 export interface Env {
   ARTIFACT_STORE: DurableObjectNamespace;
-  CARTOGRAPHER_CHAT: DurableObjectNamespace;
   ENV_LIFECYCLE: DurableObjectNamespace;
   HUB: DurableObjectNamespace<Server<Env>>;
   REPO_MERGE_LOCK: DurableObjectNamespace;
@@ -13,8 +12,6 @@ export interface Env {
   THREAD: DurableObjectNamespace;
   TILLER_VOICE: DurableObjectNamespace;
   PLAN_CHAT: DurableObjectNamespace;
-  PLANNER_CHAT: DurableObjectNamespace;
-  RESEARCH_CHAT: DurableObjectNamespace;
   REVIEWER_CHAT: DurableObjectNamespace;
   SANDBOX: DurableObjectNamespace;
   WORKSPACE: DurableObjectNamespace;
@@ -28,6 +25,10 @@ export interface Env {
   HUB_PUBLIC_URL?: string;
   WORKER_SERVICE_NAME?: string;
   WORKERS_DEV_ALIAS_DISABLED?: string;
+  TILLER_DEPLOYMENT_MODE?: string;
+  CF_ACCESS_CONFIGURED?: string;
+  CF_ACCESS_TEAM_DOMAIN?: string;
+  CF_ACCESS_JWKS_URL?: string;
   CF_ACCESS_APP_DOMAIN?: string;
   CF_ACCESS_APP_TYPE?: string;
   CF_ACCESS_OVERLAPPING_WILDCARD_APP_DOMAIN?: string;
@@ -40,11 +41,11 @@ export interface Env {
   CF_ACCESS_GATEWAY_SERVICE_TOKEN_POLICY_ID?: string;
   TILLER_GATEWAY_TUNNEL_ID?: string;
   TILLER_GATEWAY_TUNNEL_NAME?: string;
-  TILLER_GATEWAY_TUNNEL_TOKEN?: string;
   TILLER_GATEWAY_TUNNEL_TARGET_PORT?: string;
   ANTHROPIC_API_KEY: string;
   OPENAI_API_KEY?: string;
   OPENAI_MODEL?: string;
+  PLAN_CHAT_DEBUG?: string;
   CLAUDE_CODE_OAUTH_TOKEN?: string;
   TILLER_WORKERS_AI_ACCOUNT_ID?: string;
   TILLER_WORKERS_AI_API_TOKEN?: string;
@@ -53,22 +54,25 @@ export interface Env {
   CF_ACCESS_CLIENT_ID: string;
   CF_ACCESS_CLIENT_SECRET: string;
   CF_ACCESS_APP_ID?: string;
-  GITHUB_TOKEN?: string;
   DO_LOCATION_HINT?: string; // Optional HubDO locationHint, usually derived at deploy time or set manually.
 }
 
 export type ClaudeAuthMode = "auto" | "subscription" | "api";
 export type ResolvedClaudeAuthMode = "subscription" | "api";
-export type CodexAuthMode = "chatgpt" | "openai-api";
+export type CodexAuthMode = "subscription" | "api-key";
+export type CodexAuthPreference = "auto" | "subscription" | "api-key";
+export type CodexGatewayAuth = "session-token";
 export type ModelRoute = "host-gateway" | "gateway-subscription" | "api-fallback";
+export type ChatGPTAuthStatus = "missing" | "connected" | "refreshing" | "needs_reconnect";
+export type CodexRouteStatus = "available" | "gateway_offline" | "host_offline" | "api_fallback" | "unavailable";
 export const ENV_HARNESSES = ["claude-code", "codex", "opencode"] as const;
 export type EnvHarness = (typeof ENV_HARNESSES)[number];
 export const ENV_BRANCH_STATUSES = ["up-to-date", "behind-main", "ready-to-merge", "needs-attention"] as const;
 export type EnvBranchStatus = "up-to-date" | "behind-main" | "ready-to-merge" | "needs-attention";
 export const REPO_GIT_STATUSES = ["pending", "ready", "repair-required"] as const;
 export type RepoGitStatus = "pending" | "ready" | "repair-required";
-export const SCM_OPERATION_TYPES = ["merge-into-main"] as const;
-export type ScmOperationType = "merge-into-main";
+export const SCM_OPERATION_TYPES = ["merge-into-main", "update-from-main"] as const;
+export type ScmOperationType = "merge-into-main" | "update-from-main";
 export type EnvLifecyclePhase = "stopped" | "starting" | "running" | "saving" | "stopping" | "failed";
 export type EnvInfraState = "unknown" | "ready" | "stopped";
 export const ENV_STATUSES = ["creating", "starting", "running", "saving", "stopping", "stopped", "failed", "deleting", "unknown"] as const;
@@ -183,12 +187,12 @@ export interface EnvLifecycleState {
 
 export interface EnvDefinition {
   slug: string;
-  repoUrl: string;
-  repoId?: string;
+  repoId: string;
   backend: "cf" | "host";
   harness: EnvHarness;
   authMode?: ClaudeAuthMode;
   resolvedAuthMode?: ResolvedClaudeAuthMode;
+  codexAuthPreference?: CodexAuthPreference;
   codexAuthMode?: CodexAuthMode;
   opencodeProvider?: "cloudflare-workers-ai";
   opencodeModel?: "@cf/moonshotai/kimi-k2.5";
@@ -288,9 +292,11 @@ export interface HostServiceRegistration {
   connectedAt: string;
   dockerAvailable: boolean;
   codexSubscription: boolean;
+  codexGatewayAuth?: CodexGatewayAuth;
   claudeSubscription: boolean;
   gatewayPort?: number;
   gatewayUrl?: string;
+  gatewayServiceTokenHash?: string;
   gatewayTunnelType?: "quick" | "named";
   transport: "session";
 }
@@ -324,13 +330,14 @@ export interface StoredPermission {
 export interface EnvMeta {
   slug: string;
   repoUrl: string;
-  repoId?: string;
+  repoId: string;
   backend: "cf" | "host";
   runnerId?: string;
   runnerMachineId?: string;
   harness: EnvHarness;
   authMode?: ClaudeAuthMode;
   resolvedAuthMode?: ResolvedClaudeAuthMode;
+  codexAuthPreference?: CodexAuthPreference;
   codexAuthMode?: CodexAuthMode;
   opencodeProvider?: "cloudflare-workers-ai";
   opencodeModel?: "@cf/moonshotai/kimi-k2.5";
@@ -371,9 +378,13 @@ export interface EnvMeta {
   errorAt?: string;
 }
 
+export type StoredEnvMeta = Omit<EnvMeta, "repoUrl">;
+
 export interface RepoMeta {
   repoId: string;
   repoUrl: string;
+  githubInstallationId: number;
+  githubFullName: string;
   mainCommit: string | null;
   gitArtifactId: string | null;
   gitStatus: RepoGitStatus;

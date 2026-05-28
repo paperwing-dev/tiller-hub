@@ -23,6 +23,7 @@ vi.mock("../access/cloudflare-api", () => ({
     zoneId: "zone-123",
     zoneName: "paperwing.dev",
   })),
+  resolveAccountForWorkersDevRoute: vi.fn(),
   listAccessApps: vi.fn(async () => []),
   listServiceTokens: vi.fn(async () => []),
 }));
@@ -33,12 +34,14 @@ vi.mock("../protection", () => ({
     hasClaudeSubscription: true,
     hasAnthropicKey: false,
     hasChatGPTAuth: false,
+    chatgptAuthStatus: "missing",
     hasOpenAIKey: false,
     mode: "subscription",
   })),
   resolveProtectionState: vi.fn(async (_env: unknown, requestUrl: string) => ({
     currentOrigin: new URL(requestUrl).origin,
     hubUrl: new URL(requestUrl).origin,
+    routeKind: "workers-dev",
     hostKind: "workers-dev",
     protectionMode: "public",
     protectionCanAutomate: false,
@@ -46,6 +49,9 @@ vi.mock("../protection", () => ({
     unsupportedProtectionConfig: false,
     workersDevAliasDisabled: false,
     protectionAppDomain: null,
+    accessConfigured: false,
+    accessIssuer: null,
+    accessJwksUrl: null,
   })),
 }));
 

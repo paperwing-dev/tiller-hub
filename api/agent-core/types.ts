@@ -1,4 +1,4 @@
-export type RuntimeKind = "direct-tools" | "codemode" | "container";
+export type RuntimeKind = "think" | "direct-tools" | "container";
 
 export type ModelProviderKind = "external-codex" | "workers-ai";
 
@@ -9,6 +9,7 @@ export type HostedToolName =
   | "glob"
   | "save_memory"
   | "recall_memory"
+  | "save_plan"
   | "save_artifact"
   | "read_artifact"
   | "list_artifacts";
@@ -91,10 +92,7 @@ export interface ModelTarget {
 
 export type HostedAgentId =
   | "plan-chat"
-  | "research-chat"
-  | "planner-chat"
-  | "reviewer-chat"
-  | "cartographer-chat";
+  | "reviewer-chat";
 
 export interface HostedAgentMetadata {
   id: HostedAgentId;

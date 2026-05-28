@@ -1,36 +1,35 @@
 import { describe, expect, it, vi } from "vitest";
-import { createInitialEnvScmState, createInitialRepoScmState } from "../../scm/model";
+import type { EnvDefinition } from "../../types";
+import { createInitialRepoScmState } from "../../scm/model";
 import {
   commitRepoMainState,
+  createRepoWorkspaceFromGitHubAppSelection,
+  getSelectedRepoWorkspaceForRepoId,
   listEnvDefinitionSlugs,
-  listEnvMetas,
+  listRepos,
   persistEnvDefinition,
   readEnvDefinition,
-  readEnvMeta,
   readRepoMetaFromWorkspace,
 } from "../store";
 
-function makeEnvSummary(overrides: Record<string, unknown> = {}) {
-  return {
-    slug: "env-1",
-    repoUrl: "https://github.com/paperwing-dev/example",
-    backend: "cf",
-    harness: "claude-code",
-    runnerMachineId: "env-1",
-    createdAt: "2026-03-30T00:00:00.000Z",
-    updatedAt: "2026-03-30T00:00:00.000Z",
-    status: "running",
-    ...createInitialEnvScmState({
-      slug: "env-1",
-    }),
-    ...overrides,
-  };
-}
+const githubAppMocks = vi.hoisted(() => ({
+  mintGitHubInstallationToken: vi.fn(),
+  resolveGitHubAppRepositorySelection: vi.fn(),
+}));
 
-function makeEnvDefinition(overrides: Record<string, unknown> = {}) {
+vi.mock("../../github/app", async () => {
+  const actual = await vi.importActual<typeof import("../../github/app")>("../../github/app");
+  return {
+    ...actual,
+    mintGitHubInstallationToken: githubAppMocks.mintGitHubInstallationToken,
+    resolveGitHubAppRepositorySelection: githubAppMocks.resolveGitHubAppRepositorySelection,
+  };
+});
+
+function makeEnvDefinition(overrides: Partial<EnvDefinition> = {}): EnvDefinition {
   return {
     slug: "env-1",
-    repoUrl: "https://github.com/paperwing-dev/example",
+    repoId: "123456",
     backend: "cf",
     harness: "claude-code",
     startupPlanId: null,
@@ -38,6 +37,10 @@ function makeEnvDefinition(overrides: Record<string, unknown> = {}) {
     createdAt: "2026-03-30T00:00:00.000Z",
     ...overrides,
   };
+}
+
+function makeStoredEnvDefinition(overrides: Partial<EnvDefinition> = {}) {
+  return makeEnvDefinition(overrides);
 }
 
 describe("repo store env metadata helpers", () => {
@@ -58,6 +61,8 @@ describe("repo store env metadata helpers", () => {
       meta: {
         repoId: "repo-123",
         repoUrl: "https://github.com/paperwing-dev/example",
+        githubInstallationId: 98765,
+        githubFullName: "paperwing-dev/example",
         ...createInitialRepoScmState(),
         mainCommit: "abc123",
         gitArtifactId: "g-old",
@@ -85,60 +90,9 @@ describe("repo store env metadata helpers", () => {
     );
   });
 
-  it("ignores repo index entries when reading env metadata", async () => {
-    const env = {
-      ENVS_KV: {
-        get: vi.fn().mockResolvedValue(
-          JSON.stringify({
-            repoId: "repo-123",
-            repoUrl: "https://github.com/paperwing-dev/example",
-            updatedAt: "2026-03-30T00:00:00.000Z",
-          }),
-        ),
-      },
-    } as any;
-
-    await expect(readEnvMeta(env, "repo:repo-123")).resolves.toBeNull();
-  });
-
-  it("lists only envs that have an envdef row, ignoring unrelated keys in the shared namespace", async () => {
-    const env = {
-      ENVS_KV: {
-        list: vi.fn().mockImplementation(async ({ prefix }: { prefix?: string }) => {
-          if (prefix === "envdef:") {
-            return {
-              keys: [{ name: "envdef:env-1" }],
-              list_complete: true,
-              cursor: undefined,
-            };
-          }
-          return { keys: [], list_complete: true, cursor: undefined };
-        }),
-        get: vi.fn().mockImplementation(async (key: string) => {
-          if (key === "env-1") {
-            return JSON.stringify(makeEnvSummary());
-          }
-          return null;
-        }),
-      },
-    } as any;
-
-    await expect(listEnvMetas(env)).resolves.toEqual([
-      expect.objectContaining({
-        slug: "env-1",
-        repoUrl: "https://github.com/paperwing-dev/example",
-        runnerMachineId: "env-1",
-        createdAt: "2026-03-30T00:00:00.000Z",
-        updatedAt: "2026-03-30T00:00:00.000Z",
-        status: "running",
-      }),
-    ]);
-    expect(env.ENVS_KV.list).toHaveBeenCalledWith({ prefix: "envdef:", cursor: undefined });
-  });
-
   it("persists env definitions separately from summary cache rows", async () => {
     const put = vi.fn().mockResolvedValue(undefined);
-    const get = vi.fn().mockResolvedValue(JSON.stringify(makeEnvDefinition()));
+    const get = vi.fn().mockResolvedValue(JSON.stringify(makeStoredEnvDefinition()));
     const env = {
       ENVS_KV: { put, get },
     } as any;
@@ -155,31 +109,6 @@ describe("repo store env metadata helpers", () => {
       slug: "env-1",
       branchName: "env/env-1",
     });
-  });
-
-  it("returns one entry per envdef slug regardless of other keys in the namespace", async () => {
-    const env = {
-      ENVS_KV: {
-        list: vi.fn().mockImplementation(async ({ prefix }: { prefix?: string }) => {
-          if (prefix === "envdef:") {
-            return {
-              keys: [{ name: "envdef:env-1" }],
-              list_complete: true,
-              cursor: undefined,
-            };
-          }
-          return { keys: [], list_complete: true, cursor: undefined };
-        }),
-        get: vi.fn().mockImplementation(async (key: string) => {
-          if (key === "env-1") {
-            return JSON.stringify(makeEnvSummary());
-          }
-          return null;
-        }),
-      },
-    } as any;
-
-    await expect(listEnvMetas(env)).resolves.toHaveLength(1);
   });
 
   it("lists env definition slugs even when summary cache rows are missing", async () => {
@@ -205,180 +134,6 @@ describe("repo store env metadata helpers", () => {
     expect(env.ENVS_KV.list).toHaveBeenNthCalledWith(2, { prefix: "envdef:", cursor: "cursor-2" });
   });
 
-  it("skips malformed env summary cache rows instead of failing the full list", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const env = {
-      ENVS_KV: {
-        list: vi.fn().mockImplementation(async ({ prefix }: { prefix?: string }) => {
-          if (prefix === "envdef:") {
-            return {
-              keys: [{ name: "envdef:env-bad" }, { name: "envdef:env-good" }],
-              list_complete: true,
-              cursor: undefined,
-            };
-          }
-          return { keys: [], list_complete: true, cursor: undefined };
-        }),
-        get: vi.fn().mockImplementation(async (key: string) => {
-          if (key === "env-bad") {
-            return JSON.stringify({
-              slug: "env-bad",
-              repoUrl: "https://github.com/paperwing-dev/example",
-              backend: "cf",
-              harness: "claude-code",
-              createdAt: "2026-03-30T00:00:00.000Z",
-              updatedAt: "2026-03-30T00:00:00.000Z",
-              status: "running",
-            });
-          }
-          if (key === "env-good") {
-            return JSON.stringify(makeEnvSummary({
-              slug: "env-good",
-              runnerMachineId: "env-good",
-            }));
-          }
-          return null;
-        }),
-      },
-    } as any;
-
-    await expect(listEnvMetas(env)).resolves.toEqual([
-      expect.objectContaining({ slug: "env-good", runnerMachineId: "env-good" }),
-    ]);
-    expect(warn).toHaveBeenCalledWith(
-      "[repo-store] Skipping invalid env summary cache row env-bad:",
-      expect.stringContaining("missing explicit environment schema fields"),
-    );
-  });
-
-  it("re-reads KV values instead of trusting stale list metadata", async () => {
-    const env = {
-      ENVS_KV: {
-        list: vi.fn().mockImplementation(async ({ prefix }: { prefix?: string }) => {
-          if (prefix === "envdef:") {
-            return {
-              keys: [
-                {
-                  name: "envdef:env-1",
-                  metadata: {
-                    slug: "env-1",
-                    repoUrl: "https://github.com/paperwing-dev/example",
-                    runnerMachineId: "env-1",
-                    createdAt: "2026-03-30T00:00:00.000Z",
-                    branchName: "env/env-1",
-                  },
-                },
-              ],
-              list_complete: true,
-              cursor: undefined,
-            };
-          }
-          return { keys: [], list_complete: true, cursor: undefined };
-        }),
-        get: vi.fn().mockResolvedValue(
-          JSON.stringify(makeEnvSummary()),
-        ),
-      },
-    } as any;
-
-    await expect(listEnvMetas(env)).resolves.toEqual([
-      expect.objectContaining({
-        slug: "env-1",
-        repoUrl: "https://github.com/paperwing-dev/example",
-        runnerMachineId: "env-1",
-        createdAt: "2026-03-30T00:00:00.000Z",
-        branchName: "env/env-1",
-      }),
-    ]);
-  });
-
-  it("follows KV pagination cursors when listing env summaries", async () => {
-    const env = {
-      ENVS_KV: {
-        list: vi
-          .fn()
-          .mockResolvedValueOnce({
-            keys: [{ name: "envdef:env-1" }],
-            list_complete: false,
-            cursor: "cursor-2",
-          })
-          .mockResolvedValueOnce({
-            keys: [{ name: "envdef:env-2" }],
-            list_complete: true,
-            cursor: undefined,
-          }),
-        get: vi.fn().mockImplementation(async (key: string) => JSON.stringify(
-          makeEnvSummary({
-            slug: key,
-            runnerMachineId: key,
-          }),
-        )),
-      },
-    } as any;
-
-    await expect(listEnvMetas(env)).resolves.toEqual([
-      expect.objectContaining({ slug: "env-1", runnerMachineId: "env-1" }),
-      expect.objectContaining({ slug: "env-2", runnerMachineId: "env-2" }),
-    ]);
-    expect(env.ENVS_KV.list).toHaveBeenNthCalledWith(1, { prefix: "envdef:", cursor: undefined });
-    expect(env.ENVS_KV.list).toHaveBeenNthCalledWith(2, { prefix: "envdef:", cursor: "cursor-2" });
-  });
-
-  it("rejects summary rows that omit harness", async () => {
-    const env = {
-      ENVS_KV: {
-        get: vi.fn().mockResolvedValue(
-          JSON.stringify({
-            slug: "env-1",
-            repoUrl: "https://github.com/paperwing-dev/example",
-            backend: "cf",
-            createdAt: "2026-03-30T00:00:00.000Z",
-          }),
-        ),
-      },
-    } as any;
-
-    await expect(readEnvMeta(env, "env-1")).rejects.toThrow("missing explicit environment schema fields");
-  });
-
-  it("rejects summary rows that omit updatedAt", async () => {
-    const env = {
-      ENVS_KV: {
-        get: vi.fn().mockResolvedValue(
-          JSON.stringify({
-            slug: "env-1",
-            repoUrl: "https://github.com/paperwing-dev/example",
-            backend: "cf",
-            harness: "claude-code",
-            createdAt: "2026-03-30T00:00:00.000Z",
-            status: "running",
-          }),
-        ),
-      },
-    } as any;
-
-    await expect(readEnvMeta(env, "env-1")).rejects.toThrow("missing explicit environment schema fields");
-  });
-
-  it("rejects summary rows that omit status", async () => {
-    const env = {
-      ENVS_KV: {
-        get: vi.fn().mockResolvedValue(
-          JSON.stringify({
-            slug: "env-1",
-            repoUrl: "https://github.com/paperwing-dev/example",
-            backend: "cf",
-            harness: "claude-code",
-            createdAt: "2026-03-30T00:00:00.000Z",
-            updatedAt: "2026-03-30T00:00:00.000Z",
-          }),
-        ),
-      },
-    } as any;
-
-    await expect(readEnvMeta(env, "env-1")).rejects.toThrow("missing explicit environment schema fields");
-  });
-
   it("rejects env definition rows that omit harness", async () => {
     const env = {
       ENVS_KV: {
@@ -396,12 +151,27 @@ describe("repo store env metadata helpers", () => {
     await expect(readEnvDefinition(env, "env-1")).rejects.toThrow("missing explicit environment schema fields");
   });
 
+  it("rejects repo workspace metadata that omit GitHub App selection fields", async () => {
+    const workspace = {
+      readWorkspaceFile: vi.fn().mockResolvedValue(JSON.stringify({
+        repoId: "repo-123",
+        ...createInitialRepoScmState(),
+        createdAt: "2026-03-30T00:00:00.000Z",
+        updatedAt: "2026-03-30T00:00:00.000Z",
+        bootstrappedFromRef: "HEAD",
+      })),
+    } as any;
+
+    await expect(readRepoMetaFromWorkspace(workspace)).rejects.toThrow("missing explicit repository schema fields");
+  });
+
   it("rejects repo workspace metadata that omit gitStatus", async () => {
     const { gitStatus: _gitStatus, ...repoScmWithoutStatus } = createInitialRepoScmState();
     const workspace = {
       readWorkspaceFile: vi.fn().mockResolvedValue(JSON.stringify({
         repoId: "repo-123",
-        repoUrl: "https://github.com/paperwing-dev/example",
+        githubInstallationId: 98765,
+        githubFullName: "paperwing-dev/example",
         ...repoScmWithoutStatus,
         createdAt: "2026-03-30T00:00:00.000Z",
         updatedAt: "2026-03-30T00:00:00.000Z",
@@ -410,5 +180,159 @@ describe("repo store env metadata helpers", () => {
     } as any;
 
     await expect(readRepoMetaFromWorkspace(workspace)).rejects.toThrow("missing explicit repository schema fields");
+  });
+
+  it("does not repair or create repo workspaces during repoId lookup", async () => {
+    const workspace = {
+      readWorkspaceFile: vi.fn().mockResolvedValue(null),
+      readWorkspaceDir: vi.fn(),
+      writeWorkspaceFile: vi.fn().mockResolvedValue(undefined),
+      initFromTarball: vi.fn(),
+    };
+    const env = {
+      ENVS_KV: {
+        list: vi.fn().mockResolvedValue({
+          keys: [{ name: "repo:123456" }],
+          list_complete: true,
+          cursor: undefined,
+        }),
+        get: vi.fn().mockResolvedValue(JSON.stringify({
+          repoId: "123456",
+          repoUrl: "https://github.com/paperwing-dev/example",
+          updatedAt: "2026-03-30T00:00:00.000Z",
+        })),
+      },
+      WORKSPACE: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => workspace),
+      },
+    } as any;
+
+    const result = await listRepos(env);
+
+    expect(result).toEqual([]);
+    expect(env.WORKSPACE.idFromName).toHaveBeenCalledWith("plan-store:123456");
+    expect(workspace.readWorkspaceDir).not.toHaveBeenCalled();
+    expect(workspace.initFromTarball).not.toHaveBeenCalled();
+    expect(workspace.writeWorkspaceFile).not.toHaveBeenCalled();
+  });
+
+  it("revalidates persisted GitHub App selection during selected repo lookup", async () => {
+    githubAppMocks.resolveGitHubAppRepositorySelection.mockReset();
+    githubAppMocks.resolveGitHubAppRepositorySelection.mockResolvedValue({
+      repositoryId: 123456,
+      installationId: 98765,
+      fullName: "paperwing-dev/example",
+      repoUrl: "https://github.com/paperwing-dev/example",
+      private: true,
+      defaultBranch: "main",
+    });
+    const workspace = {
+      readWorkspaceFile: vi.fn().mockResolvedValue(JSON.stringify({
+        repoId: "123456",
+        githubInstallationId: 98765,
+        githubFullName: "paperwing-dev/example",
+        ...createInitialRepoScmState(),
+        createdAt: "2026-03-30T00:00:00.000Z",
+        updatedAt: "2026-03-30T00:00:00.000Z",
+        bootstrappedFromRef: "main",
+      })),
+    };
+    const env = {
+      ENVS_KV: {
+        get: vi.fn().mockResolvedValue(JSON.stringify({
+          repoId: "123456",
+          repoUrl: "https://github.com/paperwing-dev/example",
+          updatedAt: "2026-03-30T00:00:00.000Z",
+        })),
+      },
+      WORKSPACE: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => workspace),
+      },
+    } as any;
+
+    await expect(getSelectedRepoWorkspaceForRepoId(env, "123456")).resolves.toMatchObject({
+      meta: {
+        repoId: "123456",
+        githubInstallationId: 98765,
+        githubFullName: "paperwing-dev/example",
+      },
+    });
+    expect(githubAppMocks.resolveGitHubAppRepositorySelection).toHaveBeenCalledWith(env, {
+      repositoryId: 123456,
+      installationId: 98765,
+      fullName: "paperwing-dev/example",
+    });
+  });
+
+  it("persists the GitHub App selection when creating repo metadata", async () => {
+    githubAppMocks.resolveGitHubAppRepositorySelection.mockReset();
+    githubAppMocks.mintGitHubInstallationToken.mockReset();
+    githubAppMocks.resolveGitHubAppRepositorySelection.mockResolvedValue({
+      repositoryId: 123456,
+      installationId: 98765,
+      fullName: "paperwing-dev/example",
+      repoUrl: "https://github.com/paperwing-dev/example",
+      private: true,
+      defaultBranch: "main",
+    });
+    githubAppMocks.mintGitHubInstallationToken.mockResolvedValue({
+      token: "installation-token",
+      expiresAt: "2026-03-30T01:00:00.000Z",
+      installationId: 98765,
+      repository: "paperwing-dev/example",
+      permissions: {
+        metadata: "read",
+        contents: "write",
+        pull_requests: "write",
+      },
+    });
+
+    const workspace = {
+      readWorkspaceFile: vi.fn().mockResolvedValue(null),
+      initFromTarball: vi.fn().mockResolvedValue(undefined),
+      writeWorkspaceFile: vi.fn().mockResolvedValue(undefined),
+    };
+    const env = {
+      ENVS_KV: {
+        put: vi.fn().mockResolvedValue(undefined),
+      },
+      WORKSPACE: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => workspace),
+      },
+    } as any;
+
+    const result = await createRepoWorkspaceFromGitHubAppSelection(env, {
+      repositoryId: 123456,
+      installationId: 98765,
+      fullName: "Paperwing-Dev/Example",
+    });
+
+    expect(result.meta).toMatchObject({
+      repoId: "123456",
+      repoUrl: "https://github.com/paperwing-dev/example",
+      githubInstallationId: 98765,
+      githubFullName: "paperwing-dev/example",
+      bootstrappedFromRef: "main",
+    });
+    expect(result.created).toBe(true);
+    expect(workspace.initFromTarball).toHaveBeenCalledWith(
+      "https://api.github.com/repos/paperwing-dev/example/tarball/main",
+      expect.objectContaining({ Authorization: "Bearer installation-token" }),
+    );
+    const [, writtenMeta] = workspace.writeWorkspaceFile.mock.calls[0];
+    expect(JSON.parse(writtenMeta)).toMatchObject({
+      repoId: "123456",
+      githubInstallationId: 98765,
+      githubFullName: "paperwing-dev/example",
+    });
+    expect(JSON.parse(writtenMeta)).not.toHaveProperty("repoUrl");
+    expect(env.ENVS_KV.put).toHaveBeenCalledWith(
+      "repo:123456",
+      expect.stringContaining("\"repoId\":\"123456\""),
+    );
+    expect(env.ENVS_KV.put.mock.calls[0][1]).not.toContain("repoUrl");
   });
 });

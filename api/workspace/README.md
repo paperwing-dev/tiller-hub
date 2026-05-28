@@ -7,7 +7,7 @@ This folder contains the hosted workspace storage layer and the routes that expo
 `workspace/` owns:
 
 - the `WorkspaceDO`
-- the workspace host adapter used by `agents/experimental/workspace`
+- the Cloudflare Shell workspace adapter
 - file and plan materialization API routes
 
 ## Why this folder exists

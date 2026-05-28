@@ -5,7 +5,7 @@ import { createInitialEnvScmState, createInitialRepoScmState } from "../model";
 const mocks = vi.hoisted(() => ({
   getEnvLifecycleStub: vi.fn(),
   getScmOperationStub: vi.fn(),
-  ensureRepoWorkspaceFromRepoUrl: vi.fn(),
+  getRepoWorkspaceForRepoId: vi.fn(),
   projectAndPersistEnvSummary: vi.fn(),
   projectEnvMetaForAction: vi.fn(),
   reconcileEnvScmOperationState: vi.fn(),
@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   waitForRepoScmOperation: vi.fn(),
   buildScmOperationResponse: vi.fn(),
   ensureNoPendingRepoScmOperationForEnv: vi.fn(),
+  getRepoGitNotReadyError: vi.fn(),
 }));
 
 vi.mock("../../helpers", () => ({
@@ -27,7 +28,7 @@ vi.mock("../../helpers", () => ({
 }));
 
 vi.mock("../../plan/store", () => ({
-  ensureRepoWorkspaceFromRepoUrl: mocks.ensureRepoWorkspaceFromRepoUrl,
+  getSelectedRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
   readEnvSummary: vi.fn(),
 }));
 
@@ -60,10 +61,12 @@ vi.mock("../../env/scm-operations", () => ({
   waitForRepoScmOperation: mocks.waitForRepoScmOperation,
   buildScmOperationResponse: mocks.buildScmOperationResponse,
   ensureNoPendingRepoScmOperationForEnv: mocks.ensureNoPendingRepoScmOperationForEnv,
+  getRepoGitNotReadyError: mocks.getRepoGitNotReadyError,
 }));
 
 const {
   startMergeIntoMainWorkflow,
+  startUpdateFromMainWorkflow,
 } = await import("../workflows");
 
 function makeEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
@@ -88,6 +91,8 @@ function makeRepoMeta(overrides: Partial<RepoMeta> = {}): RepoMeta {
   return {
     repoId: "repo-1",
     repoUrl: "https://github.com/test/repo",
+    githubInstallationId: 98765,
+    githubFullName: "test/repo",
     createdAt: "2026-04-13T00:00:00.000Z",
     updatedAt: "2026-04-13T00:00:00.000Z",
     bootstrappedFromRef: "HEAD",
@@ -107,6 +112,7 @@ describe("scm/workflows", () => {
     mocks.projectAndPersistEnvSummary.mockImplementation(async (_env: unknown, _hub: unknown, _slug: string) => makeEnvMeta());
     mocks.projectEnvMetaForAction.mockImplementation(async (_env: unknown, meta: EnvMeta) => ({ meta, liveStatus: "stopped" }));
     mocks.ensureNoPendingRepoScmOperationForEnv.mockResolvedValue(null);
+    mocks.getRepoGitNotReadyError.mockReturnValue(null);
     mocks.buildGitOperationEnvVars.mockResolvedValue({
       TILLER_SCM_OPERATION: "merge-into-main",
       TILLER_SCM_CONFLICT_RESOLUTION_URL: "https://hub.test/api/envs/demo-env/scm-operations/op-merge/resolve-conflicts",
@@ -147,7 +153,7 @@ describe("scm/workflows", () => {
     mocks.projectAndPersistEnvSummary.mockResolvedValue(meta);
     mocks.projectEnvMetaForAction.mockResolvedValue({ meta, liveStatus: "stopped" });
     mocks.getScmOperationStub.mockReturnValue(scmOperationStub);
-    mocks.ensureRepoWorkspaceFromRepoUrl.mockResolvedValue({
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
       workspace: {},
       meta: makeRepoMeta({ mainCommit: "main-a" }),
     });
@@ -189,20 +195,83 @@ describe("scm/workflows", () => {
     expect(store.clearOperation).toHaveBeenCalledWith("op-merge");
   });
 
-  it("allows promote workflows to start even when the env is behind main", async () => {
+  it("requires update from main before promoting a behind-main env", async () => {
     const meta = makeEnvMeta({
       workspaceDirty: true,
       baseMainCommit: "main-a",
       lastKnownMainCommit: "main-a",
       branchStatus: "behind-main",
     });
+    const store = {
+      acquireMergeLock: vi.fn(),
+      createOperation: vi.fn(),
+    };
+    mocks.projectAndPersistEnvSummary.mockResolvedValue(meta);
+    mocks.projectEnvMetaForAction.mockResolvedValue({ meta, liveStatus: "stopped" });
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
+      workspace: {},
+      meta: makeRepoMeta({ mainCommit: "main-b" }),
+    });
+    mocks.getScmOperationStore.mockReturnValue(store);
+
+    const result = await startMergeIntoMainWorkflow({} as any, "https://hub.test/api/envs/demo-env/merge-into-main", "demo-env");
+
+    expect(result.status).toBe(409);
+    expect(result.body).toMatchObject({
+      code: "promote_requires_update_from_main",
+      hint: expect.stringContaining("Update from Main"),
+    });
+    expect(store.acquireMergeLock).not.toHaveBeenCalled();
+    expect(store.createOperation).not.toHaveBeenCalled();
+  });
+
+  it("rejects promote when the env base commit is missing", async () => {
+    const meta = makeEnvMeta({
+      workspaceDirty: true,
+      baseMainCommit: null,
+      lastKnownMainCommit: null,
+      branchStatus: "ready-to-merge",
+    });
+    const store = {
+      acquireMergeLock: vi.fn(),
+      createOperation: vi.fn(),
+    };
+    mocks.projectAndPersistEnvSummary.mockResolvedValue(meta);
+    mocks.projectEnvMetaForAction.mockResolvedValue({ meta, liveStatus: "stopped" });
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
+      workspace: {},
+      meta: makeRepoMeta({ mainCommit: "main-a" }),
+    });
+    mocks.getScmOperationStore.mockReturnValue(store);
+
+    const result = await startMergeIntoMainWorkflow({} as any, "https://hub.test/api/envs/demo-env/merge-into-main", "demo-env");
+
+    expect(result.status).toBe(409);
+    expect(result.body).toMatchObject({
+      code: "promote_base_not_current",
+      hint: expect.stringContaining("base commit is missing"),
+    });
+    expect(store.acquireMergeLock).not.toHaveBeenCalled();
+    expect(store.createOperation).not.toHaveBeenCalled();
+  });
+
+  it("starts update-from-main workflows through the operation store and scm backend", async () => {
+    const meta = makeEnvMeta({
+      workspaceDirty: true,
+      baseMainCommit: "main-a",
+      lastKnownMainCommit: "main-a",
+      branchStatus: "behind-main",
+    });
+    const lifecycleStub = {
+      setScmProjection: vi.fn().mockResolvedValue(undefined),
+    };
     const scmOperationStub = {
       startOperationJob: vi.fn().mockResolvedValue(undefined),
     };
     const store = {
       acquireMergeLock: vi.fn().mockResolvedValue({
         acquired: true,
-        lock: { token: "lock-token", operationId: "op-merge" },
+        lock: { token: "lock-token", operationId: "op-update" },
       }),
       createOperation: vi.fn().mockResolvedValue({}),
       clearOperation: vi.fn().mockResolvedValue(undefined),
@@ -212,26 +281,66 @@ describe("scm/workflows", () => {
     mocks.projectAndPersistEnvSummary.mockResolvedValue(meta);
     mocks.projectEnvMetaForAction.mockResolvedValue({ meta, liveStatus: "stopped" });
     mocks.getScmOperationStub.mockReturnValue(scmOperationStub);
-    mocks.ensureRepoWorkspaceFromRepoUrl.mockResolvedValue({
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
       workspace: {},
       meta: makeRepoMeta({ mainCommit: "main-b" }),
     });
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
     mocks.getScmOperationStore.mockReturnValue(store);
-    mocks.createScmOperationId.mockReturnValue("op-merge");
-    mocks.waitForRepoScmOperation.mockResolvedValue({
-      operationId: "op-merge",
-      status: "succeeded",
-      result: { action: "merged" },
+    mocks.createScmOperationId.mockReturnValue("op-update");
+    mocks.buildGitOperationEnvVars.mockResolvedValue({
+      TILLER_SCM_OPERATION: "update-from-main",
+      TILLER_SCM_CONFLICT_RESOLUTION_URL: "https://hub.test/api/envs/demo-env/scm-operations/op-update/resolve-conflicts",
     });
-    mocks.buildScmOperationResponse.mockReturnValue({ ok: true, action: "merged" });
+    mocks.waitForRepoScmOperation.mockResolvedValue({
+      operationId: "op-update",
+      status: "succeeded",
+      result: { action: "updated-from-main" },
+    });
+    mocks.buildScmOperationResponse.mockReturnValue({
+      ok: true,
+      action: "updated-from-main",
+      branchStatus: "ready-to-merge",
+    });
 
-    const result = await startMergeIntoMainWorkflow({} as any, "https://hub.test/api/envs/demo-env/merge-into-main", "demo-env");
+    const result = await startUpdateFromMainWorkflow({} as any, "https://hub.test/api/envs/demo-env/update-from-main", "demo-env");
 
     expect(result.status).toBe(200);
-    expect(store.createOperation).toHaveBeenCalledWith(expect.objectContaining({
-      type: "merge-into-main",
-    }));
+    expect(result.body).toMatchObject({
+      slug: "demo-env",
+      repoId: "repo-1",
+      ok: true,
+      action: "updated-from-main",
+      branchStatus: "ready-to-merge",
+    });
+    expect(store.acquireMergeLock).toHaveBeenCalledWith({
+      ownerId: "demo-env",
+      operationId: "op-update",
+      leaseMs: 300000,
+    });
+    expect(store.createOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operationId: "op-update",
+        type: "update-from-main",
+        mergeLockToken: "lock-token",
+      }),
+    );
     expect(scmOperationStub.startOperationJob).toHaveBeenCalledTimes(1);
+    expect(mocks.buildGitOperationEnvVars).toHaveBeenCalledWith(
+      expect.anything(),
+      "https://hub.test/api/envs/demo-env/update-from-main",
+      expect.anything(),
+      expect.objectContaining({
+        branchStatus: "behind-main",
+      }),
+      expect.objectContaining({
+        operationId: "op-update",
+        operationType: "update-from-main",
+        sourceGitArtifactId: "g-main",
+        mergeLockToken: "lock-token",
+      }),
+    );
+    expect(store.clearOperation).toHaveBeenCalledWith("op-update");
   });
 
   it("returns a useful error and releases any partially-acquired lock when promote setup throws", async () => {
@@ -253,7 +362,7 @@ describe("scm/workflows", () => {
     };
     mocks.projectAndPersistEnvSummary.mockResolvedValue(meta);
     mocks.projectEnvMetaForAction.mockResolvedValue({ meta, liveStatus: "stopped" });
-    mocks.ensureRepoWorkspaceFromRepoUrl.mockResolvedValue({
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
       workspace: {},
       meta: makeRepoMeta({ mainCommit: "main-a" }),
     });

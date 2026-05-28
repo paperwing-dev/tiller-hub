@@ -8,7 +8,7 @@ import {
 
 describe("plan-models", () => {
   it("identifies the ChatGPT plan model", () => {
-    expect(isChatGPTPlanModel("gpt-5.4")).toBe(true);
+    expect(isChatGPTPlanModel("gpt-5.5")).toBe(true);
     expect(isChatGPTPlanModel("@cf/moonshotai/kimi-k2.5")).toBe(false);
   });
 
@@ -17,9 +17,9 @@ describe("plan-models", () => {
     expect(isChatGPTPlanModel(getFallbackPlanModel())).toBe(false);
   });
 
-  it("coerces stored ChatGPT selections when ChatGPT is unavailable", () => {
+  it("coerces stored subscription selections when the subscription route is unavailable", () => {
     expect(
-      coercePlanModelSelection("gpt-5.4", {
+      coercePlanModelSelection("gpt-5.5", {
         chatgptAvailable: false,
       }),
     ).toBe(getFallbackPlanModel());

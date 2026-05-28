@@ -2,23 +2,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env, HostServiceRegistration } from "../types";
 
 const {
-  getValidOpenAIAuth,
   getSecret,
+  resolveDeploymentModeForRuntime,
   readRegisteredHostService,
   readRoutableHostService,
 } = vi.hoisted(() => ({
-  getValidOpenAIAuth: vi.fn(),
   getSecret: vi.fn(),
+  resolveDeploymentModeForRuntime: vi.fn(),
   readRegisteredHostService: vi.fn(),
   readRoutableHostService: vi.fn(),
 }));
 
-vi.mock("../openai-auth", () => ({
-  getValidOpenAIAuth,
-}));
-
 vi.mock("../setup/config", () => ({
   getSecret,
+  resolveDeploymentModeForRuntime,
 }));
 
 vi.mock("../service-registry", () => ({
@@ -38,23 +35,35 @@ function buildHost(overrides: Partial<HostServiceRegistration>): HostServiceRegi
     connectedAt: "2026-04-13T00:00:00.000Z",
     dockerAvailable: true,
     codexSubscription: true,
+    codexGatewayAuth: "session-token",
     claudeSubscription: true,
     transport: "session",
     ...overrides,
   };
 }
 
+function buildLegacyHost(overrides: Partial<HostServiceRegistration>): HostServiceRegistration {
+  const host = buildHost(overrides);
+  delete host.codexGatewayAuth;
+  return host;
+}
+
 describe("resolveCodexModelRoute", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    getValidOpenAIAuth.mockResolvedValue({
-      access_token: "access-token",
-      account_id: "acct-123",
-    });
-    getSecret.mockResolvedValue(undefined);
+    getSecret.mockImplementation(async (_env: Env, key: string) => (
+      key === "TILLER_DEPLOYMENT_MODE" ? "self-host" : undefined
+    ));
+    resolveDeploymentModeForRuntime.mockResolvedValue("self-host");
     readRegisteredHostService.mockResolvedValue(null);
     readRoutableHostService.mockResolvedValue(null);
-    global.fetch = vi.fn(async () => new Response("ok", { status: 200 })) as typeof fetch;
+    global.fetch = vi.fn(async () => Response.json({
+      ok: true,
+      capabilities: {
+        codexSubscription: true,
+        codexGatewayAuth: "session-token",
+      },
+    })) as typeof fetch;
   });
 
   afterEach(() => {
@@ -73,10 +82,10 @@ describe("resolveCodexModelRoute", () => {
       resolveCodexModelRoute(mockEnv(), { target: "host", machineId: "host-1" }),
     ).resolves.toEqual({
       kind: "host-gateway",
+      machineId: "host-1",
       providerBaseUrl: "http://host.docker.internal:8788/v1",
       responsesUrl: "http://host.docker.internal:8788/codex/responses",
-      accessToken: "access-token",
-      accountId: "acct-123",
+      codexRouteStatus: "available",
     });
     expect(readRoutableHostService).toHaveBeenCalledWith(expect.anything(), "host-1");
   });
@@ -91,7 +100,8 @@ describe("resolveCodexModelRoute", () => {
       resolveCodexModelRoute(mockEnv(), { target: "host", machineId: "host-1" }),
     ).resolves.toEqual({
       kind: "unavailable",
-      reason: "Codex requires the selected Tiller Host to be connected or an OpenAI API key.",
+      reason: "Codex requires the selected Tiller Self Host to be connected or an API key.",
+      codexRouteStatus: "host_offline",
     });
   });
 
@@ -105,7 +115,66 @@ describe("resolveCodexModelRoute", () => {
       resolveCodexModelRoute(mockEnv(), { target: "hosted" }),
     ).resolves.toEqual({
       kind: "unavailable",
-      reason: "Codex requires a running Tiller Host gateway or an OpenAI API key.",
+      reason: "Codex requires a connected Tiller Self Host or an API key.",
+      codexRouteStatus: "host_offline",
+    });
+  });
+
+  it("rejects hosted gateways that do not advertise session-token Codex auth", async () => {
+    readRegisteredHostService.mockResolvedValue(buildHost({
+      machineId: "host-1",
+      gatewayUrl: "https://tiller-gateway.example.com",
+    }));
+    readRoutableHostService.mockResolvedValue(buildLegacyHost({
+      machineId: "host-1",
+      gatewayUrl: "https://tiller-gateway.example.com",
+    }));
+
+    await expect(
+      resolveCodexModelRoute(mockEnv(), { target: "hosted" }),
+    ).resolves.toEqual({
+      kind: "unavailable",
+      reason: "Codex requires an updated Subscription Gateway with subscription session-token support.",
+      codexRouteStatus: "unavailable",
+    });
+  });
+
+  it("rejects healthy hosted gateways whose health check lacks session-token Codex auth", async () => {
+    readRegisteredHostService.mockResolvedValue(buildHost({
+      machineId: "host-1",
+      gatewayUrl: "https://tiller-gateway.example.com",
+    }));
+    readRoutableHostService.mockResolvedValue(buildHost({
+      machineId: "host-1",
+      gatewayUrl: "https://tiller-gateway.example.com",
+    }));
+    global.fetch = vi.fn(async () => Response.json({
+      ok: true,
+      capabilities: {
+        codexSubscription: true,
+      },
+    })) as typeof fetch;
+
+    await expect(
+      resolveCodexModelRoute(mockEnv(), { target: "hosted" }),
+    ).resolves.toEqual({
+      kind: "unavailable",
+      reason: "Codex requires an updated Subscription Gateway with subscription session-token support.",
+      codexRouteStatus: "unavailable",
+    });
+  });
+
+  it("can resolve subscription route status without API key fallback", async () => {
+    getSecret.mockImplementation(async (_env: Env, key: string) => (
+      key === "TILLER_DEPLOYMENT_MODE" ? "self-host" : key === "OPENAI_API_KEY" ? "sk-api-key" : undefined
+    ));
+
+    await expect(
+      resolveCodexModelRoute(mockEnv(), { target: "hosted", allowApiFallback: false }),
+    ).resolves.toEqual({
+      kind: "unavailable",
+      reason: "Codex requires a running Subscription Gateway.",
+      codexRouteStatus: "host_offline",
     });
   });
 });

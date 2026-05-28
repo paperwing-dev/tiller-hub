@@ -21,10 +21,14 @@ const ROOT_WRANGLER_CONFIG = "wrangler.jsonc";
 const GENERATED_DEPLOY_CONFIG = path.join(".wrangler", "deploy", "config.json");
 const TEMP_DEPLOY_CONFIG_NAME = "wrangler.deploy.generated.json";
 const TILLER_REGION_VAR = "TILLER_REGION";
+const TILLER_WORKER_NAME_VAR = "TILLER_WORKER_NAME";
+const WRANGLER_CI_OVERRIDE_NAME_VAR = "WRANGLER_CI_OVERRIDE_NAME";
 const DO_LOCATION_HINT_VAR = "DO_LOCATION_HINT";
 const R2_BUCKET_BINDING = "BUCKET";
 const CUSTOM_DOMAIN_ENV = "TILLER_CUSTOM_DOMAIN";
 const ACCESS_EMAILS_ENV = "TILLER_ACCESS_EMAILS";
+const ACCESS_TEAM_DOMAIN_ENV = "CF_ACCESS_TEAM_DOMAIN";
+const TILLER_ACCESS_TEAM_DOMAIN_ENV = "TILLER_ACCESS_TEAM_DOMAIN";
 const CLOUDFLARE_API_TOKEN_ENV = "CLOUDFLARE_API_TOKEN";
 const CLOUDFLARE_ACCOUNT_ID_ENV = "CLOUDFLARE_ACCOUNT_ID";
 const CLOUDFLARE_DEFAULT_ACCOUNT_ID_ENV = "CLOUDFLARE_DEFAULT_ACCOUNT_ID";
@@ -61,6 +65,27 @@ export function parseJsonc(content, filePath) {
   }
 
   return value;
+}
+
+export function parseWranglerJsonOutput(content, filePath) {
+  const trimmed = content.trim();
+  const candidateStarts = [];
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+    if (char === "{" || char === "[") {
+      candidateStarts.push(index);
+    }
+  }
+
+  for (const start of candidateStarts) {
+    try {
+      return parseJsonc(trimmed.slice(start), filePath);
+    } catch {
+      // Wrangler may print non-JSON notices before the requested JSON payload.
+    }
+  }
+
+  return parseJsonc(content, filePath);
 }
 
 async function readJsoncFile(filePath) {
@@ -122,6 +147,35 @@ export function normalizeTillerRegion(rawValue) {
   }
 
   return value;
+}
+
+export function normalizeWorkerName(rawValue, source = "Worker name") {
+  if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
+    throw new Error(`Missing ${source}.`);
+  }
+
+  const value = rawValue.trim();
+  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value)) {
+    throw new Error(
+      `${source} "${rawValue}" must use lowercase letters, numbers, and hyphens, and cannot start or end with a hyphen.`,
+    );
+  }
+
+  return value;
+}
+
+export function resolveWorkerName(rootConfig, env = process.env) {
+  const ciWorkerName = env[WRANGLER_CI_OVERRIDE_NAME_VAR]?.trim();
+  if (ciWorkerName) {
+    return normalizeWorkerName(ciWorkerName, WRANGLER_CI_OVERRIDE_NAME_VAR);
+  }
+
+  const explicitWorkerName = env[TILLER_WORKER_NAME_VAR]?.trim();
+  if (explicitWorkerName) {
+    return normalizeWorkerName(explicitWorkerName, TILLER_WORKER_NAME_VAR);
+  }
+
+  return normalizeWorkerName(rootConfig?.name, `Worker name in ${ROOT_WRANGLER_CONFIG}`);
 }
 
 export function deriveBucketName(workerName) {
@@ -259,7 +313,7 @@ async function getBucketInfo(bucketName) {
         capture: true,
       },
     );
-    return parseJsonc(stdout, "wrangler r2 bucket info output");
+    return parseWranglerJsonOutput(stdout, "wrangler r2 bucket info output");
   } catch (error) {
     if (error instanceof CommandError && isMissingBucketError(error.stderr)) {
       return null;
@@ -303,6 +357,41 @@ function getContainerImageOverride(className, { sandboxImageTag = "", scmBootstr
 
 function isManagedContainerClass(className) {
   return className === "SandboxDO" || className === "ScmBootstrapDO" || className === "ScmOperationDO";
+}
+
+export function deriveContainerApplicationName(workerName, className) {
+  return `${workerName}-${String(className).toLowerCase()}`;
+}
+
+export function rewriteContainerApplicationNames(
+  containers,
+  {
+    workerName,
+    previousWorkerName = "",
+  } = {},
+) {
+  if (!Array.isArray(containers) || typeof workerName !== "string" || workerName.length === 0) {
+    return containers ?? [];
+  }
+
+  return containers.map((container) => {
+    const className = typeof container?.class_name === "string" ? container.class_name : "";
+    if (!className) return { ...container };
+
+    const previousName = previousWorkerName
+      ? deriveContainerApplicationName(previousWorkerName, className)
+      : "";
+    const hasDerivedName = typeof container?.name !== "string"
+      || container.name.length === 0
+      || (previousName && container.name === previousName);
+
+    if (!hasDerivedName) return { ...container };
+
+    return {
+      ...container,
+      name: deriveContainerApplicationName(workerName, className),
+    };
+  });
 }
 
 export function needsLiveContainerImageLookup(
@@ -423,7 +512,12 @@ export function buildDeployConfig(
   const nextConfig = structuredClone(baseDeployConfig);
   const vars = { ...(nextConfig.vars ?? {}) };
 
+  if (workerName) {
+    nextConfig.name = workerName;
+  }
+
   delete vars[TILLER_REGION_VAR];
+  delete vars[TILLER_WORKER_NAME_VAR];
   delete vars[HUB_PUBLIC_URL_VAR];
   delete vars[WORKER_SERVICE_NAME_VAR];
   delete vars[WORKERS_DEV_ALIAS_DISABLED_VAR];
@@ -451,13 +545,19 @@ export function buildDeployConfig(
     ];
   } else {
     nextConfig.workers_dev = true;
-    delete nextConfig.preview_urls;
+    nextConfig.preview_urls = false;
     delete nextConfig.routes;
   }
 
   if (nextConfig.containers?.length) {
+    const deploymentContainers = workerName
+      ? rewriteContainerApplicationNames(nextConfig.containers, {
+        workerName: nextConfig.name,
+        previousWorkerName: baseDeployConfig?.name,
+      })
+      : structuredClone(nextConfig.containers);
     const nextContainers = resolvedContainers
-      ?? resolveContainerImages(nextConfig.containers, {
+      ?? resolveContainerImages(deploymentContainers, {
         sandboxImageTag,
         scmBootstrapImageTag,
         liveContainerImages,
@@ -488,15 +588,19 @@ async function main() {
 
   const rootConfigPath = path.join(rootDir, ROOT_WRANGLER_CONFIG);
   const rootConfig = await readJsoncFile(rootConfigPath);
-  const workerName = rootConfig?.name;
+  const workerName = resolveWorkerName(rootConfig);
   const region = normalizeTillerRegion(rootConfig?.vars?.[TILLER_REGION_VAR]);
   const bucketName = deriveBucketName(workerName);
   const customDomain = rootConfig?.vars?.[CUSTOM_DOMAIN_ENV]?.trim() || process.env[CUSTOM_DOMAIN_ENV]?.trim() || "";
   const apiToken = process.env[CLOUDFLARE_API_TOKEN_ENV]?.trim() || "";
+  const accessTeamDomain = process.env[ACCESS_TEAM_DOMAIN_ENV]?.trim()
+    || process.env[TILLER_ACCESS_TEAM_DOMAIN_ENV]?.trim()
+    || "";
   const sandboxImageTag = process.env[CONTAINER_IMAGE_TAG_ENV]?.trim() || "";
   const scmBootstrapImageTag = process.env[SCM_BOOTSTRAP_IMAGE_TAG_ENV]?.trim() || "";
   const emails = normalizeEmailList(process.env[ACCESS_EMAILS_ENV] ?? "");
 
+  console.log(`Using Worker name: ${workerName}`);
   console.log(`Using ${TILLER_REGION_VAR}=${region}`);
   console.log(`Resolved R2 bucket name: ${bucketName}`);
 
@@ -544,7 +648,11 @@ async function main() {
 
   const generatedDeployConfigPath = await resolveGeneratedDeployConfigPath(rootDir);
   const generatedDeployConfig = await readJsoncFile(generatedDeployConfigPath);
-  const needsLiveLookup = needsLiveContainerImageLookup(generatedDeployConfig.containers, {
+  const deploymentContainers = rewriteContainerApplicationNames(generatedDeployConfig.containers, {
+    workerName,
+    previousWorkerName: generatedDeployConfig.name,
+  });
+  const needsLiveLookup = needsLiveContainerImageLookup(deploymentContainers, {
     sandboxImageTag,
     scmBootstrapImageTag,
   });
@@ -554,13 +662,13 @@ async function main() {
       liveContainerImages = await resolveLiveContainerImages(
         apiToken,
         resolvedAccountId,
-        generatedDeployConfig.containers,
+        deploymentContainers,
       );
     } else {
       console.log("Container image preservation unavailable; using config defaults for unpinned containers.");
     }
   }
-  const resolvedContainerImages = resolveContainerImages(generatedDeployConfig.containers, {
+  const resolvedContainerImages = resolveContainerImages(deploymentContainers, {
     sandboxImageTag,
     scmBootstrapImageTag,
     liveContainerImages,
@@ -612,6 +720,7 @@ async function main() {
     const result = await ensureProtectedCustomDomain(hubUrl, {
       apiToken,
       emails,
+      accessTeamDomain,
     });
 
     console.log(`Protected hub deployed at ${hubUrl}`);

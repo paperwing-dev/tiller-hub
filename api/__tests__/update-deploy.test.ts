@@ -24,8 +24,11 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../update/check-release", () => ({
-  fetchLatestTillerRelease: mocks.fetchLatestTillerRelease,
   clearUpdateCheckCache: mocks.clearUpdateCheckCache,
+}));
+
+vi.mock("../update/legacy-release", () => ({
+  fetchLatestTillerRelease: mocks.fetchLatestTillerRelease,
 }));
 
 vi.mock("../workspace/tar", () => ({

@@ -54,7 +54,7 @@ function requirePinnedManagedImage(container) {
   }
 }
 
-function buildPlainTextBindings(config) {
+export function buildPlainTextBindings(config) {
   const vars = Object.entries(config.vars ?? {})
     .filter(([name]) => !RUNTIME_VAR_EXCLUDES.has(name))
     .map(([name, text]) => ({
@@ -62,10 +62,6 @@ function buildPlainTextBindings(config) {
       name,
       text: String(text),
     }));
-
-  if (!vars.some((binding) => binding.name === "ENABLED_ENV_HARNESSES")) {
-    throw new Error("Build output is missing the ENABLED_ENV_HARNESSES variable required by the updater");
-  }
 
   return vars;
 }

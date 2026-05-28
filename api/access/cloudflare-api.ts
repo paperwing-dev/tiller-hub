@@ -17,6 +17,11 @@ interface CloudflareZone {
   account?: { id?: string | null } | null;
 }
 
+export interface CloudflareAccount {
+  id: string;
+  name?: string | null;
+}
+
 export interface CloudflareAccessApp {
   id: string;
   aud?: string | null;
@@ -38,10 +43,27 @@ export interface CloudflareServiceToken {
   client_secret: string;
 }
 
+export interface CloudflareAccessOrganization {
+  auth_domain?: string | null;
+}
+
 export interface CloudflareTunnel {
   id: string;
   name: string;
   token?: string | null;
+}
+
+interface CloudflareWorkerScriptSettings {
+  id?: string | null;
+}
+
+interface CloudflareWorkerAccountSubdomain {
+  subdomain?: string | null;
+}
+
+interface CloudflareWorkerSubdomainStatus {
+  enabled?: boolean | null;
+  previews_enabled?: boolean | null;
 }
 
 interface CloudflareDnsRecord {
@@ -50,6 +72,145 @@ interface CloudflareDnsRecord {
   name?: string | null;
   content?: string | null;
   proxied?: boolean | null;
+}
+
+export interface WorkersDevRouteAccount {
+  accountId: string;
+  accountName: string | null;
+  hostname: string;
+  serviceName: string;
+  workersDevSubdomain: string;
+}
+
+function normalizeWorkersDevLabel(value: string | null | undefined): string {
+  return value?.trim().toLowerCase().replace(/\.$/, "") ?? "";
+}
+
+export function parseWorkersDevHostname(hostnameInput: string): {
+  hostname: string;
+  serviceName: string;
+  workersDevSubdomain: string;
+} {
+  const hostname = normalizeWorkersDevLabel(hostnameInput);
+  if (!hostname.endsWith(".workers.dev")) {
+    throw new Error("workers.dev Access setup only applies to workers.dev hostnames.");
+  }
+
+  const labels = hostname.slice(0, -".workers.dev".length).split(".").filter(Boolean);
+  if (labels.length < 2) {
+    throw new Error("Could not determine the Worker name and workers.dev account subdomain from this route.");
+  }
+
+  return {
+    hostname,
+    serviceName: labels[0],
+    workersDevSubdomain: labels.slice(1).join("."),
+  };
+}
+
+export async function listAccounts(apiToken: string): Promise<CloudflareAccount[]> {
+  const accounts: CloudflareAccount[] = [];
+
+  for (let page = 1; page <= 10; page += 1) {
+    const result = await cloudflareApi<CloudflareAccount[]>(
+      apiToken,
+      `/accounts?per_page=50&page=${page}`,
+      { method: "GET" },
+    );
+    accounts.push(...result);
+    if (result.length < 50) break;
+  }
+
+  return accounts;
+}
+
+export async function getWorkerAccountSubdomain(
+  apiToken: string,
+  accountId: string,
+): Promise<string | null> {
+  const result = await cloudflareApi<CloudflareWorkerAccountSubdomain>(
+    apiToken,
+    `/accounts/${accountId}/workers/subdomain`,
+    { method: "GET" },
+  );
+  const subdomain = result.subdomain?.trim();
+  return subdomain || null;
+}
+
+export async function getWorkerScriptSettings(
+  apiToken: string,
+  accountId: string,
+  serviceName: string,
+): Promise<CloudflareWorkerScriptSettings> {
+  return cloudflareApi<CloudflareWorkerScriptSettings>(
+    apiToken,
+    `/accounts/${accountId}/workers/scripts/${serviceName}/settings`,
+    { method: "GET" },
+  );
+}
+
+export async function getWorkerScriptSubdomainStatus(
+  apiToken: string,
+  accountId: string,
+  serviceName: string,
+): Promise<CloudflareWorkerSubdomainStatus> {
+  return cloudflareApi<CloudflareWorkerSubdomainStatus>(
+    apiToken,
+    `/accounts/${accountId}/workers/scripts/${serviceName}/subdomain`,
+    { method: "GET" },
+  );
+}
+
+export async function resolveAccountForWorkersDevRoute(
+  apiToken: string,
+  options: { hostname: string; serviceName?: string | null },
+): Promise<WorkersDevRouteAccount> {
+  const parsed = parseWorkersDevHostname(options.hostname);
+  const requestedServiceName = normalizeWorkersDevLabel(options.serviceName) || parsed.serviceName;
+  const accounts = await listAccounts(apiToken);
+  const matches: CloudflareAccount[] = [];
+
+  for (const account of accounts) {
+    const accountId = account.id?.trim();
+    if (!accountId) continue;
+
+    let accountSubdomain: string | null = null;
+    try {
+      accountSubdomain = await getWorkerAccountSubdomain(apiToken, accountId);
+    } catch (error) {
+      if (error instanceof CloudflareApiError && error.status === 404) {
+        continue;
+      }
+      throw error;
+    }
+
+    if (normalizeWorkersDevLabel(accountSubdomain) === parsed.workersDevSubdomain) {
+      matches.push(account);
+    }
+  }
+
+  if (matches.length === 0) {
+    throw new Error(`This token cannot find the Cloudflare account that owns ${parsed.hostname}.`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Multiple Cloudflare accounts matched ${parsed.hostname}. Scope the API token to one account and retry.`);
+  }
+
+  const account = matches[0];
+  await getWorkerScriptSettings(apiToken, account.id, requestedServiceName);
+
+  const subdomainStatus = await getWorkerScriptSubdomainStatus(apiToken, account.id, requestedServiceName);
+  if (subdomainStatus.enabled === false) {
+    throw new Error(`The workers.dev route for Worker ${requestedServiceName} is disabled in Cloudflare.`);
+  }
+
+  return {
+    accountId: account.id,
+    accountName: account.name?.trim() || null,
+    hostname: parsed.hostname,
+    serviceName: requestedServiceName,
+    workersDevSubdomain: parsed.workersDevSubdomain,
+  };
 }
 
 export async function listServiceTokens(
@@ -108,6 +269,17 @@ export async function listAccessPolicies(
   }
 
   return policies;
+}
+
+export async function getAccessOrganization(
+  apiToken: string,
+  accountId: string,
+): Promise<CloudflareAccessOrganization> {
+  return cloudflareApi<CloudflareAccessOrganization>(
+    apiToken,
+    `/accounts/${accountId}/access/organizations`,
+    { method: "GET" },
+  );
 }
 
 export async function listTunnels(
@@ -366,6 +538,31 @@ export async function createAccessEmailPolicy(
     `/accounts/${accountId}/access/apps/${appId}/policies`,
     {
       method: "POST",
+      body: JSON.stringify({
+        name: options.name,
+        decision: "allow",
+        precedence: options.precedence,
+        include: options.emails.map((email) => ({
+          email: { email },
+        })),
+        session_duration: MANAGED_ACCESS_SESSION_DURATION,
+      }),
+    },
+  );
+}
+
+export async function updateAccessEmailPolicy(
+  apiToken: string,
+  accountId: string,
+  appId: string,
+  policyId: string,
+  options: { name: string; emails: string[]; precedence: number },
+): Promise<CloudflareAccessPolicy> {
+  return cloudflareApi<CloudflareAccessPolicy>(
+    apiToken,
+    `/accounts/${accountId}/access/apps/${appId}/policies/${policyId}`,
+    {
+      method: "PUT",
       body: JSON.stringify({
         name: options.name,
         decision: "allow",

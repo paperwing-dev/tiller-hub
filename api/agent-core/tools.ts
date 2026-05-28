@@ -1,5 +1,6 @@
 import { jsonSchema, tool, type ToolSet } from "ai";
 import type { Artifact, ArtifactStoreDO } from "../coordination";
+import { renderArtifactBodyMarkdown } from "../coordination";
 import type {
   AgentSpec,
   HostedTool,
@@ -11,7 +12,6 @@ import type {
   WorkspaceContextAccess,
   WorkspaceEntry,
 } from "./types";
-import type { ResponseToolDefinition } from "./codex";
 
 const MEMORY_DIR = "/.tiller/memory";
 
@@ -39,15 +39,6 @@ function getInputStringArray(input: Record<string, unknown>, key: string): strin
   return undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function getStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === "string");
-}
-
 function formatFileInfo(entry: WorkspaceEntry): string {
   return `${entry.type === "directory" ? "d" : "f"} ${entry.path} (${entry.size}b)`;
 }
@@ -59,6 +50,14 @@ function normalizeMemoryKey(key: string): string {
 
 function formatArtifactSummary(id: string, title: string, summary: string): string {
   return [id, title, summary].filter(Boolean).join(" :: ");
+}
+
+function markdownSummary(markdown: string): string {
+  return markdown
+    .split("\n")
+    .map((line) => line.trim().replace(/^#+\s*/, ""))
+    .find(Boolean)
+    ?.slice(0, 160) ?? "";
 }
 
 export class HostedToolExecutionError extends Error {
@@ -136,12 +135,10 @@ interface ArtifactToolView {
   id: string;
   type: string;
   title: string;
-  summary: string;
-  findings: string[];
-  relevantFiles: string[];
-  openQuestions: string[];
-  proposedPlan: string;
-  memoryRefs: string[];
+  markdown: string;
+  status?: string;
+  version?: number;
+  updatedAt?: string;
   createdBy?: string;
   createdAt: string;
   basis?: {
@@ -151,41 +148,22 @@ interface ArtifactToolView {
   };
   parentArtifactId?: string;
   supersedesArtifactId?: string;
-  model?: string;
-}
-
-function extractArtifactBodyFields(body: unknown): Omit<ArtifactToolView, "id" | "type" | "title" | "createdAt"> {
-  const record = isRecord(body) ? body : {};
-  return {
-    summary: typeof record.summary === "string" ? record.summary : "",
-    findings: getStringArray(record.findings),
-    relevantFiles: getStringArray(record.relevantFiles),
-    openQuestions: getStringArray(record.openQuestions),
-    proposedPlan: typeof record.proposedPlan === "string" ? record.proposedPlan : "",
-    memoryRefs: getStringArray(record.memoryRefs),
-    ...(typeof record.createdBy === "string" ? { createdBy: record.createdBy } : {}),
-    ...(typeof record.model === "string" ? { model: record.model } : {}),
-  };
 }
 
 function toToolArtifactView(artifact: Artifact): ArtifactToolView {
-  const body = extractArtifactBodyFields(artifact.body);
   return {
     id: artifact.id,
     type: artifact.type,
     title: artifact.title,
-    summary: body.summary,
-    findings: body.findings,
-    relevantFiles: body.relevantFiles,
-    openQuestions: body.openQuestions,
-    proposedPlan: body.proposedPlan,
-    memoryRefs: body.memoryRefs,
+    markdown: renderArtifactBodyMarkdown(artifact.body),
+    status: artifact.status,
+    version: artifact.version,
+    updatedAt: artifact.updatedAt,
     createdAt: artifact.createdAt,
     ...(artifact.createdBy ? { createdBy: artifact.createdBy } : {}),
     ...(artifact.basis ? { basis: artifact.basis } : {}),
     ...(artifact.parentArtifactId ? { parentArtifactId: artifact.parentArtifactId } : {}),
     ...(artifact.supersedesArtifactId ? { supersedesArtifactId: artifact.supersedesArtifactId } : {}),
-    ...(body.model ? { model: body.model } : {}),
   };
 }
 
@@ -219,9 +197,15 @@ function buildTool(
   };
 }
 
-interface HostedToolRegistryOptions {
+export interface HostedToolRegistryOptions {
   artifactDefaults?: ArtifactToolDefaults;
-  artifactStore?: Pick<ArtifactStoreDO, "createArtifact" | "getArtifact" | "listArtifacts">;
+  artifactStore?: Pick<ArtifactStoreDO, "createArtifact" | "getArtifact" | "listArtifacts"> & Partial<Pick<ArtifactStoreDO, "savePlan">>;
+  savePlanDefaults?: {
+    repoId: string;
+    planArtifactId: string;
+    expectedVersion: number;
+    currentMainCommit: string | null;
+  };
 }
 
 export function createHostedToolRegistry(
@@ -230,6 +214,9 @@ export function createHostedToolRegistry(
 ): Map<HostedToolName, HostedTool> {
   const artifactDefaults = options.artifactDefaults ?? {};
   const artifactStore = options.artifactStore;
+  const savePlanDefaults = options.savePlanDefaults
+    ? { ...options.savePlanDefaults }
+    : null;
   const saveArtifact = async (input: Record<string, unknown>) => {
     const kind = getInputString(input, "type");
     const title = getInputString(input, "title");
@@ -269,7 +256,7 @@ export function createHostedToolRegistry(
     const parentArtifactId = getInputString(input, "parentArtifactId");
     const supersedesArtifactId = getInputString(input, "supersedesArtifactId");
 
-    const created = artifactStore.createArtifact({
+    const created = await artifactStore.createArtifact({
       repoId,
       type: persistedType,
       basis: {
@@ -288,11 +275,11 @@ export function createHostedToolRegistry(
       },
       ...(parentArtifactId ? { parentArtifactId } : {}),
       ...(supersedesArtifactId ? { supersedesArtifactId } : {}),
-      createdBy: getInputString(input, "createdBy") ?? "research",
+      createdBy: getInputString(input, "createdBy") ?? "hosted-agent",
     });
 
     const createdView = toToolArtifactView(created);
-    return ok(`Saved artifact ${formatArtifactSummary(createdView.id, createdView.title, createdView.summary)}`);
+    return ok(`Saved artifact ${formatArtifactSummary(createdView.id, createdView.title, markdownSummary(createdView.markdown))}`);
   };
   const readArtifact = async (input: Record<string, unknown>) => {
     const id = getInputString(input, "id");
@@ -302,7 +289,7 @@ export function createHostedToolRegistry(
       return fail("unavailable", "Artifact storage is unavailable in this chat.", { retryable: true });
     }
 
-    const artifact = artifactStore.getArtifact(id);
+    const artifact = await artifactStore.getArtifact(id);
     if (!artifact) return fail("not_found", `No artifact found with id ${id}`);
     return ok(JSON.stringify(toToolArtifactView(artifact), null, 2));
   };
@@ -311,12 +298,41 @@ export function createHostedToolRegistry(
       return fail("unavailable", "Artifact storage is unavailable in this chat.", { retryable: true });
     }
 
-    const artifacts = artifactStore.listArtifacts({ limit: 50 });
+    const artifacts = await artifactStore.listArtifacts({ limit: 50 });
     return ok(artifacts
       .map((artifact) => toToolArtifactView(artifact))
-      .map((artifact) => formatArtifactSummary(artifact.id, artifact.title, artifact.summary))
+      .map((artifact) => formatArtifactSummary(artifact.id, artifact.title, markdownSummary(artifact.markdown)))
       .join("\n")
       || "(no saved artifacts)");
+  };
+  const savePlan = async (input: Record<string, unknown>) => {
+    const markdown = getInputString(input, "markdown");
+    const title = getInputString(input, "title");
+    if (markdown === undefined) {
+      return fail("invalid_input", "markdown is required");
+    }
+    if (!artifactStore?.savePlan || !savePlanDefaults) {
+      return fail("unavailable", "Plan saving is unavailable in this chat.", { retryable: true });
+    }
+
+    const result = await artifactStore.savePlan({
+      repoId: savePlanDefaults.repoId,
+      id: savePlanDefaults.planArtifactId,
+      expectedVersion: savePlanDefaults.expectedVersion,
+      markdown,
+      ...(title ? { title } : {}),
+      currentMainCommit: savePlanDefaults.currentMainCommit,
+    });
+    if (result.status === "ok") {
+      savePlanDefaults.expectedVersion = result.version;
+      return ok({ status: "ok", version: result.version });
+    }
+    return ok({
+      status: "conflict",
+      currentVersion: result.currentVersion,
+      ...(result.currentTitle ? { currentTitle: result.currentTitle } : {}),
+      ...(result.currentMarkdownDigest ? { currentMarkdownDigest: result.currentMarkdownDigest } : {}),
+    });
   };
   return new Map<HostedToolName, HostedTool>([
     [
@@ -469,6 +485,25 @@ export function createHostedToolRegistry(
       ),
     ],
     [
+      "save_plan",
+      buildTool(
+        {
+          name: "save_plan",
+          description: "Save the current Markdown plan in place.",
+          parameters: {
+            type: "object",
+            properties: {
+              title: { type: "string", description: "Optional updated plan title" },
+              markdown: { type: "string", description: "Full standalone Markdown plan body" },
+            },
+            required: ["markdown"],
+            additionalProperties: false,
+          },
+        },
+        savePlan,
+      ),
+    ],
+    [
       "save_artifact",
       buildTool(
         {
@@ -563,15 +598,6 @@ export function getHostedToolsForAgent(
     }
     return tool;
   });
-}
-
-export function toResponseToolDefinitions(tools: HostedTool[]): ResponseToolDefinition[] {
-  return tools.map((tool) => ({
-    type: "function" as const,
-    name: tool.definition.name,
-    description: tool.definition.description,
-    parameters: tool.definition.parameters,
-  }));
 }
 
 export function toAiSdkTools(tools: HostedTool[]): ToolSet {

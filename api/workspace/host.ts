@@ -1,4 +1,10 @@
-import type { WorkspaceHost } from "agents/experimental/workspace";
+interface WorkspaceHost {
+  sql<T = Record<string, string | number | boolean | null>>(
+    strings: TemplateStringsArray,
+    ...values: (string | number | boolean | null)[]
+  ): T[];
+  readonly name: string;
+}
 
 interface DOContext {
   storage: { sql: SqlStorage };

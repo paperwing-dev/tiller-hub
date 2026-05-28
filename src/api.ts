@@ -16,13 +16,22 @@ import type {
   EnvHarness,
   StartupDiagnosticsState,
 } from "../api/types";
-import type { HostedAgentMetadata, PlanReviewIssueStats, PlanReviewMeta } from "../api/agent-core/types";
-import type { Artifact, ArtifactRef, PlanArtifact } from "../api/coordination/types";
-import type { UpdateCheckResult } from "../api/update/types";
+import type { HostedAgentMetadata } from "../api/agent-core/types";
+import type { Artifact, ArtifactRef, PlanArtifact, PlanStatus, ReviewerRegistryEntry } from "../api/coordination/types";
+import type {
+  HubUpdateRepoCandidate,
+  HubUpdateRepoState,
+  TillerUpdateMetadata,
+  UpdateApplyResult,
+  UpdateCheckResult,
+} from "../api/update/types";
 
 const DEFAULT_ENABLED_HARNESSES: EnvHarness[] = ["claude-code", "codex", "opencode"];
-const HOSTED_AGENT_IDS = ["plan-chat", "research-chat", "planner-chat", "reviewer-chat", "cartographer-chat"] as const;
-const RUNTIME_KINDS = ["direct-tools", "codemode", "container"] as const;
+const HOSTED_AGENT_IDS = [
+  "plan-chat",
+  "reviewer-chat",
+] as const;
+const RUNTIME_KINDS = ["think", "direct-tools", "container"] as const;
 const MODEL_PROVIDER_KINDS = ["external-codex", "workers-ai"] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -55,6 +64,12 @@ function readBooleanOr(value: unknown, fallback = false): boolean {
 
 function readIntegerOr(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isInteger(value) ? value : fallback;
+}
+
+function readPlanStatusOr(value: unknown, fallback: PlanStatus = "draft"): PlanStatus {
+  return value === "draft" || value === "todo" || value === "completed" || value === "archived"
+    ? value
+    : fallback;
 }
 
 function readNumberOr(value: unknown, fallback = 0): number {
@@ -165,12 +180,13 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
   if (!isRecord(payload)) return null;
   const slug = readString(payload.slug);
   const repoUrl = readString(payload.repoUrl);
+  const repoId = readString(payload.repoId);
   const backend = payload.backend === "cf" || payload.backend === "host" ? payload.backend : null;
   const harness = readString(payload.harness);
   const createdAt = readString(payload.createdAt);
   const updatedAt = readString(payload.updatedAt);
   const status = readString(payload.status);
-  if (!slug || !repoUrl || !backend || !harness || !createdAt || !updatedAt || !status) return null;
+  if (!slug || !repoUrl || !repoId || !backend || !harness || !createdAt || !updatedAt || !status) return null;
   if (!isEnvHarness(harness)) return null;
   if (!isEnvStatus(status)) return null;
   if (!hasExplicitEnvScmFields(payload)) return null;
@@ -179,6 +195,7 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
     ...(payload as Partial<EnvMeta>),
     slug,
     repoUrl,
+    repoId,
     backend,
     harness,
     createdAt,
@@ -207,10 +224,14 @@ function normalizeRepoMetaObject(payload: unknown): RepoMeta | null {
   if (!isRecord(payload)) return null;
   const repoId = readString(payload.repoId);
   const repoUrl = readString(payload.repoUrl);
+  const githubInstallationId = typeof payload.githubInstallationId === "number" && Number.isInteger(payload.githubInstallationId) && payload.githubInstallationId > 0
+    ? payload.githubInstallationId
+    : null;
+  const githubFullName = readString(payload.githubFullName);
   const createdAt = readString(payload.createdAt);
   const updatedAt = readString(payload.updatedAt);
   const gitStatus = readString(payload.gitStatus);
-  if (!repoId || !repoUrl || !createdAt || !updatedAt || !gitStatus) return null;
+  if (!repoId || !repoUrl || !githubInstallationId || !githubFullName || !createdAt || !updatedAt || !gitStatus) return null;
   if (!isRepoGitStatus(gitStatus)) return null;
   if (!hasExplicitRepoScmFields(payload)) return null;
 
@@ -218,6 +239,8 @@ function normalizeRepoMetaObject(payload: unknown): RepoMeta | null {
     ...(payload as Partial<RepoMeta>),
     repoId,
     repoUrl,
+    githubInstallationId,
+    githubFullName,
     mainCommit: payload.mainCommit,
     gitArtifactId: payload.gitArtifactId,
     gitStatus,
@@ -241,7 +264,7 @@ function normalizeArtifact(payload: unknown): Artifact | null {
   const type = readString(payload.type);
   const title = readString(payload.title);
   const createdAt = readString(payload.createdAt);
-  if (!id || !repoId || !type || !title || !createdAt) return null;
+  if (!id || !repoId || !type || title === null || !createdAt) return null;
 
   return {
     ...(payload as Partial<Artifact>),
@@ -250,6 +273,9 @@ function normalizeArtifact(payload: unknown): Artifact | null {
     type: type as Artifact["type"],
     title,
     createdAt,
+    status: readPlanStatusOr(payload.status),
+    updatedAt: readStringOr(payload.updatedAt, createdAt),
+    version: readIntegerOr(payload.version, 1),
     basis: {
       repoId: readStringOr(payload.basis.repoId, repoId),
       mainCommit: readNullableString(payload.basis.mainCommit),
@@ -258,6 +284,26 @@ function normalizeArtifact(payload: unknown): Artifact | null {
         : {}),
     },
   } as Artifact;
+}
+
+function normalizeReviewerRegistryEntry(payload: unknown): ReviewerRegistryEntry | null {
+  if (!isRecord(payload)) return null;
+  const threadId = readString(payload.threadId);
+  const planArtifactId = readString(payload.planArtifactId);
+  const repoId = readString(payload.repoId);
+  const reviewerModel = readString(payload.reviewerModel);
+  const createdAt = readString(payload.createdAt);
+  const updatedAt = readString(payload.updatedAt);
+  if (!threadId || !planArtifactId || !repoId || !reviewerModel || !createdAt || !updatedAt) return null;
+  return {
+    threadId,
+    planArtifactId,
+    repoId,
+    reviewerModel,
+    ...(readNullableString(payload.removedAt) ? { removedAt: readNullableString(payload.removedAt) ?? undefined } : {}),
+    createdAt,
+    updatedAt,
+  };
 }
 
 function normalizeArtifactRef(payload: unknown): ArtifactRef | null {
@@ -340,111 +386,141 @@ function normalizeVerifyCloudflareTokenResult(payload: unknown): {
   };
 }
 
-function normalizePublishProtectResult(payload: unknown): {
-  ok: boolean;
-  hostname: string;
-  hubUrl: string;
-  clientId: string;
-  clientSecret: string;
-  appDomain: string;
-  status: SetupStatus;
-} | null {
-  if (!isRecord(payload) || !isRecord(payload.status)) return null;
-  const hostname = readString(payload.hostname);
-  const hubUrl = readString(payload.hubUrl);
-  const clientId = readString(payload.clientId);
-  const clientSecret = readString(payload.clientSecret);
-  const appDomain = readString(payload.appDomain);
-  if (!hostname || !hubUrl || !clientId || !clientSecret || !appDomain) return null;
-
+function normalizeUpdateMetadata(payload: unknown): TillerUpdateMetadata | null {
+  if (!isRecord(payload)) return null;
+  if (
+    payload.schemaVersion !== 1 ||
+    payload.channel !== "deploy-button" ||
+    payload.updateMode !== "full-source" ||
+    payload.sourceRepo !== "paperwing-dev/tiller-hub"
+  ) {
+    return null;
+  }
+  const sourceId = readString(payload.sourceId);
+  const version = readString(payload.version);
+  const label = readString(payload.label);
+  const managedFiles = normalizeStringArray(payload.managedFiles);
+  if (!sourceId || !version || !label || managedFiles.length === 0) return null;
   return {
-    ok: readBooleanOr(payload.ok, true),
-    hostname,
-    hubUrl,
-    clientId,
-    clientSecret,
-    appDomain,
-    status: normalizeSetupStatus(payload.status, hubUrl),
+    schemaVersion: 1,
+    channel: "deploy-button",
+    updateMode: "full-source",
+    sourceRepo: "paperwing-dev/tiller-hub",
+    sourceId,
+    version,
+    label,
+    managedFiles,
   };
 }
 
-function normalizeCloudflareAccessResult(payload: unknown): {
-  ok: boolean;
-  hostname: string;
-  hubUrl: string;
-  zoneName: string;
-  appId: string;
-  aud: string;
-  appDomain: string;
-  clientId: string;
-  clientSecret: string;
-  emails: string[];
-  status: SetupStatus;
-} | null {
-  if (!isRecord(payload) || !isRecord(payload.status)) return null;
-  const hostname = readString(payload.hostname);
-  const hubUrl = readString(payload.hubUrl);
-  const zoneName = readString(payload.zoneName);
-  const appId = readString(payload.appId);
-  const aud = readString(payload.aud);
-  const appDomain = readString(payload.appDomain);
-  const clientId = readString(payload.clientId);
-  const clientSecret = readString(payload.clientSecret);
-  if (!hostname || !hubUrl || !zoneName || !appId || !aud || !appDomain || !clientId || !clientSecret) return null;
-
+function normalizeHubUpdateRepoCandidate(payload: unknown): HubUpdateRepoCandidate | null {
+  if (!isRecord(payload)) return null;
+  const owner = readString(payload.owner);
+  const repo = readString(payload.repo);
+  const fullName = readString(payload.fullName);
+  const label = readString(payload.label);
+  const branch = readString(payload.branch);
+  const sourceId = readString(payload.sourceId);
+  const repoId = readIntegerOr(payload.repoId, 0);
+  const installationId = readIntegerOr(payload.installationId, 0);
+  if (!owner || !repo || !fullName || !label || !branch || !sourceId || repoId <= 0 || installationId <= 0) return null;
   return {
-    ok: readBooleanOr(payload.ok, true),
-    hostname,
-    hubUrl,
-    zoneName,
-    appId,
-    aud,
-    appDomain,
-    clientId,
-    clientSecret,
-    emails: normalizeStringArray(payload.emails),
-    status: normalizeSetupStatus(payload.status, hubUrl),
+    owner,
+    repo,
+    fullName,
+    label,
+    repoId,
+    installationId,
+    branch,
+    private: readBooleanOr(payload.private, false),
+    defaultBranch: readNullableString(payload.defaultBranch),
+    sourceId,
   };
 }
 
-function normalizeProvisionMachineHostsResult(payload: unknown): {
-  ok: boolean;
-  hostname: string;
-  hubUrl: string;
-  zoneName: string;
-  gatewayHostname: string;
-  status: SetupStatus;
-} | null {
-  if (!isRecord(payload) || !isRecord(payload.status)) return null;
-  const hostname = readString(payload.hostname);
-  const hubUrl = readString(payload.hubUrl);
-  const zoneName = readString(payload.zoneName);
-  const gatewayHostname = readString(payload.gatewayHostname);
-  if (!hostname || !hubUrl || !zoneName || !gatewayHostname) return null;
-
-  return {
-    ok: readBooleanOr(payload.ok, true),
-    hostname,
-    hubUrl,
-    zoneName,
-    gatewayHostname,
-    status: normalizeSetupStatus(payload.status, hubUrl),
-  };
+function normalizeHubUpdateRepoState(payload: unknown): HubUpdateRepoState {
+  if (!isRecord(payload)) {
+    return { status: "not_checked", lastDetectedAt: null };
+  }
+  if (payload.status === "detected") {
+    const owner = readString(payload.owner);
+    const repo = readString(payload.repo);
+    const fullName = readString(payload.fullName);
+    const label = readString(payload.label);
+    const branch = readString(payload.branch);
+    const lastDetectedAt = readString(payload.lastDetectedAt);
+    const repoId = readIntegerOr(payload.repoId, 0);
+    const installationId = readIntegerOr(payload.installationId, 0);
+    if (owner && repo && fullName && label && branch && lastDetectedAt && repoId > 0 && installationId > 0) {
+      return {
+        status: "detected",
+        owner,
+        repo,
+        fullName,
+        label,
+        repoId,
+        installationId,
+        branch,
+        lastDetectedAt,
+        detectedBy: payload.detectedBy === "manual" || payload.detectedBy === "selection" ? payload.detectedBy : "auto",
+      };
+    }
+  }
+  if (payload.status === "missing") {
+    return {
+      status: "missing",
+      lastDetectedAt: readNullableString(payload.lastDetectedAt),
+    };
+  }
+  if (payload.status === "ambiguous") {
+    return {
+      status: "ambiguous",
+      lastDetectedAt: readStringOr(payload.lastDetectedAt, ""),
+      candidates: normalizeArrayResponse(payload.candidates)
+        .map(normalizeHubUpdateRepoCandidate)
+        .filter(isPresent),
+    };
+  }
+  return { status: "not_checked", lastDetectedAt: null };
 }
 
 function normalizeUpdateCheckResult(payload: unknown): UpdateCheckResult | null {
   if (!isRecord(payload)) return null;
-  const currentVersion = readString(payload.currentVersion);
-  const latestVersion = readString(payload.latestVersion);
-  const releaseNotesUrl = readString(payload.releaseNotesUrl);
-  if (typeof payload.updateAvailable !== "boolean" || !currentVersion || !latestVersion || !releaseNotesUrl) {
+  const currentUpdate = normalizeUpdateMetadata(payload.currentUpdate);
+  const latestUpdate = normalizeUpdateMetadata(payload.latestUpdate);
+  const releaseNotesUrl = readString(payload.releaseNotesUrl) ?? "https://github.com/paperwing-dev/tiller-hub";
+  if (typeof payload.updateAvailable !== "boolean" || !currentUpdate || !latestUpdate || !releaseNotesUrl) {
     return null;
   }
 
   return {
     updateAvailable: payload.updateAvailable,
-    currentVersion,
-    latestVersion,
+    currentUpdate,
+    latestUpdate,
+    buildDiagnostics: isRecord(payload.buildDiagnostics)
+      ? {
+          version: readStringOr(payload.buildDiagnostics.version, ""),
+          workersCiCommitSha: readNullableString(payload.buildDiagnostics.workersCiCommitSha),
+          workersCiBranch: readNullableString(payload.buildDiagnostics.workersCiBranch),
+        }
+      : {
+          version: "",
+          workersCiCommitSha: null,
+          workersCiBranch: null,
+        },
+    hubRepo: normalizeHubUpdateRepoState(payload.hubRepo),
+    updateMethod: payload.updateMethod === "github_repo" || payload.updateMethod === "connect_hub_repo" || payload.updateMethod === "advanced_repair"
+      ? payload.updateMethod
+      : "advanced_repair",
+    ...(isRecord(payload.issue) && readString(payload.issue.code) && readString(payload.issue.message)
+      ? {
+          issue: {
+            code: readString(payload.issue.code) as NonNullable<UpdateCheckResult["issue"]>["code"],
+            message: readString(payload.issue.message) ?? "",
+            retryable: readBooleanOr(payload.issue.retryable, false),
+          },
+        }
+      : {}),
     releaseNotesUrl,
   };
 }
@@ -463,8 +539,14 @@ export class ApiActionError extends Error {
   }
 }
 
-export type { UpdateCheckResult } from "../api/update/types";
-export type { Artifact, ArtifactRef, PlanArtifact } from "../api/coordination/types";
+export type {
+  HubUpdateRepoCandidate,
+  HubUpdateRepoState,
+  TillerUpdateMetadata,
+  UpdateApplyResult,
+  UpdateCheckResult,
+} from "../api/update/types";
+export type { Artifact, ArtifactRef, PlanArtifact, PlanStatus, ReviewerRegistryEntry } from "../api/coordination/types";
 
 function normalizeRepoArtifactState(
   payload: unknown,
@@ -486,70 +568,6 @@ function normalizeRepoArtifactState(
   };
 }
 
-function normalizeReviewRoundResult(payload: unknown): {
-  ok: true;
-  draftId: string;
-  reviews: Array<{
-    id: string;
-    model?: string;
-    summary: string;
-    reviewIssueStats?: PlanReviewIssueStats;
-    reviewMeta?: PlanReviewMeta;
-  }>;
-} {
-  if (!isRecord(payload)) {
-    return { ok: true, draftId: "", reviews: [] };
-  }
-
-  return {
-    ok: true,
-    draftId: readStringOr(payload.draftId, ""),
-    reviews: normalizeArrayResponse(payload.reviews)
-      .map((review) => {
-        if (!isRecord(review)) return null;
-        const id = readString(review.id);
-        if (!id) return null;
-        return {
-          id,
-          ...(readNullableString(review.model) ? { model: readNullableString(review.model) ?? undefined } : {}),
-          summary: readStringOr(review.summary, ""),
-          ...(isRecord(review.reviewIssueStats) ? { reviewIssueStats: review.reviewIssueStats as PlanReviewIssueStats } : {}),
-          ...(isRecord(review.reviewMeta) ? { reviewMeta: review.reviewMeta as PlanReviewMeta } : {}),
-        };
-      })
-      .filter(isPresent),
-  };
-}
-
-function normalizeIntegrationResult(payload: unknown): {
-  ok: true;
-  skipped?: boolean;
-  groundedIssueCount: number;
-  droppedIssueCount: number;
-  artifact?: PlanArtifact;
-  reply: string;
-} {
-  if (!isRecord(payload)) {
-    return {
-      ok: true,
-      groundedIssueCount: 0,
-      droppedIssueCount: 0,
-      reply: "",
-    };
-  }
-
-  const artifact = normalizeArtifact(payload.artifact) as PlanArtifact | null;
-
-  return {
-    ok: true,
-    ...(typeof payload.skipped === "boolean" ? { skipped: payload.skipped } : {}),
-    groundedIssueCount: readIntegerOr(payload.groundedIssueCount, 0),
-    droppedIssueCount: readIntegerOr(payload.droppedIssueCount, 0),
-    ...(artifact ? { artifact } : {}),
-    reply: readStringOr(payload.reply, ""),
-  };
-}
-
 function normalizeEnabledHarnesses(value: unknown): EnvHarness[] {
   const harnesses = normalizeArrayResponse(value)
     .map((item) => (item === "claude-code" || item === "codex" || item === "opencode") ? item : null)
@@ -562,20 +580,35 @@ function normalizeSetupStatus(payload: unknown, hubUrl: string): SetupStatus {
   if (!isRecord(payload)) {
     return {
       needsSetup: false,
+      setupPhase: "complete",
       isLocalDev: false,
       currentOrigin: hubUrl,
       hubUrl,
-      hostKind: fallbackHostKind,
+      deploymentMode: "hosted",
+      selfHostStatus: "not-enabled",
+      selfHostSetupAttemptId: null,
+      workersDevHubUrl: fallbackHostKind === "workers-dev" ? hubUrl : null,
+      routeKind: fallbackHostKind,
       workerServiceName: null,
       modelAuthConfigured: false,
       modelAuthMode: null,
+      hostedInfrastructureReady: false,
+      hostedBlockingReasons: ["Status response was unavailable."],
+      hostedModelReady: false,
+      hostedModelBlockingReasons: ["Status response was unavailable."],
+      selfHostReady: false,
+      selfHostBlockingReasons: ["Status response was unavailable."],
+      workersAiConfigured: false,
       hasClaudeSubscription: false,
       hasAnthropicKey: false,
       hasChatGPTAuth: false,
+      chatgptAuthStatus: "missing",
       hasOpenAIKey: false,
-      planChatgptConfigured: false,
-      planChatgptAvailable: false,
-      planChatgptReason: null,
+      codexRouteStatus: "unavailable",
+      openaiPlannerConfigured: false,
+      openaiPlannerAvailable: false,
+      openaiPlannerRoute: null,
+      openaiPlannerReason: null,
       hostRegistered: false,
       hostRegisteredMode: "none",
       hostGatewayAvailable: false,
@@ -595,20 +628,45 @@ function normalizeSetupStatus(payload: unknown, hubUrl: string): SetupStatus {
       unsupportedProtectionConfig: false,
       workersDevAliasDisabled: false,
       protectionAppDomain: null,
+      accessConfigured: false,
+      accessIssuer: null,
+      accessJwksUrl: null,
       hostConnected: false,
       hostConnectionMode: "none",
       idleTimeoutMinutes: 10,
       canonicalMainBootstrapDepth: 0,
+      githubAppAvailable: false,
+      githubAppConfigured: false,
+      githubAppReady: false,
+      githubAppSlug: null,
+      githubAppInstallUrl: null,
+      githubAppManageUrl: "https://github.com/settings/installations",
+      githubAppPublicHubDisabled: true,
+      selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
     };
   }
 
-  const hostKind = payload.hostKind === "workers-dev" || payload.hostKind === "custom-domain"
+  const legacyRouteKind = payload.hostKind === "workers-dev" || payload.hostKind === "custom-domain"
     ? payload.hostKind
     : fallbackHostKind;
+  const routeKind = payload.routeKind === "workers-dev" || payload.routeKind === "custom-domain"
+    ? payload.routeKind
+    : legacyRouteKind;
+  const deploymentMode = payload.deploymentMode === "self-host" ? "self-host" : "hosted";
+  const selfHostStatus = payload.selfHostStatus === "setup-in-progress"
+    || payload.selfHostStatus === "enabled"
+    || payload.selfHostStatus === "offline"
+    || payload.selfHostStatus === "ready"
+    || payload.selfHostStatus === "not-enabled"
+    ? payload.selfHostStatus
+    : deploymentMode === "self-host"
+      ? readBooleanOr(payload.selfHostReady)
+        ? "ready"
+        : "offline"
+      : "not-enabled";
   const modelAuthMode = payload.modelAuthMode === "subscription"
     || payload.modelAuthMode === "api"
-    || payload.modelAuthMode === "chatgpt"
-    || payload.modelAuthMode === "openai-api"
+    || payload.modelAuthMode === "api-key"
     ? payload.modelAuthMode
     : null;
   const hostGatewayMode = payload.hostGatewayMode === "quick"
@@ -619,23 +677,67 @@ function normalizeSetupStatus(payload: unknown, hubUrl: string): SetupStatus {
   const hostRegisteredMode = payload.hostRegisteredMode === "session" ? "session" : "none";
   const protectionMode = payload.protectionMode === "cf-access" ? "cf-access" : "public";
   const hostConnectionMode = payload.hostConnectionMode === "session" ? "session" : "none";
+  const setupPhase = payload.setupPhase === "protect-hub"
+    || payload.setupPhase === "github-app"
+    || payload.setupPhase === "model-access"
+    || payload.setupPhase === "complete"
+    ? payload.setupPhase
+    : readBooleanOr(payload.needsSetup)
+      ? "model-access"
+      : "complete";
 
   return {
-    needsSetup: readBooleanOr(payload.needsSetup),
+    needsSetup: setupPhase !== "complete",
+    setupPhase,
     isLocalDev: readBooleanOr(payload.isLocalDev),
     currentOrigin: readStringOr(payload.currentOrigin, hubUrl),
     hubUrl: readStringOr(payload.hubUrl, hubUrl),
-    hostKind,
+    deploymentMode,
+    selfHostStatus,
+    selfHostSetupAttemptId: readNullableString(payload.selfHostSetupAttemptId),
+    workersDevHubUrl: readNullableString(payload.workersDevHubUrl),
+    routeKind,
     workerServiceName: readNullableString(payload.workerServiceName),
     modelAuthConfigured: readBooleanOr(payload.modelAuthConfigured),
     modelAuthMode,
+    hostedInfrastructureReady: readBooleanOr(payload.hostedInfrastructureReady),
+    hostedBlockingReasons: normalizeArrayResponse(payload.hostedBlockingReasons)
+      .map(readString)
+      .filter(isPresent),
+    hostedModelReady: readBooleanOr(payload.hostedModelReady),
+    hostedModelBlockingReasons: normalizeArrayResponse(payload.hostedModelBlockingReasons)
+      .map(readString)
+      .filter(isPresent),
+    selfHostReady: readBooleanOr(payload.selfHostReady),
+    selfHostBlockingReasons: normalizeArrayResponse(payload.selfHostBlockingReasons)
+      .map(readString)
+      .filter(isPresent),
+    workersAiConfigured: readBooleanOr(payload.workersAiConfigured),
     hasClaudeSubscription: readBooleanOr(payload.hasClaudeSubscription),
     hasAnthropicKey: readBooleanOr(payload.hasAnthropicKey),
     hasChatGPTAuth: readBooleanOr(payload.hasChatGPTAuth),
+    chatgptAuthStatus: payload.chatgptAuthStatus === "connected"
+      || payload.chatgptAuthStatus === "refreshing"
+      || payload.chatgptAuthStatus === "needs_reconnect"
+      || payload.chatgptAuthStatus === "missing"
+      ? payload.chatgptAuthStatus
+      : readBooleanOr(payload.hasChatGPTAuth)
+        ? "connected"
+        : "missing",
     hasOpenAIKey: readBooleanOr(payload.hasOpenAIKey),
-    planChatgptConfigured: readBooleanOr(payload.planChatgptConfigured),
-    planChatgptAvailable: readBooleanOr(payload.planChatgptAvailable),
-    planChatgptReason: readNullableString(payload.planChatgptReason),
+    codexRouteStatus: payload.codexRouteStatus === "available"
+      || payload.codexRouteStatus === "gateway_offline"
+      || payload.codexRouteStatus === "host_offline"
+      || payload.codexRouteStatus === "api_fallback"
+      || payload.codexRouteStatus === "unavailable"
+      ? payload.codexRouteStatus
+      : "unavailable",
+    openaiPlannerConfigured: readBooleanOr(payload.openaiPlannerConfigured),
+    openaiPlannerAvailable: readBooleanOr(payload.openaiPlannerAvailable),
+    openaiPlannerRoute: payload.openaiPlannerRoute === "api-key" || payload.openaiPlannerRoute === "subscription-gateway"
+      ? payload.openaiPlannerRoute
+      : null,
+    openaiPlannerReason: readNullableString(payload.openaiPlannerReason),
     hostRegistered: readBooleanOr(payload.hostRegistered),
     hostRegisteredMode,
     hostGatewayAvailable: readBooleanOr(payload.hostGatewayAvailable),
@@ -655,10 +757,21 @@ function normalizeSetupStatus(payload: unknown, hubUrl: string): SetupStatus {
     unsupportedProtectionConfig: readBooleanOr(payload.unsupportedProtectionConfig),
     workersDevAliasDisabled: readBooleanOr(payload.workersDevAliasDisabled),
     protectionAppDomain: readNullableString(payload.protectionAppDomain),
+    accessConfigured: readBooleanOr(payload.accessConfigured),
+    accessIssuer: readNullableString(payload.accessIssuer),
+    accessJwksUrl: readNullableString(payload.accessJwksUrl),
     hostConnected: readBooleanOr(payload.hostConnected),
     hostConnectionMode,
     idleTimeoutMinutes: readNumberOr(payload.idleTimeoutMinutes, 10),
     canonicalMainBootstrapDepth: readNumberOr(payload.canonicalMainBootstrapDepth, 0),
+    githubAppAvailable: readBooleanOr(payload.githubAppAvailable),
+    githubAppConfigured: readBooleanOr(payload.githubAppConfigured),
+    githubAppReady: readBooleanOr(payload.githubAppReady),
+    githubAppSlug: readNullableString(payload.githubAppSlug),
+    githubAppInstallUrl: readNullableString(payload.githubAppInstallUrl),
+    githubAppManageUrl: readStringOr(payload.githubAppManageUrl, "https://github.com/settings/installations"),
+    githubAppPublicHubDisabled: readBooleanOr(payload.githubAppPublicHubDisabled),
+    selfUpdateRepo: normalizeHubUpdateRepoState(payload.selfUpdateRepo),
   };
 }
 
@@ -840,7 +953,12 @@ export async function resolvePermission(
 
 // ── Environment (sandbox) helpers ─────────────────────────────────
 
-export type { EnvHarness, EnvMeta, RepoMeta, StartupDiagnosticsState } from "../api/types";
+export type { CodexAuthPreference, EnvHarness, EnvMeta, RepoMeta, StartupDiagnosticsState } from "../api/types";
+
+export type StartupPlanSelection =
+  | { mode: "todo" }
+  | { mode: "specific"; artifactId: string }
+  | { mode: "none" };
 
 export async function fetchEnvs(hubUrl: string): Promise<EnvMeta[]> {
   const res = await fetch(`${hubUrl}/api/envs`, {
@@ -885,17 +1003,18 @@ export async function fetchEnvStartupDiagnostics(
 
 export async function createEnv(
   hubUrl: string,
-  repoUrl: string,
+  repoId: string,
   backend: "cf" | "host",
   harness: EnvHarness,
   authMode?: "auto" | "subscription" | "api",
-  planId?: string | null,
+  codexAuthPreference?: "auto" | "subscription" | "api-key",
+  planSelection?: StartupPlanSelection,
 ): Promise<EnvMeta> {
   const res = await fetch(`${hubUrl}/api/envs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify({ repoUrl, backend, harness, authMode, planId }),
+    body: JSON.stringify({ repoId, backend, harness, authMode, codexAuthPreference, planSelection }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
@@ -911,7 +1030,7 @@ export async function createEnv(
 export async function startEnv(
   hubUrl: string,
   slug: string,
-  options?: { planId?: string | null },
+  options?: { planSelection?: StartupPlanSelection },
 ): Promise<{ ok: boolean; slug: string; status: string }> {
   const res = await fetch(`${hubUrl}/api/envs/${slug}/start`, {
     method: "POST",
@@ -969,6 +1088,90 @@ export async function mergeEnvIntoMain(
     credentials: "include",
   });
   if (!res.ok) throw await parseApiError(res, `Promote to Main failed: ${res.status}`);
+  return res.json();
+}
+
+export type EnvChangeStatus = "added" | "modified" | "deleted";
+
+export interface EnvChangeEntry {
+  path: string;
+  status: EnvChangeStatus;
+  oldSize: number | null;
+  newSize: number | null;
+  oldHash: string | null;
+  newHash: string | null;
+  previewableHint?: "unknown" | "text" | "binary" | "too-large";
+}
+
+export interface EnvChangesResponse {
+  slug: string;
+  repoId: string;
+  repoUrl: string;
+  comparisonBasis: "promote-preview";
+  oldCommit: string | null;
+  newBaseCommit: string | null;
+  branchStatus: "ready-to-merge" | "up-to-date";
+  summary: {
+    total: number;
+    added: number;
+    modified: number;
+    deleted: number;
+  };
+  files: EnvChangeEntry[];
+}
+
+export interface EnvChangeFileResponse {
+  path: string;
+  status: EnvChangeStatus;
+  previewable: boolean;
+  reason?: "binary" | "too-large" | "not-found";
+  maxPreviewBytes: number;
+  oldString: string;
+  newString: string;
+  oldSize: number | null;
+  newSize: number | null;
+}
+
+export async function fetchEnvChanges(hubUrl: string, slug: string): Promise<EnvChangesResponse> {
+  const res = await fetch(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/changes`, {
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to load promote preview: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnvChangeFile(
+  hubUrl: string,
+  slug: string,
+  path: string,
+): Promise<EnvChangeFileResponse> {
+  const url = new URL(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/changes/file`);
+  url.searchParams.set("path", path);
+  const res = await fetch(url.toString(), {
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to load file diff: ${res.status}`);
+  return res.json();
+}
+
+export async function updateEnvFromMain(
+  hubUrl: string,
+  slug: string,
+): Promise<{
+  ok: boolean;
+  slug: string;
+  repoId: string;
+  operationId?: string;
+  pending?: boolean;
+  action?: "updated-from-main" | "up-to-date" | "conflicted";
+  currentMainCommit?: string | null;
+  branchStatus?: "ready-to-merge" | "up-to-date" | "needs-attention";
+}> {
+  const res = await fetch(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/update-from-main`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Update from Main failed: ${res.status}`);
   return res.json();
 }
 
@@ -1039,15 +1242,132 @@ export async function fetchRepoArtifacts(
   return normalizeRepoArtifactState(await res.json().catch(() => null));
 }
 
+export async function createPlan(
+  hubUrl: string,
+  repoId: string,
+  title?: string,
+): Promise<Artifact> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to create plan: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
+  if (!artifact) {
+    throw new Error("Malformed plan response");
+  }
+  return artifact;
+}
+
+export async function updatePlanStatus(
+  hubUrl: string,
+  repoId: string,
+  id: string,
+  status: PlanStatus,
+  expectedVersion?: number | null,
+): Promise<Artifact> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/artifacts/${id}/status`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ status, expectedVersion }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to update plan status: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
+  if (!artifact) {
+    throw new Error("Malformed plan status response");
+  }
+  return artifact;
+}
+
+export async function discardPlan(
+  hubUrl: string,
+  repoId: string,
+  id: string,
+  expectedVersion?: number | null,
+): Promise<Artifact> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${id}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ expectedVersion }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to discard plan: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
+  if (!artifact) {
+    throw new Error("Malformed discard plan response");
+  }
+  return artifact;
+}
+
+export async function fetchPlanReviewers(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+): Promise<ReviewerRegistryEntry[]> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch reviewers: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  return isRecord(body)
+    ? normalizeArrayResponse(body.reviewers).map(normalizeReviewerRegistryEntry).filter(isPresent)
+    : [];
+}
+
+export async function addPlanReviewer(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  reviewerModel: string,
+): Promise<ReviewerRegistryEntry> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ reviewerModel }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to add reviewer: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const reviewer = isRecord(body) ? normalizeReviewerRegistryEntry(body.reviewer) : null;
+  if (!reviewer) {
+    throw new Error("Malformed reviewer response");
+  }
+  return reviewer;
+}
+
+export async function removePlanReviewer(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  threadId: string,
+): Promise<void> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to remove reviewer: ${res.status}`);
+}
+
 export async function createRepo(
   hubUrl: string,
-  repoUrl: string,
+  selection: GitHubRepositorySelection,
 ): Promise<RepoMeta> {
   const res = await fetch(`${hubUrl}/api/repos`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify({ repoUrl }),
+    body: JSON.stringify({
+      repositoryId: selection.repositoryId,
+      installationId: selection.installationId,
+      fullName: selection.fullName,
+    }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
@@ -1058,6 +1378,84 @@ export async function createRepo(
     throw new Error("Malformed repo response");
   }
   return repo;
+}
+
+export interface GitHubRepositorySelection {
+  repositoryId: number;
+  installationId: number;
+  fullName: string;
+  repoUrl: string;
+  private: boolean;
+  defaultBranch: string | null;
+}
+
+export interface GitHubRepositoryWarning {
+  installationId?: number;
+  code: string;
+  message: string;
+}
+
+export interface GitHubRepositoriesResponse {
+  repositories: GitHubRepositorySelection[];
+  warnings: GitHubRepositoryWarning[];
+}
+
+function normalizeGitHubRepositorySelection(payload: unknown): GitHubRepositorySelection | null {
+  if (!isRecord(payload)) return null;
+  const repositoryId = readIntegerOr(payload.repositoryId, 0);
+  const installationId = readIntegerOr(payload.installationId, 0);
+  const fullName = readString(payload.fullName);
+  const repoUrl = readString(payload.repoUrl);
+  if (repositoryId <= 0 || installationId <= 0 || !fullName || !repoUrl) return null;
+  return {
+    repositoryId,
+    installationId,
+    fullName,
+    repoUrl,
+    private: readBooleanOr(payload.private, false),
+    defaultBranch: readNullableString(payload.defaultBranch),
+  };
+}
+
+function normalizeGitHubRepositoryWarning(payload: unknown): GitHubRepositoryWarning | null {
+  if (!isRecord(payload)) return null;
+  const code = readString(payload.code);
+  const message = readString(payload.message);
+  if (!code || !message) return null;
+  return {
+    ...(typeof payload.installationId === "number" ? { installationId: payload.installationId } : {}),
+    code,
+    message,
+  };
+}
+
+export async function fetchGitHubRepositories(hubUrl: string): Promise<GitHubRepositoriesResponse> {
+  const res = await fetch(`${hubUrl}/api/github/repositories`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    if (isRecord(body)) {
+      const error = buildApiActionError({
+        error: readString(body.error) ?? undefined,
+        code: readString(body.code) ?? undefined,
+      }, `Failed to fetch GitHub repositories: ${res.status}`);
+      throw error;
+    }
+    throw new Error(`Failed to fetch GitHub repositories: ${res.status}`);
+  }
+  if (!isRecord(body)) {
+    throw new Error("Malformed GitHub repository response");
+  }
+  return {
+    repositories: normalizeArrayResponse<unknown>(body.repositories)
+      .map(normalizeGitHubRepositorySelection)
+      .filter(isPresent),
+    warnings: normalizeArrayResponse<unknown>(body.warnings)
+      .map(normalizeGitHubRepositoryWarning)
+      .filter(isPresent),
+  };
 }
 
 export async function fetchRepos(hubUrl: string): Promise<RepoMeta[]> {
@@ -1109,102 +1507,39 @@ export async function bootstrapRepoGitArtifact(
   };
 }
 
-export async function setRepoRef(
-  hubUrl: string,
-  repoId: string,
-  name: string,
-  artifactId: string,
-  expectedVersion?: number | null,
-): Promise<{ ok: true; ref: ArtifactRef; artifact: Artifact }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/refs/${encodeURIComponent(name)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ artifactId, expectedVersion }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error || `Failed to update ref: ${res.status}`);
-  }
-  const body = await res.json().catch(() => null);
-  const ref = isRecord(body) ? normalizeArtifactRef(body.ref) : null;
-  const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
-  if (!ref || !artifact) {
-    throw new Error("Malformed ref response");
-  }
-  return { ok: true, ref, artifact };
-}
-
-export async function runArtifactReviewRound(
-  hubUrl: string,
-  repoId: string,
-  id: string,
-): Promise<{
-  ok: true;
-  draftId: string;
-  reviews: Array<{
-    id: string;
-    model?: string;
-    summary: string;
-    reviewIssueStats?: PlanReviewIssueStats;
-    reviewMeta?: PlanReviewMeta;
-  }>;
-}> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/artifacts/${id}/review-round`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error || `Failed to run review round: ${res.status}`);
-  }
-  return normalizeReviewRoundResult(await res.json().catch(() => null));
-}
-
-export async function integrateArtifactReviews(
-  hubUrl: string,
-  repoId: string,
-  id: string,
-  options: { selectedModel?: string },
-): Promise<{
-  ok: true;
-  skipped?: boolean;
-  groundedIssueCount: number;
-  droppedIssueCount: number;
-  artifact?: PlanArtifact;
-  reply: string;
-}> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/artifacts/${id}/integrate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(options),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error || `Failed to integrate reviews: ${res.status}`);
-  }
-  return normalizeIntegrationResult(await res.json().catch(() => null));
-}
-
 // ── Setup / Settings helpers ─────────────────────────────────────
 
 export interface SetupStatus {
   needsSetup: boolean;
+  setupPhase: "protect-hub" | "github-app" | "model-access" | "complete";
   isLocalDev: boolean;
   currentOrigin: string;
   hubUrl: string;
-  hostKind: "workers-dev" | "custom-domain";
+  deploymentMode: "hosted" | "self-host";
+  selfHostStatus: "not-enabled" | "setup-in-progress" | "enabled" | "offline" | "ready";
+  selfHostSetupAttemptId: string | null;
+  workersDevHubUrl: string | null;
+  routeKind: "workers-dev" | "custom-domain";
   workerServiceName: string | null;
   modelAuthConfigured: boolean;
-  modelAuthMode: "subscription" | "api" | "chatgpt" | "openai-api" | null;
+  modelAuthMode: "subscription" | "api" | "api-key" | null;
+  hostedInfrastructureReady: boolean;
+  hostedBlockingReasons: string[];
+  hostedModelReady: boolean;
+  hostedModelBlockingReasons: string[];
+  selfHostReady: boolean;
+  selfHostBlockingReasons: string[];
+  workersAiConfigured: boolean;
   hasClaudeSubscription: boolean;
   hasAnthropicKey: boolean;
   hasChatGPTAuth: boolean;
+  chatgptAuthStatus: "missing" | "connected" | "refreshing" | "needs_reconnect";
   hasOpenAIKey: boolean;
-  planChatgptConfigured: boolean;
-  planChatgptAvailable: boolean;
-  planChatgptReason: string | null;
+  codexRouteStatus: "available" | "gateway_offline" | "host_offline" | "api_fallback" | "unavailable";
+  openaiPlannerConfigured: boolean;
+  openaiPlannerAvailable: boolean;
+  openaiPlannerRoute: "api-key" | "subscription-gateway" | null;
+  openaiPlannerReason: string | null;
   hostRegistered: boolean;
   hostRegisteredMode: "none" | "session";
   hostGatewayAvailable: boolean;
@@ -1224,10 +1559,21 @@ export interface SetupStatus {
   unsupportedProtectionConfig: boolean;
   workersDevAliasDisabled: boolean;
   protectionAppDomain: string | null;
+  accessConfigured: boolean;
+  accessIssuer: string | null;
+  accessJwksUrl: string | null;
   hostConnected: boolean;
   hostConnectionMode: "none" | "session";
   idleTimeoutMinutes: number;
   canonicalMainBootstrapDepth: number;
+  githubAppAvailable: boolean;
+  githubAppConfigured: boolean;
+  githubAppReady: boolean;
+  githubAppSlug: string | null;
+  githubAppInstallUrl: string | null;
+  githubAppManageUrl: string;
+  githubAppPublicHubDisabled: boolean;
+  selfUpdateRepo: HubUpdateRepoState;
 }
 
 export async function fetchSetupStatus(hubUrl: string): Promise<SetupStatus> {
@@ -1236,6 +1582,34 @@ export async function fetchSetupStatus(hubUrl: string): Promise<SetupStatus> {
   });
   if (!res.ok) throw new Error(`Failed to fetch setup status: ${res.status}`);
   return normalizeSetupStatus(await res.json().catch(() => null), hubUrl);
+}
+
+export interface SeedOpenAIAuthInput {
+  access_token: string;
+  refresh_token: string;
+  id_token?: string;
+  expires_in?: number;
+}
+
+export async function seedOpenAIAuth(
+  hubUrl: string,
+  input: SeedOpenAIAuthInput,
+): Promise<{ authenticated: boolean; expires_at?: number; account_id?: string }> {
+  const res = await fetch(`${hubUrl}/api/auth/openai/seed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Codex login import failed: ${res.status}`);
+  }
+  return {
+    authenticated: isRecord(body) && body.authenticated === true,
+    ...(isRecord(body) && typeof body.expires_at === "number" ? { expires_at: body.expires_at } : {}),
+    ...(isRecord(body) && typeof body.account_id === "string" ? { account_id: body.account_id } : {}),
+  };
 }
 
 export type HostStatusState =
@@ -1393,31 +1767,87 @@ export async function submitSetup(
   return body;
 }
 
-export async function publishProtectHub(
+export async function saveGitHubAppConfig(
   hubUrl: string,
-  options: { hostname: string; apiToken: string; emails: string[] },
-): Promise<{
-  ok: boolean;
-  hostname: string;
-  hubUrl: string;
-  clientId: string;
-  clientSecret: string;
-  appDomain: string;
-  status: SetupStatus;
-}> {
-  const res = await fetch(`${hubUrl}/api/setup/publish-protect`, {
+  input: {
+    appId: string;
+    clientId: string;
+    slug: string;
+    privateKey: string;
+  },
+): Promise<SetupStatus> {
+  const res = await fetch(`${hubUrl}/api/github/app-config`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify(options),
+    body: JSON.stringify(input),
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw buildApiActionError(body, `Publish & Protect failed: ${res.status}`);
-  const result = normalizePublishProtectResult(body);
-  if (!result) {
-    throw new Error("Malformed publish & protect response");
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `GitHub App setup failed: ${res.status}`);
   }
-  return result;
+  if (isRecord(body) && isRecord(body.status)) {
+    return normalizeSetupStatus(body.status, hubUrl);
+  }
+  return await fetchSetupStatus(hubUrl);
+}
+
+export type GitHubAccessTestStatus =
+  | "ready"
+  | "not_configured"
+  | "missing_installation"
+  | "repo_not_selected"
+  | "missing_permissions"
+  | "invalid_repo"
+  | "invalid_config"
+  | "github_error"
+  | "public_hub_disabled";
+
+export interface GitHubAccessTestResult {
+  ok: boolean;
+  status: GitHubAccessTestStatus;
+  message: string;
+  repo: string | null;
+  installUrl: string | null;
+  manageUrl: string | null;
+}
+
+export async function testGitHubAppAccess(hubUrl: string, selection: GitHubRepositorySelection): Promise<GitHubAccessTestResult> {
+  const res = await fetch(`${hubUrl}/api/github/test-access`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({
+      repositoryId: selection.repositoryId,
+      installationId: selection.installationId,
+      fullName: selection.fullName,
+    }),
+  });
+  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `GitHub App access test failed: ${res.status}`);
+  }
+  if (!isRecord(body) || typeof body.status !== "string" || typeof body.ok !== "boolean") {
+    throw new Error("Malformed GitHub App access test response");
+  }
+  return {
+    ok: body.ok,
+    status: (
+      body.status === "ready"
+      || body.status === "not_configured"
+      || body.status === "missing_installation"
+      || body.status === "repo_not_selected"
+      || body.status === "missing_permissions"
+      || body.status === "invalid_repo"
+      || body.status === "invalid_config"
+      || body.status === "github_error"
+      || body.status === "public_hub_disabled"
+    ) ? body.status : "github_error",
+    message: readStringOr(body.message, "GitHub App access test failed."),
+    repo: readNullableString(body.repo),
+    installUrl: readNullableString(body.installUrl),
+    manageUrl: readNullableString(body.manageUrl),
+  };
 }
 
 export async function verifyCloudflareToken(
@@ -1445,61 +1875,33 @@ export async function verifyCloudflareToken(
   return result;
 }
 
-export async function setupCloudflareAccess(
+export async function setupWorkersDevAccess(
   hubUrl: string,
-  options: { apiToken: string; emails: string[] },
-): Promise<{
-  ok: boolean;
-  hostname: string;
-  hubUrl: string;
-  zoneName: string;
-  appId: string;
-  aud: string;
-  appDomain: string;
-  clientId: string;
-  clientSecret: string;
-  emails: string[];
-  status: SetupStatus;
-}> {
-  const res = await fetch(`${hubUrl}/api/access/setup`, {
+): Promise<SetupStatus> {
+  const res = await fetch(`${hubUrl}/api/setup/workers-dev-access`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify(options),
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw buildApiActionError(body, `Cloudflare Access setup failed: ${res.status}`);
-  const result = normalizeCloudflareAccessResult(body);
-  if (!result) {
-    throw new Error("Malformed Cloudflare Access setup response");
+  if (!res.ok) throw buildApiActionError(body, `workers.dev Access setup failed: ${res.status}`);
+  if (isRecord(body) && isRecord(body.status)) {
+    return normalizeSetupStatus(body.status, hubUrl);
   }
-  return result;
+  return await fetchSetupStatus(hubUrl);
 }
 
-export async function provisionMachineHosts(
-  hubUrl: string,
-  options: { apiToken: string },
-): Promise<{
-  ok: boolean;
-  hostname: string;
-  hubUrl: string;
-  zoneName: string;
-  gatewayHostname: string;
-  status: SetupStatus;
-}> {
-  const res = await fetch(`${hubUrl}/api/access/provision-machine-hosts`, {
+export async function returnToHostedTiller(hubUrl: string): Promise<{ ok: boolean; redirectUrl: string }> {
+  const res = await fetch(`${hubUrl}/api/setup/self-host/return-to-hosted`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify(options),
+    cache: "no-store",
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw buildApiActionError(body, `Protected machine-host provisioning failed: ${res.status}`);
-  const result = normalizeProvisionMachineHostsResult(body);
-  if (!result) {
-    throw new Error("Malformed protected machine-host provisioning response");
-  }
-  return result;
+  if (!res.ok) throw buildApiActionError(body, `Return to Hosted Tiller failed: ${res.status}`);
+  return {
+    ok: isRecord(body) && body.ok === true,
+    redirectUrl: isRecord(body) ? readStringOr(body.redirectUrl, hubUrl) : hubUrl,
+  };
 }
 
 export async function checkForUpdate(hubUrl: string): Promise<UpdateCheckResult> {
@@ -1517,17 +1919,61 @@ export async function checkForUpdate(hubUrl: string): Promise<UpdateCheckResult>
 
 export async function applyUpdate(
   hubUrl: string,
+): Promise<UpdateApplyResult> {
+  const res = await fetch(`${hubUrl}/api/update/apply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+  });
+  const body = await res.json<UpdateApplyResult | { error?: string }>().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!res.ok) throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to apply update: ${res.status}`);
+  return body as UpdateApplyResult;
+}
+
+export async function applyCloudflareRepairUpdate(
+  hubUrl: string,
   apiToken: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  const res = await fetch(`${hubUrl}/api/update/apply`, {
+  const res = await fetch(`${hubUrl}/api/update/repair/cloudflare-redeploy`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify({ apiToken }),
   });
   const body = await res.json<{ ok: boolean; error?: string }>().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(body.error || `Failed to apply update: ${res.status}`);
+  if (!res.ok) throw new Error(body.error || `Failed to apply repair update: ${res.status}`);
   return body;
+}
+
+export async function detectSelfUpdateRepo(hubUrl: string): Promise<HubUpdateRepoState> {
+  const res = await fetch(`${hubUrl}/api/update/hub-repo/detect`, {
+    method: "POST",
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!res.ok) throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Self-update repo detection failed: ${res.status}`);
+  return normalizeHubUpdateRepoState(body);
+}
+
+export async function selectSelfUpdateRepo(
+  hubUrl: string,
+  candidate: HubUpdateRepoCandidate,
+): Promise<HubUpdateRepoState> {
+  const res = await fetch(`${hubUrl}/api/update/hub-repo/select`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({
+      repoId: candidate.repoId,
+      installationId: candidate.installationId,
+      fullName: candidate.fullName,
+      branch: candidate.branch,
+    }),
+  });
+  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!res.ok) throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Self-update repo selection failed: ${res.status}`);
+  return normalizeHubUpdateRepoState(body);
 }
 
 // ── WebSocket helper ──────────────────────────────────────────────

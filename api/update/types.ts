@@ -1,9 +1,120 @@
 export interface UpdateCheckResult {
   updateAvailable: boolean;
-  currentVersion: string;
-  latestVersion: string;
+  currentUpdate: TillerUpdateMetadata;
+  latestUpdate: TillerUpdateMetadata;
+  buildDiagnostics: UpdateBuildDiagnostics;
+  hubRepo: HubUpdateRepoState;
+  updateMethod: "github_repo" | "connect_hub_repo" | "advanced_repair";
+  issue?: UpdateIssue;
   releaseNotesUrl: string;
 }
+
+export interface TillerUpdateMetadata {
+  schemaVersion: 1;
+  channel: "deploy-button";
+  updateMode: "full-source";
+  sourceRepo: "paperwing-dev/tiller-hub";
+  sourceId: string;
+  version: string;
+  label: string;
+  managedFiles: string[];
+}
+
+export interface UpdateBuildDiagnostics {
+  version: string;
+  workersCiCommitSha: string | null;
+  workersCiBranch: string | null;
+}
+
+export type HubUpdateRepoStatus = "detected" | "missing" | "ambiguous" | "not_checked";
+
+export interface HubUpdateRepoCandidate {
+  owner: string;
+  repo: string;
+  fullName: string;
+  label: string;
+  repoId: number;
+  installationId: number;
+  branch: string;
+  private: boolean;
+  defaultBranch: string | null;
+  sourceId: string;
+}
+
+export interface HubUpdateRepoDetected {
+  status: "detected";
+  owner: string;
+  repo: string;
+  fullName: string;
+  label: string;
+  repoId: number;
+  installationId: number;
+  branch: string;
+  lastDetectedAt: string;
+  detectedBy: "auto" | "manual" | "selection";
+}
+
+export interface HubUpdateRepoMissing {
+  status: "missing";
+  lastDetectedAt: string | null;
+}
+
+export interface HubUpdateRepoAmbiguous {
+  status: "ambiguous";
+  lastDetectedAt: string;
+  candidates: HubUpdateRepoCandidate[];
+}
+
+export interface HubUpdateRepoNotChecked {
+  status: "not_checked";
+  lastDetectedAt: null;
+}
+
+export type HubUpdateRepoState =
+  | HubUpdateRepoDetected
+  | HubUpdateRepoMissing
+  | HubUpdateRepoAmbiguous
+  | HubUpdateRepoNotChecked;
+
+export interface UpdateIssue {
+  code:
+    | "hub_repo_not_configured"
+    | "hub_repo_ambiguous"
+    | "not_a_tiller_hub_repo"
+    | "managed_files_removed"
+    | "advanced_repair_required"
+    | "update_branch_moved"
+    | "direct_update_rejected"
+    | "update_check_failed";
+  message: string;
+  retryable?: boolean;
+}
+
+export type UpdateApplyResult =
+  | {
+      ok: true;
+      status: "queued";
+      expectedSourceId: string;
+      commitSha: string;
+    }
+  | {
+      ok: true;
+      status: "noop";
+      expectedSourceId: string;
+    }
+  | {
+      ok: false;
+      status:
+        | "hub_repo_not_configured"
+        | "not_a_tiller_hub_repo"
+        | "managed_files_removed"
+        | "advanced_repair_required"
+        | "update_branch_moved"
+        | "direct_update_rejected";
+      error: string;
+      retryable?: boolean;
+      missingManagedFiles?: string[];
+    };
 
 export interface GitHubReleaseAsset {
   name: string;

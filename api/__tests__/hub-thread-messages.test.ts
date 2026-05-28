@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 vi.mock("partyserver", () => ({
   Server: class {
@@ -62,7 +62,7 @@ function createSqlResult<T extends SqlResultRow>(rows: T[], rowsWritten = 0) {
 class FakeSqlStorage {
   private readonly db = new DatabaseSync(":memory:");
 
-  exec(query: string, ...params: unknown[]) {
+  exec(query: string, ...params: SQLInputValue[]) {
     if (/^\s*(select|pragma)\b/i.test(query)) {
       const rows = this.db.prepare(query).all(...params) as SqlResultRow[];
       return createSqlResult(rows);

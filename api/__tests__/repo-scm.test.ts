@@ -6,11 +6,9 @@ import { projectRepoSummary } from "../sync/projectors";
 
 const mocks = vi.hoisted(() => ({
   getRepoWorkspaceForRepoId: vi.fn(),
+  createRepoWorkspaceFromGitHubAppSelection: vi.fn(),
   listRepos: vi.fn(),
-  listEnvMetas: vi.fn(),
   readRepoIndexEntry: vi.fn(),
-  ensureRepoWorkspaceFromRepoUrl: vi.fn(),
-  deriveRepoId: vi.fn(),
   deleteRepoIndex: vi.fn(),
   persistRepoMeta: vi.fn(),
   getScmBootstrapStub: vi.fn(),
@@ -32,11 +30,10 @@ vi.mock("../plan/store", async () => {
   return {
     ...actual,
     getRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
+    getSelectedRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
+    createRepoWorkspaceFromGitHubAppSelection: mocks.createRepoWorkspaceFromGitHubAppSelection,
     listRepos: mocks.listRepos,
-    listEnvMetas: mocks.listEnvMetas,
     readRepoIndexEntry: mocks.readRepoIndexEntry,
-    ensureRepoWorkspaceFromRepoUrl: mocks.ensureRepoWorkspaceFromRepoUrl,
-    deriveRepoId: mocks.deriveRepoId,
     deleteRepoIndex: mocks.deleteRepoIndex,
     persistRepoMeta: mocks.persistRepoMeta,
   };
@@ -102,6 +99,7 @@ function createRepoBinding(overrides: Record<string, unknown> = {}) {
     BUCKET: {
       put: vi.fn().mockResolvedValue({ key: "repos/repo-1/git-artifacts/g1.tar.zst" }),
       get: vi.fn(),
+      list: vi.fn().mockResolvedValue({ objects: [], truncated: false }),
       delete: vi.fn().mockResolvedValue(undefined),
     },
     HUB: {
@@ -123,6 +121,8 @@ function makeRepoMeta(overrides: Record<string, unknown> = {}) {
   return {
     repoId: "repo-1",
     repoUrl: "https://github.com/test/repo",
+    githubInstallationId: 98765,
+    githubFullName: "test/repo",
     ...createInitialRepoScmState(),
     createdAt: "2026-04-09T00:00:00.000Z",
     updatedAt: "2026-04-09T00:00:00.000Z",
@@ -135,7 +135,6 @@ describe("repo git artifact routes", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mocks.listRepos.mockResolvedValue([]);
-    mocks.listEnvMetas.mockResolvedValue([]);
     mocks.integratePlanReviews.mockResolvedValue({});
     mocks.runPlanReviewRound.mockResolvedValue({});
     mocks.resolveProtectionState.mockResolvedValue({
@@ -236,6 +235,73 @@ describe("repo git artifact routes", () => {
     await expect(res.json()).resolves.toEqual(projectRepoSummary(meta));
   });
 
+  it("creates repos only from GitHub App selected repository claims", async () => {
+    const env = createRepoBinding();
+    mocks.resolveProtectionState.mockResolvedValue({ protectionMode: "cf-access" });
+    const repo = {
+      workspace: {},
+      meta: makeRepoMeta({
+        repoId: "123456",
+        repoUrl: "https://github.com/test/repo",
+        gitStatus: "ready",
+        gitArtifactId: "g-current",
+        mainCommit: "abc123",
+      }),
+      created: true,
+    };
+    mocks.createRepoWorkspaceFromGitHubAppSelection.mockResolvedValue(repo);
+
+    const app = createTestApp();
+    const executionCtx = createExecutionCtx();
+    const res = await app.request(
+      "/api/repos",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repositoryId: 123456,
+          installationId: 9876,
+          fullName: "test/repo",
+        }),
+      },
+      env as any,
+      executionCtx as any,
+    );
+
+    expect(res.status).toBe(201);
+    await expect(res.json()).resolves.toMatchObject({
+      repoId: "123456",
+      repoUrl: "https://github.com/test/repo",
+    });
+    expect(mocks.createRepoWorkspaceFromGitHubAppSelection).toHaveBeenCalledWith(env, {
+      repositoryId: 123456,
+      installationId: 9876,
+      fullName: "test/repo",
+    });
+    expect(env.HUB.get().broadcastRepoUpsert).toHaveBeenCalledWith(expect.objectContaining({ repoId: "123456" }));
+  });
+
+  it("rejects URL-based repo creation payloads", async () => {
+    const env = createRepoBinding();
+    mocks.resolveProtectionState.mockResolvedValue({ protectionMode: "cf-access" });
+    const app = createTestApp();
+    const res = await app.request(
+      "/api/repos",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoUrl: "https://github.com/test/repo" }),
+      },
+      env as any,
+    );
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({
+      error: "repositoryId, installationId, and fullName are required",
+    });
+    expect(mocks.createRepoWorkspaceFromGitHubAppSelection).not.toHaveBeenCalled();
+  });
+
   it("rejects replacing the canonical git artifact once bootstrap has completed", async () => {
     const env = createRepoBinding();
     mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
@@ -268,41 +334,96 @@ describe("repo git artifact routes", () => {
   it("emits env removes before repo remove during repo deletion", async () => {
     const env = createRepoBinding();
     env.BUCKET.list = vi.fn().mockResolvedValue({ objects: [] });
+    const envDefinitions = new Map<string, string>([
+      ["envdef:env-a", JSON.stringify({
+        slug: "env-a",
+        repoId: "repo-1",
+        backend: "cf",
+        harness: "claude-code",
+        startupPlanId: null,
+        branchName: "env/env-a",
+        createdAt: "2026-04-09T00:00:00.000Z",
+      })],
+      ["envdef:env-b", JSON.stringify({
+        slug: "env-b",
+        repoId: "repo-1",
+        backend: "cf",
+        harness: "claude-code",
+        startupPlanId: null,
+        branchName: "env/env-b",
+        createdAt: "2026-04-09T00:00:00.000Z",
+      })],
+    ]);
+    env.ENVS_KV.get = vi.fn().mockImplementation(async (key: string) => envDefinitions.get(key) ?? null);
+    env.ENVS_KV.list = vi.fn().mockImplementation(async ({ prefix }: { prefix?: string } = {}) => ({
+      keys: Array.from(envDefinitions.keys())
+        .filter((key) => key.startsWith(prefix ?? ""))
+        .map((name) => ({ name })),
+      list_complete: true,
+      cursor: undefined,
+    }));
     const hub = env.HUB.get() as {
       broadcastEnvRemove: ReturnType<typeof vi.fn>;
       broadcastRepoRemove: ReturnType<typeof vi.fn>;
     };
+    mocks.getEnvLifecycleStub.mockReturnValue({
+      peekMutableState: vi.fn().mockResolvedValue({
+        status: "stopped",
+        lifecyclePhase: "stopped",
+        lifecycleOpId: null,
+        lifecycleOperation: null,
+        lifecycleDesiredState: "stopped",
+        lifecycleLastRunnerState: "stopped",
+        lifecycleLastWorkspaceSyncedAckOpId: null,
+        lifecycleInfraState: "stopped",
+        lifecycleRuntimeReady: false,
+        lifecycleUpdatedAt: "2026-04-09T00:00:00.000Z",
+        runnerId: null,
+        runnerMachineId: "machine-a",
+        bootMessage: null,
+        bootStepId: null,
+        authWarning: null,
+        branchStatus: null,
+        workspaceDirty: null,
+        workspaceNeedsAttention: null,
+        workspaceLastSyncedAt: null,
+        baseMainCommit: null,
+        lastKnownMainCommit: null,
+        scmOperationType: null,
+        scmOperationId: null,
+        scmOperationPhase: null,
+        scmOperationStartedAt: null,
+        scmOperationUpdatedAt: null,
+        scmLastCompletedAt: null,
+        scmLastDurationMs: null,
+        scmLastTimings: null,
+        leadHarnessStatus: null,
+        leadHarnessError: null,
+        leadHarnessUpdatedAt: null,
+        error: null,
+        errorAt: null,
+        updatedAt: "2026-04-09T00:00:00.000Z",
+      }),
+      clearMutableState: vi.fn().mockResolvedValue(null),
+    });
     mocks.getWorkspaceStub.mockReturnValue({
       destroyWorkspace: vi.fn().mockResolvedValue(undefined),
     });
+    const destroyRepoWorkspace = vi.fn().mockResolvedValue(undefined);
     mocks.readRepoIndexEntry.mockResolvedValue({
       repoId: "repo-1",
       repoUrl: "https://github.com/test/repo",
     });
     mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
-      workspace: {},
+      workspace: {
+        destroyWorkspace: destroyRepoWorkspace,
+      },
       meta: makeRepoMeta({
         mainCommit: "abc123",
         gitArtifactId: "g-current",
         gitStatus: "ready",
       }),
     });
-    mocks.listEnvMetas.mockResolvedValue([
-      {
-        slug: "env-a",
-        repoId: "repo-1",
-        repoUrl: "https://github.com/test/repo",
-        runnerMachineId: "machine-a",
-        createdAt: "2026-04-09T00:00:00.000Z",
-      },
-      {
-        slug: "env-b",
-        repoId: "repo-1",
-        repoUrl: "https://github.com/test/repo",
-        runnerMachineId: "machine-b",
-        createdAt: "2026-04-09T00:00:00.000Z",
-      },
-    ]);
     mocks.deleteRepoIndex.mockResolvedValue(undefined);
 
     const app = createTestApp();
@@ -333,6 +454,7 @@ describe("repo git artifact routes", () => {
     expect(
       Math.max(...hub.broadcastEnvRemove.mock.invocationCallOrder),
     ).toBeLessThan(hub.broadcastRepoRemove.mock.invocationCallOrder[0]);
+    expect(destroyRepoWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it("only accepts staged repo artifacts for the reserved merge artifact id", async () => {
@@ -425,7 +547,6 @@ describe("repo git artifact routes", () => {
       }),
     });
     mocks.getSecret.mockImplementation(async (_env: unknown, key: string) => {
-      if (key === "GITHUB_TOKEN") return "gh-token";
       if (key === "CF_ACCESS_CLIENT_ID") return "cf-id";
       if (key === "CF_ACCESS_CLIENT_SECRET") return "cf-secret";
       return undefined;
@@ -458,15 +579,25 @@ describe("repo git artifact routes", () => {
     expect(envVars).toMatchObject({
       TILLER_BOOTSTRAP_MODE: "repo-git",
       TILLER_REPO_ID: "repo-1",
+      HUB_URL: "https://hub.example.com",
       TILLER_REPO_GIT_ARTIFACT_URL: "https://hub.example.com/api/repos/repo-1/git-artifact",
       TILLER_REPO_GIT_FAILURE_URL: "https://hub.example.com/api/repos/repo-1/git-artifact/bootstrap-failed",
       TILLER_REPO_GIT_PROGRESS_URL: "https://hub.example.com/api/repos/repo-1/git-artifact/bootstrap-progress",
       TILLER_REPO_GIT_BOOTSTRAP_REF: "HEAD",
       TILLER_REPO_GIT_BOOTSTRAP_DEPTH: "0",
-      GITHUB_TOKEN: "gh-token",
+      NODE_OPTIONS: "--dns-result-order=ipv4first",
+      TILLER_GITHUB_BRIDGE_ID: expect.any(String),
+      TILLER_GITHUB_BRIDGE_SECRET: expect.any(String),
+      TILLER_GITHUB_ALLOWED_REPO: "test/repo",
       CF_ACCESS_CLIENT_ID: "cf-id",
       CF_ACCESS_CLIENT_SECRET: "cf-secret",
     });
+    expect(envVars.NODE_OPTIONS).not.toContain("no-network-family-autoselection");
+    expect(env.ENVS_KV.put).toHaveBeenCalledWith(
+      expect.stringMatching(/^github-bridge:/),
+      expect.stringContaining("\"type\":\"repo-bootstrap\""),
+      expect.objectContaining({ expirationTtl: expect.any(Number) }),
+    );
     expect(mocks.getRunnerBackend).not.toHaveBeenCalled();
   });
 

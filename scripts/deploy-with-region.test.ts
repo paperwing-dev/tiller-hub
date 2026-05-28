@@ -2,14 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
   VALID_TILLER_REGIONS,
   buildDeployConfig,
+  deriveContainerApplicationName,
   deriveBucketName,
   ensureWranglerAccountId,
   extractBucketLocation,
   needsLiveContainerImageLookup,
+  normalizeWorkerName,
   normalizeTillerRegion,
   normalizeEmailList,
   parseDotEnv,
+  parseWranglerJsonOutput,
   resolveContainerImages,
+  resolveWorkerName,
+  rewriteContainerApplicationNames,
 } from "./deploy-with-region.mjs";
 
 describe("normalizeTillerRegion", () => {
@@ -31,6 +36,46 @@ describe("normalizeTillerRegion", () => {
 describe("deriveBucketName", () => {
   it("creates a deterministic bucket name from the worker name", () => {
     expect(deriveBucketName("Paperwing Tiller Hub")).toBe("paperwing-tiller-hub-r2-d272aa20");
+  });
+});
+
+describe("normalizeWorkerName", () => {
+  it("accepts lowercase Worker names with hyphens", () => {
+    expect(normalizeWorkerName("  tiller-hub-sage ")).toBe("tiller-hub-sage");
+  });
+
+  it("rejects names Wrangler cannot safely deploy", () => {
+    expect(() => normalizeWorkerName("Tiller Hub")).toThrow(/lowercase letters/);
+    expect(() => normalizeWorkerName("-tiller-hub")).toThrow(/cannot start or end/);
+  });
+});
+
+describe("resolveWorkerName", () => {
+  it("uses the Workers Builds override before local fallback values", () => {
+    expect(
+      resolveWorkerName(
+        { name: "tiller-hub" },
+        {
+          WRANGLER_CI_OVERRIDE_NAME: "tiller-hub-maple",
+          TILLER_WORKER_NAME: "tiller-hub-local",
+        },
+      ),
+    ).toBe("tiller-hub-maple");
+  });
+
+  it("supports a local explicit Worker name override", () => {
+    expect(
+      resolveWorkerName(
+        { name: "tiller-hub" },
+        {
+          TILLER_WORKER_NAME: "tiller-hub-river",
+        },
+      ),
+    ).toBe("tiller-hub-river");
+  });
+
+  it("falls back to the root Wrangler name", () => {
+    expect(resolveWorkerName({ name: "tiller-hub" }, {})).toBe("tiller-hub");
   });
 });
 
@@ -61,6 +106,58 @@ describe("buildDeployConfig", () => {
       },
     ]);
     expect(config.workers_dev).toBe(true);
+    expect(config.preview_urls).toBe(false);
+  });
+
+  it("can rewrite the generated config to the selected Worker name", () => {
+    const config = buildDeployConfig(
+      {
+        name: "tiller-hub",
+        vars: {
+          TILLER_REGION: "wnam",
+          TILLER_WORKER_NAME: "tiller-hub-ignore-runtime",
+        },
+      },
+      {
+        bucketName: "tiller-hub-river-r2-12345678",
+        region: "wnam",
+        workerName: "tiller-hub-river",
+      },
+    );
+
+    expect(config.name).toBe("tiller-hub-river");
+    expect(config.vars).toEqual({
+      DO_LOCATION_HINT: "wnam",
+    });
+  });
+
+  it("rewrites generated container application names to the selected Worker name", () => {
+    const config = buildDeployConfig(
+      {
+        name: "tiller-hub",
+        vars: { TILLER_REGION: "wnam" },
+        containers: [
+          {
+            class_name: "SandboxDO",
+            name: "tiller-hub-sandboxdo",
+            image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          },
+        ],
+      },
+      {
+        bucketName: "tiller-hub-river-r2-12345678",
+        region: "wnam",
+        workerName: "tiller-hub-river",
+      },
+    );
+
+    expect(config.containers).toEqual([
+      {
+        class_name: "SandboxDO",
+        name: "tiller-hub-river-sandboxdo",
+        image: "docker.io/jamieatlason/tiller-sandbox:stable",
+      },
+    ]);
   });
 
   it("builds a protected custom-domain deploy config", () => {
@@ -242,6 +339,36 @@ describe("buildDeployConfig", () => {
   });
 });
 
+describe("rewriteContainerApplicationNames", () => {
+  it("derives names from class names", () => {
+    expect(deriveContainerApplicationName("tiller-hub-maple", "SandboxDO")).toBe("tiller-hub-maple-sandboxdo");
+  });
+
+  it("preserves custom container names", () => {
+    expect(
+      rewriteContainerApplicationNames(
+        [
+          {
+            class_name: "SandboxDO",
+            name: "custom-sandbox",
+            image: "docker.io/example/sandbox:stable",
+          },
+        ],
+        {
+          workerName: "tiller-hub-maple",
+          previousWorkerName: "tiller-hub",
+        },
+      ),
+    ).toEqual([
+      {
+        class_name: "SandboxDO",
+        name: "custom-sandbox",
+        image: "docker.io/example/sandbox:stable",
+      },
+    ]);
+  });
+});
+
 describe("resolveContainerImages", () => {
   const containers = [
     {
@@ -389,6 +516,17 @@ describe("parseDotEnv", () => {
       TILLER_CUSTOM_DOMAIN: "tiller.example.com",
       TILLER_ACCESS_EMAILS: "one@example.com,two@example.com",
     });
+  });
+});
+
+describe("parseWranglerJsonOutput", () => {
+  it("ignores Wrangler notices before JSON output", () => {
+    expect(
+      parseWranglerJsonOutput(
+        "Cloudflare agent skills are available for: Claude Code, Cursor, Codex.\n{\"location\":\"WNAM\"}\n",
+        "wrangler output",
+      ),
+    ).toEqual({ location: "WNAM" });
   });
 });
 

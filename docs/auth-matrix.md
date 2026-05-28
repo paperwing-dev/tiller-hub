@@ -17,11 +17,13 @@ These are used to deploy the worker, not during normal runtime.
 | `CLOUDFLARE_API_TOKEN` | Wrangler deploys / CI | Yes | Standard Cloudflare API token for deploy-time operations. |
 | `CLOUDFLARE_ACCOUNT_ID` | Wrangler deploys / CI | Sometimes | Useful when Wrangler cannot infer the account automatically. |
 | `TILLER_REGION` | Deploy flow | Yes for the deploy-button path | One of `wnam`, `enam`, `weur`, `eeur`, `apac`, or `oc`. |
+| `WRANGLER_CI_OVERRIDE_NAME` | Workers Builds | Auto-set by Cloudflare | Selected Worker name from Cloudflare's setup page. Tiller uses it for generated resource names. |
 
 Optional power-user deploy inputs:
 
 | Name | Where used | Required | Notes |
 | --- | --- | --- | --- |
+| `TILLER_WORKER_NAME` | `npm run deploy` | Optional | Local explicit Worker name override. Useful when deploying more than one hosted hub in the same account. |
 | `TILLER_CUSTOM_DOMAIN` | `npm run deploy` | Optional | Deploys directly to a protected custom domain instead of `workers.dev`. |
 | `TILLER_ACCESS_EMAILS` | `npm run deploy` | Required with `TILLER_CUSTOM_DOMAIN` | Comma- or newline-separated emails allowed through Cloudflare Access. |
 | `CF_ACCESS_CLIENT_ID` | local `tiller` only | Optional | Not required for deploy. Useful for protected custom-domain hubs. |
@@ -43,10 +45,10 @@ These are the live bindings or secrets used by the deployed worker.
 | `DEFAULT_NAMESPACE` | Yes | Default namespace selection | Current system still assumes a default namespace exists. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Optional | Claude subscription auth in containers | Current subscription path for Claude containers. |
 | `ANTHROPIC_API_KEY` | Optional | Anthropic API auth in containers | Used when Claude auth resolves to API mode. |
-| `OPENAI_API_KEY` | Optional | Codex/OpenAI API fallback | Used when no active Codex gateway subscription route exists. |
+| `OPENAI_API_KEY` | Optional | Codex API key fallback | Used when no active Codex gateway subscription route exists. |
 | `TILLER_OPENCODE_PROXY_TOKEN` | Internal | OpenCode hub proxy auth | Generated automatically by the hub and injected into OpenCode containers. |
 | `OPENAI_MODEL` | Optional | Hosted Research model override | Defaults are defined by agent specs if unset. |
-| `GITHUB_TOKEN` | Optional | Private repo tarballs and GitHub package access | Needed for private repos or package pulls that require auth. |
+| `GITHUB_APP_ID` / `GITHUB_APP_CLIENT_ID` / `GITHUB_APP_SLUG` / `GITHUB_APP_PRIVATE_KEY` | Optional | GitHub repo access | Stored in HubDO config by the GitHub App setup flow. Repository add/env creation only uses repos selected in this App installation. Public `workers.dev` hubs cannot add repos. |
 | `DO_LOCATION_HINT` | Optional | Hub Durable Object placement override | Usually injected automatically from `TILLER_REGION`. |
 
 ## Runtime-discovered local services
@@ -123,7 +125,7 @@ Required on the machine:
 - `hubUrl`
 - `clientId` and `clientSecret`, only if the hub is a protected custom domain
 - `tiller host`
-- ChatGPT/Codex auth available on that machine
+- imported Codex subscription login available in Tiller
 
 Normal path:
 

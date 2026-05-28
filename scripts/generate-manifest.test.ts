@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { buildManifestContainers } from "./generate-manifest.mjs";
+import { buildManifestContainers, buildPlainTextBindings } from "./generate-manifest.mjs";
 
 const envKeys = [
   "CONTAINER_IMAGE_TAG",
@@ -84,5 +84,15 @@ describe("generate-manifest container images", () => {
         },
       ],
     })).toThrow(/must use a pinned image ref/);
+  });
+});
+
+describe("generate-manifest plain text bindings", () => {
+  it("does not require default harness enablement to be encoded as Worker config", () => {
+    expect(buildPlainTextBindings({
+      vars: {
+        TILLER_REGION: "wnam",
+      },
+    })).toEqual([]);
   });
 });

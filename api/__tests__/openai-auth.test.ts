@@ -5,6 +5,7 @@ import {
   refreshAccessToken,
   resetOpenAIAuthStateForTests,
   seedTokens,
+  validateAndSeedTokens,
 } from "../openai-auth";
 
 class MemoryKV {
@@ -87,6 +88,52 @@ describe("openai-auth", () => {
     expect(refreshed.expires_at).toBe(Date.now() + 7200 * 1000);
   });
 
+  it("validateAndSeedTokens refreshes before storing imported tokens", async () => {
+    const env = createTestEnv();
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: createJwt({ chatgpt_account_id: "acct_imported" }),
+        refresh_token: "refresh_imported_rotated",
+        expires_in: 7200,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const stored = await validateAndSeedTokens(env, {
+      access_token: createJwt({ chatgpt_account_id: "acct_imported" }),
+      refresh_token: "refresh_imported",
+      expires_in: 1,
+    });
+
+    expect(stored.refresh_token).toBe("refresh_imported_rotated");
+    expect(stored.expires_at).toBe(Date.now() + 7200 * 1000);
+    await expect(getValidOpenAIAuth(env)).resolves.toEqual(stored);
+  });
+
+  it("validateAndSeedTokens does not replace existing tokens when imported refresh fails", async () => {
+    const env = createTestEnv();
+    const existing = await seedTokens(env, {
+      access_token: createJwt({ chatgpt_account_id: "acct_existing" }),
+      refresh_token: "refresh_existing",
+      expires_in: 3600,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({}),
+    }));
+
+    await expect(validateAndSeedTokens(env, {
+      access_token: createJwt({ chatgpt_account_id: "acct_bad" }),
+      refresh_token: "refresh_bad",
+      expires_in: 1,
+    })).rejects.toThrow("OpenAI token refresh failed: 400");
+
+    await expect(getValidOpenAIAuth(env)).resolves.toEqual(existing);
+  });
+
   it("getValidOpenAIAuth returns cached tokens when still valid", async () => {
     const env = createTestEnv();
     const fetchSpy = vi.fn();
@@ -139,6 +186,6 @@ describe("openai-auth", () => {
 
   it("getStatus reports unauthenticated when nothing is seeded", async () => {
     const env = createTestEnv();
-    await expect(getStatus(env)).resolves.toEqual({ authenticated: false });
+    await expect(getStatus(env)).resolves.toEqual({ authenticated: false, status: "missing" });
   });
 });

@@ -17,7 +17,7 @@ The main question is:
 
 - Goal: high-quality codebase understanding and general hosted assistance
 - Runtime pattern: hosted direct tools
-- Model path: external Codex / `gpt-5.4`
+- Model path: external Codex / `gpt-5.5`
 - What it is testing:
   - `AIChatAgent` as the primary hosted chat surface
   - hosted file and memory tools without requiring a container
@@ -174,7 +174,7 @@ What this is meant to validate later:
 
 ## Open Questions
 
-- Should the best planner simply be a second `gpt-5.4` persona instead of a different model/runtime?
+- Should the best planner simply be a second `gpt-5.5` persona instead of a different model/runtime?
 - Which hosted tasks truly benefit from `Codemode` enough to justify latency?
 - When MCP becomes first-class, does `Codemode` become more compelling?
 - Should handoffs eventually move from file-backed artifacts to Workflow-backed orchestration?

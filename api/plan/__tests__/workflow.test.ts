@@ -7,7 +7,6 @@ import {
   parsePlanIntegrationResponse,
   parsePlanReviewResponse,
   resolvePlanModel,
-  resolveStartupPlanId,
   summarizeFilteredReview,
 } from "../workflow";
 
@@ -21,77 +20,32 @@ const draft: PlanArtifact = {
   },
   title: "Plan tests for tiller",
   body: {
-    summary: "Draft summary",
-    findings: [],
-    relevantFiles: ["/packages/tiller/src/index.ts"],
-    openQuestions: [],
-    proposedPlan: [
+    markdown: [
       "1. Harness and workspace integration",
       "- Add package scripts in /packages/tiller/package.json.",
       "2. Batch 1 — config and auth tests",
       "- Test loadConfig() returns {} on malformed JSON.",
       "3. Batch 2 — HubClient unit tests with isolated WebSocket/timers",
     ].join("\n"),
-    memoryRefs: [],
-    model: "gpt-5.4",
   },
   createdBy: "plan",
   createdAt: "2026-03-28T00:00:00.000Z",
 };
 
 describe("resolvePlanModel", () => {
-  it("defaults to ChatGPT 5.4 when the selection is invalid", () => {
+  it("defaults to ChatGPT 5.5 when the selection is invalid", () => {
     expect(resolvePlanModel("not-a-real-model")).toBe(PLAN_DEFAULT_MODEL);
     expect(resolvePlanModel(undefined)).toBe(PLAN_DEFAULT_MODEL);
   });
 
   it("returns supported planner models unchanged", () => {
-    expect(resolvePlanModel("gpt-5.4")).toBe("gpt-5.4");
+    expect(resolvePlanModel("gpt-5.5")).toBe("gpt-5.5");
     expect(resolvePlanModel("@cf/nvidia/nemotron-3-120b-a12b")).toBe(
       "@cf/nvidia/nemotron-3-120b-a12b",
     );
     expect(resolvePlanModel("@cf/moonshotai/kimi-k2.5")).toBe(
       "@cf/moonshotai/kimi-k2.5",
     );
-  });
-});
-
-describe("resolveStartupPlanId", () => {
-  it("prefers the explicit request when one is provided", () => {
-    expect(
-      resolveStartupPlanId({
-        requestedPlanId: "requested",
-        startupPlanId: "stored",
-        approvedPlans: [{ id: "latest" }],
-      }),
-    ).toBe("requested");
-  });
-
-  it("falls back to the stored startup plan before the latest approved plan", () => {
-    expect(
-      resolveStartupPlanId({
-        startupPlanId: "stored",
-        approvedPlans: [{ id: "latest" }],
-      }),
-    ).toBe("stored");
-  });
-
-  it("uses the latest approved plan when nothing else is chosen", () => {
-    expect(
-      resolveStartupPlanId({
-        approvedPlans: [{ id: "latest" }],
-      }),
-    ).toBe("latest");
-  });
-
-  it("returns null when the user explicitly chooses no plan", () => {
-    expect(
-      resolveStartupPlanId({
-        requestedPlanId: null,
-        startupPlanId: "stored",
-        approvedPlans: [{ id: "latest" }],
-      }),
-    ).toBeNull();
   });
 });
 
@@ -193,7 +147,7 @@ describe("integration helpers", () => {
   it("builds an integration prompt with inline draft and filtered issues", () => {
     const prompt = buildPlanIntegrationPrompt({
       draft,
-      selectedModel: "gpt-5.4",
+      selectedModel: "gpt-5.5",
       filteredIssues: [
         {
           sourceReviewId: "review-1",

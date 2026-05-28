@@ -4,11 +4,12 @@ import type {
   PlanReviewIssueStats,
 } from "../agent-core";
 import type { PlanArtifact, ReviewArtifact } from "../coordination";
+import { renderArtifactBodyMarkdown } from "../coordination";
 
-export const PLAN_DEFAULT_MODEL = "gpt-5.4";
+export const PLAN_DEFAULT_MODEL = "gpt-5.5";
 
 export const PLAN_MODEL_OPTIONS = [
-  { id: "gpt-5.4", label: "ChatGPT 5.4" },
+  { id: "gpt-5.5", label: "ChatGPT 5.5" },
   { id: "@cf/nvidia/nemotron-3-120b-a12b", label: "Nemotron 120B" },
   { id: "@cf/moonshotai/kimi-k2.5", label: "Kimi K2.5" },
 ] as const;
@@ -100,22 +101,6 @@ export function resolvePlanModel(value: unknown): PlanModelId {
   return isPlanModelId(value) ? value : PLAN_DEFAULT_MODEL;
 }
 
-export function resolveStartupPlanId(options: {
-  requestedPlanId?: string | null;
-  startupPlanId?: string | null;
-  approvedPlans?: Array<Pick<PlanArtifact, "id">>;
-}): string | null {
-  if (options.requestedPlanId !== undefined) {
-    return options.requestedPlanId;
-  }
-
-  if (options.startupPlanId) {
-    return options.startupPlanId;
-  }
-
-  return options.approvedPlans?.[0]?.id ?? null;
-}
-
 export function isWorkersAIPlanModel(model: string): boolean {
   return model.startsWith("@cf/");
 }
@@ -161,6 +146,7 @@ function normalizeEvidenceQuote(value: string): string {
 }
 
 export function buildPlanReviewPrompt(draft: Pick<PlanArtifact, "title" | "body">): string {
+  const draftMarkdown = renderArtifactBodyMarkdown(draft.body);
   return [
     "Review the implementation plan below.",
     "Use the available read-only repository tools before answering so your critique is code-aware.",
@@ -176,12 +162,9 @@ export function buildPlanReviewPrompt(draft: Pick<PlanArtifact, "title" | "body"
     "- Maximum 6 issues.",
     "",
     `Goal: ${draft.title}`,
-    `Summary: ${draft.body.summary}`,
     "",
     "Plan:",
-    draft.body.proposedPlan,
-    "",
-    draft.body.relevantFiles.length > 0 ? `Relevant files: ${draft.body.relevantFiles.join(", ")}` : "Relevant files: none",
+    draftMarkdown,
   ].join("\n");
 }
 
@@ -226,7 +209,7 @@ export function filterPlanReviewIssues(options: {
   const kept: FilteredPlanReviewIssue[] = [];
   const dropped: DroppedPlanReviewIssue[] = [];
   const seen = new Set<string>();
-  const draftText = `${options.draft.body.summary}\n${options.draft.body.proposedPlan}`;
+  const draftText = renderArtifactBodyMarkdown(options.draft.body);
 
   for (const issue of options.issues) {
     const evidenceQuote = normalizeEvidenceQuote(issue.evidenceQuote);
@@ -306,6 +289,7 @@ export function buildPlanIntegrationPrompt(options: {
   filteredIssues: FilteredPlanReviewIssue[];
   selectedModel: string;
 }): string {
+  const draftMarkdown = renderArtifactBodyMarkdown(options.draft.body);
   const issueBlocks =
     options.filteredIssues.length > 0
       ? options.filteredIssues
@@ -339,10 +323,9 @@ export function buildPlanIntegrationPrompt(options: {
     "",
     `Selected planner model: ${options.selectedModel}`,
     `Goal: ${options.draft.title}`,
-    `Current draft summary: ${options.draft.body.summary}`,
     "",
     "Current draft plan:",
-    options.draft.body.proposedPlan,
+    draftMarkdown,
     "",
     "Filtered review issues:",
     issueBlocks,

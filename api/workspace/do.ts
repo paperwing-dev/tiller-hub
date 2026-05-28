@@ -1,12 +1,22 @@
 import { DurableObject } from "cloudflare:workers";
-import { Workspace, type FileInfo } from "agents/experimental/workspace";
+import { Workspace, type FileInfo } from "@cloudflare/shell";
 import type { Env } from "../types";
-import { createWorkspaceHost } from "./host";
 
 export interface ManifestEntry {
   path: string;
   size: number;
   mtime: number;
+}
+
+export interface HashedManifestEntry {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface WorkspaceFileStat {
+  path: string;
+  size: number;
 }
 
 function matchesAnyPrefix(path: string, prefixes: string[] = []): boolean {
@@ -27,7 +37,8 @@ export class WorkspaceDO extends DurableObject<Env> {
 
   private get workspace(): Workspace {
     if (!this._workspace) {
-      this._workspace = new Workspace(createWorkspaceHost(this.ctx), {
+      this._workspace = new Workspace({
+        sql: this.ctx.storage.sql,
         r2: this.env.BUCKET,
         r2Prefix: this.ctx.id.toString(),
         inlineThreshold: 1_000_000,
@@ -36,11 +47,35 @@ export class WorkspaceDO extends DurableObject<Env> {
     return this._workspace;
   }
 
-  getManifest(): ManifestEntry[] {
+  async getManifest(): Promise<ManifestEntry[]> {
     console.log("[workspace-do] getManifest called");
-    const files = this.workspace.glob("**/*").filter((f) => f.type === "file");
+    const files = (await this.workspace.glob("**/*")).filter((f) => f.type === "file");
     console.log(`[workspace-do] getManifest -> ${files.length} files`);
     return files.map((f) => ({ path: f.path, size: f.size, mtime: f.updatedAt }));
+  }
+
+  async getHashedManifest(options?: { excludePrefixes?: string[] }): Promise<HashedManifestEntry[]> {
+    const files = (await this.workspace.glob("**/*"))
+      .filter((entry) => entry.type === "file" && !matchesAnyPrefix(entry.path, options?.excludePrefixes))
+      .sort((left, right) => left.path.localeCompare(right.path));
+
+    const entries: HashedManifestEntry[] = [];
+    for (const file of files) {
+      const body = await this.workspace.readFileBytes(file.path);
+      if (body === null) continue;
+      entries.push({
+        path: file.path,
+        size: file.size,
+        sha256: await sha256HexBytes(body),
+      });
+    }
+    return entries;
+  }
+
+  async statWorkspaceFile(path: string): Promise<WorkspaceFileStat | null> {
+    const stat = await this.workspace.stat(path);
+    if (!stat || stat.type !== "file") return null;
+    return { path: stat.path, size: stat.size };
   }
 
   async readWorkspaceFile(path: string): Promise<string | null> {
@@ -75,15 +110,15 @@ export class WorkspaceDO extends DurableObject<Env> {
     }
   }
 
-  readWorkspaceDir(dir?: string): FileInfo[] {
+  readWorkspaceDir(dir?: string): Promise<FileInfo[]> {
     return this.workspace.readDir(dir);
   }
 
-  globWorkspace(pattern: string): FileInfo[] {
+  globWorkspace(pattern: string): Promise<FileInfo[]> {
     return this.workspace.glob(pattern);
   }
 
-  getWorkspaceInfo(): { fileCount: number; directoryCount: number; totalBytes: number; r2FileCount: number } {
+  getWorkspaceInfo(): Promise<{ fileCount: number; directoryCount: number; totalBytes: number; r2FileCount: number }> {
     return this.workspace.getWorkspaceInfo();
   }
 
@@ -104,8 +139,8 @@ export class WorkspaceDO extends DurableObject<Env> {
 
   async computeWorkspaceTreeHash(options?: { excludePrefixes?: string[] }): Promise<string> {
     const encoder = new TextEncoder();
-    const files = this.workspace
-      .glob("**/*")
+    const files = (await this.workspace
+      .glob("**/*"))
       .filter((entry) => entry.type === "file" && !matchesAnyPrefix(entry.path, options?.excludePrefixes))
       .sort((left, right) => left.path.localeCompare(right.path));
 
@@ -121,8 +156,8 @@ export class WorkspaceDO extends DurableObject<Env> {
 
   async downloadTar(options?: { excludePrefixes?: string[] }): Promise<Uint8Array> {
     console.log("[workspace-do] downloadTar called");
-    const files = this.workspace
-      .glob("**/*")
+    const files = (await this.workspace
+      .glob("**/*"))
       .filter((f) => f.type === "file" && !matchesAnyPrefix(f.path, options?.excludePrefixes));
     console.log(`[workspace-do] downloadTar: ${files.length} files to pack`);
     const encoder = new TextEncoder();
@@ -173,7 +208,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     options?: { preservePrefixes?: string[]; clearFirst?: boolean; stripFirstSegment?: boolean },
   ): Promise<{ fileCount: number }> {
     if (options?.clearFirst) {
-      const files = this.workspace.glob("**/*").filter((entry) =>
+      const files = (await this.workspace.glob("**/*")).filter((entry) =>
         entry.type === "file" && !matchesAnyPrefix(entry.path, options.preservePrefixes),
       );
       for (const file of files) {
@@ -266,7 +301,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
 
   async destroyWorkspace(): Promise<void> {
-    const files = this.workspace.glob("**/*").filter((entry) => entry.type === "file");
+    const files = (await this.workspace.glob("**/*")).filter((entry) => entry.type === "file");
     for (const file of files) {
       await this.workspace.deleteFile(file.path);
     }

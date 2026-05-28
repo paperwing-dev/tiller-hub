@@ -77,3 +77,12 @@ export function getHostedToolOutputFingerprint(
     )
     .join("|");
 }
+
+export function listHostedToolOutputs(messages: UIMessage[], toolName: string): unknown[] {
+  return messages.flatMap((message) =>
+    message.parts
+      .filter(isToolUIPart)
+      .filter((part) => getToolName(part) === toolName && part.state === "output-available")
+      .map((part) => part.output),
+  );
+}

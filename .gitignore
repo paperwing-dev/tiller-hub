@@ -1,6 +1,6 @@
 node_modules/
 dist/
 .wrangler/
-.env
-.dev.vars
+.env*
+.dev.vars*
 *.local

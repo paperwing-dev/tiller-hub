@@ -506,6 +506,7 @@ export async function ensureProtectedCustomDomain(
   {
     apiToken,
     emails,
+    accessTeamDomain,
   },
   options = {},
 ) {
@@ -522,6 +523,7 @@ export async function ensureProtectedCustomDomain(
     body: JSON.stringify({
       apiToken,
       emails,
+      ...(accessTeamDomain ? { accessTeamDomain } : {}),
     }),
   };
   let response;

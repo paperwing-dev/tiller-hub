@@ -1,8 +1,6 @@
 import {
-  getApprovedPlanArtifact,
-  getPlanArtifactById,
-  loadRepoArtifacts,
-  renderArtifactPlanMarkdown,
+  asPlanArtifact,
+  renderArtifactBodyMarkdown,
   type ArtifactStoreDO,
   type PlanArtifact,
 } from "../coordination";
@@ -17,9 +15,10 @@ import { getSecret } from "../setup/config";
 import { resolveProtectionState } from "../protection";
 import { resolveScmRunnerBackendKind } from "./runner-backend";
 import { resolveCodexModelRoute } from "../model-route";
+import { mintCodexGatewaySessionToken } from "../gateway-session";
 import {
   buildScmContainerEnvVars,
-  resolveRequestedStartupPlanId,
+  type StartupPlanSelection,
 } from "../scm/model";
 import {
   resolveContainerHubUrl,
@@ -31,40 +30,84 @@ import {
   buildEnvScmConflictResolutionUrl,
   buildRepoGitArtifactStagingUrl,
 } from "./hub-url";
-import { ensureRepoWorkspaceFromRepoUrl } from "../plan/store";
+import type { SelectedRepoWorkspace } from "../plan/store";
 import type { RepoScmOperationType } from "../scm/repo-merge-lock-do";
-import workspacePolicy from "../../../containers/workspace-policy.json";
+import workspacePolicy from "./workspace-policy.json";
+import { isGitHubAppAllowedForRequest } from "../github/app";
+import {
+  bridgeCredentialsToEnvVars,
+  createGitHubBridgeRecord,
+} from "../github/bridge";
 
-export type RepoWorkspaceHandle = Awaited<ReturnType<typeof ensureRepoWorkspaceFromRepoUrl>>;
+export type RepoWorkspaceHandle = SelectedRepoWorkspace;
 
 export const ENV_ONLY_CANONICAL_EXCLUDES = workspacePolicy.envOnlyCanonicalExcludes;
 export const TREE_HASH_EXCLUDES = ENV_ONLY_CANONICAL_EXCLUDES;
+export const STARTUP_PLAN_IMPLEMENTATION_PREAMBLE = [
+  "A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context.",
+  "Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation",
+  "and verification.",
+].join("\n");
 
 interface RepoPlanSource {
   meta: Pick<RepoMeta, "repoId" | "mainCommit">;
 }
 
-async function resolveSelectedPlanArtifact(
-  repo: RepoPlanSource,
-  artifactStore: Pick<ArtifactStoreDO, "listArtifacts" | "listRefs">,
-  meta: EnvMeta,
-  currentMainCommit: string | null,
-  requestedPlanId?: string | null,
-): Promise<PlanArtifact | null> {
-  const { artifacts, refs } = await loadRepoArtifacts(repo.meta, artifactStore);
-  const preferredPlanId = resolveRequestedStartupPlanId(meta, requestedPlanId);
-  const selectedPlan = preferredPlanId
-    ? getPlanArtifactById(artifacts, preferredPlanId)
-    : getApprovedPlanArtifact(artifacts, refs);
+type StartupArtifactStore = Pick<ArtifactStoreDO, "getArtifact" | "listLatestTodoPlansForMain">;
 
-  if (!selectedPlan) {
-    if (!preferredPlanId) return null;
-    throw new Error(`Plan artifact not found: ${preferredPlanId}`);
+export function buildStartupPlanDocument(planText: string): string {
+  const trimmed = planText.trim();
+  if (!trimmed) {
+    return STARTUP_PLAN_IMPLEMENTATION_PREAMBLE;
   }
 
-  if (selectedPlan.basis.mainCommit !== (meta.baseMainCommit ?? currentMainCommit)) {
+  const normalized = trimmed.replace(/\r\n/g, "\n");
+  if (normalized.startsWith(STARTUP_PLAN_IMPLEMENTATION_PREAMBLE)) {
+    return trimmed;
+  }
+
+  return `${STARTUP_PLAN_IMPLEMENTATION_PREAMBLE}\n\n${trimmed}`;
+}
+
+async function resolveLatestTodoPlan(
+  artifactStore: StartupArtifactStore,
+  repoId: string,
+  mainCommit: string | null,
+): Promise<PlanArtifact | null> {
+  if (!mainCommit) return null;
+  return (await artifactStore.listLatestTodoPlansForMain(repoId, mainCommit, 1))[0] as PlanArtifact | undefined ?? null;
+}
+
+async function resolveSelectedPlanArtifact(
+  repo: RepoPlanSource,
+  artifactStore: StartupArtifactStore,
+  meta: EnvMeta,
+  currentMainCommit: string | null,
+  selection: StartupPlanSelection,
+): Promise<PlanArtifact | null> {
+  if (selection.mode === "none") {
+    return null;
+  }
+
+  const selectedPlan = selection.mode === "specific"
+    ? asPlanArtifact(await artifactStore.getArtifact(selection.artifactId))
+    : await resolveLatestTodoPlan(
+      artifactStore,
+      repo.meta.repoId,
+      currentMainCommit,
+    );
+
+  if (!selectedPlan) {
+    if (selection.mode === "todo") return null;
+    throw new Error(`Plan artifact not found: ${selection.artifactId}`);
+  }
+
+  if (
+    selection.mode !== "specific" &&
+    selectedPlan.basis.mainCommit !== currentMainCommit
+  ) {
     throw new Error(
-      `Plan artifact ${selectedPlan.id} belongs to ${selectedPlan.basis.mainCommit ?? "unknown main"}, expected ${meta.baseMainCommit ?? currentMainCommit ?? "unknown main"}.`,
+      `Plan artifact ${selectedPlan.id} belongs to ${selectedPlan.basis.mainCommit ?? "unknown main"}, expected ${currentMainCommit ?? "unknown main"}.`,
     );
   }
 
@@ -73,25 +116,29 @@ async function resolveSelectedPlanArtifact(
 
 export async function resolveSelectedPlanId(
   repo: RepoPlanSource,
-  artifactStore: Pick<ArtifactStoreDO, "listArtifacts" | "listRefs">,
+  artifactStore: StartupArtifactStore,
   meta: EnvMeta,
   currentMainCommit: string | null,
-  requestedPlanId?: string | null,
+  selection: StartupPlanSelection,
 ): Promise<string | null> {
-  const selectedPlan = await resolveSelectedPlanArtifact(repo, artifactStore, meta, currentMainCommit, requestedPlanId);
+  const selectedPlan = await resolveSelectedPlanArtifact(repo, artifactStore, meta, currentMainCommit, selection);
   return selectedPlan?.id ?? null;
 }
 
 export async function materializeStartupPlan(
   repo: RepoPlanSource,
-  artifactStore: Pick<ArtifactStoreDO, "listArtifacts" | "listRefs">,
+  artifactStore: StartupArtifactStore,
   envWorkspace: ReturnType<typeof getWorkspaceStub>,
   meta: EnvMeta,
   currentMainCommit: string | null,
+  selection: StartupPlanSelection,
 ): Promise<string | null> {
-  const selectedPlan = await resolveSelectedPlanArtifact(repo, artifactStore, meta, currentMainCommit);
+  const selectedPlan = await resolveSelectedPlanArtifact(repo, artifactStore, meta, currentMainCommit, selection);
   if (selectedPlan) {
-    await envWorkspace.writeWorkspaceFile("/.tiller/plan.md", renderArtifactPlanMarkdown(selectedPlan));
+    await envWorkspace.writeWorkspaceFile(
+      "/.tiller/plan.md",
+      buildStartupPlanDocument(renderArtifactBodyMarkdown(selectedPlan.body)),
+    );
   } else {
     await envWorkspace.clearWorkspacePlanFile();
   }
@@ -103,21 +150,26 @@ export async function buildContainerLaunchConfig(
   requestUrl: string,
   slug: string,
   repoUrl: string,
-  repoMeta?: Pick<RepoMeta, "repoId" | "gitArtifactId"> | null,
+  repoMeta: Pick<RepoMeta, "repoId" | "gitArtifactId" | "githubFullName"> | null | undefined,
   meta: EnvMeta,
   options?: {
     hostMachineId?: string | null;
   },
 ): Promise<{
   envVars: Record<string, string>;
-  meta: Pick<EnvMeta, "harness" | "authMode" | "resolvedAuthMode" | "codexAuthMode" | "opencodeProvider" | "opencodeModel" | "modelRoute" | "authWarning">;
+  meta: Pick<EnvMeta, "harness" | "authMode" | "resolvedAuthMode" | "codexAuthPreference" | "codexAuthMode" | "opencodeProvider" | "opencodeModel" | "modelRoute" | "authWarning">;
 }> {
   const backend = meta.backend;
   const harness = meta.harness;
   const runnerId = meta.runnerId ?? slug;
   const hubPublicUrl = await resolveContainerHubUrl(env, requestUrl, backend);
-  const githubToken = await getSecret(env, "GITHUB_TOKEN");
   const protection = await resolveProtectionState(env, requestUrl);
+  const githubBridge = repoMeta?.githubFullName && await isGitHubAppAllowedForRequest(env, new Request(requestUrl))
+    ? await createGitHubBridgeRecord(env, {
+        subject: { type: "interactive-env", envSlug: slug },
+        githubFullName: repoMeta.githubFullName,
+      })
+    : null;
   const cfClientId =
     protection.protectionMode === "cf-access"
       ? (await getSecret(env, "CF_ACCESS_CLIENT_ID"))?.trim() ?? ""
@@ -143,34 +195,52 @@ export async function buildContainerLaunchConfig(
           ),
         }
       : {}),
-    NODE_OPTIONS: "--dns-result-order=ipv4first --no-network-family-autoselection",
+    NODE_OPTIONS: "--dns-result-order=ipv4first",
     TILLER_HARNESS: harness,
     ...buildScmContainerEnvVars(meta),
     ...(cfClientId ? { CF_ACCESS_CLIENT_ID: cfClientId } : {}),
     ...(cfClientSecret ? { CF_ACCESS_CLIENT_SECRET: cfClientSecret } : {}),
-    ...(githubToken ? { GITHUB_TOKEN: githubToken } : {}),
+    ...(githubBridge ? bridgeCredentialsToEnvVars(githubBridge) : {}),
   };
 
   if (harness === "codex") {
-    const gatewayRoute = await resolveCodexModelRoute(env, {
-      target: backend === "host" ? "host" : "hosted",
-      machineId: backend === "host" ? (options?.hostMachineId ?? meta.runnerMachineId ?? null) : null,
-    });
+    const codexAuthPreference = meta.codexAuthPreference ?? "auto";
+    const gatewayRoute = codexAuthPreference === "api-key"
+      ? undefined
+      : await resolveCodexModelRoute(env, {
+        target: backend === "host" ? "host" : "hosted",
+        machineId: backend === "host" ? (options?.hostMachineId ?? meta.runnerMachineId ?? null) : null,
+      });
+    const gatewaySession = codexAuthPreference !== "api-key"
+      && (gatewayRoute?.kind === "gateway-subscription" || gatewayRoute?.kind === "host-gateway")
+      ? await mintCodexGatewaySessionToken(env, {
+        envSlug: slug,
+        routeKind: gatewayRoute.kind,
+        machineId: gatewayRoute.machineId,
+        gatewayUrl: gatewayRoute.kind === "gateway-subscription" ? gatewayRoute.gatewayUrl : null,
+      })
+      : null;
     const auth = await resolveCodexContainerAuth(env, {
       backend,
       gatewayRoute: gatewayRoute ?? undefined,
+      authPreference: codexAuthPreference,
+      gatewaySessionToken: gatewaySession?.token ?? null,
     });
     return {
       envVars: {
         ...commonEnvVars,
+        TILLER_CODEX_AUTH_PREFERENCE: auth.authPreference,
         TILLER_CODEX_AUTH_MODE: auth.resolvedAuthMode,
         TILLER_CODEX_MODEL_ROUTE: auth.modelRoute,
+        ...(auth.authWarning ? { TILLER_CODEX_AUTH_WARNING: auth.authWarning } : {}),
         ...auth.envVars,
       },
       meta: {
         harness,
+        codexAuthPreference: auth.authPreference,
         codexAuthMode: auth.resolvedAuthMode,
         modelRoute: auth.modelRoute,
+        ...(auth.authWarning ? { authWarning: auth.authWarning } : {}),
       },
     };
   }
@@ -230,7 +300,19 @@ export async function buildGitOperationEnvVars(
   const backend = resolveScmRunnerBackendKind(env);
   const hubPublicUrl = await resolveContainerHubUrl(env, requestUrl, backend);
   const protection = await resolveProtectionState(env, requestUrl);
-  const githubToken = await getSecret(env, "GITHUB_TOKEN");
+  const jobSlug = `scm-op-${meta.slug}-${options.operationId.slice(-8)}`;
+  const githubBridge = await isGitHubAppAllowedForRequest(env, new Request(requestUrl))
+    ? await createGitHubBridgeRecord(env, {
+        subject: {
+          type: "scm-operation",
+          jobSlug,
+          envSlug: meta.slug,
+          repoId: repo.meta.repoId,
+          operationId: options.operationId,
+        },
+        githubFullName: repo.meta.githubFullName,
+      })
+    : null;
   const cfClientId =
     protection.protectionMode === "cf-access"
       ? (await getSecret(env, "CF_ACCESS_CLIENT_ID"))?.trim() ?? ""
@@ -245,6 +327,7 @@ export async function buildGitOperationEnvVars(
     TILLER_SCM_OPERATION: options.operationType,
     TILLER_SCM_OPERATION_ID: options.operationId,
     TILLER_REPO_ID: repo.meta.repoId,
+    HUB_URL: hubPublicUrl,
     TILLER_BRANCH_NAME: meta.branchName ?? "",
     TILLER_BASE_MAIN_COMMIT: meta.baseMainCommit ?? "",
     TILLER_ENV_WORKSPACE_API_BASE: buildEnvWorkspaceApiBaseUrl(hubPublicUrl, meta.slug),
@@ -257,7 +340,7 @@ export async function buildGitOperationEnvVars(
     TILLER_SCM_PROGRESS_URL: `${hubPublicUrl.replace(/\/+$/, "")}/api/envs/${encodeURIComponent(meta.slug)}/scm-operations/${encodeURIComponent(options.operationId)}/progress`,
     TILLER_SCM_FAILURE_URL: buildEnvScmOperationFailedUrl(hubPublicUrl, meta.slug, options.operationId),
     TILLER_ENV_ONLY_PATHS: ENV_ONLY_CANONICAL_EXCLUDES.join(","),
-    ...(options.operationType === "merge-into-main" && options.stagedGitArtifactId
+    ...((options.operationType === "merge-into-main" || options.operationType === "update-from-main")
       ? {
           TILLER_SCM_HEARTBEAT_URL: buildEnvScmOperationHeartbeatUrl(hubPublicUrl, meta.slug, options.operationId),
           TILLER_SCM_CONFLICT_RESOLUTION_URL: buildEnvScmConflictResolutionUrl(
@@ -266,11 +349,15 @@ export async function buildGitOperationEnvVars(
             options.operationId,
           ),
           ...(options.mergeLockToken ? { TILLER_SCM_MERGE_LOCK_TOKEN: options.mergeLockToken } : {}),
+        }
+      : {}),
+    ...(options.operationType === "merge-into-main" && options.stagedGitArtifactId
+      ? {
           TILLER_REPO_GIT_STAGING_URL: buildRepoGitArtifactStagingUrl(hubPublicUrl, repo.meta.repoId, options.operationId),
           TILLER_REPO_GIT_ARTIFACT_ID: options.stagedGitArtifactId,
         }
       : {}),
-    ...(githubToken ? { GITHUB_TOKEN: githubToken } : {}),
+    ...(githubBridge ? bridgeCredentialsToEnvVars(githubBridge) : {}),
     ...(cfClientId ? { CF_ACCESS_CLIENT_ID: cfClientId } : {}),
     ...(cfClientSecret ? { CF_ACCESS_CLIENT_SECRET: cfClientSecret } : {}),
   };

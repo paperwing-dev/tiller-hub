@@ -4,7 +4,7 @@ import { createInitialEnvScmState } from "../model";
 
 const mocks = vi.hoisted(() => ({
   getEnvLifecycleStub: vi.fn(),
-  ensureRepoWorkspaceFromRepoUrl: vi.fn(),
+  getRepoWorkspaceForRepoId: vi.fn(),
   getScmOperationStore: vi.fn(),
 }));
 
@@ -13,7 +13,7 @@ vi.mock("../../helpers", () => ({
 }));
 
 vi.mock("../../plan/store", () => ({
-  ensureRepoWorkspaceFromRepoUrl: mocks.ensureRepoWorkspaceFromRepoUrl,
+  getSelectedRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
 }));
 
 vi.mock("../operation-store", () => ({
@@ -43,7 +43,7 @@ function makeMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
 describe("scm/env-state", () => {
   beforeEach(() => {
     mocks.getEnvLifecycleStub.mockReset();
-    mocks.ensureRepoWorkspaceFromRepoUrl.mockReset();
+    mocks.getRepoWorkspaceForRepoId.mockReset();
     mocks.getScmOperationStore.mockReset();
   });
 
@@ -73,7 +73,7 @@ describe("scm/env-state", () => {
       scmOperationUpdatedAt: "2026-04-13T00:01:00.000Z",
     });
     const persisted = clearScmOperationState(meta, {
-      completedAt: meta.scmOperationUpdatedAt,
+      completedAt: meta.scmOperationUpdatedAt ?? undefined,
     });
 
     await expect(

@@ -4,6 +4,7 @@ import {
   createAccessEmailPolicy,
   createAccessServiceTokenPolicy,
   MANAGED_ACCESS_SESSION_DURATION,
+  resolveAccountForWorkersDevRoute,
 } from "../access/cloudflare-api";
 
 const originalFetch = global.fetch;
@@ -15,7 +16,7 @@ afterEach(() => {
 
 function mockCloudflareFetch() {
   const fetchMock = vi.fn(
-    async () =>
+    async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(
         JSON.stringify({
           success: true,
@@ -67,5 +68,44 @@ describe("Cloudflare Access API defaults", () => {
       MANAGED_ACCESS_SESSION_DURATION,
     );
     expect(MANAGED_ACCESS_SESSION_DURATION).toBe("720h");
+  });
+});
+
+describe("resolveAccountForWorkersDevRoute", () => {
+  it("checks Worker ownership with the JSON settings endpoint instead of downloading script content", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        errors: [],
+        result: [{ id: "account-123", name: "Paperwing" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        errors: [],
+        result: { subdomain: "preview" },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        errors: [],
+        result: { id: "tiller-hub" },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        errors: [],
+        result: { enabled: true, previews_enabled: true },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(resolveAccountForWorkersDevRoute("cf-token", {
+      hostname: "tiller-hub.preview.workers.dev",
+    })).resolves.toMatchObject({
+      accountId: "account-123",
+      serviceName: "tiller-hub",
+      workersDevSubdomain: "preview",
+    });
+
+    expect(String(fetchMock.mock.calls[2]![0])).toContain(
+      "/accounts/account-123/workers/scripts/tiller-hub/settings",
+    );
   });
 });

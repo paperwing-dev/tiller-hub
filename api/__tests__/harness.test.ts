@@ -14,7 +14,11 @@ describe("isEnvHarness", () => {
 
 describe("resolveEnabledHarnesses", () => {
   it("defaults to the standard harness set when no explicit enablement is configured", () => {
-    expect(resolveEnabledHarnesses({ ENABLED_ENV_HARNESSES: undefined })).toEqual(["claude-code", "codex"]);
+    expect(resolveEnabledHarnesses({ ENABLED_ENV_HARNESSES: undefined })).toEqual([
+      "claude-code",
+      "codex",
+      "opencode",
+    ]);
   });
 
   it("filters invalid values and deduplicates", () => {

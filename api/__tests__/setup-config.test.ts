@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { getCanonicalMainBootstrapDepth, invalidateConfigCache } from "../setup/config";
+import { getCanonicalMainBootstrapDepth, invalidateConfigCache, resolveDeploymentModeForRuntime } from "../setup/config";
 
 function createEnv(config: Record<string, string>) {
   return {
@@ -7,6 +7,10 @@ function createEnv(config: Record<string, string>) {
       idFromName: () => "hub-id",
       get: () => ({
         getAllConfig: async () => config,
+        getConfig: async (key: string) => config[key],
+        setConfig: async (key: string, value: string) => {
+          config[key] = value;
+        },
       }),
     },
   } as any;
@@ -49,5 +53,30 @@ describe("getCanonicalMainBootstrapDepth", () => {
     await expect(
       getCanonicalMainBootstrapDepth(createEnv({ CANONICAL_MAIN_BOOTSTRAP_DEPTH: "25" })),
     ).resolves.toBe(25);
+  });
+});
+
+describe("resolveDeploymentModeForRuntime", () => {
+  beforeEach(() => {
+    invalidateConfigCache();
+  });
+
+  it("defaults to hosted even when custom-domain gateway remnants exist", async () => {
+    await expect(
+      resolveDeploymentModeForRuntime(createEnv({
+        HUB_PUBLIC_URL: "https://tiller.example.com",
+        TILLER_GATEWAY_HOSTNAME: "tiller-gateway.example.com",
+        TILLER_GATEWAY_TUNNEL_ID: "tunnel-id",
+      })),
+    ).resolves.toBe("hosted");
+  });
+
+  it("uses the persisted lifecycle mode when set", async () => {
+    await expect(
+      resolveDeploymentModeForRuntime(createEnv({
+        HUB_PUBLIC_URL: "https://tiller.example.com",
+        TILLER_DEPLOYMENT_MODE: "self-host",
+      })),
+    ).resolves.toBe("self-host");
   });
 });

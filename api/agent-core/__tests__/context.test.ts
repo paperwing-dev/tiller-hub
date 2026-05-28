@@ -1,7 +1,25 @@
 import { describe, expect, it } from "vitest";
-import type { Workspace, FileInfo } from "agents/experimental/workspace";
+import type { Workspace, FileInfo } from "@cloudflare/shell";
 import { buildSystemPrompt } from "../context";
-import { RESEARCH_AGENT_SPEC } from "../specs";
+import type { AgentSpec } from "../types";
+
+const CONTEXT_TEST_SPEC: AgentSpec = {
+  name: "context-test",
+  runtime: "direct-tools",
+  modelTarget: {
+    provider: "workers-ai",
+    defaultModel: "@cf/test",
+  },
+  toolNames: ["read_file", "list_files", "glob"],
+  baseInstructions: "You are a helpful coding assistant.",
+  includeProjectContext: true,
+  includeMemories: true,
+  includeRecentArtifacts: true,
+  injectWorkspaceSummary: true,
+  maxMemoryFiles: 6,
+  maxRecentArtifacts: 3,
+  maxContextChars: 20_000,
+};
 
 class FakeWorkspace {
   private files = new Map<string, string>();
@@ -53,7 +71,7 @@ describe("buildSystemPrompt", () => {
       "/README.md": "hello",
     }) as unknown as Workspace;
 
-    const prompt = await buildSystemPrompt(RESEARCH_AGENT_SPEC, workspace, {
+    const prompt = await buildSystemPrompt(CONTEXT_TEST_SPEC, workspace, {
       recentArtifactsPrompt: [
         "<recent-artifacts>",
         '<artifact id="123" kind="research" createdAt="2026-03-27T00:00:00.000Z">',

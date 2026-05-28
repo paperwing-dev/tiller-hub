@@ -6,19 +6,19 @@ describe("getEnvAuthBadge", () => {
     expect(
       getEnvAuthBadge({
         harness: "codex",
-        codexAuthMode: "chatgpt",
+        codexAuthMode: "subscription",
       }),
     ).toMatchObject({
-      label: "ChatGPT",
+      label: "Subscription",
     });
 
     expect(
       getEnvAuthBadge({
         harness: "codex",
-        codexAuthMode: "openai-api",
+        codexAuthMode: "api-key",
       }),
     ).toMatchObject({
-      label: "OpenAI API key",
+      label: "API key",
     });
   });
 

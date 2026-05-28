@@ -3,11 +3,13 @@ import type {
   ClaudeAuthMode,
   ResolvedClaudeAuthMode,
   CodexAuthMode,
+  CodexAuthPreference,
   ModelRoute,
 } from "../types";
 import type { RunnerBackendKind } from "./runner-backend";
 import { getOrCreateSecret, getSecret } from "../setup/config";
 import type { ResolvedCodexModelRoute } from "../model-route";
+import { getValidOpenAIAuth } from "../openai-auth";
 
 export interface ResolvedContainerAuth {
   authMode: ClaudeAuthMode;
@@ -17,8 +19,10 @@ export interface ResolvedContainerAuth {
 }
 
 export interface ResolvedCodexContainerAuth {
+  authPreference: CodexAuthPreference;
   resolvedAuthMode: CodexAuthMode;
   modelRoute: ModelRoute;
+  authWarning?: string;
   envVars: Record<string, string>;
 }
 
@@ -123,7 +127,7 @@ export async function resolveContainerAuth(
 
   if (authMode === "subscription") {
     if (backend === "cf") {
-      throw new Error("Claude subscription auth is only supported on Tiller Host environments. Cloudflare Containers must use ANTHROPIC_API_KEY.");
+      throw new Error("Claude subscription auth is only supported on Tiller Self Host environments. Cloudflare Containers must use ANTHROPIC_API_KEY.");
     }
     if (!oauthToken) {
       throw new Error("Claude subscription auth requested, but CLAUDE_CODE_OAUTH_TOKEN is not configured");
@@ -183,20 +187,67 @@ export async function resolveCodexContainerAuth(
   options?: {
     backend?: RunnerBackendKind;
     gatewayRoute?: ResolvedCodexModelRoute;
+    authPreference?: CodexAuthPreference;
+    gatewaySessionToken?: string | null;
   },
 ): Promise<ResolvedCodexContainerAuth> {
-  if (options?.gatewayRoute?.kind === "gateway-subscription" || options?.gatewayRoute?.kind === "host-gateway") {
+  const authPreference = options?.authPreference ?? "auto";
+
+  if (authPreference === "api-key") {
+    const apiKey = await getSecret(env, "OPENAI_API_KEY");
+    if (!apiKey) {
+      throw new Error("Codex API key auth requested, but OPENAI_API_KEY is not configured.");
+    }
     return {
-      resolvedAuthMode: "chatgpt",
-      modelRoute: options.gatewayRoute.kind,
+      authPreference,
+      resolvedAuthMode: "api-key",
+      modelRoute: "api-fallback",
+      envVars: { OPENAI_API_KEY: apiKey },
+    };
+  }
+
+  const gatewayRoute = options?.gatewayRoute;
+  if (gatewayRoute?.kind === "gateway-subscription" || gatewayRoute?.kind === "host-gateway") {
+    const gatewaySessionToken = options?.gatewaySessionToken?.trim();
+    if (!gatewaySessionToken) {
+      throw new Error("Codex subscription auth requires a Subscription Gateway session token.");
+    }
+    try {
+      await getValidOpenAIAuth(env);
+    } catch (error) {
+      if (authPreference === "subscription") {
+        throw new Error("Codex subscription auth requested, but the imported Codex login needs re-import.");
+      }
+
+      const apiKey = await getSecret(env, "OPENAI_API_KEY");
+      if (apiKey) {
+        return {
+          authPreference,
+          resolvedAuthMode: "api-key",
+          modelRoute: "api-fallback",
+          authWarning: "Subscription auth needs reconnect; using the API key.",
+          envVars: { OPENAI_API_KEY: apiKey },
+        };
+      }
+
+      throw new Error("Codex subscription auth requires an imported Codex subscription login in Tiller.");
+    }
+    return {
+      authPreference,
+      resolvedAuthMode: "subscription",
+      modelRoute: gatewayRoute.kind,
       envVars: {
-        TILLER_CODEX_GATEWAY_BASE_URL: options.gatewayRoute.providerBaseUrl,
-        TILLER_CODEX_GATEWAY_ACCESS_TOKEN: options.gatewayRoute.accessToken,
-        ...(options.gatewayRoute.accountId
-          ? { TILLER_CODEX_GATEWAY_ACCOUNT_ID: options.gatewayRoute.accountId }
-          : {}),
+        TILLER_CODEX_GATEWAY_BASE_URL: gatewayRoute.providerBaseUrl,
+        TILLER_CODEX_GATEWAY_SESSION_TOKEN: gatewaySessionToken,
       },
     };
+  }
+
+  if (authPreference === "subscription") {
+    const reason = gatewayRoute?.kind === "unavailable"
+      ? gatewayRoute.reason
+      : "subscription gateway route is unavailable.";
+    throw new Error(`Codex subscription auth requested, but ${reason}`);
   }
 
   const apiKey = await getSecret(env, "OPENAI_API_KEY");
@@ -205,24 +256,30 @@ export async function resolveCodexContainerAuth(
       throw new Error("Codex requires OPENAI_API_KEY for Cloudflare Container environments.");
     }
 
-    if (options?.gatewayRoute?.kind === "api-fallback") {
+    if (gatewayRoute?.kind === "api-fallback") {
       return {
-        resolvedAuthMode: "openai-api",
+        authPreference,
+        resolvedAuthMode: "api-key",
         modelRoute: "api-fallback",
-        envVars: { OPENAI_API_KEY: options.gatewayRoute.openaiApiKey },
+        authWarning: "Subscription gateway route is unavailable; using the API key.",
+        envVars: { OPENAI_API_KEY: gatewayRoute.openaiApiKey },
       };
     }
 
     throw new Error(
       options?.backend === "host"
-        ? "Codex requires a connected Tiller Host gateway or an OpenAI API key."
-        : "Codex requires a running Tiller Host gateway or an OpenAI API key.",
+        ? "Codex requires a connected Subscription Gateway or an API key."
+        : "Codex requires a running Subscription Gateway or an API key.",
     );
   }
 
   return {
-    resolvedAuthMode: "openai-api",
+    authPreference,
+    resolvedAuthMode: "api-key",
     modelRoute: "api-fallback",
+    ...(authPreference === "auto"
+      ? { authWarning: "Subscription gateway route is unavailable; using the API key." }
+      : {}),
     envVars: { OPENAI_API_KEY: apiKey },
   };
 }

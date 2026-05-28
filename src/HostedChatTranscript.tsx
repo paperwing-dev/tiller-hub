@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, type RefObject } from "react";
 import type { UIMessage } from "ai";
-import { listHostedChatMessages } from "./hosted-chat";
+import { listHostedChatMessages, type HostedChatMessage } from "./hosted-chat";
 
 interface HostedChatTranscriptProps {
   messages: UIMessage[];
@@ -10,6 +10,7 @@ interface HostedChatTranscriptProps {
   emptyState: string;
   thinkingLabel?: string;
   scrollRef?: RefObject<HTMLDivElement | null>;
+  messageActions?: (message: HostedChatMessage) => React.ReactNode;
 }
 
 export default function HostedChatTranscript({
@@ -20,6 +21,7 @@ export default function HostedChatTranscript({
   emptyState,
   thinkingLabel = "Thinking...",
   scrollRef,
+  messageActions,
 }: HostedChatTranscriptProps) {
   const internalScrollRef = useRef<HTMLDivElement>(null);
   const activeScrollRef = scrollRef ?? internalScrollRef;
@@ -34,7 +36,7 @@ export default function HostedChatTranscript({
   }, [activeScrollRef, renderedMessages.length, status]);
 
   return (
-    <div ref={activeScrollRef} className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+    <div ref={activeScrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
       {loading && (
         <div className="py-8 text-center text-sm text-[#57606a]">Loading...</div>
       )}
@@ -77,6 +79,7 @@ export default function HostedChatTranscript({
               </div>
             )}
             <div className="whitespace-pre-wrap break-words">{message.content}</div>
+            {messageActions?.(message)}
           </div>
         </div>
       ))}

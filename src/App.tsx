@@ -10,19 +10,23 @@ import {
   createRepo,
   bootstrapRepoGitArtifact,
   checkForUpdate,
+  ApiActionError,
 } from './api';
 import type {
+  CodexAuthPreference,
   EnvHarness,
   LiveMessage,
   ReconnectingWebSocket,
   SetupStatus,
   UpdateCheckResult,
+  GitHubRepositorySelection,
 } from './api';
 import { useToast } from './Toast';
 import SessionList from './SessionList';
 import SessionView from './SessionView';
 import EnvWaitingView from './EnvWaitingView';
 import PlanView from './PlanView';
+import ChangesView from './ChangesView';
 import { NewRepoDialog, NewEnvDialog } from './NewEnvDialog';
 import StartPlanDialog from './StartPlanDialog';
 import SettingsPage from './SettingsPage';
@@ -44,11 +48,6 @@ import { pickPrimaryEnvSession } from './session-attachment';
 
 const HUB_URL = window.location.origin;
 
-// Request notification permission once on load
-if ('Notification' in window && Notification.permission === 'default') {
-  Notification.requestPermission();
-}
-
 export function refreshDashboardStateAfterHubConnect(actions: {
   refreshSessions: () => void;
   refreshEnvs: () => void;
@@ -61,6 +60,23 @@ export function refreshDashboardStateAfterHubConnect(actions: {
   actions.refreshSetupStatus();
 }
 
+export function getTopLevelUpdateIssue(result: UpdateCheckResult): string | null {
+  return result.issue?.code === 'update_check_failed' ? result.issue.message : null;
+}
+
+export function getUpdateCheckFailure(error: unknown): { message: string; code: string | null } {
+  if (error instanceof ApiActionError) {
+    return {
+      message: error.message,
+      code: error.code ?? null,
+    };
+  }
+  return {
+    message: error instanceof Error ? error.message : 'Self-update check failed.',
+    code: null,
+  };
+}
+
 export default function Dashboard() {
   const [sessions, setSessions] = useState<StoredSession[]>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
@@ -71,7 +87,7 @@ export default function Dashboard() {
     Map<string, StoredPermission[]>
   >(new Map());
   const [showNewRepo, setShowNewRepo] = useState(false);
-  const [newEnvTarget, setNewEnvTarget] = useState<{ repoUrl: string; repoId: string } | null>(null);
+  const [newEnvTarget, setNewEnvTarget] = useState<{ repoId: string } | null>(null);
   const [startDialogSlug, setStartDialogSlug] = useState<string | null>(null);
   const [lastRepoMainEvent, setLastRepoMainEvent] = useState<{
     repoId: string;
@@ -89,6 +105,7 @@ export default function Dashboard() {
   const [setupChecked, setSetupChecked] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateCheckResult | null>(null);
   const [updateIssue, setUpdateIssue] = useState<string | null>(null);
+  const [updateIssueCode, setUpdateIssueCode] = useState<string | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [hostRefreshNonce, setHostRefreshNonce] = useState(0);
@@ -98,19 +115,24 @@ export default function Dashboard() {
   const loadUpdateStatus = useCallback(async (): Promise<{
     status: UpdateCheckResult | null;
     issue: string | null;
+    issueCode: string | null;
     dismissed: boolean;
   }> => {
     try {
       const result = await checkForUpdate(HUB_URL);
+      const issue = getTopLevelUpdateIssue(result);
       return {
         status: result,
-        issue: null,
-        dismissed: isUpdateDismissed(result.latestVersion),
+        issue,
+        issueCode: issue ? result.issue?.code ?? null : null,
+        dismissed: isUpdateDismissed(result.latestUpdate.sourceId),
       };
     } catch (error) {
+      const failure = getUpdateCheckFailure(error);
       return {
         status: null,
-        issue: error instanceof Error ? error.message : 'Self-update check failed.',
+        issue: failure.message,
+        issueCode: failure.code,
         dismissed: false,
       };
     }
@@ -121,6 +143,7 @@ export default function Dashboard() {
     const next = await loadUpdateStatus();
     setUpdateStatus(next.status);
     setUpdateIssue(next.issue);
+    setUpdateIssueCode(next.issueCode);
     setUpdateDismissed(next.dismissed);
     setIsCheckingUpdate(false);
     return next;
@@ -133,20 +156,35 @@ export default function Dashboard() {
     } catch {
       setSetupStatus({
         needsSetup: false,
+        setupPhase: "complete",
         isLocalDev: isLoopbackHostname(new URL(HUB_URL).hostname),
         currentOrigin: HUB_URL,
         hubUrl: HUB_URL,
-        hostKind: HUB_URL.includes(".workers.dev") ? "workers-dev" : "custom-domain",
+        deploymentMode: "hosted",
+        selfHostStatus: "not-enabled",
+        selfHostSetupAttemptId: null,
+        workersDevHubUrl: HUB_URL.includes(".workers.dev") ? HUB_URL : null,
+        routeKind: HUB_URL.includes(".workers.dev") ? "workers-dev" : "custom-domain",
         workerServiceName: null,
         modelAuthConfigured: false,
         modelAuthMode: null,
+        hostedInfrastructureReady: false,
+        hostedBlockingReasons: ["Status response was unavailable."],
+        hostedModelReady: false,
+        hostedModelBlockingReasons: ["Status response was unavailable."],
+        selfHostReady: false,
+        selfHostBlockingReasons: ["Status response was unavailable."],
+        workersAiConfigured: false,
         hasClaudeSubscription: false,
         hasAnthropicKey: false,
         hasChatGPTAuth: false,
+        chatgptAuthStatus: "missing",
         hasOpenAIKey: false,
-        planChatgptConfigured: false,
-        planChatgptAvailable: false,
-        planChatgptReason: null,
+        codexRouteStatus: "unavailable",
+        openaiPlannerConfigured: false,
+        openaiPlannerAvailable: false,
+        openaiPlannerRoute: null,
+        openaiPlannerReason: null,
         hostRegistered: false,
         hostRegisteredMode: "none",
         hostGatewayAvailable: false,
@@ -166,10 +204,21 @@ export default function Dashboard() {
         unsupportedProtectionConfig: false,
         workersDevAliasDisabled: false,
         protectionAppDomain: null,
+        accessConfigured: false,
+        accessIssuer: null,
+        accessJwksUrl: null,
         hostConnected: false,
         hostConnectionMode: "none",
         idleTimeoutMinutes: 10,
         canonicalMainBootstrapDepth: 0,
+        githubAppAvailable: false,
+        githubAppConfigured: false,
+        githubAppReady: false,
+        githubAppSlug: null,
+        githubAppInstallUrl: null,
+        githubAppManageUrl: "https://github.com/settings/installations",
+        githubAppPublicHubDisabled: true,
+        selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
       });
     }
   }, []);
@@ -202,6 +251,20 @@ export default function Dashboard() {
   useEffect(() => {
     sessionsRef.current = sessions;
   }, [sessions]);
+
+  useEffect(() => {
+    if (selection.type !== 'none' || repos.length === 0) return;
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const repoId = params.get('repoId');
+    if (!repoId) return;
+    const repo = repos.find((candidate) => candidate.repoId === repoId);
+    if (!repo) return;
+    setSelection({
+      type: 'plan',
+      repoId: repo.repoId,
+      planArtifactId: params.get('planArtifactId'),
+    });
+  }, [repos, selection.type]);
 
   // Auto-promote env selection to its live session once both the env is running
   // and the primary session has been observed.
@@ -254,14 +317,14 @@ export default function Dashboard() {
   }, []);
 
   const handleCreateRepo = useCallback(
-    async (repoUrl: string) => {
-      const repo = await createRepo(HUB_URL, repoUrl);
+    async (selection: GitHubRepositorySelection) => {
+      const repo = await createRepo(HUB_URL, selection);
       upsertRepo(repo);
       addToast({
         title: 'Repository added',
         body: isRepoMainReady(repo)
-          ? repoUrl.replace(/^https?:\/\/(www\.)?github\.com\//, '')
-          : `${repoUrl.replace(/^https?:\/\/(www\.)?github\.com\//, '')} · preparing canonical main`,
+          ? selection.fullName
+          : `${selection.fullName} · preparing canonical main`,
         variant: 'success',
       });
       setShowNewRepo(false);
@@ -273,10 +336,11 @@ export default function Dashboard() {
     async (
       backend: "cf" | "host",
       harness: EnvHarness,
+      codexAuthPreference?: CodexAuthPreference,
     ) => {
-      const repoUrl = newEnvTarget?.repoUrl;
-      if (!repoUrl) return;
-      const env = await createEnv(HUB_URL, repoUrl, backend, harness);
+      const repoId = newEnvTarget?.repoId;
+      if (!repoId) return;
+      const env = await createEnv(HUB_URL, repoId, backend, harness, undefined, codexAuthPreference);
       upsertEnv(env);
       addToast({
         title: 'Environment created',
@@ -285,7 +349,7 @@ export default function Dashboard() {
       });
       if (env.authWarning) {
         addToast({
-          title: 'Claude auth',
+          title: env.harness === 'codex' ? 'Codex auth' : 'Claude auth',
           body: env.authWarning,
           variant: 'warning',
           duration: 8000,
@@ -486,7 +550,11 @@ export default function Dashboard() {
           variant: 'warning',
         });
         // Browser notification when tab is hidden
-        if (document.hidden && Notification.permission === 'granted') {
+        if (
+          document.hidden &&
+          'Notification' in window &&
+          Notification.permission === 'granted'
+        ) {
           new Notification(
             `Tiller: Permission needed — ${permission.tool_name}`,
             {
@@ -585,6 +653,15 @@ export default function Dashboard() {
   const planSelection = selection.type === 'plan' ? selection : null;
   const selectedPlanRepo =
     planSelection ? repos.find((repo) => repo.repoId === planSelection.repoId) ?? null : null;
+  const newEnvRepo =
+    newEnvTarget ? repos.find((repo) => repo.repoId === newEnvTarget.repoId) ?? null : null;
+  const changesSelection = selection.type === 'changes' ? selection : null;
+  const selectedChangesEnv =
+    changesSelection ? envs.find((env) => env.slug === changesSelection.envSlug) ?? null : null;
+  const selectedChangesRepo =
+    selectedChangesEnv?.repoId
+      ? repos.find((repo) => repo.repoId === selectedChangesEnv.repoId) ?? null
+      : null;
 
   const selectedId = selection.type === 'session' ? selection.sessionId : null;
   const selectedEnvSlug = selection.type === 'env' ? selection.envSlug : null;
@@ -683,12 +760,14 @@ export default function Dashboard() {
           onRecoverEnv={recoverEnv}
           onEnvSelect={handleEnvSelect}
           selectedEnvSlug={selectedEnvSlug}
-          onPlanSelect={(repoId, repoUrl) =>
-            setSelection({ type: 'plan', repoId, repoUrl })
+          onChangesSelect={(envSlug) => setSelection({ type: 'changes', envSlug })}
+          selectedChangesEnvSlug={changesSelection?.envSlug ?? null}
+          onPlanSelect={(repoId) =>
+            setSelection({ type: 'plan', repoId })
           }
           planRepoId={planSelection?.repoId ?? null}
           onStartRequest={(slug) => setStartDialogSlug(slug)}
-          onAddEnv={(repoId, repoUrl) => setNewEnvTarget({ repoId, repoUrl })}
+          onAddEnv={(repoId) => setNewEnvTarget({ repoId })}
           onRetryRepoMain={(repoId) => {
             void handleRetryRepoMain(repoId);
           }}
@@ -723,8 +802,8 @@ export default function Dashboard() {
           <div className="border-b border-[#d0d7de] bg-[#f6f8fa] px-4 py-2">
             <p className="text-sm font-medium text-[#24292f]">Localhost hub</p>
             <p className="text-xs text-[#57606a]">
-              This localhost hub supports Tiller Host environments only. Run <code>tiller host</code> before starting
-              environments. Hosted ChatGPT planning stays unavailable here unless a host gateway is published.
+              This localhost hub is for contributor development and supports Tiller Self Host environments only. Run
+              <code>tiller host</code> before starting environments.
             </p>
           </div>
         )}
@@ -733,10 +812,8 @@ export default function Dashboard() {
             <div>
               <p className="text-sm font-medium text-[#24292f]">This hub is publicly accessible.</p>
               <p className="text-xs text-[#57606a]">
-                {setupStatus.unsupportedProtectionConfig
-                  ? 'This workers.dev deployment still has stale Cloudflare Access values configured. They are ignored until you publish and protect a custom domain.'
-                  : setupStatus.hostKind === 'workers-dev'
-                  ? 'Open Settings when you are ready to publish to your own domain and protect it with Cloudflare Access.'
+                {setupStatus.routeKind === 'workers-dev'
+                  ? 'Open Settings to finish Cloudflare Access for this workers.dev route, or publish a custom domain for Tiller Self Host.'
                   : 'Open Settings to finish protecting this custom domain.'}
               </p>
             </div>
@@ -759,14 +836,16 @@ export default function Dashboard() {
             hubUrl={HUB_URL}
             status={updateStatus}
             issue={updateIssue}
+            issueCode={updateIssueCode}
             isChecking={isCheckingUpdate}
             onDismiss={() => {
               if (updateStatus) {
-                dismissUpdate(updateStatus.latestVersion);
+                dismissUpdate(updateStatus.latestUpdate.sourceId);
                 setUpdateDismissed(true);
               }
               setSelection({ type: 'none' });
             }}
+            onOpenSettings={() => setSelection({ type: 'settings' })}
             onRetryCheck={() => {
               void refreshUpdateStatus().then((next) => {
                 if (next.status && !next.issue && !next.status.updateAvailable) {
@@ -776,15 +855,25 @@ export default function Dashboard() {
             }}
             onUpdated={() => {
               setUpdateIssue(null);
+              setUpdateIssueCode(null);
               setUpdateStatus((prev) => prev
                 ? {
                     ...prev,
-                    currentVersion: prev.latestVersion,
+                    currentUpdate: prev.latestUpdate,
                     updateAvailable: false,
                   }
                 : prev);
               setUpdateDismissed(false);
             }}
+          />
+        ) : changesSelection && selectedChangesEnv && selectedChangesRepo ? (
+          <ChangesView
+            key={selectedChangesEnv.slug}
+            env={selectedChangesEnv}
+            repo={selectedChangesRepo}
+            hubUrl={HUB_URL}
+            onRecoverEnv={recoverEnv}
+            onRecoverEntities={recoverEntities}
           />
         ) : shouldShowSelectedSession && selectedSession ? (
           <SessionView
@@ -799,15 +888,16 @@ export default function Dashboard() {
             onPermissionResolved={handlePermissionResolved}
             onRecoverEnv={recoverEnv}
           />
-        ) : planSelection ? (
+        ) : planSelection && selectedPlanRepo ? (
           <PlanView
             key={planSelection.repoId}
             repoId={planSelection.repoId}
-            repoUrl={planSelection.repoUrl}
+            repoUrl={selectedPlanRepo.repoUrl}
             repoMainCommit={selectedPlanRepo?.mainCommit ?? null}
+            planArtifactId={planSelection.planArtifactId ?? null}
             mainEvent={lastRepoMainEvent}
-            chatgptAvailable={setupStatus?.planChatgptAvailable ?? true}
-            chatgptUnavailableReason={setupStatus?.planChatgptReason ?? null}
+            chatgptAvailable={setupStatus?.openaiPlannerAvailable ?? true}
+            chatgptUnavailableReason={setupStatus?.openaiPlannerReason ?? null}
           />
         ) : waitingEnv ? (
           <EnvWaitingView
@@ -826,27 +916,20 @@ export default function Dashboard() {
       {showNewRepo && (
         <NewRepoDialog
           onClose={() => setShowNewRepo(false)}
+          hubUrl={HUB_URL}
+          repos={repos}
           onCreate={handleCreateRepo}
         />
       )}
-      {newEnvTarget && (
+      {newEnvTarget && newEnvRepo && (
         <NewEnvDialog
           onClose={() => setNewEnvTarget(null)}
           isLocalDev={isLocalDev}
+          deploymentMode={setupStatus?.deploymentMode ?? 'hosted'}
           hostConnected={setupStatus?.hostConnected ?? false}
+          hostGatewayAvailable={setupStatus?.hostGatewayAvailable ?? false}
           enabledHarnesses={setupStatus?.enabledHarnesses ?? ['claude-code']}
-          repo={
-            repos.find((repo) => repo.repoId === newEnvTarget.repoId) ?? {
-              repoId: newEnvTarget.repoId,
-              repoUrl: newEnvTarget.repoUrl,
-              mainCommit: null,
-              gitArtifactId: null,
-              gitStatus: 'pending',
-              createdAt: '',
-              updatedAt: '',
-              bootstrappedFromRef: null,
-            }
-          }
+          repo={newEnvRepo}
           onCreate={handleCreateEnv}
         />
       )}

@@ -1,15 +1,23 @@
 import { Hono } from "hono";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { HonoEnv } from "../types";
 
 const {
   readRegisteredHostService,
   readRoutableHostService,
   isQuickTunnelUrl,
+  githubAppMocks,
 } = vi.hoisted(() => ({
   readRegisteredHostService: vi.fn(),
   readRoutableHostService: vi.fn(),
   isQuickTunnelUrl: vi.fn((url: string) => url.includes("trycloudflare.com")),
+  githubAppMocks: {
+    getGitHubAppConfig: vi.fn(async () => null),
+    getGitHubAppInstallUrl: vi.fn((slug: string) => `https://github.com/apps/${slug}/installations/new`),
+    getGitHubAppManageUrl: vi.fn(() => "https://github.com/settings/installations"),
+    isGitHubAppAllowedForRequest: vi.fn(async () => true),
+    listGitHubAppRepositories: vi.fn(async () => ({ repositories: [], warnings: [] })),
+  },
 }));
 
 vi.mock("../setup/config", () => ({
@@ -18,6 +26,9 @@ vi.mock("../setup/config", () => ({
   loadConfig: vi.fn(async () => ({})),
   getIdleTimeoutMinutes: vi.fn(async () => 10),
   getCanonicalMainBootstrapDepth: vi.fn(async () => 0),
+  setDeploymentMode: vi.fn(),
+  resolveDeploymentMode: vi.fn(async (_env: unknown, options: { hostRegistered?: boolean; hostGatewayConfigured?: boolean; gatewayProvisioned?: boolean }) =>
+    options.hostRegistered || options.hostGatewayConfigured || options.gatewayProvisioned ? "self-host" : "hosted"),
 }));
 
 vi.mock("../setup/cloudflare", () => ({
@@ -36,7 +47,8 @@ vi.mock("../chatgpt-availability", () => ({
   resolveChatGPTAvailability: vi.fn(async () => ({
     configured: false,
     available: false,
-    unavailableReason: "Connect ChatGPT in Tiller and keep a Tiller Host gateway online to use hosted ChatGPT planning.",
+    unavailableReason: "Configure OPENAI_API_KEY to use the OpenAI planner in Hosted Tiller.",
+    codexRouteStatus: "unavailable",
     gatewayUrl: null,
     route: null,
   })),
@@ -47,6 +59,8 @@ vi.mock("../service-registry", () => ({
   readRoutableHostService,
   isQuickTunnelUrl,
 }));
+
+vi.mock("../github/app", () => githubAppMocks);
 
 vi.mock("../protection", async () => {
   const actual = await vi.importActual<typeof import("../protection")>("../protection");
@@ -59,11 +73,13 @@ vi.mock("../protection", async () => {
       hasClaudeSubscription: true,
       hasAnthropicKey: false,
       hasChatGPTAuth: false,
+      chatgptAuthStatus: "missing",
       hasOpenAIKey: false,
     })),
     resolveProtectionState: vi.fn(async (_env: unknown, requestUrl: string) => ({
       currentOrigin: new URL(requestUrl).origin,
       hubUrl: new URL(requestUrl).origin,
+      routeKind: "custom-domain",
       hostKind: "custom-domain",
       protectionMode: "public",
       protectionCanAutomate: true,
@@ -71,11 +87,16 @@ vi.mock("../protection", async () => {
       unsupportedProtectionConfig: false,
       workersDevAliasDisabled: false,
       protectionAppDomain: null,
+      accessConfigured: false,
+      accessIssuer: null,
+      accessJwksUrl: null,
     })),
   };
 });
 
 import setupRoutes from "../setup/routes";
+import { resolveEnabledHarnesses } from "../env/harness";
+import { hasEnabledHarnessModelAuth, resolveProtectionState } from "../protection";
 
 function createApp() {
   const app = new Hono<HonoEnv>();
@@ -84,6 +105,15 @@ function createApp() {
 }
 
 describe("GET /api/setup/status", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    githubAppMocks.getGitHubAppConfig.mockResolvedValue(null);
+    githubAppMocks.getGitHubAppInstallUrl.mockImplementation((slug: string) => `https://github.com/apps/${slug}/installations/new`);
+    githubAppMocks.getGitHubAppManageUrl.mockReturnValue("https://github.com/settings/installations");
+    githubAppMocks.isGitHubAppAllowedForRequest.mockResolvedValue(true);
+    githubAppMocks.listGitHubAppRepositories.mockResolvedValue({ repositories: [], warnings: [] });
+  });
+
   it("marks localhost requests as local development", async () => {
     readRegisteredHostService.mockResolvedValue({
       machineId: "host-123",
@@ -121,12 +151,16 @@ describe("GET /api/setup/status", () => {
       hostGatewayConfigured: false,
       hostGatewayMode: "none",
       canonicalMainBootstrapDepth: 0,
+      githubAppInstallUrl: null,
+      githubAppManageUrl: "https://github.com/settings/installations",
+      deploymentMode: "self-host",
+      routeKind: "custom-domain",
       browserProtected: false,
       gatewayProvisioned: false,
       workersDevCutoverPending: true,
-      planChatgptConfigured: false,
-      planChatgptAvailable: false,
-      planChatgptReason: "Connect ChatGPT in Tiller and keep a Tiller Host gateway online to use hosted ChatGPT planning.",
+      openaiPlannerConfigured: false,
+      openaiPlannerAvailable: false,
+      openaiPlannerReason: "Configure OPENAI_API_KEY to use the OpenAI planner in Hosted Tiller.",
     });
   });
 
@@ -175,6 +209,170 @@ describe("GET /api/setup/status", () => {
       hostGatewayAvailable: true,
       hostGatewayConfigured: true,
       hostGatewayMode: "named",
+    });
+  });
+
+  it("requires protect-hub first on fresh hosted workers.dev deployments", async () => {
+    vi.mocked(resolveProtectionState).mockResolvedValueOnce({
+      currentOrigin: "https://demo.preview.workers.dev",
+      hubUrl: "https://demo.preview.workers.dev",
+      routeKind: "workers-dev",
+      hostKind: "workers-dev",
+      protectionMode: "public",
+      protectionCanAutomate: false,
+      serviceTokenConfigured: false,
+      unsupportedProtectionConfig: false,
+      workersDevAliasDisabled: false,
+      protectionAppDomain: null,
+      accessConfigured: false,
+      accessIssuer: null,
+      accessJwksUrl: null,
+    });
+    readRegisteredHostService.mockResolvedValue(null);
+    readRoutableHostService.mockResolvedValue(null);
+
+    const app = createApp();
+    const res = await app.request(
+      "https://demo.preview.workers.dev/api/setup/status",
+      { method: "GET" },
+      {} as any,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      needsSetup: true,
+      setupPhase: "protect-hub",
+      routeKind: "workers-dev",
+      accessConfigured: false,
+    });
+  });
+
+  it("treats the Workers AI binding as ready model access for OpenCode", async () => {
+    vi.mocked(resolveEnabledHarnesses).mockReturnValueOnce(["opencode"]);
+    vi.mocked(hasEnabledHarnessModelAuth).mockReturnValueOnce(false);
+    githubAppMocks.getGitHubAppConfig.mockResolvedValueOnce({
+      appId: "1",
+      clientId: "client-id",
+      slug: "tiller-test",
+      privateKey: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+    });
+    githubAppMocks.listGitHubAppRepositories.mockResolvedValueOnce({
+      repositories: [{
+        installationId: 123,
+        repositoryId: 456,
+        fullName: "owner/repo",
+        repoUrl: "https://github.com/owner/repo",
+        private: true,
+        defaultBranch: "main",
+      }],
+      warnings: [],
+    });
+    vi.mocked(resolveProtectionState).mockResolvedValueOnce({
+      currentOrigin: "https://tiller.example.com",
+      hubUrl: "https://tiller.example.com",
+      routeKind: "custom-domain",
+      hostKind: "custom-domain",
+      protectionMode: "cf-access",
+      protectionCanAutomate: true,
+      serviceTokenConfigured: false,
+      unsupportedProtectionConfig: false,
+      workersDevAliasDisabled: false,
+      protectionAppDomain: "tiller.example.com",
+      accessConfigured: true,
+      accessIssuer: "https://team.cloudflareaccess.com",
+      accessJwksUrl: "https://team.cloudflareaccess.com/cdn-cgi/access/certs",
+    });
+    readRegisteredHostService.mockResolvedValue(null);
+    readRoutableHostService.mockResolvedValue(null);
+
+    const app = createApp();
+    const res = await app.request(
+      "https://tiller.example.com/api/setup/status",
+      { method: "GET" },
+      { AI: {} } as any,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      needsSetup: false,
+      setupPhase: "complete",
+      workersAiConfigured: true,
+      hostedModelReady: true,
+      hostedModelBlockingReasons: [],
+      githubAppReady: true,
+    });
+  });
+
+  it("requires GitHub App setup after Access is ready", async () => {
+    vi.mocked(resolveEnabledHarnesses).mockReturnValueOnce(["opencode"]);
+    vi.mocked(hasEnabledHarnessModelAuth).mockReturnValueOnce(false);
+    vi.mocked(resolveProtectionState).mockResolvedValueOnce({
+      currentOrigin: "https://demo.preview.workers.dev",
+      hubUrl: "https://demo.preview.workers.dev",
+      routeKind: "workers-dev",
+      hostKind: "workers-dev",
+      protectionMode: "cf-access",
+      protectionCanAutomate: false,
+      serviceTokenConfigured: false,
+      unsupportedProtectionConfig: false,
+      workersDevAliasDisabled: false,
+      protectionAppDomain: "demo.preview.workers.dev",
+      accessConfigured: true,
+      accessIssuer: "https://team.cloudflareaccess.com",
+      accessJwksUrl: "https://team.cloudflareaccess.com/cdn-cgi/access/certs",
+    });
+    readRegisteredHostService.mockResolvedValue(null);
+    readRoutableHostService.mockResolvedValue(null);
+
+    const app = createApp();
+    const res = await app.request(
+      "https://demo.preview.workers.dev/api/setup/status",
+      { method: "GET" },
+      { AI: {} } as any,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      needsSetup: true,
+      setupPhase: "github-app",
+      accessConfigured: true,
+      githubAppConfigured: false,
+      githubAppReady: false,
+    });
+  });
+
+  it("uses the current request route for protect-hub even if HUB_PUBLIC_URL points at a custom domain", async () => {
+    vi.mocked(resolveProtectionState).mockResolvedValueOnce({
+      currentOrigin: "https://demo.preview.workers.dev",
+      hubUrl: "https://tiller.example.com",
+      routeKind: "custom-domain",
+      hostKind: "custom-domain",
+      protectionMode: "public",
+      protectionCanAutomate: true,
+      serviceTokenConfigured: false,
+      unsupportedProtectionConfig: false,
+      workersDevAliasDisabled: false,
+      protectionAppDomain: null,
+      accessConfigured: false,
+      accessIssuer: null,
+      accessJwksUrl: null,
+    });
+    readRegisteredHostService.mockResolvedValue(null);
+    readRoutableHostService.mockResolvedValue(null);
+
+    const app = createApp();
+    const res = await app.request(
+      "https://demo.preview.workers.dev/api/setup/status",
+      { method: "GET" },
+      {} as any,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      needsSetup: true,
+      setupPhase: "protect-hub",
+      currentOrigin: "https://demo.preview.workers.dev",
+      hubUrl: "https://tiller.example.com",
     });
   });
 

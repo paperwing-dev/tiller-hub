@@ -2,6 +2,7 @@ import { Container } from "@cloudflare/containers";
 import type { Env } from "./types";
 import { getEnvLifecycleStub } from "./helpers";
 import { getHub, projectAndPersistEnvSummary } from "./env/service";
+import { revokeCodexGatewaySessionsForEnv } from "./gateway-session";
 
 const STOP_CONTROL_PORT = 8790;
 const STOP_CONTROL_PREPARE_PATH = "/prepare-stop";
@@ -110,7 +111,10 @@ export class SandboxDO extends Container<Env> {
         return;
       }
 
-      await projectAndPersistEnvSummary(this.env, getHub(this.env), slug);
+      const projected = await projectAndPersistEnvSummary(this.env, getHub(this.env), slug);
+      if (projected?.status === "stopped") {
+        await revokeCodexGatewaySessionsForEnv(this.env, slug);
+      }
     } catch (err) {
       console.error(`[sandbox] Failed to mark env infra-ready on start:`, err);
       throw err;

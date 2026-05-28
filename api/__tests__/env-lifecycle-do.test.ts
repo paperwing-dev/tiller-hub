@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EnvLifecycleState, EnvMeta } from "../types";
-import { createInitialEnvScmState } from "../scm/model";
+import { createInitialEnvScmState, createInitialRepoScmState } from "../scm/model";
 import { ENV_LIFECYCLE_SAVE_TIMEOUT_MS, ENV_LIFECYCLE_STOP_TIMEOUT_MS } from "../env-lifecycle";
 
 vi.mock("cloudflare:workers", () => ({
@@ -51,11 +51,11 @@ function createSubject(envOverrides: Record<string, unknown> = {}) {
   instance.ctx = {
     storage: createMemoryStorage(),
   } as any;
-  instance.env = envOverrides as any;
+  (instance as any).env = envOverrides;
   return instance;
 }
 
-function createLegacyMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
+function createEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
   return {
     slug: "demo-env",
     repoUrl: "https://github.com/test/repo",
@@ -278,7 +278,7 @@ describe("EnvLifecycleDO", () => {
 
   it("applies a partial workspace patch from the stop-finalize ack", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(createLegacyMeta({ baseMainCommit: "main-old" }));
+    await subject.initializeMutableStateFromMeta(createEnvMeta({ baseMainCommit: "main-old" }));
     const initial = await subject.requestStop();
 
     await subject.noteStopWorkspaceSynced(initial.activeOpId, {
@@ -355,6 +355,23 @@ describe("EnvLifecycleDO", () => {
     vi.useRealTimers();
   });
 
+  it("peeks mutable state without resolving lifecycle timeouts", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const subject = createSubject();
+    await subject.requestStop();
+
+    vi.setSystemTime(new Date("2026-04-10T00:01:20.000Z"));
+    await expect(subject.peekMutableState()).resolves.toMatchObject({
+      status: "saving",
+      lifecyclePhase: "saving",
+    });
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "failed",
+    });
+    vi.useRealTimers();
+  });
+
   it("persists and broadcasts a timed-out stop from the alarm path", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
@@ -367,11 +384,18 @@ describe("EnvLifecycleDO", () => {
             return JSON.stringify({
               slug: "demo-env",
               repoUrl: "https://github.com/test/repo",
+              repoId: "repo-1",
               backend: "cf",
               harness: "claude-code",
               startupPlanId: null,
               branchName: "env/demo-env",
               createdAt: "2026-04-10T00:00:00.000Z",
+            });
+          }
+          if (key === "repo:repo-1") {
+            return JSON.stringify({
+              repoId: "repo-1",
+              updatedAt: "2026-04-10T00:00:00.000Z",
             });
           }
           return kvWrites.get(key) ?? null;
@@ -386,9 +410,28 @@ describe("EnvLifecycleDO", () => {
           broadcastEnvUpsert,
         }),
       },
+      WORKSPACE: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn().mockReturnValue({
+          readWorkspaceFile: vi.fn(async (path: string) => {
+            if (path !== "/.tiller/repo/meta.json") {
+              return null;
+            }
+            return JSON.stringify({
+              repoId: "repo-1",
+              githubInstallationId: 98765,
+              githubFullName: "test/repo",
+              ...createInitialRepoScmState(),
+              createdAt: "2026-04-10T00:00:00.000Z",
+              updatedAt: "2026-04-10T00:00:00.000Z",
+              bootstrappedFromRef: "HEAD",
+            });
+          }),
+        }),
+      },
     };
     const subject = createSubject(env);
-    await subject.hydrateFromSummary(createLegacyMeta());
+    await subject.initializeMutableStateFromMeta(createEnvMeta());
     await subject.requestStop();
 
     vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 5_000));
@@ -431,7 +474,7 @@ describe("EnvLifecycleDO", () => {
 
   it("preserves workspace sync state across boot, harness, and scm updates", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(createLegacyMeta());
+    await subject.initializeMutableStateFromMeta(createEnvMeta());
 
     await subject.recordStopWorkspaceSynced({
       workspaceDirty: true,
@@ -464,7 +507,7 @@ describe("EnvLifecycleDO", () => {
     const subject = createSubject();
 
     await expect(
-      subject.hydrateFromSummary(createLegacyMeta({ status: undefined })),
+      subject.initializeMutableStateFromMeta(createEnvMeta({ status: undefined })),
     ).rejects.toThrow("Env summary is missing explicit core fields");
   });
 
@@ -472,13 +515,13 @@ describe("EnvLifecycleDO", () => {
     const subject = createSubject();
 
     await expect(
-      subject.hydrateFromSummary(createLegacyMeta({ updatedAt: undefined })),
+      subject.initializeMutableStateFromMeta(createEnvMeta({ updatedAt: undefined })),
     ).rejects.toThrow("Env summary is missing explicit core fields");
   });
 
   it("clears stale scm projection without erasing workspace or lifecycle state", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(createLegacyMeta({
+    await subject.initializeMutableStateFromMeta(createEnvMeta({
       status: "stopped",
       workspaceDirty: true,
       workspaceLastSyncedAt: "2026-04-10T00:00:00.000Z",

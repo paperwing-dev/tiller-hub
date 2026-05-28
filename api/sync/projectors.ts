@@ -6,28 +6,49 @@ import {
   type EnvMeta,
   type RepoMeta,
 } from "../types";
+import { githubRepoUrlFromFullName } from "../github/repo";
 
-export function assertExplicitEnvSummaryFields(meta: Pick<EnvMeta, "slug" | "status" | "updatedAt">): void {
-  if (!isEnvStatus(meta.status) || typeof meta.updatedAt !== "string") {
-    throw new Error(`Env summary is missing explicit core fields for ${meta.slug}`);
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function assertExplicitEnvSummaryFields(meta: unknown): void {
+  const record = isRecord(meta) ? meta : {};
+  if (!isEnvStatus(typeof record.status === "string" ? record.status : null) || typeof record.updatedAt !== "string") {
+    const slug = typeof record.slug === "string" ? record.slug : "unknown";
+    throw new Error(`Env summary is missing explicit core fields for ${slug}`);
   }
 }
 
-export function assertExplicitRepoSummaryFields(meta: Pick<RepoMeta, "repoId" | "gitStatus" | "updatedAt">): void {
-  if (!isRepoGitStatus(meta.gitStatus) || typeof meta.updatedAt !== "string") {
-    throw new Error(`Repo summary is missing explicit core fields for ${meta.repoId}`);
+export function assertExplicitRepoSummaryFields(meta: unknown): void {
+  const record = isRecord(meta) ? meta : {};
+  if (
+    !isRepoGitStatus(typeof record.gitStatus === "string" ? record.gitStatus : null) ||
+    typeof record.updatedAt !== "string" ||
+    !Number.isInteger(record.githubInstallationId) ||
+    record.githubInstallationId <= 0 ||
+    typeof record.githubFullName !== "string" ||
+    typeof record.repoUrl !== "string" ||
+    record.repoUrl !== githubRepoUrlFromFullName(record.githubFullName)
+  ) {
+    const repoId = typeof record.repoId === "string" ? record.repoId : "unknown";
+    throw new Error(`Repo summary is missing explicit core fields for ${repoId}`);
   }
 }
 
-export function assertExplicitEnvScmFields(meta: EnvMeta): void {
+export function assertExplicitEnvScmFields(meta: unknown): void {
   if (!hasExplicitEnvScmFields(meta)) {
-    throw new Error(`Env summary is missing explicit environment schema fields for ${meta.slug}`);
+    const record = isRecord(meta) ? meta : {};
+    const slug = typeof record.slug === "string" ? record.slug : "unknown";
+    throw new Error(`Env summary is missing explicit environment schema fields for ${slug}`);
   }
 }
 
-export function assertExplicitRepoScmFields(meta: RepoMeta): void {
+export function assertExplicitRepoScmFields(meta: unknown): void {
   if (!hasExplicitRepoScmFields(meta)) {
-    throw new Error(`Repo summary is missing explicit repository schema fields for ${meta.repoId}`);
+    const record = isRecord(meta) ? meta : {};
+    const repoId = typeof record.repoId === "string" ? record.repoId : "unknown";
+    throw new Error(`Repo summary is missing explicit repository schema fields for ${repoId}`);
   }
 }
 

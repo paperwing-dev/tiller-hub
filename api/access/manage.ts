@@ -14,12 +14,15 @@ import {
   deleteAccessPolicy,
   deleteServiceToken,
   ensureTunnelDnsRecord,
+  getAccessOrganization,
   getTunnelToken,
   listAccessApps,
   listAccessPolicies,
   listTunnels,
   putTunnelConfiguration,
+  updateAccessEmailPolicy,
 } from "./cloudflare-api";
+import { MANAGED_ACCESS_CONFIG_KEYS } from "./config-keys";
 
 const MANAGED_BROWSER_POLICY_NAME = "Allow hub users";
 const MANAGED_SERVICE_TOKEN_POLICY_NAME = "Allow hub service token";
@@ -27,26 +30,10 @@ const MANAGED_BROWSER_POLICY_PRECEDENCE = 100;
 const MANAGED_SERVICE_TOKEN_POLICY_PRECEDENCE = 200;
 const MANAGED_GATEWAY_TUNNEL_NAME = "tiller-gateway";
 const MANAGED_GATEWAY_TUNNEL_TARGET_PORT = 8788;
-const MANAGED_ACCESS_CONFIG_KEYS = [
-  "CF_ACCESS_APP_ID",
-  "CF_ACCESS_AUD",
-  "CF_ACCESS_APP_DOMAIN",
-  "CF_ACCESS_APP_TYPE",
-  "CF_ACCESS_OVERLAPPING_WILDCARD_APP_DOMAIN",
-  "CF_ACCESS_CLIENT_ID",
-  "CF_ACCESS_CLIENT_SECRET",
-  "CF_ACCESS_BROWSER_POLICY_ID",
-  "CF_ACCESS_SERVICE_TOKEN_ID",
-  "CF_ACCESS_SERVICE_TOKEN_POLICY_ID",
-  "TILLER_GATEWAY_HOSTNAME",
-  "CF_ACCESS_GATEWAY_APP_ID",
-  "CF_ACCESS_GATEWAY_APP_DOMAIN",
-  "CF_ACCESS_GATEWAY_SERVICE_TOKEN_POLICY_ID",
-  "TILLER_GATEWAY_TUNNEL_ID",
-  "TILLER_GATEWAY_TUNNEL_NAME",
-  "TILLER_GATEWAY_TUNNEL_TOKEN",
-  "TILLER_GATEWAY_TUNNEL_TARGET_PORT",
-] as const;
+
+function freshManagedGatewayTunnelName(): string {
+  return `${MANAGED_GATEWAY_TUNNEL_NAME}-${crypto.randomUUID().slice(0, 8)}`;
+}
 
 function managedServiceConfig(): {
   label: string;
@@ -66,6 +53,10 @@ function managedServiceConfig(): {
 
 function normalizeDomain(value: string | null | undefined): string {
   return value?.trim().toLowerCase() ?? "";
+}
+
+function normalizeAccessTeamDomain(value: string | null | undefined): string {
+  return normalizeDomain(value).replace(/^https?:\/\//, "").replace(/\/+$/, "");
 }
 
 function wildcardCoversHost(pattern: string, hostname: string): boolean {
@@ -90,6 +81,7 @@ export interface PreparedManagedAccess {
   hostname: string;
   app: CloudflareAccessApp;
   appDomain: string;
+  accessTeamDomain: string;
   browserPolicy: CloudflareAccessPolicy | null;
   serviceToken: CloudflareServiceToken;
   serviceTokenPolicy: CloudflareAccessPolicy;
@@ -119,6 +111,7 @@ export interface PersistedAccessConfig {
   appId: string;
   appAud: string;
   appDomain: string;
+  accessTeamDomain: string;
   clientId: string;
   clientSecret: string;
   browserPolicyId: string | null;
@@ -133,12 +126,27 @@ export interface PersistedManagedServiceHostAccessConfig {
   serviceTokenPolicyId: string;
   tunnelId: string;
   tunnelName: string;
+  tunnelTargetPort: number;
+}
+
+export interface ProvisionedManagedGatewayTunnel {
+  hostname: string;
+  appId: string;
+  appDomain: string;
+  serviceTokenPolicyId: string;
+  tunnelId: string;
+  tunnelName: string;
   tunnelToken: string;
   tunnelTargetPort: number;
 }
 
-export interface ProvisionedManagedServiceHosts {
-  gateway: PreparedManagedServiceHostAccess;
+export interface ProvisionedWorkersDevBrowserAccess {
+  accountId: string;
+  hostname: string;
+  app: CloudflareAccessApp;
+  appDomain: string;
+  browserPolicy: CloudflareAccessPolicy | null;
+  overlappingWildcardApp: CloudflareAccessApp | null;
 }
 
 export function buildWildcardUnsupportedMessage(hostnameInput: string, wildcardDomainInput: string): string {
@@ -227,6 +235,7 @@ export async function prepareManagedExactHostAccess(
     hostname: string;
     emails: string[];
     reuseExistingServiceToken?: boolean;
+    accessTeamDomain?: string | null;
   },
 ): Promise<PreparedManagedAccess> {
   const hostname = normalizeDomain(options.hostname);
@@ -293,6 +302,20 @@ export async function prepareManagedExactHostAccess(
     }
   };
 
+  let accessTeamDomain = normalizeAccessTeamDomain(options.accessTeamDomain);
+  try {
+    if (!accessTeamDomain) {
+      const organization = await getAccessOrganization(options.apiToken, options.accountId);
+      accessTeamDomain = normalizeAccessTeamDomain(organization.auth_domain);
+    }
+    if (!accessTeamDomain) {
+      throw new Error("Cloudflare did not return the Zero Trust organization auth domain.");
+    }
+  } catch (error) {
+    await cleanupDraftResources().catch(() => {});
+    throw error;
+  }
+
   try {
     if (options.emails.length > 0) {
       browserPolicy = await createAccessEmailPolicy(options.apiToken, options.accountId, app.id, {
@@ -337,6 +360,7 @@ export async function prepareManagedExactHostAccess(
     hostname,
     app,
     appDomain: hostname,
+    accessTeamDomain,
     browserPolicy,
     serviceToken,
     serviceTokenPolicy,
@@ -346,6 +370,98 @@ export async function prepareManagedExactHostAccess(
     previousServiceTokenPolicyId,
     cleanupDraftResources,
   };
+}
+
+export async function provisionWorkersDevBrowserAccess(
+  options: {
+    apiToken: string;
+    accountId: string;
+    hostname: string;
+    emails: string[];
+  },
+): Promise<ProvisionedWorkersDevBrowserAccess> {
+  const hostname = normalizeDomain(options.hostname);
+  if (!hostname.endsWith(".workers.dev")) {
+    throw new Error("workers.dev Access setup only applies to workers.dev hostnames.");
+  }
+  if (options.emails.length === 0) {
+    throw new Error("At least one email address is required to create the workers.dev Access policy.");
+  }
+
+  const coverage = await resolveAccessCoverage(
+    options.apiToken,
+    options.accountId,
+    hostname,
+  );
+
+  if (!coverage.exactApp && coverage.overlappingWildcardApp) {
+    return {
+      accountId: options.accountId,
+      hostname,
+      app: coverage.overlappingWildcardApp,
+      appDomain: normalizeDomain(coverage.overlappingWildcardApp.domain) || hostname,
+      browserPolicy: null,
+      overlappingWildcardApp: coverage.overlappingWildcardApp,
+    };
+  }
+
+  const { exactApp } = coverage;
+  const app = exactApp ?? await createAccessApp(options.apiToken, options.accountId, {
+    domain: hostname,
+    name: `Tiller Hub (${hostname})`,
+  });
+  if (!app.id || !app.aud) {
+    throw new Error("Cloudflare did not return the workers.dev Access application identifiers.");
+  }
+
+  const cleanupDraftResources = async () => {
+    if (!exactApp) {
+      await deleteAccessApp(options.apiToken, options.accountId, app.id!).catch(() => {});
+    }
+  };
+
+  try {
+    const existingPolicies = await listAccessPolicies(options.apiToken, options.accountId, app.id);
+    const existingBrowserPolicy = existingPolicies.find((policy) => {
+      return normalizeDomain(policy.name) === normalizeDomain(MANAGED_BROWSER_POLICY_NAME);
+    }) ?? null;
+    const precedence = typeof existingBrowserPolicy?.precedence === "string"
+      ? Number.parseInt(existingBrowserPolicy.precedence, 10)
+      : existingBrowserPolicy?.precedence;
+    const browserPolicyPrecedence = typeof precedence === "number" && Number.isFinite(precedence)
+      ? precedence
+      : allocateAccessPolicyPrecedence(existingPolicies, MANAGED_BROWSER_POLICY_PRECEDENCE);
+
+    const browserPolicy = existingBrowserPolicy?.id
+      ? await updateAccessEmailPolicy(
+        options.apiToken,
+        options.accountId,
+        app.id,
+        existingBrowserPolicy.id,
+        {
+          name: MANAGED_BROWSER_POLICY_NAME,
+          emails: options.emails,
+          precedence: browserPolicyPrecedence,
+        },
+      )
+      : await createAccessEmailPolicy(options.apiToken, options.accountId, app.id, {
+        name: MANAGED_BROWSER_POLICY_NAME,
+        emails: options.emails,
+        precedence: browserPolicyPrecedence,
+      });
+
+    return {
+      accountId: options.accountId,
+      hostname,
+      app,
+      appDomain: hostname,
+      browserPolicy,
+      overlappingWildcardApp: coverage.overlappingWildcardApp,
+    };
+  } catch (error) {
+    await cleanupDraftResources().catch(() => {});
+    throw error;
+  }
 }
 
 export async function prepareManagedServiceHostAccess(
@@ -426,27 +542,30 @@ export async function prepareManagedServiceHostAccess(
   };
 }
 
-async function provisionManagedGatewayTunnel(
+export async function provisionManagedGatewayTunnel(
   env: Env,
   options: {
     apiToken: string;
     accountId: string;
     zoneId: string;
     hostname: string;
+    forceFreshTunnel?: boolean;
   },
-): Promise<PersistedManagedServiceHostAccessConfig> {
+): Promise<ProvisionedManagedGatewayTunnel> {
   const hostname = normalizeDomain(options.hostname);
   if (!hostname) {
     throw new Error("Could not determine the Gateway hostname for this hub.");
   }
 
-  const persistedTunnelId = readConfigId(await getSecret(env, "TILLER_GATEWAY_TUNNEL_ID"));
+  const persistedTunnelId = options.forceFreshTunnel
+    ? null
+    : readConfigId(await getSecret(env, "TILLER_GATEWAY_TUNNEL_ID"));
   const persistedTunnelName =
-    readConfigId(await getSecret(env, "TILLER_GATEWAY_TUNNEL_NAME")) ?? MANAGED_GATEWAY_TUNNEL_NAME;
-  const persistedTunnelToken = readConfigId(await getSecret(env, "TILLER_GATEWAY_TUNNEL_TOKEN"));
-
+    options.forceFreshTunnel
+      ? freshManagedGatewayTunnelName()
+      : readConfigId(await getSecret(env, "TILLER_GATEWAY_TUNNEL_NAME")) ?? MANAGED_GATEWAY_TUNNEL_NAME;
   let tunnelId = persistedTunnelId;
-  let tunnelToken = persistedTunnelToken;
+  let tunnelToken: string | null = null;
   const tunnelName = persistedTunnelName || MANAGED_GATEWAY_TUNNEL_NAME;
 
   if (!tunnelId) {
@@ -521,6 +640,8 @@ export async function persistManagedAccessConfig(
   await setHubConfig(env, {
     CF_ACCESS_APP_ID: values.appId,
     CF_ACCESS_AUD: values.appAud,
+    CF_ACCESS_TEAM_DOMAIN: `https://${values.accessTeamDomain}`,
+    CF_ACCESS_JWKS_URL: "",
     CF_ACCESS_APP_DOMAIN: values.appDomain,
     CF_ACCESS_APP_TYPE: "",
     CF_ACCESS_OVERLAPPING_WILDCARD_APP_DOMAIN: "",
@@ -553,25 +674,6 @@ export async function restoreManagedAccessConfigSnapshot(
   invalidateConfigCache();
 }
 
-export async function persistManagedServiceHostAccessConfig(
-  env: Env,
-  values: {
-    gateway: PersistedManagedServiceHostAccessConfig;
-  },
-): Promise<void> {
-  await setHubConfig(env, {
-    TILLER_GATEWAY_HOSTNAME: values.gateway.hostname,
-    CF_ACCESS_GATEWAY_APP_ID: values.gateway.appId,
-    CF_ACCESS_GATEWAY_APP_DOMAIN: values.gateway.appDomain,
-    CF_ACCESS_GATEWAY_SERVICE_TOKEN_POLICY_ID: values.gateway.serviceTokenPolicyId,
-    TILLER_GATEWAY_TUNNEL_ID: values.gateway.tunnelId,
-    TILLER_GATEWAY_TUNNEL_NAME: values.gateway.tunnelName,
-    TILLER_GATEWAY_TUNNEL_TOKEN: values.gateway.tunnelToken,
-    TILLER_GATEWAY_TUNNEL_TARGET_PORT: String(values.gateway.tunnelTargetPort),
-  });
-  invalidateConfigCache();
-}
-
 export function buildPersistedManagedAccessConfig(
   prepared: PreparedManagedAccess,
 ): PersistedAccessConfig {
@@ -579,6 +681,7 @@ export function buildPersistedManagedAccessConfig(
     appId: prepared.app.id!,
     appAud: prepared.app.aud!,
     appDomain: prepared.appDomain,
+    accessTeamDomain: prepared.accessTeamDomain,
     clientId: prepared.serviceToken.client_id,
     clientSecret: prepared.serviceToken.client_secret,
     browserPolicyId: prepared.browserPolicy?.id ?? prepared.previousBrowserPolicyId,
@@ -592,7 +695,6 @@ export function buildPersistedManagedServiceHostAccessConfig(
   tunnel: {
     tunnelId: string;
     tunnelName: string;
-    tunnelToken: string;
     tunnelTargetPort: number;
   },
 ): PersistedManagedServiceHostAccessConfig {
@@ -603,7 +705,6 @@ export function buildPersistedManagedServiceHostAccessConfig(
     serviceTokenPolicyId: prepared.serviceTokenPolicy.id,
     tunnelId: tunnel.tunnelId,
     tunnelName: tunnel.tunnelName,
-    tunnelToken: tunnel.tunnelToken,
     tunnelTargetPort: tunnel.tunnelTargetPort,
   };
 }
@@ -643,70 +744,46 @@ export async function cleanupSupersededManagedHubAccess(
   }
 }
 
-export async function cleanupSupersededManagedServiceHostAccess(
+export async function revokeSelfHostSetupCredentials(
   apiToken: string,
-  prepared: PreparedManagedServiceHostAccess,
+  resources: {
+    accountId: string;
+    hubAppId: string | null | undefined;
+    hubBrowserPolicyId: string | null | undefined;
+    hubServiceTokenPolicyId: string | null | undefined;
+    hubServiceTokenId: string | null | undefined;
+    gatewayAppId: string | null | undefined;
+    gatewayServiceTokenPolicyId: string | null | undefined;
+  },
 ): Promise<void> {
-  if (prepared.previousAppId && prepared.previousAppId !== prepared.app.id) {
-    await deleteAccessApp(apiToken, prepared.accountId, prepared.previousAppId).catch(() => {});
-    return;
-  }
+  const accountId = resources.accountId.trim();
+  if (!accountId) return;
 
-  if (
-    prepared.previousServiceTokenPolicyId
-    && prepared.previousServiceTokenPolicyId !== prepared.serviceTokenPolicy.id
-  ) {
+  if (resources.hubAppId?.trim() && resources.hubBrowserPolicyId?.trim()) {
     await deleteAccessPolicy(
       apiToken,
-      prepared.accountId,
-      prepared.app.id!,
-      prepared.previousServiceTokenPolicyId,
+      accountId,
+      resources.hubAppId.trim(),
+      resources.hubBrowserPolicyId.trim(),
     ).catch(() => {});
   }
-}
-
-export async function provisionManagedServiceHosts(
-  env: Env,
-  options: {
-    apiToken: string;
-    accountId: string;
-    zoneId: string;
-    gatewayHostname: string | null;
-    serviceTokenId: string;
-  },
-): Promise<ProvisionedManagedServiceHosts> {
-  let preparedGateway: PreparedManagedServiceHostAccess | null = null;
-  try {
-    preparedGateway = await prepareManagedServiceHostAccess(env, {
-      apiToken: options.apiToken,
-      accountId: options.accountId,
-      hostname: options.gatewayHostname,
-      serviceTokenId: options.serviceTokenId,
-    });
-
-    const gatewayTunnel = await provisionManagedGatewayTunnel(env, {
-      apiToken: options.apiToken,
-      accountId: options.accountId,
-      zoneId: options.zoneId,
-      hostname: preparedGateway.hostname,
-    });
-
-    await persistManagedServiceHostAccessConfig(env, {
-      gateway: buildPersistedManagedServiceHostAccessConfig(preparedGateway, {
-        tunnelId: gatewayTunnel.tunnelId,
-        tunnelName: gatewayTunnel.tunnelName,
-        tunnelToken: gatewayTunnel.tunnelToken,
-        tunnelTargetPort: gatewayTunnel.tunnelTargetPort,
-      }),
-    });
-
-    await cleanupSupersededManagedServiceHostAccess(options.apiToken, preparedGateway).catch(() => {});
-
-    return {
-      gateway: preparedGateway,
-    };
-  } catch (error) {
-    await preparedGateway?.cleanupDraftResources().catch(() => {});
-    throw error;
+  if (resources.hubAppId?.trim() && resources.hubServiceTokenPolicyId?.trim()) {
+    await deleteAccessPolicy(
+      apiToken,
+      accountId,
+      resources.hubAppId.trim(),
+      resources.hubServiceTokenPolicyId.trim(),
+    ).catch(() => {});
+  }
+  if (resources.gatewayAppId?.trim() && resources.gatewayServiceTokenPolicyId?.trim()) {
+    await deleteAccessPolicy(
+      apiToken,
+      accountId,
+      resources.gatewayAppId.trim(),
+      resources.gatewayServiceTokenPolicyId.trim(),
+    ).catch(() => {});
+  }
+  if (resources.hubServiceTokenId?.trim()) {
+    await deleteServiceToken(apiToken, accountId, resources.hubServiceTokenId.trim()).catch(() => {});
   }
 }

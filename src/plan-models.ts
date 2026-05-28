@@ -1,7 +1,7 @@
-export const PLAN_DEFAULT_MODEL = "gpt-5.4";
+export const PLAN_DEFAULT_MODEL = "gpt-5.5";
 
 export const PLAN_MODEL_OPTIONS = [
-  { id: "gpt-5.4", label: "ChatGPT 5.4" },
+  { id: "gpt-5.5", label: "ChatGPT 5.5" },
   { id: "@cf/nvidia/nemotron-3-120b-a12b", label: "Nemotron 120B" },
   { id: "@cf/moonshotai/kimi-k2.5", label: "Kimi K2.5" },
 ] as const;
@@ -12,8 +12,8 @@ export function isPlanModelId(value: string | null): value is PlanModelId {
   return PLAN_MODEL_OPTIONS.some((option) => option.id === value);
 }
 
-export function isChatGPTPlanModel(value: string | null | undefined): value is "gpt-5.4" {
-  return value === "gpt-5.4";
+export function isChatGPTPlanModel(value: string | null | undefined): value is "gpt-5.5" {
+  return value === "gpt-5.5";
 }
 
 export function getFallbackPlanModel(): PlanModelId {

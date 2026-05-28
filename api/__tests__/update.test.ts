@@ -21,7 +21,21 @@ import {
   reconcileContainerApplication,
   resolveAccountAndScript,
 } from "../update/cloudflare-deploy";
+import { parseTillerUpdateMetadata } from "../update/metadata";
 import type { UpdateManifest } from "../update/types";
+
+function updateMarker(sourceId: string, version = "0.2.0") {
+  return {
+    schemaVersion: 1,
+    channel: "deploy-button",
+    updateMode: "full-source",
+    sourceRepo: "paperwing-dev/tiller-hub",
+    sourceId,
+    version,
+    label: `Source ${sourceId}`,
+    managedFiles: ["package.json", "wrangler.jsonc"],
+  };
+}
 
 const manifest: UpdateManifest = {
   version: "0.2.0",
@@ -70,6 +84,16 @@ describe("compareVersions", () => {
   });
 });
 
+describe("parseTillerUpdateMetadata", () => {
+  it("requires a release version", () => {
+    const parsed = parseTillerUpdateMetadata(updateMarker("current-source", "0.2.27"));
+    expect(parsed?.version).toBe("0.2.27");
+
+    const { version: _version, ...withoutVersion } = updateMarker("current-source");
+    expect(parseTillerUpdateMetadata(withoutVersion)).toBeNull();
+  });
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -79,13 +103,10 @@ afterEach(() => {
 });
 
 describe("checkForUpdate", () => {
-  it("ignores cached results from an older deployed version", async () => {
+  it("ignores cached results from an older deployed source id", async () => {
     vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      tag_name: "tiller-hub-v0.2.0",
-      html_url: "https://github.com/paperwing-dev/tiller-hub/releases/tag/tiller-hub-v0.2.0",
-      assets: [],
-    }), {
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(updateMarker("latest-source")), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     }));
@@ -95,8 +116,8 @@ describe("checkForUpdate", () => {
       ENVS_KV: {
         get: vi.fn().mockResolvedValue({
           updateAvailable: true,
-          currentVersion: "0.1.0",
-          latestVersion: "0.2.0",
+          currentUpdate: updateMarker("old-source"),
+          latestUpdate: updateMarker("latest-source"),
           releaseNotesUrl: "https://example.com/stale",
         }),
         put: vi.fn().mockResolvedValue(undefined),
@@ -106,12 +127,15 @@ describe("checkForUpdate", () => {
     const result = await checkForUpdate(env as never);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(result.currentVersion).toBe("0.1.1");
-    expect(result.latestVersion).toBe("0.2.0");
+    expect(result.currentUpdate.sourceId).toBe("current-source");
+    expect(result.latestUpdate.sourceId).toBe("latest-source");
+    expect(result.updateAvailable).toBe(true);
     expect(env.ENVS_KV.put).toHaveBeenCalledTimes(1);
   });
 
-  it("surfaces a service-unavailable error when the release repo is private or unpublished", async () => {
+  it("surfaces update metadata lookup failures as an advanced-repair issue", async () => {
+    vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
       message: "Not Found",
     }), {
@@ -126,9 +150,60 @@ describe("checkForUpdate", () => {
       },
     };
 
-    await expect(checkForUpdate(env as never)).rejects.toThrow(
-      "[503] Latest tiller-hub release is not accessible. The paperwing-dev/tiller-hub repo may be private or may not have a published release yet.",
-    );
+    const result = await checkForUpdate(env as never);
+    expect(result.updateAvailable).toBe(false);
+    expect(result.updateMethod).toBe("advanced_repair");
+    expect(result.issue?.code).toBe("update_check_failed");
+  });
+
+  it("clears cached hub-repo issues after the self-update repo is detected", async () => {
+    vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
+
+    const env = {
+      ENVS_KV: {
+        get: vi.fn().mockResolvedValue({
+          updateAvailable: true,
+          currentUpdate: updateMarker("current-source"),
+          latestUpdate: updateMarker("latest-source"),
+          buildDiagnostics: {
+            version: "0.1.1",
+            workersCiCommitSha: null,
+            workersCiBranch: null,
+          },
+          hubRepo: { status: "missing", lastDetectedAt: "2026-05-27T00:00:00.000Z" },
+          updateMethod: "connect_hub_repo",
+          issue: {
+            code: "hub_repo_not_configured",
+            message: "Connect the generated deploy-button GitHub repository before updating normally.",
+          },
+          releaseNotesUrl: "https://github.com/paperwing-dev/tiller-hub",
+        }),
+        put: vi.fn().mockResolvedValue(undefined),
+      },
+      HUB: {
+        idFromName: vi.fn(() => "hub-id"),
+        get: vi.fn(() => ({
+          getAllConfig: vi.fn().mockResolvedValue({
+            HUB_UPDATE_REPO_STATUS: "detected",
+            HUB_UPDATE_REPO_OWNER: "me",
+            HUB_UPDATE_REPO_REPO: "hub",
+            HUB_UPDATE_REPO_ID: "123",
+            HUB_UPDATE_REPO_INSTALLATION_ID: "456",
+            HUB_UPDATE_REPO_BRANCH: "main",
+            HUB_UPDATE_REPO_LABEL: "me/hub (main)",
+            HUB_UPDATE_REPO_LAST_DETECTED_AT: "2026-05-27T01:00:00.000Z",
+            HUB_UPDATE_REPO_DETECTED_BY: "manual",
+          }),
+        })),
+      },
+    };
+
+    const result = await checkForUpdate(env as never);
+
+    expect(result.updateMethod).toBe("github_repo");
+    expect(result.hubRepo.status).toBe("detected");
+    expect(result.issue).toBeUndefined();
   });
 });
 

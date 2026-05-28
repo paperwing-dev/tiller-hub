@@ -128,7 +128,7 @@ Review-round persistence is also two-phase now: all model outputs are generated 
 
 - Visible planner:
   - `/packages/hub/api/agents/plan-chat-agent.ts`
-  - rich repo-aware drafting surface for the user
+  - Think-based, repo-aware drafting surface for the user
 - Internal review runner:
   - `/packages/hub/api/plan/review-service.ts`
   - code-aware, read-only, scoped tool usage

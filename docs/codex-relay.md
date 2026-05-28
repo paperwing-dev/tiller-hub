@@ -6,9 +6,23 @@ inside `tiller host`.
 Use this when `tiller-hub` is deployed on Cloudflare Workers but Codex traffic
 should egress from a machine on your home network.
 
-## 1. Start Tiller Host
+## 1. Import a Codex Login into Tiller
 
-On the machine that has ChatGPT/Codex subscription access:
+Import a Codex login from Tiller Settings. Settings shows a copy button for a
+Terminal script that reads the local Codex login automatically. If Tiller is
+installed on the machine that already has a Codex subscription login, the shorter
+CLI path is:
+
+```bash
+tiller auth import codex
+```
+
+Tiller stores and refreshes the imported Codex credential in the hub. Containers never
+receive refresh tokens and do not read `~/.codex/auth.json`.
+
+## 2. Start Tiller Host
+
+On the machine that should provide the gateway route:
 
 ```bash
 cd <project-root>/packages/tiller
@@ -30,7 +44,7 @@ and exposes:
 - `POST /codex/responses`
 - `POST /v1/responses`
 
-## 2. Expose it with Cloudflare Tunnel
+## 3. Expose it with Cloudflare Tunnel
 
 For a quick test:
 
@@ -44,7 +58,7 @@ For a stable deployment, use a named tunnel and a hostname such as
 `tiller host` can manage the tunnel for you when your config includes
 `gatewayHostname` / `TILLER_GATEWAY_HOSTNAME`.
 
-## 3. Service discovery
+## 4. Service discovery
 
 No worker secrets are needed for the gateway URL.
 
@@ -52,14 +66,16 @@ Instead:
 
 1. `tiller host` connects to the hub
 2. it registers the active gateway URL and capabilities in `HubDO`
-3. hosted Plan/Research and remote Codex envs discover that registration at runtime
+3. the hub mints scoped gateway session tokens for hosted Plan/Research and remote Codex envs
+4. the gateway exchanges each session token with the hub for short-lived upstream access
 
-## 4. Fallback behavior
+## 5. Fallback behavior
 
 When a healthy gateway is available, Codex routing prefers the gateway-backed
 subscription path.
 
 When no healthy gateway is available:
 
-- if `OPENAI_API_KEY` is configured, Tiller falls back automatically
+- Codex envs with `auto` auth can fall back to `OPENAI_API_KEY` with a visible warning
+- Codex envs with `subscription` auth fail clearly instead of falling back
 - otherwise Codex-backed hosted features are unavailable

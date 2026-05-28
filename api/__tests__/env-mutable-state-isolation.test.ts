@@ -95,7 +95,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("workspace-sync state survives a later boot-progress update", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
 
     await subject.setBootProgress("Reconnecting harness...");
     const state = await readMutableState(subject);
@@ -108,7 +108,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("workspace-sync state survives a later harness-failed update", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
 
     await subject.setLeadHarnessFailed("harness crashed");
     const state = await readMutableState(subject);
@@ -121,7 +121,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("workspace-sync state survives a later SCM projection change", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
 
     await subject.setScmProjection({
       type: "merge-into-main",
@@ -139,7 +139,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("SCM clear preserves lifecycle and workspace-sync fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
     await subject.setScmProjection({
       type: "merge-into-main",
       operationId: "op-42",
@@ -158,7 +158,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("idle auto-stop (requestStop + clearError) cannot erase fresh workspace metadata", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
 
     await subject.clearError();
     await subject.requestStop();
@@ -171,7 +171,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("workspace-sync failure cannot erase previously saved workspace metadata", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
     const stopLifecycle = await subject.requestStop();
 
     await subject.recordWorkspaceSyncFailed(stopLifecycle.activeOpId, "persistence error");
@@ -185,7 +185,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("stale SCM clear cannot erase unrelated lifecycle or workspace fields", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
     await subject.setScmProjection({
       type: "merge-into-main",
       operationId: "op-merge-1",
@@ -203,7 +203,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("setRunnerBinding updates only binding fields, leaves workspace alone", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
 
     await subject.setRunnerBinding({
       runnerId: "new-runner",
@@ -217,7 +217,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("setAuthWarning leaves workspace untouched", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
 
     await subject.setAuthWarning("token near expiry");
     const state = await readMutableState(subject);
@@ -229,7 +229,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("clearing auth warning leaves workspace untouched", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
     await subject.setAuthWarning("token near expiry");
 
     await subject.setAuthWarning(null);
@@ -241,7 +241,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("recordStopWorkspaceSynced overwrites workspace fields but preserves unrelated state", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace({ bootMessage: "booting" }));
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace({ bootMessage: "booting" }));
     await subject.setLeadHarnessFailed("crashed");
 
     await subject.recordStopWorkspaceSynced({
@@ -264,7 +264,7 @@ describe("Mutable state isolation (regression)", () => {
 
   it("clearError leaves workspace and SCM fields untouched", async () => {
     const subject = createSubject();
-    await subject.hydrateFromSummary(metaWithWorkspace());
+    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
     await subject.setError("transient failure");
     await subject.setScmProjection({
       type: "merge-into-main",

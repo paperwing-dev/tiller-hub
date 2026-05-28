@@ -1,10 +1,13 @@
-import { rpcError } from "../errors";
 import type { Env } from "../types";
-import type { GitHubRelease, UpdateCheckResult, UpdateRelease } from "./types";
-
-const UPDATE_CHECK_CACHE_KEY = "tiller:update-check";
-const UPDATE_CACHE_TTL_SECONDS = 86_400;
-const LATEST_RELEASE_URL = "https://api.github.com/repos/paperwing-dev/tiller-hub/releases/latest";
+import { readHubUpdateRepoState } from "./hub-repo";
+import {
+  fetchPublicUpdateMetadata,
+  getBuildDiagnostics,
+  getCurrentUpdateMetadata,
+  UPDATE_CACHE_TTL_SECONDS,
+  UPDATE_CHECK_CACHE_KEY,
+} from "./metadata";
+import type { HubUpdateRepoState, TillerUpdateMetadata, UpdateCheckResult } from "./types";
 
 function normalizeVersionTag(tagName: string): string {
   return tagName.trim().replace(/^tiller-hub-v/i, "").replace(/^v/i, "");
@@ -34,69 +37,79 @@ export function compareVersions(left: string, right: string): number {
   return 0;
 }
 
-function isRpcEncodedError(error: unknown): error is Error {
-  return error instanceof Error && /^\[\d{3}\] /.test(error.message);
+function isHubRepoConfigured(state: HubUpdateRepoState): boolean {
+  return state.status === "detected";
 }
 
-function describeReleaseLookupFailure(status: number): string {
-  if (status === 404) {
-    return "Latest tiller-hub release is not accessible. The paperwing-dev/tiller-hub repo may be private or may not have a published release yet.";
-  }
-  if (status === 401 || status === 403) {
-    return `Latest tiller-hub release lookup is not authorized by GitHub (${status}).`;
-  }
-  return `GitHub release lookup failed: ${status}`;
+function updateMethodForState(hubRepo: HubUpdateRepoState): UpdateCheckResult["updateMethod"] {
+  if (isHubRepoConfigured(hubRepo)) return "github_repo";
+  return "connect_hub_repo";
 }
 
-export async function fetchLatestTillerRelease(): Promise<UpdateRelease> {
-  const response = await fetch(LATEST_RELEASE_URL, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "tiller-hub",
-    },
-  });
-  if (!response.ok) {
-    throw rpcError("ServiceUnavailable", describeReleaseLookupFailure(response.status));
+function issueForState(
+  updateAvailable: boolean,
+  hubRepo: HubUpdateRepoState,
+): UpdateCheckResult["issue"] {
+  if (!updateAvailable || hubRepo.status === "detected") return undefined;
+  if (hubRepo.status === "ambiguous") {
+    return {
+      code: "hub_repo_ambiguous",
+      message: "Multiple selected GitHub repositories look like Tiller deploy-button hubs. Choose the self-update repo before updating.",
+    };
   }
-
-  const release = await response.json<GitHubRelease>();
-  const tagName = release.tag_name?.trim() ?? "";
-  const version = normalizeVersionTag(tagName);
-  if (!tagName || !version) {
-    throw new Error("GitHub latest release is missing a valid tag name");
-  }
-
   return {
-    tagName,
-    version,
-    releaseNotesUrl: release.html_url,
-    assets: Array.isArray(release.assets) ? release.assets : [],
+    code: "hub_repo_not_configured",
+    message: "Connect the generated deploy-button GitHub repository before updating normally.",
   };
+}
+
+function buildUpdateCheckResult(
+  currentUpdate: TillerUpdateMetadata,
+  latestUpdate: TillerUpdateMetadata,
+  hubRepo: HubUpdateRepoState,
+): UpdateCheckResult {
+  const updateAvailable = currentUpdate.sourceId !== latestUpdate.sourceId;
+  return {
+    updateAvailable,
+    currentUpdate,
+    latestUpdate,
+    buildDiagnostics: getBuildDiagnostics(),
+    hubRepo,
+    updateMethod: updateMethodForState(hubRepo),
+    ...(issueForState(updateAvailable, hubRepo) ? { issue: issueForState(updateAvailable, hubRepo) } : {}),
+    releaseNotesUrl: `https://github.com/${latestUpdate.sourceRepo}`,
+  };
+}
+
+function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMetadata): value is UpdateCheckResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<UpdateCheckResult>;
+  return typeof result.updateAvailable === "boolean" &&
+    result.currentUpdate?.sourceId === currentUpdate.sourceId &&
+    typeof result.currentUpdate.version === "string" &&
+    typeof result.latestUpdate?.sourceId === "string" &&
+    typeof result.latestUpdate.version === "string" &&
+    typeof result.releaseNotesUrl === "string";
 }
 
 export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
   try {
+    const currentUpdate = getCurrentUpdateMetadata();
+    const hubRepo = await readHubUpdateRepoState(env);
     const cached = await env.ENVS_KV.get(UPDATE_CHECK_CACHE_KEY, "json");
-    if (cached && typeof cached === "object") {
-      const result = cached as Partial<UpdateCheckResult>;
-      if (
-        typeof result.updateAvailable === "boolean" &&
-        typeof result.currentVersion === "string" &&
-        typeof result.latestVersion === "string" &&
-        typeof result.releaseNotesUrl === "string" &&
-        result.currentVersion === __TILLER_VERSION__
-      ) {
-        return result as UpdateCheckResult;
-      }
+    if (isCacheableUpdateResult(cached, currentUpdate)) {
+      const currentIssue = issueForState(cached.updateAvailable, hubRepo);
+      const { issue: _cachedIssue, hubRepo: _cachedHubRepo, updateMethod: _cachedUpdateMethod, ...cachedResult } = cached;
+      return {
+        ...cachedResult,
+        hubRepo,
+        updateMethod: updateMethodForState(hubRepo),
+        ...(currentIssue ? { issue: currentIssue } : {}),
+      };
     }
 
-    const release = await fetchLatestTillerRelease();
-    const result: UpdateCheckResult = {
-      updateAvailable: compareVersions(__TILLER_VERSION__, release.version) < 0,
-      currentVersion: __TILLER_VERSION__,
-      latestVersion: release.version,
-      releaseNotesUrl: release.releaseNotesUrl,
-    };
+    const latestUpdate = await fetchPublicUpdateMetadata();
+    const result = buildUpdateCheckResult(currentUpdate, latestUpdate, hubRepo);
 
     await env.ENVS_KV.put(
       UPDATE_CHECK_CACHE_KEY,
@@ -106,11 +119,26 @@ export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
 
     return result;
   } catch (error) {
-    if (isRpcEncodedError(error)) {
-      throw error;
-    }
     const message = error instanceof Error ? error.message : "Unknown error";
-    throw rpcError("ServiceUnavailable", `Self-update check failed: ${message}`);
+    const currentUpdate = getCurrentUpdateMetadata();
+    const latestUpdate = currentUpdate;
+    const hubRepo = await readHubUpdateRepoState(env).catch((): HubUpdateRepoState => ({
+      status: "not_checked",
+      lastDetectedAt: null,
+    }));
+    return {
+      updateAvailable: false,
+      currentUpdate,
+      latestUpdate,
+      buildDiagnostics: getBuildDiagnostics(),
+      hubRepo,
+      updateMethod: "advanced_repair",
+      issue: {
+        code: "update_check_failed",
+        message: `Self-update check failed: ${message}`,
+      },
+      releaseNotesUrl: `https://github.com/${currentUpdate.sourceRepo}`,
+    };
   }
 }
 

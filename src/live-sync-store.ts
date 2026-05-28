@@ -7,12 +7,12 @@ export type DashboardSelection =
   | { type: "none" }
   | { type: "session"; sessionId: string }
   | { type: "env"; envSlug: string }
-  | { type: "plan"; repoId: string; repoUrl: string }
+  | { type: "changes"; envSlug: string }
+  | { type: "plan"; repoId: string; planArtifactId?: string | null }
   | { type: "update" }
   | { type: "settings" };
 
 export interface NewEnvTarget {
-  repoUrl: string;
   repoId: string;
 }
 
@@ -90,6 +90,9 @@ export function reconcileSelectionAfterEnvRemove(
   if (current.type === "env" && current.envSlug === slug) {
     return { type: "none" };
   }
+  if (current.type === "changes" && current.envSlug === slug) {
+    return { type: "none" };
+  }
   if (current.type === "session") {
     const session = sessions.find((candidate) => candidate.id === current.sessionId);
     if (session && getManagedEnvSlug(session) === slug) {
@@ -122,7 +125,7 @@ export function reconcileSelectionAfterRunningEnv(
   sessions: StoredSession[],
   envs: EnvMeta[],
 ): DashboardSelection {
-  if (current.type !== "env") {
+  if (current.type !== "env" && current.type !== "changes") {
     return current;
   }
   const env = envs.find((candidate) => candidate.slug === current.envSlug);
@@ -145,6 +148,9 @@ export function reconcileSelectionAfterEnvRefresh(
   const nextSlugs = new Set(nextEnvs.map((env) => env.slug));
 
   if (current.type === "env" && !nextSlugs.has(current.envSlug)) {
+    return { type: "none" };
+  }
+  if (current.type === "changes" && !nextSlugs.has(current.envSlug)) {
     return { type: "none" };
   }
 

@@ -26,8 +26,10 @@ It is responsible for:
 
 - loading `.env` for local power-user deploys
 - reading `wrangler.jsonc`
+- honoring the Worker name selected by Workers Builds or `TILLER_WORKER_NAME`
 - validating `TILLER_REGION`
 - deriving a stable R2 bucket name from the Worker name
+- deriving generated container application names from the selected Worker name
 - ensuring `CLOUDFLARE_ACCOUNT_ID` is set for Wrangler when deploying with an
   API token
 - creating the R2 bucket non-interactively when it does not exist
@@ -45,6 +47,8 @@ There are two supported modes:
 1. Bootstrap mode
    - no `TILLER_CUSTOM_DOMAIN`
    - deploys to `workers.dev`
+   - uses Cloudflare's selected Worker name in Workers Builds
+   - supports `TILLER_WORKER_NAME` for local explicit-name deploys
 
 2. Protected custom-domain mode
    - `TILLER_CUSTOM_DOMAIN` is set

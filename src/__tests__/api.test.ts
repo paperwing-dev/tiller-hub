@@ -1,16 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   checkForUpdate,
+  createEnv,
+  createPlan,
+  createRepo,
   createReconnectingWebSocket,
+  discardPlan,
   fetchEnv,
   fetchEnvs,
   fetchHostStatus,
+  fetchGitHubRepositories,
   fetchRepoArtifacts,
   fetchRepos,
   fetchSessions,
   fetchSetupStatus,
-  publishProtectHub,
-  runArtifactReviewRound,
+  testGitHubAppAccess,
   verifyCloudflareToken,
   verifyModelAuth,
 } from "../api";
@@ -52,6 +56,105 @@ describe("fetchRepoArtifacts", () => {
     await expect(fetchRepoArtifacts("https://example.com", "repo-1")).resolves.toEqual({
       artifacts: [],
       refs: [],
+    });
+  });
+
+  it("accepts empty plan titles for untitled drafts", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        artifacts: [{
+          id: "plan-1",
+          repoId: "repo-1",
+          type: "plan",
+          title: "",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          version: 1,
+          status: "draft",
+          basis: {
+            repoId: "repo-1",
+            mainCommit: "abc123",
+          },
+          body: {
+            markdown: "",
+          },
+        }],
+        refs: [],
+      }), { status: 200 }),
+    );
+
+    await expect(fetchRepoArtifacts("https://example.com", "repo-1")).resolves.toMatchObject({
+      artifacts: [{ id: "plan-1", title: "" }],
+      refs: [],
+    });
+  });
+
+  it("normalizes wrapped create-plan responses", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        ok: true,
+        artifact: {
+          id: "plan-1",
+          repoId: "repo-1",
+          type: "plan",
+          title: "",
+          createdAt: "2026-05-20T00:00:00.000Z",
+          updatedAt: "2026-05-20T00:00:00.000Z",
+          version: 1,
+          status: "draft",
+          basis: {
+            repoId: "repo-1",
+            mainCommit: "abc123",
+          },
+          body: {
+            markdown: "",
+          },
+        },
+      }), { status: 201 }),
+    );
+
+    await expect(createPlan("https://example.com", "repo-1")).resolves.toMatchObject({
+      id: "plan-1",
+      title: "",
+      status: "draft",
+      version: 1,
+    });
+  });
+
+  it("normalizes wrapped discard-plan responses", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        ok: true,
+        artifact: {
+          id: "plan-1",
+          repoId: "repo-1",
+          type: "plan",
+          title: "Draft",
+          createdAt: "2026-05-20T00:00:00.000Z",
+          updatedAt: "2026-05-20T00:00:00.000Z",
+          version: 2,
+          status: "draft",
+          basis: {
+            repoId: "repo-1",
+            mainCommit: "abc123",
+          },
+          body: {
+            markdown: "Draft",
+          },
+        },
+      }), { status: 200 }),
+    );
+
+    await expect(discardPlan("https://example.com", "repo-1", "plan-1", 2)).resolves.toMatchObject({
+      id: "plan-1",
+      status: "draft",
+      version: 2,
+    });
+    expect(fetchSpy).toHaveBeenCalledWith("https://example.com/api/repos/repo-1/plans/plan-1", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ expectedVersion: 2 }),
     });
   });
 });
@@ -110,6 +213,108 @@ describe("list-style api helpers", () => {
 
     await expect(fetchRepos("https://example.com")).rejects.toThrow("Malformed repo response");
   });
+
+  it("creates envs by repoId", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        slug: "env-1",
+        repoId: "repo-1",
+        repoUrl: "https://github.com/test/repo",
+        backend: "cf",
+        harness: "codex",
+        createdAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+        status: "creating",
+        startupPlanId: null,
+        branchName: "env/env-1",
+        branchStatus: null,
+        workspaceDirty: null,
+        workspaceNeedsAttention: null,
+        workspaceLastSyncedAt: null,
+        baseMainCommit: null,
+        lastKnownMainCommit: null,
+        scmOperationType: null,
+        scmOperationId: null,
+        scmOperationPhase: null,
+        scmOperationStartedAt: null,
+        scmOperationUpdatedAt: null,
+        scmLastCompletedAt: null,
+        scmLastDurationMs: null,
+        scmLastTimings: null,
+      }), { status: 201 }),
+    );
+
+    await createEnv("https://example.com", "repo-1", "cf", "codex");
+
+    expect(fetchSpy).toHaveBeenCalledWith("https://example.com/api/envs", expect.objectContaining({
+      method: "POST",
+      body: expect.stringContaining("\"repoId\":\"repo-1\""),
+    }));
+    expect(fetchSpy.mock.calls[0]?.[1]?.body as string).not.toContain("repoUrl");
+  });
+
+  it("creates repos from GitHub App repository selections", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        repoId: "42",
+        repoUrl: "https://github.com/test/repo",
+        githubInstallationId: 100,
+        githubFullName: "test/repo",
+        mainCommit: null,
+        gitArtifactId: null,
+        gitStatus: "pending",
+        gitError: null,
+        gitFormatVersion: null,
+        gitProgressPhase: null,
+        gitProgressStartedAt: null,
+        gitProgressUpdatedAt: null,
+        gitLastBootstrapDurationMs: null,
+        gitLastBootstrapTimings: null,
+        createdAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+        bootstrappedFromRef: "main",
+      }), { status: 201 }),
+    );
+
+    await createRepo("https://example.com", {
+      repositoryId: 42,
+      installationId: 100,
+      fullName: "test/repo",
+      repoUrl: "https://github.com/test/repo",
+      private: true,
+      defaultBranch: "main",
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith("https://example.com/api/repos", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        repositoryId: 42,
+        installationId: 100,
+        fullName: "test/repo",
+      }),
+    }));
+  });
+
+  it("normalizes GitHub App repository selections", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        repositories: [{
+          repositoryId: 42,
+          installationId: 100,
+          fullName: "test/repo",
+          repoUrl: "https://github.com/test/repo",
+          private: true,
+          defaultBranch: "main",
+        }],
+        warnings: [],
+      }), { status: 200 }),
+    );
+
+    await expect(fetchGitHubRepositories("https://example.com")).resolves.toEqual({
+      repositories: [expect.objectContaining({ repositoryId: 42, fullName: "test/repo" })],
+      warnings: [],
+    });
+  });
 });
 
 describe("verifyModelAuth", () => {
@@ -135,7 +340,7 @@ describe("verifyModelAuth", () => {
         ok: false,
         results: [
           null,
-          { key: "OPENAI_API_KEY", mode: "openai-api", ok: true },
+          { key: "OPENAI_API_KEY", mode: "api-key", ok: true },
           { key: "BROKEN_RESULT" },
         ],
       }), { status: 200 }),
@@ -146,7 +351,7 @@ describe("verifyModelAuth", () => {
       results: [
         {
           key: "OPENAI_API_KEY",
-          mode: "openai-api",
+          mode: "api-key",
           ok: true,
         },
       ],
@@ -173,16 +378,70 @@ describe("single-object api helpers", () => {
 
   it("fills setup status defaults when the payload is partial", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ planChatgptAvailable: true }), { status: 200 }),
+      new Response(JSON.stringify({ openaiPlannerAvailable: true }), { status: 200 }),
     );
 
     await expect(fetchSetupStatus("https://example.com")).resolves.toMatchObject({
       hubUrl: "https://example.com",
       currentOrigin: "https://example.com",
       enabledHarnesses: ["claude-code", "codex", "opencode"],
-      planChatgptAvailable: true,
+      openaiPlannerAvailable: true,
       hostGatewayMode: "none",
+      githubAppInstallUrl: null,
+      githubAppManageUrl: "https://github.com/settings/installations",
+      githubAppReady: false,
     });
+  });
+
+  it("derives setup needs from normalized setup phase", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        needsSetup: true,
+        setupPhase: "complete",
+      }), { status: 200 }),
+    );
+
+    await expect(fetchSetupStatus("https://example.com")).resolves.toMatchObject({
+      needsSetup: false,
+      setupPhase: "complete",
+    });
+  });
+
+  it("normalizes GitHub App access test responses", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        ok: false,
+        status: "missing_permissions",
+        message: "Needs pull request permissions.",
+        repo: "owner/repo",
+        installUrl: "https://github.com/apps/tiller-test/installations/new",
+        manageUrl: "https://github.com/settings/installations",
+      }), { status: 200 }),
+    );
+
+    await expect(testGitHubAppAccess("https://example.com", {
+      repositoryId: 42,
+      installationId: 1234,
+      fullName: "owner/repo",
+      repoUrl: "https://github.com/owner/repo",
+      private: false,
+      defaultBranch: "main",
+    })).resolves.toEqual({
+      ok: false,
+      status: "missing_permissions",
+      message: "Needs pull request permissions.",
+      repo: "owner/repo",
+      installUrl: "https://github.com/apps/tiller-test/installations/new",
+      manageUrl: "https://github.com/settings/installations",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("https://example.com/api/github/test-access", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        repositoryId: 42,
+        installationId: 1234,
+        fullName: "owner/repo",
+      }),
+    }));
   });
 
   it("derives host status state when the payload omits the richer fields", async () => {
@@ -217,18 +476,6 @@ describe("single-object api helpers", () => {
     });
   });
 
-  it("normalizes review rounds with missing reviews", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, draftId: "draft-1" }), { status: 200 }),
-    );
-
-    await expect(runArtifactReviewRound("https://example.com", "repo-1", "draft-1")).resolves.toEqual({
-      ok: true,
-      draftId: "draft-1",
-      reviews: [],
-    });
-  });
-
   it("throws for malformed Cloudflare token verification payloads", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ ok: true, hostname: "hub.example.com" }), { status: 200 }),
@@ -240,28 +487,9 @@ describe("single-object api helpers", () => {
     })).rejects.toThrow("Malformed Cloudflare token verification response");
   });
 
-  it("throws for malformed publish & protect payloads", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({
-        ok: true,
-        hostname: "hub.example.com",
-        hubUrl: "https://hub.example.com",
-        clientId: "client-id",
-        clientSecret: "client-secret",
-        appDomain: "hub.example.com",
-      }), { status: 200 }),
-    );
-
-    await expect(publishProtectHub("https://example.com", {
-      hostname: "hub.example.com",
-      apiToken: "token",
-      emails: ["user@example.com"],
-    })).rejects.toThrow("Malformed publish & protect response");
-  });
-
   it("throws for malformed update check payloads", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ currentVersion: "1.0.0" }), { status: 200 }),
+      new Response(JSON.stringify({ updateAvailable: true }), { status: 200 }),
     );
 
     await expect(checkForUpdate("https://example.com")).rejects.toThrow("Malformed update check response");
@@ -328,6 +556,7 @@ describe("createReconnectingWebSocket", () => {
             env: {
               slug: "env-1",
               repoUrl: "https://github.com/test/repo",
+              repoId: "repo-1",
               backend: "cf",
               harness: "claude-code",
               runnerMachineId: "env-1",

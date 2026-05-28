@@ -38,7 +38,7 @@ function pickDefined<T extends JsonRecord>(source: JsonRecord, keys: (keyof T & 
   const result: Partial<T> = {};
   for (const key of keys) {
     if (source[key] !== undefined) {
-      result[key] = source[key] as T[keyof T];
+      result[key] = source[key] as T[typeof key];
     }
   }
   return result;
