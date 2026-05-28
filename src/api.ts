@@ -470,6 +470,7 @@ function normalizeHubUpdateRepoState(payload: unknown): HubUpdateRepoState {
     return {
       status: "missing",
       lastDetectedAt: readNullableString(payload.lastDetectedAt),
+      visibleGitHubOwners: normalizeStringArray(payload.visibleGitHubOwners),
     };
   }
   if (payload.status === "ambiguous") {

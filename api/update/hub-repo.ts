@@ -28,6 +28,7 @@ const CONFIG_KEYS = {
   lastDetectedAt: "HUB_UPDATE_REPO_LAST_DETECTED_AT",
   detectedBy: "HUB_UPDATE_REPO_DETECTED_BY",
   candidates: "HUB_UPDATE_REPO_CANDIDATES",
+  visibleGitHubOwners: "HUB_UPDATE_REPO_VISIBLE_GITHUB_OWNERS",
 } as const;
 
 const AUTO_DETECT_RETRY_MS = 5 * 60 * 1000;
@@ -75,6 +76,25 @@ function parseCandidates(value: string | undefined): HubUpdateRepoCandidate[] {
   } catch {
     return [];
   }
+}
+
+function parseStringArray(value: string | undefined): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function deriveVisibleGitHubOwners(repositories: GitHubAppRepositorySelection[]): string[] {
+  const owners = repositories.flatMap((repository) => {
+    const owner = repository.fullName.split("/", 1)[0]?.trim();
+    return owner ? [owner] : [];
+  });
+  return [...new Set(owners)].sort((left, right) => left.localeCompare(right));
 }
 
 function isHubUpdateRepoCandidate(value: unknown): value is HubUpdateRepoCandidate {
@@ -126,7 +146,11 @@ export async function readHubUpdateRepoState(env: Env): Promise<HubUpdateRepoSta
   }
 
   if (status === "missing") {
-    return { status: "missing", lastDetectedAt };
+    return {
+      status: "missing",
+      lastDetectedAt,
+      visibleGitHubOwners: parseStringArray(config[CONFIG_KEYS.visibleGitHubOwners]),
+    };
   }
 
   if (status === "ambiguous" && lastDetectedAt) {
@@ -180,14 +204,19 @@ async function persistDetected(
   };
 }
 
-async function persistMissing(env: Env, detectedAt = nowIso()): Promise<HubUpdateRepoState> {
+async function persistMissing(
+  env: Env,
+  visibleGitHubOwners: string[],
+  detectedAt = nowIso(),
+): Promise<HubUpdateRepoState> {
   await writeState(env, {
     [CONFIG_KEYS.status]: "missing",
     [CONFIG_KEYS.lastDetectedAt]: detectedAt,
     [CONFIG_KEYS.detectedBy]: "auto",
     [CONFIG_KEYS.candidates]: "",
+    [CONFIG_KEYS.visibleGitHubOwners]: JSON.stringify(visibleGitHubOwners),
   });
-  return { status: "missing", lastDetectedAt: detectedAt };
+  return { status: "missing", lastDetectedAt: detectedAt, visibleGitHubOwners };
 }
 
 async function persistAmbiguous(
@@ -283,6 +312,7 @@ export async function detectHubUpdateRepo(
   const result = await listGitHubAppRepositories(env);
   const candidates: HubUpdateRepoCandidate[] = [];
   const seenRepoIds = new Set<number>();
+  const visibleGitHubOwners = deriveVisibleGitHubOwners(result.repositories);
 
   for (const repository of result.repositories) {
     if (seenRepoIds.has(repository.repositoryId)) continue;
@@ -297,7 +327,7 @@ export async function detectHubUpdateRepo(
     return persistDetected(env, candidates[0], options.detectedBy ?? "auto");
   }
   if (candidates.length === 0) {
-    return persistMissing(env);
+    return persistMissing(env, visibleGitHubOwners);
   }
   return persistAmbiguous(env, candidates);
 }

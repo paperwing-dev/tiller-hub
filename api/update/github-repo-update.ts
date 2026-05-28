@@ -270,7 +270,7 @@ function refUpdateRejectedResult(status: number, body: unknown): UpdateApplyResu
   return {
     ok: false,
     status: "direct_update_rejected",
-    error: `${message} Use Advanced Repair if branch policy or permissions block direct commits.`,
+    error: `${message} Use Cloudflare update if branch policy or permissions block direct commits.`,
   };
 }
 
@@ -396,7 +396,7 @@ function applyFailureResult(error: unknown): UpdateApplyResult {
   return {
     ok: false,
     status: "advanced_repair_required",
-    error: `Normal GitHub update failed: ${message}. Use Advanced Repair if retrying does not resolve it.`,
+    error: `Normal GitHub update failed: ${message}. Use Cloudflare update if retrying does not resolve it.`,
   };
 }
 
@@ -406,7 +406,7 @@ async function applyGitHubRepoUpdateInternal(env: Env): Promise<UpdateApplyResul
     return {
       ok: false,
       status: "hub_repo_not_configured",
-      error: "Connect the generated deploy-button GitHub repository before updating.",
+      error: "No GitHub self-update repository is connected. Use Cloudflare update with a temporary API token.",
     };
   }
 
@@ -433,7 +433,7 @@ async function applyGitHubRepoUpdateInternal(env: Env): Promise<UpdateApplyResul
     return {
       ok: false,
       status: "managed_files_removed",
-      error: "This update removes managed files and requires Advanced Repair.",
+      error: "This update removes managed files and requires Cloudflare update.",
       missingManagedFiles: removedManagedFiles,
     };
   }

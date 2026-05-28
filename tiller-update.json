@@ -3,9 +3,9 @@
   "channel": "deploy-button",
   "updateMode": "full-source",
   "sourceRepo": "paperwing-dev/tiller-hub",
-  "sourceId": "0686d902244d9d8e519f752937b5f0ad8b33a5ca",
-  "version": "0.2.31",
-  "label": "Tiller Hub v0.2.31",
+  "sourceId": "edc20f9638355fc1640fa64d36fea6631756efac",
+  "version": "0.2.33",
+  "label": "Tiller Hub v0.2.33",
   "managedFiles": [
     ".gitignore",
     "api/access/cloudflare-api.ts",

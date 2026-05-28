@@ -72,6 +72,7 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     githubAppInstallUrl: null,
     githubAppManageUrl: "https://github.com/settings/installations",
     githubAppPublicHubDisabled: true,
+    selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
     ...overrides,
   };
 }

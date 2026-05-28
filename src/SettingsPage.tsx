@@ -260,6 +260,16 @@ function statusToneClasses(tone: "success" | "warning" | "neutral") {
   };
 }
 
+function visibleGitHubOwnersForUpdateRepo(status: SetupStatus["selfUpdateRepo"]): string[] {
+  return status.status === "missing" ? status.visibleGitHubOwners : [];
+}
+
+function formatVisibleGitHubOwners(owners: string[]): string {
+  if (owners.length === 0) return "no GitHub owners";
+  if (owners.length === 1) return owners[0];
+  return owners.join(", ");
+}
+
 function hostRuntimeStatus(status: SetupStatus): {
   title: string;
   detail: string;
@@ -1217,6 +1227,7 @@ function GitHubAppSettings({
   }
 
   const testCopy = lastTest ? accessResultCopy(lastTest) : null;
+  const visibleUpdateRepoOwners = visibleGitHubOwnersForUpdateRepo(selfUpdateRepo);
   const resultClasses = testCopy?.tone === "success"
     ? "border-[#1a7f37]/25 bg-[#f0fff4] text-[#1a7f37]"
     : testCopy?.tone === "warning"
@@ -1427,6 +1438,18 @@ function GitHubAppSettings({
                   {candidate.label}
                 </button>
               ))}
+            </div>
+          )}
+          {selfUpdateRepo.status === "missing" && (
+            <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
+              <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
+              <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
+                {visibleUpdateRepoOwners.length > 0
+                  ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
+                  : " Tiller cannot currently see any selected GitHub App repositories."}
+                {" "}Open Cloudflare Worker Settings &gt; Builds and compare the connected repo owner.
+              </p>
             </div>
           )}
         </div>

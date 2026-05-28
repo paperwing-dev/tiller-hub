@@ -3,9 +3,9 @@
 An opinionated way to manage AI harnesess. Almost all built on Cloudflare. Supports sandboxing, agent orchestration, worktrees, voice -- everything and the kitchen sync.
 
 
-> **Note:** This package is synced to a [public standalone repo](https://github.com/paperwing-dev/tiller-hub) for Cloudflare's deploy button. Development happens in this monorepo.
+> **Note:** This package is released to a [public standalone repo](https://github.com/paperwing-dev/tiller-hub) for Cloudflare's deploy button. Development happens in this monorepo.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/paperwing-dev/tiller-hub&autoDeploy=true)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/paperwing-dev/tiller-hub)
 
 _Steer queries to the agent that fits the job, using infrastructure sized to the task. Switch to more powerful agents and compute seamlessly, picking up right where the last agent left off._
 

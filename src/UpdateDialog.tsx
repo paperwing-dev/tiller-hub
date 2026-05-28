@@ -1,17 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { applyCloudflareRepairUpdate, applyUpdate, checkForUpdate, detectSelfUpdateRepo, selectSelfUpdateRepo } from './api';
+import { applyUpdate, checkForUpdate, detectSelfUpdateRepo, selectSelfUpdateRepo } from './api';
 import type { HubUpdateRepoCandidate, UpdateCheckResult } from './api';
 import { useToast } from './Toast';
 import { formatUpdateName } from './update-display';
 
-const CLOUDFLARE_TOKEN_URL = 'https://dash.cloudflare.com/profile/api-tokens';
-const REQUIRED_PERMISSIONS = [
-  'Workers Scripts:Edit',
-  'Account Settings:Read',
-  'Zone:Read',
-  'Workers KV Storage:Edit',
-  'Workers R2 Storage:Edit',
-] as const;
 const PROGRESS_STAGES = [
   'resolving-account',
   'checking-bindings',
@@ -64,6 +56,16 @@ function formatStage(stage: ProgressStage): string {
   }
 }
 
+function visibleGitHubOwnersForUpdateRepo(status: UpdateCheckResult['hubRepo']): string[] {
+  return status.status === 'missing' ? status.visibleGitHubOwners : [];
+}
+
+function formatVisibleGitHubOwners(owners: string[]): string {
+  if (owners.length === 0) return 'no GitHub owners';
+  if (owners.length === 1) return owners[0];
+  return owners.join(', ');
+}
+
 export default function UpdateDialog({
   hubUrl,
   status,
@@ -76,7 +78,6 @@ export default function UpdateDialog({
   onUpdated,
 }: UpdateDialogProps) {
   const addToast = useToast();
-  const [apiToken, setApiToken] = useState('');
   const [stage, setStage] = useState<ProgressStage>('idle');
   const [isApplying, setIsApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -84,7 +85,6 @@ export default function UpdateDialog({
 
   useEffect(() => {
     if (!status) {
-      setApiToken('');
       setStage('idle');
       setIsApplying(false);
       setError(null);
@@ -95,7 +95,6 @@ export default function UpdateDialog({
       return;
     }
 
-    setApiToken('');
     setStage('idle');
     setIsApplying(false);
     setError(null);
@@ -173,14 +172,21 @@ export default function UpdateDialog({
     }
   }
 
-  async function handleUpdateNow() {
+  async function handleGitHubRepoUpdate() {
     if (!status) {
       return;
     }
 
     if (status.updateMethod !== 'github_repo') {
-      setError(status.issue?.message ?? 'Connect the self-update repo before applying a normal update.');
-      setStage('error');
+      const message = status.hubRepo.status === 'ambiguous'
+        ? 'Choose the self-update repository before updating.'
+        : 'Connect the generated deploy-button repo before updating. If Cloudflare is using a different GitHub account, install the Tiller GitHub App on that same account or repo.';
+      setError(message);
+      addToast({
+        title: 'Self-update repo not connected',
+        body: message,
+        variant: 'warning',
+      });
       return;
     }
 
@@ -238,38 +244,6 @@ export default function UpdateDialog({
       setError(message);
       addToast({
         title: 'Update failed',
-        body: message,
-        variant: 'error',
-      });
-    }
-  }
-
-  async function handleAdvancedRepair() {
-    if (!apiToken.trim()) {
-      setError('Cloudflare API token is required for Advanced Repair.');
-      setStage('error');
-      return;
-    }
-    setIsApplying(true);
-    setError(null);
-    setStage(PROGRESS_STAGES[0]);
-    try {
-      await applyCloudflareRepairUpdate(hubUrl, apiToken.trim());
-      setStage('complete');
-      setIsApplying(false);
-      addToast({
-        title: 'Repair deployed',
-        body: 'Reload to use the repaired Tiller Hub build.',
-        variant: 'success',
-      });
-      onUpdated();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Advanced Repair failed';
-      setStage('error');
-      setIsApplying(false);
-      setError(message);
-      addToast({
-        title: 'Repair failed',
         body: message,
         variant: 'error',
       });
@@ -350,6 +324,9 @@ export default function UpdateDialog({
 
   const currentUpdateName = formatUpdateName(status.currentUpdate);
   const latestUpdateName = formatUpdateName(status.latestUpdate);
+  const visibleUpdateRepoOwners = visibleGitHubOwnersForUpdateRepo(status.hubRepo);
+  const showProgress = stage !== 'idle';
+  const sameUpdateName = currentUpdateName === latestUpdateName;
 
   return (
     <div className="flex-1 overflow-auto bg-[#f6f8fa]">
@@ -364,8 +341,17 @@ export default function UpdateDialog({
                 Upgrade Tiller Hub
               </h1>
               <p className="mt-2 text-sm text-[#57606a]">
-                This deployment is currently running <strong>{currentUpdateName}</strong>.
-                {' '}The latest available version is <strong>{latestUpdateName}</strong>.
+                {status.updateAvailable && sameUpdateName ? (
+                  <>
+                    This deployment is running <strong>{currentUpdateName}</strong>.
+                    {' '}A newer source build is available for the same version.
+                  </>
+                ) : (
+                  <>
+                    This deployment is currently running <strong>{currentUpdateName}</strong>.
+                    {' '}The latest available version is <strong>{latestUpdateName}</strong>.
+                  </>
+                )}
               </p>
             </div>
             <a
@@ -386,7 +372,7 @@ export default function UpdateDialog({
                   ? `${status.hubRepo.fullName} · ${status.hubRepo.branch}`
                   : status.hubRepo.status === 'ambiguous'
                     ? 'Multiple selected repositories contain Tiller update metadata.'
-                    : 'Connect the generated deploy-button repo to update through GitHub.'}
+                    : 'No generated deploy-button repo is connected yet.'}
               </p>
               {status.hubRepo.status === 'ambiguous' && (
                 <div className="mt-3 grid gap-2">
@@ -403,6 +389,18 @@ export default function UpdateDialog({
                   ))}
                 </div>
               )}
+              {status.hubRepo.status === 'missing' && (
+                <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
+                  <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
+                  <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                    Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
+                    {visibleUpdateRepoOwners.length > 0
+                      ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
+                      : ' Tiller cannot currently see any selected GitHub App repositories.'}
+                    {' '}Open Cloudflare Worker Settings &gt; Builds and compare the connected repo owner.
+                  </p>
+                </div>
+              )}
               {status.hubRepo.status !== 'detected' && (
                 <button
                   type="button"
@@ -410,63 +408,45 @@ export default function UpdateDialog({
                   disabled={isApplying}
                   className="mt-3 rounded border border-[#0969da] bg-white px-3 py-1.5 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
                 >
-                  Connect self-update repo
+                  Check GitHub repos
                 </button>
               )}
             </div>
 
             <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
-              <p className="text-sm font-semibold text-[#24292f]">Advanced Repair</p>
-              <p className="mt-1 text-xs text-[#57606a]">
-                Repair by redeploying with a temporary Cloudflare API token.
+              <p className="text-sm font-semibold text-[#24292f]">Update source</p>
+              <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                Tiller updates by committing the latest hub source into the deploy-button repo connected to Cloudflare Builds.
               </p>
-              <input
-                id="cf-api-token"
-                type="password"
-                value={apiToken}
-                onChange={(event) => setApiToken(event.target.value)}
-                placeholder="Paste Cloudflare token"
-                className="mt-3 w-full rounded-lg border border-[#d0d7de] bg-white px-3 py-2 text-sm text-[#24292f] outline-none transition-colors focus:border-[#0969da]"
-              />
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => void handleAdvancedRepair()}
-                  disabled={isApplying || !apiToken.trim()}
-                  className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
-                >
-                  Advanced Repair
-                </button>
-                <a
-                  href={CLOUDFLARE_TOKEN_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#f6f8fa]"
-                >
-                  Token settings
-                </a>
-              </div>
             </div>
           </div>
 
-          <div className="mt-5 rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
-            <p className="text-sm font-semibold text-[#24292f]">Progress</p>
-            <p className="mt-1 text-sm text-[#57606a]">{formatStage(stage)}</p>
-            {error && (
-              <p className="mt-3 rounded-lg border border-[#cf222e]/20 bg-[#ffebe9] px-3 py-2 text-sm text-[#cf222e]">
-                {error}
-              </p>
-            )}
-          </div>
+          {showProgress && (
+            <div className="mt-5 rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
+              <p className="text-sm font-semibold text-[#24292f]">Progress</p>
+              <p className="mt-1 text-sm text-[#57606a]">{formatStage(stage)}</p>
+              {error && (
+                <p className="mt-3 rounded-lg border border-[#cf222e]/20 bg-[#ffebe9] px-3 py-2 text-sm text-[#cf222e]">
+                  {error}
+                </p>
+              )}
+            </div>
+          )}
+
+          {error && !showProgress && (
+            <p className="mt-5 rounded-lg border border-[#cf222e]/20 bg-[#ffebe9] px-3 py-2 text-sm text-[#cf222e]">
+              {error}
+            </p>
+          )}
 
           <div className="mt-6 flex flex-wrap items-center gap-3">
             <button
               type="button"
-              onClick={() => void handleUpdateNow()}
-              disabled={isApplying || stage === 'complete' || status.updateMethod !== 'github_repo'}
+              onClick={() => void handleGitHubRepoUpdate()}
+              disabled={isApplying || stage === 'complete'}
               className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {isApplying ? 'Updating...' : 'Update Now'}
+              {isApplying ? 'Updating...' : 'Update'}
             </button>
             {stage === 'complete' && (
               <button

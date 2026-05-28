@@ -1,7 +1,7 @@
 import type { Env } from "../types";
 import { readHubUpdateRepoState, resolveHubUpdateRepoState } from "./hub-repo";
 import {
-  fetchPublicUpdateMetadata,
+  fetchLatestReleaseUpdateMetadata,
   getBuildDiagnostics,
   getCurrentUpdateMetadata,
   UPDATE_CACHE_TTL_SECONDS,
@@ -59,7 +59,7 @@ function issueForState(
   }
   return {
     code: "hub_repo_not_configured",
-    message: "Connect the generated deploy-button GitHub repository before updating normally.",
+    message: "No GitHub self-update repository is connected. Use Cloudflare update with a temporary API token, or install the Tiller GitHub App on the generated deploy-button repo if one exists.",
   };
 }
 
@@ -67,6 +67,7 @@ function buildUpdateCheckResult(
   currentUpdate: TillerUpdateMetadata,
   latestUpdate: TillerUpdateMetadata,
   hubRepo: HubUpdateRepoState,
+  releaseNotesUrl: string,
 ): UpdateCheckResult {
   const updateAvailable = currentUpdate.sourceId !== latestUpdate.sourceId;
   return {
@@ -77,7 +78,7 @@ function buildUpdateCheckResult(
     hubRepo,
     updateMethod: updateMethodForState(hubRepo),
     ...(issueForState(updateAvailable, hubRepo) ? { issue: issueForState(updateAvailable, hubRepo) } : {}),
-    releaseNotesUrl: `https://github.com/${latestUpdate.sourceRepo}`,
+    releaseNotesUrl,
   };
 }
 
@@ -108,8 +109,13 @@ export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
       };
     }
 
-    const latestUpdate = await fetchPublicUpdateMetadata();
-    const result = buildUpdateCheckResult(currentUpdate, latestUpdate, hubRepo);
+    const latestRelease = await fetchLatestReleaseUpdateMetadata();
+    const result = buildUpdateCheckResult(
+      currentUpdate,
+      latestRelease.update,
+      hubRepo,
+      latestRelease.releaseNotesUrl,
+    );
 
     await env.ENVS_KV.put(
       UPDATE_CHECK_CACHE_KEY,

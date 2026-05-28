@@ -37,6 +37,38 @@ function updateMarker(sourceId: string, version = "0.2.0") {
   };
 }
 
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function latestReleaseResponse(version = "0.2.0"): Response {
+  return jsonResponse({
+    tag_name: `tiller-hub-v${version}`,
+    html_url: `https://github.com/paperwing-dev/tiller-hub/releases/tag/tiller-hub-v${version}`,
+    assets: [],
+  });
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  return input instanceof Request ? input.url : String(input);
+}
+
+function mockLatestReleaseFetch(latestUpdate = updateMarker("latest-source")) {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = requestUrl(input);
+    if (url.endsWith("/repos/paperwing-dev/tiller-hub/releases/latest")) {
+      return latestReleaseResponse(latestUpdate.version);
+    }
+    if (url.endsWith(`/paperwing-dev/tiller-hub/tiller-hub-v${latestUpdate.version}/tiller-update.json`)) {
+      return jsonResponse(latestUpdate);
+    }
+    return jsonResponse({ message: "Not Found" }, 404);
+  });
+}
+
 const manifest: UpdateManifest = {
   version: "0.2.0",
   compatibility_date: "2025-01-29",
@@ -106,10 +138,7 @@ describe("checkForUpdate", () => {
   it("ignores cached results from an older deployed source id", async () => {
     vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
     vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(updateMarker("latest-source")), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    const fetchMock = mockLatestReleaseFetch(updateMarker("latest-source"));
     vi.stubGlobal("fetch", fetchMock);
 
     const env = {
@@ -126,9 +155,14 @@ describe("checkForUpdate", () => {
 
     const result = await checkForUpdate(env as never);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map((call) => requestUrl(call[0]))).toEqual([
+      "https://api.github.com/repos/paperwing-dev/tiller-hub/releases/latest",
+      "https://raw.githubusercontent.com/paperwing-dev/tiller-hub/tiller-hub-v0.2.0/tiller-update.json",
+    ]);
     expect(result.currentUpdate.sourceId).toBe("current-source");
     expect(result.latestUpdate.sourceId).toBe("latest-source");
+    expect(result.releaseNotesUrl).toBe("https://github.com/paperwing-dev/tiller-hub/releases/tag/tiller-hub-v0.2.0");
     expect(result.updateAvailable).toBe(true);
     expect(env.ENVS_KV.put).toHaveBeenCalledTimes(1);
   });
@@ -136,12 +170,9 @@ describe("checkForUpdate", () => {
   it("surfaces update metadata lookup failures as an advanced-repair issue", async () => {
     vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
     vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
       message: "Not Found",
-    }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    })));
+    }, 404)));
 
     const env = {
       ENVS_KV: {
@@ -171,7 +202,7 @@ describe("checkForUpdate", () => {
             workersCiCommitSha: null,
             workersCiBranch: null,
           },
-          hubRepo: { status: "missing", lastDetectedAt: "2026-05-27T00:00:00.000Z" },
+          hubRepo: { status: "missing", lastDetectedAt: "2026-05-27T00:00:00.000Z", visibleGitHubOwners: [] },
           updateMethod: "connect_hub_repo",
           issue: {
             code: "hub_repo_not_configured",

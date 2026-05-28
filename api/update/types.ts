@@ -57,6 +57,7 @@ export interface HubUpdateRepoDetected {
 export interface HubUpdateRepoMissing {
   status: "missing";
   lastDetectedAt: string | null;
+  visibleGitHubOwners: string[];
 }
 
 export interface HubUpdateRepoAmbiguous {

@@ -120,7 +120,50 @@ describe("resolveHubUpdateRepoState", () => {
     expect(result).toEqual({
       status: "missing",
       lastDetectedAt: "2026-05-28T00:00:00.000Z",
+      visibleGitHubOwners: [],
     });
     expect(listGitHubAppRepositories).not.toHaveBeenCalled();
+  });
+
+  it("returns visible GitHub owners when no deploy-button hub repo is found", async () => {
+    const { env, store } = createEnv();
+    listGitHubAppRepositories.mockResolvedValue({
+      repositories: [
+        {
+          installationId: 456,
+          repositoryId: 123,
+          fullName: "adam/regular-repo",
+          repoUrl: "https://github.com/adam/regular-repo",
+          private: true,
+          defaultBranch: "main",
+        },
+        {
+          installationId: 456,
+          repositoryId: 124,
+          fullName: "paperwing-dev/other-repo",
+          repoUrl: "https://github.com/paperwing-dev/other-repo",
+          private: true,
+          defaultBranch: "main",
+        },
+      ],
+      warnings: [],
+    });
+    mintGitHubInstallationToken.mockResolvedValue({
+      token: "installation-token",
+      expiresAt: "2026-05-29T00:00:00.000Z",
+      installationId: 456,
+      repository: "*",
+      permissions: { metadata: "read", contents: "write", pull_requests: "write" },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404 })));
+
+    const result = await resolveHubUpdateRepoState(env as never, { autoDetect: true });
+
+    expect(result).toEqual({
+      status: "missing",
+      lastDetectedAt: expect.any(String),
+      visibleGitHubOwners: ["adam", "paperwing-dev"],
+    });
+    expect(JSON.parse(store.HUB_UPDATE_REPO_VISIBLE_GITHUB_OWNERS)).toEqual(["adam", "paperwing-dev"]);
   });
 });

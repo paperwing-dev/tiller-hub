@@ -1,9 +1,11 @@
-import type { TillerUpdateMetadata } from "./types";
+import type { GitHubRelease, TillerUpdateMetadata } from "./types";
 
 export const PUBLIC_HUB_REPO = "paperwing-dev/tiller-hub";
 export const UPDATE_METADATA_PATH = "tiller-update.json";
-export const UPDATE_CHECK_CACHE_KEY = "tiller:update-check:v2";
+export const UPDATE_CHECK_CACHE_KEY = "tiller:update-check:v3";
 export const UPDATE_CACHE_TTL_SECONDS = 300;
+
+const LATEST_RELEASE_URL = `https://api.github.com/repos/${PUBLIC_HUB_REPO}/releases/latest`;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -73,8 +75,22 @@ export function getBuildDiagnostics() {
   };
 }
 
-export async function fetchPublicUpdateMetadata(): Promise<TillerUpdateMetadata> {
-  const response = await fetch(`https://raw.githubusercontent.com/${PUBLIC_HUB_REPO}/main/${UPDATE_METADATA_PATH}`, {
+function normalizeVersionTag(tagName: string): string {
+  return tagName.trim().replace(/^tiller-hub-v/i, "").replace(/^v/i, "");
+}
+
+function describeReleaseLookupFailure(status: number): string {
+  if (status === 404) {
+    return `Latest ${PUBLIC_HUB_REPO} release is not accessible. The repo may be private or may not have a published release yet.`;
+  }
+  if (status === 401 || status === 403) {
+    return `Latest ${PUBLIC_HUB_REPO} release lookup is not authorized by GitHub (${status}).`;
+  }
+  return `GitHub release lookup failed: ${status}`;
+}
+
+async function fetchPublicUpdateMetadataAtRef(ref: string): Promise<TillerUpdateMetadata> {
+  const response = await fetch(`https://raw.githubusercontent.com/${PUBLIC_HUB_REPO}/${encodeURIComponent(ref)}/${UPDATE_METADATA_PATH}`, {
     headers: {
       Accept: "application/json",
       "User-Agent": "tiller-hub",
@@ -88,6 +104,37 @@ export async function fetchPublicUpdateMetadata(): Promise<TillerUpdateMetadata>
     throw new Error("Latest deploy-button update metadata is invalid.");
   }
   return parsed;
+}
+
+export async function fetchLatestReleaseUpdateMetadata(): Promise<{
+  update: TillerUpdateMetadata;
+  releaseNotesUrl: string;
+}> {
+  const releaseResponse = await fetch(LATEST_RELEASE_URL, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "tiller-hub",
+    },
+  });
+  if (!releaseResponse.ok) {
+    throw new Error(describeReleaseLookupFailure(releaseResponse.status));
+  }
+
+  const release = await releaseResponse.json<GitHubRelease>();
+  const tagName = release.tag_name?.trim() ?? "";
+  if (!tagName) {
+    throw new Error("GitHub latest release is missing a valid tag name.");
+  }
+
+  const update = await fetchPublicUpdateMetadataAtRef(tagName);
+  if (normalizeVersionTag(update.version) !== normalizeVersionTag(tagName)) {
+    throw new Error(`${UPDATE_METADATA_PATH} version ${update.version} does not match release tag ${tagName}.`);
+  }
+
+  return {
+    update,
+    releaseNotesUrl: release.html_url || `https://github.com/${PUBLIC_HUB_REPO}/releases/tag/${encodeURIComponent(tagName)}`,
+  };
 }
 
 export function findRemovedManagedFiles(current: TillerUpdateMetadata, latest: TillerUpdateMetadata): string[] {
