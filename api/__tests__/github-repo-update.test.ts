@@ -42,6 +42,14 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function latestReleaseResponse(version = "0.2.0"): Response {
+  return jsonResponse({
+    tag_name: `tiller-hub-v${version}`,
+    html_url: `https://github.com/paperwing-dev/tiller-hub/releases/tag/tiller-hub-v${version}`,
+    assets: [],
+  });
+}
+
 function blobResponse(text: string): Response {
   return jsonResponse({
     content: Buffer.from(text, "utf8").toString("base64"),
@@ -104,8 +112,11 @@ describe("applyGitHubRepoUpdate", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
 
-      if (method === "GET" && url.endsWith("/repos/paperwing-dev/tiller-hub/git/ref/heads/main")) {
-        return jsonResponse({ object: { sha: "public-head" } });
+      if (method === "GET" && url.endsWith("/repos/paperwing-dev/tiller-hub/releases/latest")) {
+        return latestReleaseResponse("0.2.0");
+      }
+      if (method === "GET" && url.endsWith("/repos/paperwing-dev/tiller-hub/git/ref/tags/tiller-hub-v0.2.0")) {
+        return jsonResponse({ object: { sha: "public-head", type: "commit" } });
       }
       if (method === "GET" && url.endsWith("/repos/paperwing-dev/tiller-hub/git/commits/public-head")) {
         return jsonResponse({ tree: { sha: "public-tree" } });
@@ -128,7 +139,7 @@ describe("applyGitHubRepoUpdate", () => {
         return blobResponse('{"name":"hub"}');
       }
       if (method === "GET" && url.endsWith("/repos/me/hub/git/ref/heads/main")) {
-        return jsonResponse({ object: { sha: "target-head" } });
+        return jsonResponse({ object: { sha: "target-head", type: "commit" } });
       }
       if (method === "GET" && url.endsWith("/repos/me/hub/git/commits/target-head")) {
         return jsonResponse({ tree: { sha: "target-tree" } });
@@ -177,6 +188,14 @@ describe("applyGitHubRepoUpdate", () => {
       expect.stringContaining("/repos/me/hub/git/trees"),
       expect.objectContaining({ method: "POST" }),
     );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.github.com/repos/paperwing-dev/tiller-hub/git/ref/tags/tiller-hub-v0.2.0",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "https://api.github.com/repos/paperwing-dev/tiller-hub/git/ref/heads/main",
+      expect.anything(),
+    );
     expect(mocks.clearUpdateCheckCache).toHaveBeenCalledTimes(1);
   });
 
@@ -188,6 +207,6 @@ describe("applyGitHubRepoUpdate", () => {
 
     expect(result.ok).toBe(false);
     expect(result.status).toBe("advanced_repair_required");
-    expect(result.error).toContain("temporarily unavailable");
+    expect(result.error).toContain("GitHub release lookup failed: 503");
   });
 });

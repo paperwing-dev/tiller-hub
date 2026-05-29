@@ -43,4 +43,13 @@ describe("EnvWaitingView", () => {
     expect(markup).toContain("Workspace saved. Waiting for the container to stop");
     expect(markup).not.toContain("Container is stopped");
   });
+
+  it("does not render duplicate Stop or Delete controls in the detail header", () => {
+    const markup = renderToStaticMarkup(
+      <EnvWaitingView env={makeEnv({ status: "running" })} hubUrl="https://hub.test" />,
+    );
+
+    expect(markup).not.toContain(">Stop<");
+    expect(markup).not.toContain(">Delete<");
+  });
 });

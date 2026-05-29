@@ -118,7 +118,7 @@ describe("resolveContainerAuth", () => {
     expect(result.envVars).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token" });
   });
 
-  it("uses api key in auto mode with a clear warning", async () => {
+  it("uses api key in auto mode without adding an auth warning", async () => {
     const result = await resolveContainerAuth(
       mockEnv({ ANTHROPIC_API_KEY: "api-key" }),
     );
@@ -126,7 +126,40 @@ describe("resolveContainerAuth", () => {
     expect(result.authMode).toBe("auto");
     expect(result.resolvedAuthMode).toBe("api");
     expect(result.envVars).toEqual({ ANTHROPIC_API_KEY: "api-key" });
-    expect(result.authWarning).toContain("Anthropic API key");
+    expect(result.authWarning).toBeUndefined();
+  });
+
+  it("falls back to the API key for host-backed Claude Code envs when no subscription token is available", async () => {
+    const result = await resolveContainerAuth(
+      mockEnv({ ANTHROPIC_API_KEY: "api-key" }),
+      { backend: "host" },
+    );
+
+    expect(result.authMode).toBe("auto");
+    expect(result.resolvedAuthMode).toBe("api");
+    expect(result.envVars).toEqual({ ANTHROPIC_API_KEY: "api-key" });
+  });
+
+  it("allows explicit API auth for host-backed Claude Code envs", async () => {
+    const result = await resolveContainerAuth(
+      mockEnv({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token", ANTHROPIC_API_KEY: "api-key" }),
+      { backend: "host", requested: "api" },
+    );
+
+    expect(result.authMode).toBe("api");
+    expect(result.resolvedAuthMode).toBe("api");
+    expect(result.envVars).toEqual({ ANTHROPIC_API_KEY: "api-key" });
+  });
+
+  it("prefers subscription auth for host-backed Claude Code auto mode", async () => {
+    const result = await resolveContainerAuth(
+      mockEnv({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token", ANTHROPIC_API_KEY: "api-key" }),
+      { backend: "host" },
+    );
+
+    expect(result.authMode).toBe("auto");
+    expect(result.resolvedAuthMode).toBe("subscription");
+    expect(result.envVars).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token" });
   });
 
   it("requires oauth token in subscription mode", async () => {
@@ -201,6 +234,12 @@ describe("resolveContainerAuth", () => {
       "No auth configured",
     );
   });
+
+  it("tells host-backed Claude Code users they need subscription auth or an API key", async () => {
+    await expect(resolveContainerAuth(mockEnv({}), { backend: "host" })).rejects.toThrow(
+      "requires either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY",
+    );
+  });
 });
 
 describe("resolveCodexContainerAuth", () => {
@@ -229,7 +268,7 @@ describe("resolveCodexContainerAuth", () => {
   });
 
   it("requires OPENAI_API_KEY for Cloudflare containers", async () => {
-    await expect(resolveCodexContainerAuth(mockEnv({}))).rejects.toThrow("API key");
+    await expect(resolveCodexContainerAuth(mockEnv({}), { backend: "cf" })).rejects.toThrow("OPENAI_API_KEY");
   });
 
   it("returns host gateway env vars when a host route is available", async () => {
@@ -261,7 +300,21 @@ describe("resolveCodexContainerAuth", () => {
       resolveCodexContainerAuth(mockEnv({}), {
         backend: "host",
       }),
-    ).rejects.toThrow("connected Subscription Gateway");
+    ).rejects.toThrow("requires a connected Subscription Gateway or OPENAI_API_KEY");
+  });
+
+  it("allows explicit API key auth for host-backed Codex envs", async () => {
+    await expect(
+      resolveCodexContainerAuth(mockEnv({ OPENAI_API_KEY: "openai-key" }), {
+        backend: "host",
+        authPreference: "api-key",
+      }),
+    ).resolves.toEqual({
+      authPreference: "api-key",
+      resolvedAuthMode: "api-key",
+      modelRoute: "api-fallback",
+      envVars: { OPENAI_API_KEY: "openai-key" },
+    });
   });
 
   it("returns OPENAI_API_KEY when configured", async () => {
@@ -269,7 +322,6 @@ describe("resolveCodexContainerAuth", () => {
       authPreference: "auto",
       resolvedAuthMode: "api-key",
       modelRoute: "api-fallback",
-      authWarning: "Subscription gateway route is unavailable; using the API key.",
       envVars: { OPENAI_API_KEY: "openai-key" },
     });
   });
@@ -323,7 +375,6 @@ describe("resolveCodexContainerAuth", () => {
       authPreference: "auto",
       resolvedAuthMode: "api-key",
       modelRoute: "api-fallback",
-      authWarning: "Subscription auth needs reconnect; using the API key.",
       envVars: { OPENAI_API_KEY: "openai-key" },
     });
   });

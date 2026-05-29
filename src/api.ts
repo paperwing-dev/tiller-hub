@@ -1411,6 +1411,7 @@ export interface GitHubRepositoryWarning {
 export interface GitHubRepositoriesResponse {
   repositories: GitHubRepositorySelection[];
   warnings: GitHubRepositoryWarning[];
+  repositorySelection: "all" | "selected" | "unknown";
 }
 
 function normalizeGitHubRepositorySelection(payload: unknown): GitHubRepositorySelection | null {
@@ -1468,6 +1469,9 @@ export async function fetchGitHubRepositories(hubUrl: string): Promise<GitHubRep
     warnings: normalizeArrayResponse<unknown>(body.warnings)
       .map(normalizeGitHubRepositoryWarning)
       .filter(isPresent),
+    repositorySelection: body.repositorySelection === "all" || body.repositorySelection === "selected"
+      ? body.repositorySelection
+      : "unknown",
   };
 }
 

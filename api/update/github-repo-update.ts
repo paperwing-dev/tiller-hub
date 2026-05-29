@@ -4,6 +4,7 @@ import { mintGitHubInstallationToken } from "../github/app";
 import { clearUpdateCheckCache } from "./check-release";
 import { fetchRepoUpdateMetadata, readHubUpdateRepoState } from "./hub-repo";
 import {
+  fetchLatestPublicHubReleaseRef,
   findRemovedManagedFiles,
   getBuildChannel,
   getCurrentUpdateMetadata,
@@ -21,6 +22,13 @@ interface GitHubApiResponse<T> {
 }
 
 interface GitRefResponse {
+  object?: {
+    sha?: string;
+    type?: string;
+  };
+}
+
+interface GitTagResponse {
   object?: {
     sha?: string;
     type?: string;
@@ -116,15 +124,47 @@ function fromBase64(value: string): Uint8Array {
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
-async function getBranchHead(token: string | null, owner: string, repo: string, branch: string): Promise<string> {
+async function getGitRefCommit(
+  token: string | null,
+  owner: string,
+  repo: string,
+  namespace: "heads" | "tags",
+  name: string,
+): Promise<string> {
   const response = await githubApi<GitRefResponse>(
     token,
-    `/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`,
+    `/repos/${owner}/${repo}/git/ref/${namespace}/${encodeURIComponent(name)}`,
   );
-  if (response.status !== 200 || !response.body?.object?.sha) {
-    throw new Error(readGitHubMessage(response.body, `Failed to read branch ${branch}: HTTP ${response.status}`));
+  if (response.status !== 200 || !response.body?.object?.sha || !response.body.object.type) {
+    throw new Error(readGitHubMessage(response.body, `Failed to read ${namespace}/${name}: HTTP ${response.status}`));
   }
-  return response.body.object.sha;
+
+  let objectSha = response.body.object.sha;
+  let objectType = response.body.object.type;
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (objectType === "commit") return objectSha;
+    if (objectType !== "tag") break;
+
+    const tagResponse = await githubApi<GitTagResponse>(
+      token,
+      `/repos/${owner}/${repo}/git/tags/${objectSha}`,
+    );
+    if (tagResponse.status !== 200 || !tagResponse.body?.object?.sha || !tagResponse.body.object.type) {
+      throw new Error(readGitHubMessage(tagResponse.body, `Failed to read tag object ${objectSha}: HTTP ${tagResponse.status}`));
+    }
+    objectSha = tagResponse.body.object.sha;
+    objectType = tagResponse.body.object.type;
+  }
+
+  throw new Error(`GitHub ref ${namespace}/${name} does not resolve to a commit.`);
+}
+
+async function getBranchHead(token: string | null, owner: string, repo: string, branch: string): Promise<string> {
+  return getGitRefCommit(token, owner, repo, "heads", branch);
+}
+
+async function getTagHead(token: string | null, owner: string, repo: string, tagName: string): Promise<string> {
+  return getGitRefCommit(token, owner, repo, "tags", tagName);
 }
 
 async function getCommitTree(token: string | null, owner: string, repo: string, commitSha: string): Promise<string> {
@@ -304,12 +344,13 @@ interface PublicSourceSnapshot {
 }
 
 async function readPublicSourceSnapshot(): Promise<PublicSourceSnapshot> {
-  const commitSha = await getBranchHead(null, PUBLIC_HUB_OWNER, PUBLIC_HUB_NAME, "main");
+  const latestRelease = await fetchLatestPublicHubReleaseRef();
+  const commitSha = await getTagHead(null, PUBLIC_HUB_OWNER, PUBLIC_HUB_NAME, latestRelease.tagName);
   const treeSha = await getCommitTree(null, PUBLIC_HUB_OWNER, PUBLIC_HUB_NAME, commitSha);
   const files = await getRecursiveTree(null, PUBLIC_HUB_OWNER, PUBLIC_HUB_NAME, treeSha);
   const metadataSha = files.get(UPDATE_METADATA_PATH);
   if (!metadataSha) {
-    throw new Error(`Public hub source ${commitSha} is missing ${UPDATE_METADATA_PATH}.`);
+    throw new Error(`Public hub release ${latestRelease.tagName} is missing ${UPDATE_METADATA_PATH}.`);
   }
 
   const metadataText = new TextDecoder().decode(
@@ -317,11 +358,14 @@ async function readPublicSourceSnapshot(): Promise<PublicSourceSnapshot> {
   );
   const latestUpdate = parseTillerUpdateMetadata(JSON.parse(metadataText) as unknown);
   if (!latestUpdate) {
-    throw new Error(`Public hub source ${commitSha} has invalid ${UPDATE_METADATA_PATH}.`);
+    throw new Error(`Public hub release ${latestRelease.tagName} has invalid ${UPDATE_METADATA_PATH}.`);
+  }
+  if (formatUpdateVersion(latestUpdate.version) !== formatUpdateVersion(latestRelease.tagName)) {
+    throw new Error(`${UPDATE_METADATA_PATH} version ${latestUpdate.version} does not match release tag ${latestRelease.tagName}.`);
   }
   for (const managedPath of latestUpdate.managedFiles) {
     if (!files.has(managedPath)) {
-      throw new Error(`Public hub source ${commitSha} is missing managed file ${managedPath}.`);
+      throw new Error(`Public hub release ${latestRelease.tagName} is missing managed file ${managedPath}.`);
     }
   }
 

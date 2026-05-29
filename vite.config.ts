@@ -4,6 +4,7 @@ import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { cloudflare } from "@cloudflare/vite-plugin";
+import { resolveBuildChannel } from "./scripts/build-channel.mjs";
 
 const require = createRequire(import.meta.url);
 const packageRoot = path.resolve(import.meta.dirname);
@@ -36,10 +37,6 @@ function readUpdateMetadata(): unknown {
         }
       : {}),
   };
-}
-
-function resolveBuildChannel(): "development" | "release" {
-  return process.env.TILLER_BUILD_CHANNEL?.trim() === "development" ? "development" : "release";
 }
 
 export default defineConfig(({ command }) => ({

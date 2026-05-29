@@ -133,6 +133,27 @@ describe("UpdateDialog", () => {
     expect(html).not.toContain("Ready to apply the latest release.");
   });
 
+  it("combines the update source and repository setup", () => {
+    const html = renderToString(
+      <UpdateDialog
+        hubUrl="https://example.workers.dev"
+        status={makeUpdateStatus()}
+        issue={null}
+        isChecking={false}
+        onDismiss={vi.fn()}
+        onOpenSettings={vi.fn()}
+        onRetryCheck={vi.fn()}
+        onUpdated={vi.fn()}
+      />,
+    );
+
+    expect(html).toContain("Update source");
+    expect(html).toContain("Repository");
+    expect(html).toContain("Tiller updates by committing the latest hub source");
+    expect(html).toContain("adam/tiller-hub · main");
+    expect(html).not.toContain("Self-update repository");
+  });
+
   it("clarifies same-version source updates", () => {
     const status = makeUpdateStatus({
       currentUpdate: {

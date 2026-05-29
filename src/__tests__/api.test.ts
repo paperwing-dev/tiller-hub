@@ -307,12 +307,14 @@ describe("list-style api helpers", () => {
           defaultBranch: "main",
         }],
         warnings: [],
+        repositorySelection: "all",
       }), { status: 200 }),
     );
 
     await expect(fetchGitHubRepositories("https://example.com")).resolves.toEqual({
       repositories: [expect.objectContaining({ repositoryId: 42, fullName: "test/repo" })],
       warnings: [],
+      repositorySelection: "all",
     });
   });
 });

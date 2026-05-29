@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { MutableRefObject } from "react";
 import type { StoredSession, StoredPermission, EnvMeta } from "../api/types";
-import { stopEnv, type LiveMessage, type ReconnectingWebSocket } from "./api";
+import type { LiveMessage, ReconnectingWebSocket } from "./api";
 import type { TerminalViewHandle } from "./TerminalView";
 import TerminalView from "./TerminalView";
 import PermissionBanner from "./PermissionBanner";
@@ -9,23 +9,29 @@ import StatusBar from "./StatusBar";
 import VoiceAgent from "./VoiceAgent";
 import { useVoiceAgent } from "@cloudflare/voice/react";
 import type { UseVoiceAgentReturn } from "@cloudflare/voice/react";
-import { getEnvAuthBadge, getEnvModelBadge, getLeadHarnessBadge, getHarnessBadgeClass, getHarnessBadgeLabel } from "./env-harness";
+import { getEnvAuthBadge, getHarnessBadgeClass, getHarnessBadgeLabel } from "./env-harness";
+import { getBackendBadgeLabel, getEnvDisplayName } from "./env-display";
 import { canStopEnvStatus } from "./env-runtime";
+
+const SHOW_LEGACY_COMPOSER = false;
 
 interface SessionViewProps {
   session: StoredSession;
-  env?: Pick<
-    EnvMeta,
-    | "slug"
-    | "status"
-    | "harness"
-    | "resolvedAuthMode"
-    | "authMode"
-    | "codexAuthMode"
-    | "opencodeProvider"
-    | "opencodeModel"
-    | "leadHarnessStatus"
-  > | null;
+  env?: (
+    Pick<
+      EnvMeta,
+      | "slug"
+      | "status"
+      | "harness"
+      | "resolvedAuthMode"
+      | "authMode"
+      | "codexAuthMode"
+      | "opencodeProvider"
+      | "opencodeModel"
+      | "leadHarnessStatus"
+    > &
+    Partial<Pick<EnvMeta, "backend" | "startupPlanId">>
+  ) | null;
   hubUrl: string;
   onWsMessage: MutableRefObject<((msg: LiveMessage) => void) | null>;
   wsSend: MutableRefObject<ReconnectingWebSocket | null>;
@@ -46,7 +52,6 @@ export default function SessionView({
   updateLastSeq,
   permissions = [],
   onPermissionResolved,
-  onRecoverEnv,
 }: SessionViewProps) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -75,7 +80,6 @@ export default function SessionView({
   const [debugCopyState, setDebugCopyState] = useState<
     "idle" | "copied" | "failed"
   >("idle");
-  const [envActionBusy, setEnvActionBusy] = useState(false);
 
   // Voice call state — tracks whether user has started a call
   const [voiceActive, setVoiceActive] = useState(false);
@@ -322,9 +326,10 @@ export default function SessionView({
     if (connected) setSendError(null);
   }, [connected]);
 
-  // Focus the message input when switching into a session so the user can type
-  // immediately. Terminal still takes focus on mousedown for raw-key input.
+  // Legacy composer is preserved for now, but hidden while the terminal is the
+  // primary interaction surface.
   useEffect(() => {
+    if (!SHOW_LEGACY_COMPOSER) return;
     textareaRef.current?.focus();
   }, [session.id]);
 
@@ -504,13 +509,9 @@ export default function SessionView({
   const pendingPermissions = permissions.filter((p) => p.status === "pending");
   const harness = env?.harness ?? null;
   const authBadge = env ? getEnvAuthBadge(env) : null;
-  const modelBadge = env ? getEnvModelBadge(env) : null;
-  const harnessBadge = env ? getLeadHarnessBadge(env) : null;
-  const envStatus = env?.status ?? "unknown";
-  const envCanStop =
-    !!env?.slug &&
-    canStopEnvStatus(envStatus);
-
+  const displayName = env
+    ? getEnvDisplayName({ startupPlanId: env.startupPlanId ?? null })
+    : session.tag;
   // Slash command palette
   const showPalette = input.startsWith("/") && !input.includes(" ");
   const paletteFilter = input.slice(1).toLowerCase();
@@ -521,20 +522,6 @@ export default function SessionView({
     );
   }, [meta?.slashCommands, showPalette, paletteFilter]);
   const clampedIndex = Math.min(paletteIndex, Math.max(filteredCommands.length - 1, 0));
-
-  const handleStopEnv = useCallback(async () => {
-    if (!env?.slug || envActionBusy) return;
-    setEnvActionBusy(true);
-    try {
-      const res = await stopEnv(hubUrl, env.slug);
-      onRecoverEnv?.(env.slug, res.status);
-    } catch (err) {
-      console.error("[tiller] env stop failed:", err);
-      alert(err instanceof Error ? err.message : "Failed to stop environment.");
-    } finally {
-      setEnvActionBusy(false);
-    }
-  }, [env, envActionBusy, hubUrl, onRecoverEnv]);
 
   return (
     <>
@@ -547,8 +534,13 @@ export default function SessionView({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-semibold text-[#24292f]">
-                {session.tag}
+                {displayName}
               </h2>
+              {env?.backend && (
+                <span className="rounded border border-[#d0d7de] bg-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a]">
+                  {getBackendBadgeLabel(env.backend)}
+                </span>
+              )}
               {harness && (
                 <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getHarnessBadgeClass(harness)}`}>
                   {getHarnessBadgeLabel(harness)}
@@ -557,16 +549,6 @@ export default function SessionView({
               {authBadge && (
                 <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${authBadge.className}`}>
                   {authBadge.label}
-                </span>
-              )}
-              {modelBadge && (
-                <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${modelBadge.className}`}>
-                  {modelBadge.label}
-                </span>
-              )}
-              {harnessBadge && (
-                <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${harnessBadge.className}`}>
-                  {harnessBadge.label}
                 </span>
               )}
             </div>
@@ -579,15 +561,6 @@ export default function SessionView({
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {envCanStop && (
-            <button
-              onClick={handleStopEnv}
-              disabled={envActionBusy}
-              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors disabled:opacity-40"
-            >
-              Stop
-            </button>
-          )}
           {!VOICE_DISABLED && !voiceActive && (
             <button
               onClick={handleStartVoice}
@@ -662,93 +635,95 @@ export default function SessionView({
       />
 
       {/* Input */}
-      <div className="p-3 border-t border-[#d0d7de] bg-[#f6f8fa] relative">
-        {showPalette && filteredCommands.length > 0 && (
-          <div className="absolute bottom-full left-3 right-3 mb-1 bg-white border border-[#d0d7de] rounded-lg shadow-lg max-h-52 overflow-y-auto z-10">
-            {filteredCommands.map((cmd, i) => (
-              <button
-                key={cmd.name}
-                onClick={() => selectPaletteCommand(cmd.name)}
-                onMouseEnter={() => setPaletteIndex(i)}
-                className={`w-full text-left px-3 py-2 text-sm flex items-baseline gap-2 ${
-                  i === clampedIndex
-                    ? "bg-[#0969da] text-white"
-                    : "text-[#24292f] hover:bg-[#f6f8fa]"
-                }`}
-              >
-                <span className="font-mono font-medium">/{cmd.name}</span>
-                {cmd.description && (
-                  <span
-                    className={`text-xs truncate ${
-                      i === clampedIndex ? "text-white/70" : "text-[#57606a]"
-                    }`}
-                  >
-                    {cmd.description}
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
-        )}
-        {sendError && <p className="text-red-600 text-xs mb-2">{sendError}</p>}
-        <div className="flex gap-2">
-          <textarea
-            ref={textareaRef}
-            value={input}
-            onChange={handleTextareaChange}
-            onKeyDown={handleKeyDown}
-            placeholder={
-              !connected
-                ? "Reconnecting..."
-                : active
-                  ? "Type a message\u2026 (Shift+Enter for newline)"
-                  : "Session inactive"
-            }
-            disabled={!active || sending || !connected}
-            rows={1}
-            className="flex-1 bg-white border border-[#d0d7de] rounded px-3 py-2 text-sm text-[#24292f] placeholder:text-[#6e7781] overflow-hidden disabled:opacity-50 focus:outline-none focus:border-[#0969da] focus:ring-1 focus:ring-[#0969da]/30 transition-colors max-h-40"
-          />
-          {active && connected && (
-            <>
-              <button
-                onClick={() => sendRawKey("\x1b[A")}
-                className="rounded px-2 py-2 text-sm font-medium border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
-                title="Up arrow"
-              >
-                &#x25B2;
-              </button>
-              <button
-                onClick={() => sendRawKey("\x1b[B")}
-                className="rounded px-2 py-2 text-sm font-medium border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
-                title="Down arrow"
-              >
-                &#x25BC;
-              </button>
-              <button
-                onClick={() => sendRawKey("\r")}
-                className="rounded px-3 py-2 text-sm font-medium border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
-                title="Send Enter keystroke"
-              >
-                Enter &#x23CE;
-              </button>
-              <button
-                onClick={handleAbort}
-                className="bg-red-600 hover:bg-red-700 rounded px-3 py-2 text-sm font-medium text-white transition-colors"
-                title="Send Ctrl+C to abort"
-              >
-                Abort
-              </button>
-            </>
+      {SHOW_LEGACY_COMPOSER && (
+        <div className="p-3 border-t border-[#d0d7de] bg-[#f6f8fa] relative">
+          {showPalette && filteredCommands.length > 0 && (
+            <div className="absolute bottom-full left-3 right-3 mb-1 bg-white border border-[#d0d7de] rounded-lg shadow-lg max-h-52 overflow-y-auto z-10">
+              {filteredCommands.map((cmd, i) => (
+                <button
+                  key={cmd.name}
+                  onClick={() => selectPaletteCommand(cmd.name)}
+                  onMouseEnter={() => setPaletteIndex(i)}
+                  className={`w-full text-left px-3 py-2 text-sm flex items-baseline gap-2 ${
+                    i === clampedIndex
+                      ? "bg-[#0969da] text-white"
+                      : "text-[#24292f] hover:bg-[#f6f8fa]"
+                  }`}
+                >
+                  <span className="font-mono font-medium">/{cmd.name}</span>
+                  {cmd.description && (
+                    <span
+                      className={`text-xs truncate ${
+                        i === clampedIndex ? "text-white/70" : "text-[#57606a]"
+                      }`}
+                    >
+                      {cmd.description}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
           )}
-          <button
-            onClick={handleSend}
-            disabled={!active || sending || !input.trim() || !connected}
-            className="bg-[#0969da] hover:bg-[#0a5bc4] rounded px-4 py-2 text-sm font-medium text-white disabled:opacity-40 transition-colors"
-          >
-            Send
-          </button>
+          {sendError && <p className="text-red-600 text-xs mb-2">{sendError}</p>}
+          <div className="flex gap-2">
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={handleTextareaChange}
+              onKeyDown={handleKeyDown}
+              placeholder={
+                !connected
+                  ? "Reconnecting..."
+                  : active
+                    ? "Type a message\u2026 (Shift+Enter for newline)"
+                    : "Session inactive"
+              }
+              disabled={!active || sending || !connected}
+              rows={1}
+              className="flex-1 bg-white border border-[#d0d7de] rounded px-3 py-2 text-sm text-[#24292f] placeholder:text-[#6e7781] overflow-hidden disabled:opacity-50 focus:outline-none focus:border-[#0969da] focus:ring-1 focus:ring-[#0969da]/30 transition-colors max-h-40"
+            />
+            {active && connected && (
+              <>
+                <button
+                  onClick={() => sendRawKey("\x1b[A")}
+                  className="rounded px-2 py-2 text-sm font-medium border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
+                  title="Up arrow"
+                >
+                  &#x25B2;
+                </button>
+                <button
+                  onClick={() => sendRawKey("\x1b[B")}
+                  className="rounded px-2 py-2 text-sm font-medium border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
+                  title="Down arrow"
+                >
+                  &#x25BC;
+                </button>
+                <button
+                  onClick={() => sendRawKey("\r")}
+                  className="rounded px-3 py-2 text-sm font-medium border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
+                  title="Send Enter keystroke"
+                >
+                  Enter &#x23CE;
+                </button>
+                <button
+                  onClick={handleAbort}
+                  className="bg-red-600 hover:bg-red-700 rounded px-3 py-2 text-sm font-medium text-white transition-colors"
+                  title="Send Ctrl+C to abort"
+                >
+                  Abort
+                </button>
+              </>
+            )}
+            <button
+              onClick={handleSend}
+              disabled={!active || sending || !input.trim() || !connected}
+              className="bg-[#0969da] hover:bg-[#0a5bc4] rounded px-4 py-2 text-sm font-medium text-white disabled:opacity-40 transition-colors"
+            >
+              Send
+            </button>
+          </div>
         </div>
-      </div>
+      )}
     </>
   );
 }

@@ -164,6 +164,7 @@ describe("GitHub App routes", () => {
         return new Response(JSON.stringify([
           {
             id: 111,
+            repository_selection: "all",
             permissions: { contents: "write", metadata: "read", pull_requests: "write" },
           },
         ]), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -205,6 +206,7 @@ describe("GitHub App routes", () => {
         },
       ],
       warnings: [],
+      repositorySelection: "all",
     });
   });
 

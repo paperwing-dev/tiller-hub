@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { fetchHostStatus, type HostStatus } from './api';
 
 interface ConnectionsBadgeProps {
   hubUrl: string;
   hubConnected: boolean;
   hostRefreshNonce: number;
+  showHost: boolean;
 }
 
 function formatRelative(iso: string, now: number): string {
@@ -30,14 +31,12 @@ function truncateMid(value: string, max = 16): string {
 
 function describeHostStatus(hostStatus: HostStatus | null, hostError: string | null): {
   title: string;
-  label: string;
   detail: string;
   dotClassName: string;
 } {
   if (hostError) {
     return {
       title: 'Host: status unavailable',
-      label: 'Unavailable',
       detail: 'Could not fetch host status from the hub.',
       dotClassName: 'bg-[#d0d7de]',
     };
@@ -47,28 +46,24 @@ function describeHostStatus(hostStatus: HostStatus | null, hostError: string | n
     case 'registered-offline':
       return {
         title: 'Host: registered, offline',
-        label: 'Registered, offline',
         detail: 'The hub still has a registered host, but the live connection is offline.',
         dotClassName: 'bg-red-500',
       };
     case 'connected-no-gateway':
       return {
         title: 'Host: connected, gateway not configured',
-        label: 'Connected, no gateway',
         detail: 'The host is connected, but it has not published a browser gateway.',
         dotClassName: 'bg-[#d4a72c]',
       };
     case 'gateway-unavailable':
       return {
         title: 'Host: connected, gateway unavailable',
-        label: 'Gateway unavailable',
         detail: 'The host is connected and has gateway config, but the live gateway is not available.',
         dotClassName: 'bg-[#d4a72c]',
       };
     case 'gateway-available':
       return {
         title: 'Host: connected, gateway available',
-        label: 'Gateway available',
         detail: 'The host is connected and the published gateway is available.',
         dotClassName: 'bg-green-500',
       };
@@ -76,7 +71,6 @@ function describeHostStatus(hostStatus: HostStatus | null, hostError: string | n
     default:
       return {
         title: 'Host: not registered',
-        label: 'Not registered',
         detail: 'No host machine has registered with this hub.',
         dotClassName: 'bg-[#d0d7de]',
       };
@@ -87,6 +81,7 @@ export default function ConnectionsBadge({
   hubUrl,
   hubConnected,
   hostRefreshNonce,
+  showHost,
 }: ConnectionsBadgeProps) {
   const [open, setOpen] = useState(false);
   const [hostStatus, setHostStatus] = useState<HostStatus | null>(null);
@@ -95,6 +90,11 @@ export default function ConnectionsBadge({
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    if (!showHost) {
+      setHostStatus(null);
+      setHostError(null);
+      return undefined;
+    }
     let cancelled = false;
     fetchHostStatus(hubUrl)
       .then((status) => {
@@ -109,7 +109,7 @@ export default function ConnectionsBadge({
     return () => {
       cancelled = true;
     };
-  }, [hubUrl, hostRefreshNonce]);
+  }, [hubUrl, hostRefreshNonce, showHost]);
 
   useEffect(() => {
     if (!open) return;
@@ -136,13 +136,13 @@ export default function ConnectionsBadge({
   }, [open]);
 
   const hostState = describeHostStatus(hostStatus, hostError);
-  const machine = hostStatus?.machine ?? null;
 
   const title = useMemo(() => {
     const hubText = hubConnected ? 'Hub: connected' : 'Hub: offline';
+    if (!showHost) return hubText;
     const hostText = hostState.title;
     return `${hubText} · ${hostText}`;
-  }, [hubConnected, hostState.title]);
+  }, [hubConnected, hostState.title, showHost]);
 
   return (
     <div ref={rootRef} className="relative inline-flex items-center">
@@ -159,12 +159,14 @@ export default function ConnectionsBadge({
           />
           <span>Hub</span>
         </span>
-        <span className="inline-flex items-center gap-1">
-          <span
-            className={`inline-block h-2 w-2 rounded-full ${hostState.dotClassName}`}
-          />
-          <span>Host</span>
-        </span>
+        {showHost && (
+          <span className="inline-flex items-center gap-1">
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${hostState.dotClassName}`}
+            />
+            <span>Host</span>
+          </span>
+        )}
       </button>
 
       {open && (
@@ -181,99 +183,79 @@ export default function ConnectionsBadge({
             </div>
           </div>
 
-          <div className="px-3 py-2">
-            <div className="flex items-center gap-2">
-              <span
-                className={`inline-block h-2 w-2 rounded-full ${hostState.dotClassName}`}
-              />
-              <span className="text-xs font-semibold text-[#24292f]">Host</span>
-              <span className="ml-auto text-[11px] text-[#57606a]">
-                {hostState.label}
-              </span>
-            </div>
-            <p className="mt-1 text-[11px] text-[#57606a]">
-              {hostState.detail}
-            </p>
-
-            {machine && (
-              <dl className="mt-2 space-y-1 text-[11px]">
-                <div className="flex items-center gap-2">
-                  <dt className="w-20 text-[#57606a]">Machine</dt>
-                  <dd
-                    className="flex-1 font-mono text-[#24292f] truncate"
-                    title={machine.machineId}
-                  >
-                    {truncateMid(machine.machineId, 20)}
-                  </dd>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void navigator.clipboard?.writeText(machine.machineId);
-                    }}
-                    className="text-[#57606a] hover:text-[#24292f]"
-                    title="Copy machine id"
-                  >
-                    ⧉
-                  </button>
-                </div>
-                <div className="flex items-center gap-2">
-                  <dt className="w-20 text-[#57606a]">Since</dt>
-                  <dd className="flex-1 text-[#24292f]" title={machine.connectedAt}>
-                    {formatRelative(machine.connectedAt, now)}
-                  </dd>
-                </div>
-                {machine.gatewayUrl && (
-                  <div className="flex items-center gap-2">
-                    <dt className="w-20 text-[#57606a]">Gateway</dt>
-                    <dd className="flex-1 truncate">
-                      <a
-                        href={machine.gatewayUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-[#0969da] hover:underline"
-                      >
-                        {machine.gatewayUrl}
-                      </a>
-                    </dd>
-                  </div>
-                )}
-                {!machine.gatewayUrl && (
-                  <div className="flex items-center gap-2">
-                    <dt className="w-20 text-[#57606a]">Gateway</dt>
-                    <dd className="flex-1 text-[#24292f]">
-                      {hostStatus?.gatewayConfigured ? 'Configured, unavailable' : 'Not configured'}
-                    </dd>
-                  </div>
-                )}
-                <div className="flex items-center gap-2 pt-1">
-                  <dt className="w-20 text-[#57606a]">Auth</dt>
-                  <dd className="flex-1 flex flex-wrap gap-1">
-                    {machine.codexSubscription && (
-                      <span className="rounded border border-[#d0d7de] bg-[#f6f8fa] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a]">
-                        Codex
-                      </span>
-                    )}
-                    {machine.claudeSubscription && (
-                      <span className="rounded border border-[#d0d7de] bg-[#f6f8fa] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a]">
-                        Claude
-                      </span>
-                    )}
-                    {!machine.codexSubscription && !machine.claudeSubscription && (
-                      <span className="text-[11px] text-[#57606a]">None</span>
-                    )}
-                  </dd>
-                </div>
-              </dl>
-            )}
-
-            {hostError && (
-              <p className="mt-2 text-[11px] text-red-600" title={hostError}>
-                Could not fetch host status.
+          {showHost && (
+            <div className="px-3 py-2">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`inline-block h-2 w-2 rounded-full ${hostState.dotClassName}`}
+                />
+                <span className="text-xs font-semibold text-[#24292f]">Host</span>
+              </div>
+              <p className="mt-1 text-[11px] text-[#57606a]">
+                {hostState.detail}
               </p>
-            )}
-          </div>
+
+              <HostConnectionDetails
+                hostStatus={hostStatus}
+                hostError={hostError}
+                now={now}
+              />
+            </div>
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+export function HostConnectionDetails({
+  hostStatus,
+  hostError,
+  now,
+}: {
+  hostStatus: HostStatus | null;
+  hostError: string | null;
+  now: number;
+}) {
+  const machine = hostStatus?.machine ?? null;
+
+  return (
+    <>
+      {machine && (
+        <dl className="mt-2 space-y-1 text-[11px]">
+          <div className="flex items-center gap-2">
+            <dt className="w-20 text-[#57606a]">Machine</dt>
+            <dd
+              className="flex-1 font-mono text-[#24292f] truncate"
+              title={machine.machineId}
+            >
+              {truncateMid(machine.machineId, 20)}
+            </dd>
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard?.writeText(machine.machineId);
+              }}
+              className="text-[#57606a] hover:text-[#24292f]"
+              title="Copy machine id"
+            >
+              ⧉
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <dt className="w-20 text-[#57606a]">Since</dt>
+            <dd className="flex-1 text-[#24292f]" title={machine.connectedAt}>
+              {formatRelative(machine.connectedAt, now)}
+            </dd>
+          </div>
+        </dl>
+      )}
+
+      {hostError && (
+        <p className="mt-2 text-[11px] text-red-600" title={hostError}>
+          Could not fetch host status.
+        </p>
+      )}
+    </>
   );
 }

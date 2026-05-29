@@ -219,6 +219,30 @@ describe("checkForUpdate", () => {
     expect(env.ENVS_KV.put).toHaveBeenCalledTimes(1);
   });
 
+  it("uses source identity even when the running Hub version is newer than the latest public release tag", async () => {
+    vi.stubGlobal("__TILLER_VERSION__", "0.2.35");
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source", "0.2.35"));
+    const fetchMock = mockLatestReleaseFetch(updateMarker("latest-public-source", "0.1.1"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const env = {
+      ENVS_KV: {
+        get: vi.fn().mockResolvedValue(null),
+        put: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+
+    const result = await checkForUpdate(env as never);
+
+    expect(fetchMock.mock.calls.map((call) => requestUrl(call[0]))).toEqual([
+      "https://api.github.com/repos/paperwing-dev/tiller-hub/releases/latest",
+      "https://raw.githubusercontent.com/paperwing-dev/tiller-hub/tiller-hub-v0.1.1/tiller-update.json",
+    ]);
+    expect(result.currentUpdate.version).toBe("0.2.35");
+    expect(result.latestUpdate.version).toBe("0.1.1");
+    expect(result.updateAvailable).toBe(true);
+  });
+
   it("surfaces update metadata lookup failures as an advanced-repair issue", async () => {
     vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
     vi.stubGlobal("__TILLER_CURRENT_UPDATE__", updateMarker("current-source"));

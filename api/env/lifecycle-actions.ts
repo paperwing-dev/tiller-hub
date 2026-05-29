@@ -16,7 +16,7 @@ import {
 import { resolveDeploymentModeForRuntime } from "../setup/config";
 import { isHostRoutable, readRegisteredHostService, readRoutableHostService } from "../service-registry";
 import { projectEnvSummary } from "../sync/projectors";
-import type { ClaudeAuthMode, Env, EnvHarness, EnvMeta, HostServiceRegistration } from "../types";
+import type { ClaudeAuthMode, CodexAuthPreference, Env, EnvHarness, EnvMeta, HostServiceRegistration } from "../types";
 import { resolveClaudeAuthMode } from "./container-auth";
 import { isHarnessEnabled } from "./harness";
 import {
@@ -332,11 +332,15 @@ export async function createEnvAction(args: {
   if (harness !== "codex" && requestedCodexAuthPreference) {
     return { status: 400, body: { error: "codexAuthPreference is only supported for the codex harness" } };
   }
-  const authMode = harness === "claude-code"
-    ? resolveClaudeAuthMode({ requested: requestedAuthMode ?? null })
+  const authMode: ClaudeAuthMode | undefined = harness === "claude-code"
+    ? backendKind === "host"
+      ? "auto"
+      : resolveClaudeAuthMode({ requested: requestedAuthMode ?? null })
     : undefined;
-  const codexAuthPreference = harness === "codex"
-    ? deploymentMode === "hosted"
+  const codexAuthPreference: CodexAuthPreference | undefined = harness === "codex"
+    ? backendKind === "host"
+      ? "auto"
+      : deploymentMode === "hosted"
       ? "api-key"
       : (requestedCodexAuthPreference === "subscription" || requestedCodexAuthPreference === "api-key" ? requestedCodexAuthPreference : "auto")
     : undefined;

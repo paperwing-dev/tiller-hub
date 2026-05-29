@@ -12,6 +12,7 @@ import {
   type EnvChangesResponse,
 } from "./api";
 import { getDisplayEnvBranchStatus } from "./env-state";
+import { getEnvDisplayName } from "./env-display";
 import type { RecoverEntitiesOptions } from "./live-sync-store";
 
 interface ChangesViewProps {
@@ -70,6 +71,7 @@ export default function ChangesView({
     () => changes?.files.find((file) => file.path === selectedPath) ?? null,
     [changes, selectedPath],
   );
+  const displayName = getEnvDisplayName(env);
 
   const loadChanges = async () => {
     if (!canLoadPreview) {
@@ -165,7 +167,7 @@ export default function ChangesView({
   });
 
   const resetToMain = () => {
-    if (!confirm(`Reset "${env.slug}" to main? This will discard unpromoted changes.`)) {
+    if (!confirm(`Reset "${displayName}" to main? This will discard unpromoted changes.`)) {
       return;
     }
     void runAction(async () => {
@@ -222,8 +224,7 @@ export default function ChangesView({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <div className="text-xs font-medium uppercase tracking-wide text-[#57606a]">Promote Preview</div>
-            <h2 className="mt-0.5 truncate text-base font-semibold text-[#24292f]">{env.slug}</h2>
-            <p className="mt-1 truncate text-xs text-[#57606a]">{repo.repoUrl}</p>
+            <h2 className="mt-0.5 truncate text-base font-semibold text-[#24292f]">{displayName}</h2>
             <p className="mt-1 text-xs text-[#57606a]">
               Main {shortCommit(repo.mainCommit)} · Env base {shortCommit(env.baseMainCommit)}
             </p>

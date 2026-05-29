@@ -128,7 +128,7 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).not.toContain("Private key PEM");
   });
 
-  it("renders configured app install and manage links as new-tab links", async () => {
+  it("renders configured GitHub App status without extra management controls", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
     const html = renderToString(
       <SettingsPage
@@ -144,10 +144,65 @@ describe("SettingsPage GitHub App wizard", () => {
       />,
     );
 
-    expect(html).toContain('href="https://github.com/apps/tiller-test/installations/new"');
-    expect(html).toContain('href="https://github.com/settings/installations"');
-    expect(html.match(/target="_blank"/g)?.length).toBeGreaterThanOrEqual(2);
-    expect(html).toContain("Test access");
+    expect(html).toContain("GitHub App configured");
+    expect(html).toContain("GitHub App URL");
+    expect(html).toContain("https://github.com/apps/tiller-test");
+    expect(html).toContain("It is not a repository URL");
+    expect(html).not.toContain("1. Create GitHub App");
+    expect(html).not.toContain("2. Install repositories");
+    expect(html).not.toContain("3. Use in Tiller");
+    expect(html).not.toContain("Checking repositories");
+    expect(html).not.toContain("Install more repos");
+    expect(html).not.toContain("Manage GitHub Apps");
+    expect(html).not.toContain("Test access");
+  });
+
+  it("keeps environment lifecycle settings behind Advanced by default", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage status={baseStatus()} onDone={() => undefined} onRefresh={async () => undefined} />,
+    );
+
+    expect(html).toContain("Advanced");
+    expect(html).toContain("Show advanced");
+    expect(html).not.toContain("Environment auto-stop");
+    expect(html).not.toContain("Idle timeout");
+    expect(html).not.toContain("Canonical main history depth");
+  });
+
+  it("keeps Codex subscription actions on the subscription row", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage status={baseStatus()} onDone={() => undefined} onRefresh={async () => undefined} />,
+    );
+
+    expect(html).toContain("Codex Subscription Login");
+    expect(html).toContain("Check status");
+    expect(html).toContain("Import Codex Login");
+    expect(html).not.toContain("Import or replace");
+  });
+
+  it("disables Codex import when a subscription login is already present", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          hasChatGPTAuth: true,
+          chatgptAuthStatus: "connected",
+          openaiPlannerAvailable: true,
+          openaiPlannerRoute: "subscription-gateway",
+          hostRegistered: true,
+          hostConnected: true,
+          hostGatewayConfigured: true,
+          hostGatewayAvailable: true,
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain("Subscription active");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Import Codex Login<\/button>/);
   });
 
   it("warns when the self-update repo is not visible to the GitHub App", async () => {
@@ -240,5 +295,28 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).toContain("Healthy");
     expect(html).toContain("Return to Hosted Tiller");
     expect(html).toContain("return to hosted");
+    expect(html).not.toContain("Technical details");
+    expect(html).not.toContain("Host runtime");
+  });
+
+  it("shows Self Host technical details when the active host needs attention", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          selfHostStatus: "offline",
+          selfHostReady: false,
+          hostRegistered: true,
+          hostConnected: false,
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain("Tiller Self Host is active");
+    expect(html).toContain("Needs attention");
+    expect(html).toContain("Technical details");
+    expect(html).toContain("Host runtime");
   });
 });

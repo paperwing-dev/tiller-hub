@@ -75,7 +75,7 @@ export default function UpdateButton({ status, issue, dismissed, isChecking, onO
       type="button"
       onClick={state.enabled ? onOpen : undefined}
       disabled={!state.enabled}
-      className={`absolute right-4 top-3 z-20 rounded-md border px-3 py-1.5 text-xs font-semibold transition-colors ${className}`}
+      className={`inline-flex h-8 items-center rounded-md border px-3 text-xs font-semibold transition-colors ${className}`}
       title={state.title}
       aria-label={state.title}
     >

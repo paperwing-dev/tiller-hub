@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   getRunnerBackend: vi.fn(),
   getSecret: vi.fn(),
   resolveProtectionState: vi.fn(),
+  getValidOpenAIAuth: vi.fn(),
 }));
 
 vi.mock("../helpers", () => ({
@@ -57,6 +58,10 @@ vi.mock("../protection", async () => {
     resolveProtectionState: mocks.resolveProtectionState,
   };
 });
+
+vi.mock("../openai-auth", () => ({
+  getValidOpenAIAuth: mocks.getValidOpenAIAuth,
+}));
 
 const { default: envRoutes } = await import("../env/routes");
 
@@ -824,6 +829,11 @@ describe("branch-backed git env operations", () => {
     mocks.getSecret.mockImplementation(async (_env: unknown, key: string) => {
       if (key === "OPENAI_API_KEY") return "openai-key";
       return undefined;
+    });
+    mocks.getValidOpenAIAuth.mockResolvedValue({
+      access_token: "chatgpt-access-token",
+      refresh_token: "chatgpt-refresh-token",
+      expires_at: Date.now() + 3600_000,
     });
     mocks.resolveProtectionState.mockResolvedValue({
       protectionMode: "cf-access",
@@ -1858,7 +1868,9 @@ describe("branch-backed git env operations", () => {
         connectedAt: "2026-04-09T00:00:00.000Z",
         dockerAvailable: true,
         codexSubscription: true,
+        codexGatewayAuth: "session-token",
         claudeSubscription: false,
+        gatewayPort: 8788,
         transport: "session",
       }),
       isHostRoutable: vi.fn().mockResolvedValue(true),

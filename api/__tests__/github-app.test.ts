@@ -328,6 +328,7 @@ describe("GitHub App installation tokens", () => {
           {
             id: 1001,
             permissions: { contents: "write", metadata: "read", pull_requests: "write" },
+            repository_selection: "selected",
           },
           {
             id: 1002,
@@ -376,6 +377,7 @@ describe("GitHub App installation tokens", () => {
           code: "github_app_missing_permissions",
         }),
       ],
+      repositorySelection: "selected",
     });
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,

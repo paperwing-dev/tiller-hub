@@ -4,7 +4,7 @@ export function getHarnessBadgeLabel(harness: EnvHarness): string {
   return harness === "codex"
     ? "Codex"
     : harness === "opencode"
-      ? "OpenCode"
+      ? "Open Code"
       : "Claude Code";
 }
 
@@ -31,16 +31,13 @@ export function getEnvAuthBadge(
   }
 
   if (harness === "opencode") {
-    return {
-      label: "Workers AI",
-      className: "border-cyan-200 bg-cyan-50 text-cyan-700",
-    };
+    return null;
   }
 
   if (!env.resolvedAuthMode) return null;
 
   return {
-    label: env.resolvedAuthMode === "api" ? "Anthropic API key" : "Subscription",
+    label: env.resolvedAuthMode === "api" ? "API key" : "Subscription",
     className: env.resolvedAuthMode === "api"
       ? "border-amber-200 bg-amber-50 text-amber-700"
       : "border-emerald-200 bg-emerald-50 text-emerald-700",
@@ -48,24 +45,13 @@ export function getEnvAuthBadge(
 }
 
 export function getEnvModelBadge(
-  env: Pick<EnvMeta, "harness" | "opencodeModel">,
+  _env: Pick<EnvMeta, "harness" | "opencodeModel">,
 ): { label: string; className: string } | null {
-  if (env.harness !== "opencode") {
-    return null;
-  }
-
-  return {
-    label: "Kimi K2.5",
-    className: "border-fuchsia-200 bg-fuchsia-50 text-fuchsia-700",
-  };
+  return null;
 }
 
 export function getLeadHarnessBadge(
-  env: Pick<EnvMeta, "leadHarnessStatus">,
+  _env: Pick<EnvMeta, "leadHarnessStatus">,
 ): { label: string; className: string } | null {
-  if (env.leadHarnessStatus !== "failed") return null;
-  return {
-    label: "Harness failed",
-    className: "border-red-200 bg-red-50 text-red-700",
-  };
+  return null;
 }

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { EnvMeta } from "../api/types";
 import type { Artifact } from "../api/coordination/types";
 import { fetchRepoArtifacts, startEnv, type StartupPlanSelection } from "./api";
-import { groupPlansByStatus, isPlanOutdatedForMain, listPlanArtifacts, renderArtifactBodyMarkdown } from "./plan-artifacts";
+import { isPlanOutdatedForMain, listPlanArtifacts, renderArtifactBodyMarkdown } from "./plan-artifacts";
 
 interface StartPlanDialogProps {
   env: EnvMeta;
@@ -12,7 +12,7 @@ interface StartPlanDialogProps {
   onStarted: () => void;
 }
 
-type PlanChoice = "todo" | "specific" | "none";
+type PlanChoice = "specific" | "none";
 
 export default function StartPlanDialog({
   env,
@@ -25,15 +25,10 @@ export default function StartPlanDialog({
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [choice, setChoice] = useState<PlanChoice>("todo");
+  const [choice, setChoice] = useState<PlanChoice>("none");
   const [selectedPlanId, setSelectedPlanId] = useState("");
 
   const planArtifacts = useMemo(() => listPlanArtifacts(artifacts), [artifacts]);
-  const todoPlans = useMemo(() => groupPlansByStatus(artifacts).todo, [artifacts]);
-  const latestCurrentTodoPlan = useMemo(
-    () => todoPlans.find((plan) => !isPlanOutdatedForMain(plan, repoMainCommit)) ?? null,
-    [repoMainCommit, todoPlans],
-  );
   const selectedPlan = useMemo(
     () => planArtifacts.find((plan) => plan.id === selectedPlanId) ?? planArtifacts[0] ?? null,
     [planArtifacts, selectedPlanId],
@@ -80,12 +75,13 @@ export default function StartPlanDialog({
     setStarting(true);
     setError(null);
     try {
-      const planSelection: StartupPlanSelection =
-        choice === "none"
-          ? { mode: "none" }
-          : choice === "specific" && selectedPlan
-            ? { mode: "specific", artifactId: selectedPlan.id }
-            : { mode: "todo" };
+      let planSelection: StartupPlanSelection = { mode: "none" };
+      if (choice === "specific") {
+        if (!selectedPlan) {
+          throw new Error("Choose a plan before starting the container.");
+        }
+        planSelection = { mode: "specific", artifactId: selectedPlan.id };
+      }
       await startEnv(hubUrl, env.slug, { planSelection });
       onStarted();
       onClose();
@@ -104,7 +100,7 @@ export default function StartPlanDialog({
         <div className="border-b border-[#d0d7de] px-5 py-4">
           <h3 className="text-sm font-semibold text-[#24292f]">Start Container</h3>
           <p className="mt-1 text-xs text-[#57606a]">
-            Choose the latest current-main plan to do, pick a specific plan, or start without one.
+            Start without a plan, or pick a specific saved plan.
           </p>
         </div>
 
@@ -128,17 +124,15 @@ export default function StartPlanDialog({
                   <input
                     type="radio"
                     name={`plan-choice-${env.slug}`}
-                    checked={choice === "todo"}
-                    onChange={() => setChoice("todo")}
+                    checked={choice === "none"}
+                    onChange={() => setChoice("none")}
                     disabled={starting}
                     className="mt-0.5"
                   />
                   <div className="min-w-0">
-                    <div className="text-sm font-medium text-[#24292f]">Latest plan to do</div>
+                    <div className="text-sm font-medium text-[#24292f]">No plan</div>
                     <div className="text-xs text-[#57606a]">
-                      {latestCurrentTodoPlan
-                        ? `${latestCurrentTodoPlan.title || "Untitled plan"} · ${formatTimestamp(latestCurrentTodoPlan.updatedAt)}`
-                        : "No current-main todo plan available."}
+                      Start the container without writing /.tiller/plan.md.
                     </div>
                   </div>
                 </label>
@@ -170,22 +164,6 @@ export default function StartPlanDialog({
                   </div>
                 </label>
 
-                <label className="flex cursor-pointer items-start gap-3 rounded border border-[#d0d7de] px-3 py-2">
-                  <input
-                    type="radio"
-                    name={`plan-choice-${env.slug}`}
-                    checked={choice === "none"}
-                    onChange={() => setChoice("none")}
-                    disabled={starting}
-                    className="mt-0.5"
-                  />
-                  <div className="min-w-0">
-                    <div className="text-sm font-medium text-[#24292f]">No plan</div>
-                    <div className="text-xs text-[#57606a]">
-                      Start the container without writing /.tiller/plan.md.
-                    </div>
-                  </div>
-                </label>
               </div>
             )}
           </div>

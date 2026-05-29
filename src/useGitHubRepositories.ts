@@ -4,6 +4,7 @@ import { ApiActionError, fetchGitHubRepositories, type GitHubRepositorySelection
 export interface GitHubRepositoriesState {
   repositories: GitHubRepositorySelection[];
   warnings: GitHubRepositoryWarning[];
+  repositorySelection: "all" | "selected" | "unknown";
   loading: boolean;
   error: string | null;
 }
@@ -46,13 +47,14 @@ export function useGitHubRepositories(
   const [state, setState] = useState<GitHubRepositoriesState>({
     repositories: [],
     warnings: [],
+    repositorySelection: "unknown",
     loading: enabled,
     error: null,
   });
 
   useEffect(() => {
     if (!enabled) {
-      setState({ repositories: [], warnings: [], loading: false, error: null });
+      setState({ repositories: [], warnings: [], repositorySelection: "unknown", loading: false, error: null });
       return undefined;
     }
 
@@ -64,6 +66,7 @@ export function useGitHubRepositories(
         setState({
           repositories: result.repositories,
           warnings: result.warnings,
+          repositorySelection: result.repositorySelection,
           loading: false,
           error: null,
         });
@@ -73,6 +76,7 @@ export function useGitHubRepositories(
         setState({
           repositories: [],
           warnings: [],
+          repositorySelection: "unknown",
           loading: false,
           error: formatGitHubRepositoryError(err),
         });

@@ -204,12 +204,13 @@ export async function buildContainerLaunchConfig(
   };
 
   if (harness === "codex") {
-    const codexAuthPreference = meta.codexAuthPreference ?? "auto";
+    const codexAuthPreference = backend === "host" ? "auto" : (meta.codexAuthPreference ?? "auto");
     const gatewayRoute = codexAuthPreference === "api-key"
       ? undefined
       : await resolveCodexModelRoute(env, {
         target: backend === "host" ? "host" : "hosted",
         machineId: backend === "host" ? (options?.hostMachineId ?? meta.runnerMachineId ?? null) : null,
+        allowApiFallback: codexAuthPreference !== "subscription",
       });
     const gatewaySession = codexAuthPreference !== "api-key"
       && (gatewayRoute?.kind === "gateway-subscription" || gatewayRoute?.kind === "host-gateway")
@@ -263,7 +264,7 @@ export async function buildContainerLaunchConfig(
   }
 
   const auth = await resolveContainerAuth(env, {
-    stored: meta.authMode ?? null,
+    stored: backend === "host" ? "auto" : (meta.authMode ?? null),
     backend,
   });
 

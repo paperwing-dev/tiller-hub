@@ -72,6 +72,7 @@ interface GitHubApiResponse<T> {
 interface GitHubInstallationResponse {
   id?: number;
   permissions?: Record<string, string>;
+  repository_selection?: "all" | "selected";
 }
 
 interface GitHubInstallationRepositoryResponse {
@@ -670,6 +671,7 @@ async function listGitHubAppInstallations(jwt: string): Promise<GitHubInstallati
 export async function listGitHubAppRepositories(env: Env): Promise<{
   repositories: GitHubAppRepositorySelection[];
   warnings: GitHubAppRepositoryWarning[];
+  repositorySelection: "all" | "selected" | "unknown";
 }> {
   const config = await getGitHubAppConfig(env);
   if (!config) {
@@ -681,6 +683,7 @@ export async function listGitHubAppRepositories(env: Env): Promise<{
 
   const repositories: GitHubAppRepositorySelection[] = [];
   const warnings: GitHubAppRepositoryWarning[] = [];
+  const repositorySelections: Array<"all" | "selected"> = [];
   if (installations.length === 0) {
     warnings.push({
       code: "github_app_missing_installation",
@@ -703,6 +706,9 @@ export async function listGitHubAppRepositories(env: Env): Promise<{
       });
       continue;
     }
+    if (installation.repository_selection === "all" || installation.repository_selection === "selected") {
+      repositorySelections.push(installation.repository_selection);
+    }
 
     try {
       const token = await mintGitHubInstallationTokenForInstallation(installation.id, jwt, "write");
@@ -723,6 +729,11 @@ export async function listGitHubAppRepositories(env: Env): Promise<{
   return {
     repositories: Array.from(deduped.values()).sort((left, right) => left.fullName.localeCompare(right.fullName)),
     warnings,
+    repositorySelection: repositorySelections.length > 0 && repositorySelections.every((selection) => selection === "all")
+      ? "all"
+      : repositorySelections.length > 0
+        ? "selected"
+        : "unknown",
   };
 }
 

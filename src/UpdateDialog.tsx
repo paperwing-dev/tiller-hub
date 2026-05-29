@@ -13,6 +13,8 @@ const PROGRESS_STAGES = [
   'deploying',
 ] as const;
 
+const AUTO_RELOAD_DELAY_MS = 1200;
+
 type ProgressStage =
   | 'idle'
   | (typeof PROGRESS_STAGES)[number]
@@ -48,7 +50,7 @@ function formatStage(stage: ProgressStage): string {
     case 'deploying':
       return 'Deploying the updated Worker bundle.';
     case 'complete':
-      return 'Update complete. Reload to start serving the new build.';
+      return 'Update complete.';
     case 'error':
       return 'Update failed. Review the error details below.';
     default:
@@ -81,33 +83,46 @@ export default function UpdateDialog({
   const [stage, setStage] = useState<ProgressStage>('idle');
   const [isApplying, setIsApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [autoReloadScheduled, setAutoReloadScheduled] = useState(false);
   const intervalRef = useRef<number | null>(null);
+  const reloadTimeoutRef = useRef<number | null>(null);
+
+  function clearProgressTimer() {
+    if (intervalRef.current != null) {
+      window.clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }
+
+  function clearReloadTimer() {
+    if (reloadTimeoutRef.current != null) {
+      window.clearTimeout(reloadTimeoutRef.current);
+      reloadTimeoutRef.current = null;
+    }
+  }
 
   useEffect(() => {
     if (!status) {
       setStage('idle');
       setIsApplying(false);
       setError(null);
-      if (intervalRef.current != null) {
-        window.clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
+      setAutoReloadScheduled(false);
+      clearProgressTimer();
+      clearReloadTimer();
       return;
     }
 
     setStage('idle');
     setIsApplying(false);
     setError(null);
-    if (intervalRef.current != null) {
-      window.clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
+    setAutoReloadScheduled(false);
+    clearProgressTimer();
+    clearReloadTimer();
   }, [status?.latestUpdate.sourceId]);
 
   useEffect(() => () => {
-    if (intervalRef.current != null) {
-      window.clearInterval(intervalRef.current);
-    }
+    clearProgressTimer();
+    clearReloadTimer();
   }, []);
 
   async function waitForDeployment(expectedSourceId: string) {
@@ -192,6 +207,7 @@ export default function UpdateDialog({
 
     setIsApplying(true);
     setError(null);
+    setAutoReloadScheduled(false);
     setStage(PROGRESS_STAGES[0]);
     intervalRef.current = window.setInterval(() => {
       setStage((current) => {
@@ -204,13 +220,11 @@ export default function UpdateDialog({
 
     try {
       const result = await applyUpdate(hubUrl);
-      if (intervalRef.current != null) {
-        window.clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
+      clearProgressTimer();
       if (!result.ok) {
         throw new Error(result.error);
       }
+      let shouldReload = false;
       if (result.status === 'queued') {
         setStage('deploying');
         addToast({
@@ -222,25 +236,32 @@ export default function UpdateDialog({
         if (!deployed) {
           throw new Error('Update was committed, but this Worker has not reported the new source id yet.');
         }
+        shouldReload = true;
       }
       setStage('complete');
       setIsApplying(false);
+      setAutoReloadScheduled(shouldReload);
       addToast({
         title: result.status === 'noop' ? 'No update needed' : 'Update deployed',
         body: result.status === 'noop'
           ? 'The configured hub repo already matches upstream.'
-          : 'Reload to use the new Tiller Hub build.',
+          : 'Reloading to use the new Tiller Hub build.',
         variant: 'success',
       });
       onUpdated();
-    } catch (err) {
-      if (intervalRef.current != null) {
-        window.clearInterval(intervalRef.current);
-        intervalRef.current = null;
+      if (shouldReload) {
+        clearReloadTimer();
+        reloadTimeoutRef.current = window.setTimeout(() => {
+          window.location.reload();
+        }, AUTO_RELOAD_DELAY_MS);
       }
+    } catch (err) {
+      clearProgressTimer();
+      clearReloadTimer();
       const message = err instanceof Error ? err.message : 'Update failed';
       setStage('error');
       setIsApplying(false);
+      setAutoReloadScheduled(false);
       setError(message);
       addToast({
         title: 'Update failed',
@@ -373,16 +394,30 @@ export default function UpdateDialog({
             <div className="mt-6 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] px-4 py-3">
               <p className="text-sm font-semibold text-[#24292f]">Development build</p>
               <p className="mt-1 text-sm text-[#57606a]">
-                Dogfood deployments are updated with <code>npm run deploy</code>. Release self-update is disabled for this build.
+                Dogfood deployments use the development deploy path. Release self-update is disabled for this build.
               </p>
             </div>
           )}
 
           {!isDevelopmentBuild && (
-            <div className="mt-6 grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
-              <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
-                <p className="text-sm font-semibold text-[#24292f]">Self-update repository</p>
-                <p className="mt-1 text-xs text-[#57606a]">
+            <div className="mt-6 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-[#24292f]">Update source</p>
+                  <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                    Tiller updates by committing the latest hub source into the deploy-button repo connected to Cloudflare Builds.
+                  </p>
+                </div>
+                {status.hubRepo.status === 'detected' && (
+                  <span className="w-fit rounded-full border border-[#1a7f37]/20 bg-[#dafbe1] px-2 py-0.5 text-xs font-medium text-[#1a7f37]">
+                    Connected
+                  </span>
+                )}
+              </div>
+
+              <div className="mt-4 border-t border-[#d0d7de] pt-3">
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">Repository</p>
+                <p className="mt-1 text-xs leading-5 text-[#57606a]">
                   {status.hubRepo.status === 'detected'
                     ? `${status.hubRepo.fullName} · ${status.hubRepo.branch}`
                     : status.hubRepo.status === 'ambiguous'
@@ -427,20 +462,17 @@ export default function UpdateDialog({
                   </button>
                 )}
               </div>
-
-              <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
-                <p className="text-sm font-semibold text-[#24292f]">Update source</p>
-                <p className="mt-1 text-xs leading-5 text-[#57606a]">
-                  Tiller updates by committing the latest hub source into the deploy-button repo connected to Cloudflare Builds.
-                </p>
-              </div>
             </div>
           )}
 
           {showProgress && (
             <div className="mt-5 rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
               <p className="text-sm font-semibold text-[#24292f]">Progress</p>
-              <p className="mt-1 text-sm text-[#57606a]">{formatStage(stage)}</p>
+              <p className="mt-1 text-sm text-[#57606a]">
+                {stage === 'complete' && autoReloadScheduled
+                  ? 'Update complete. Reloading to start serving the new build.'
+                  : formatStage(stage)}
+              </p>
               {error && (
                 <p className="mt-3 rounded-lg border border-[#cf222e]/20 bg-[#ffebe9] px-3 py-2 text-sm text-[#cf222e]">
                   {error}
@@ -464,15 +496,6 @@ export default function UpdateDialog({
                 className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isApplying ? 'Updating...' : 'Update'}
-              </button>
-            )}
-            {stage === 'complete' && (
-              <button
-                type="button"
-                onClick={() => window.location.reload()}
-                className="rounded-lg border border-[#d0d7de] bg-white px-4 py-2 text-sm font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
-              >
-                Reload
               </button>
             )}
             <button

@@ -7,7 +7,6 @@ interface PlanCategorySidebarProps {
   repoMainCommit: string | null;
   loading?: boolean;
   onSelect: (artifactId: string) => void;
-  onNewPlan: () => void;
   onMove: (artifact: PlanArtifact, status: PlanStatus) => void;
   onDiscard: (artifact: PlanArtifact) => void;
 }
@@ -25,7 +24,6 @@ export default function PlanCategorySidebar({
   repoMainCommit,
   loading = false,
   onSelect,
-  onNewPlan,
   onMove,
   onDiscard,
 }: PlanCategorySidebarProps) {
@@ -38,12 +36,6 @@ export default function PlanCategorySidebar({
           <div className="text-sm font-semibold text-[#24292f]">Plans</div>
           <div className="text-xs text-[#57606a]">Mutable Markdown plans</div>
         </div>
-        <button
-          onClick={onNewPlan}
-          className="rounded bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white hover:bg-[#0860c4]"
-        >
-          New Plan
-        </button>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">

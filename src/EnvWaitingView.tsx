@@ -1,18 +1,15 @@
 import React, { useEffect, useState } from "react";
 import type { EnvMeta, StartupDiagnosticLogTails, StartupDiagnosticsSnapshot } from "../api/types";
 import {
-  deleteEnv,
   fetchEnvStartupDiagnostics,
-  stopEnv,
   type StartupDiagnosticsState,
 } from "./api";
 import {
   getEnvAuthBadge,
-  getEnvModelBadge,
-  getLeadHarnessBadge,
   getHarnessBadgeClass,
   getHarnessBadgeLabel,
 } from "./env-harness";
+import { getBackendBadgeLabel, getEnvDisplayName } from "./env-display";
 
 const STATUS_COLORS: Record<string, string> = {
   running: "bg-green-500",
@@ -118,8 +115,7 @@ function renderLogTail(title: string, value: string | null) {
   );
 }
 
-export default function EnvWaitingView({ env, hubUrl, onRecoverEnv, onStartRequest }: EnvWaitingViewProps) {
-  const [busy, setBusy] = useState(false);
+export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaitingViewProps) {
   const [diagnostics, setDiagnostics] = useState<StartupDiagnosticsState>({ active: null, lastFailed: null });
   const [showLastFailed, setShowLastFailed] = useState(false);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
@@ -127,7 +123,6 @@ export default function EnvWaitingView({ env, hubUrl, onRecoverEnv, onStartReque
   const status = env.status || "unknown";
   const isCreating = status === "creating";
   const isStarting = status === "starting";
-  const isRunning = status === "running";
   const isSaving = status === "saving";
   const isStopping = status === "stopping";
   const isDeleting = status === "deleting";
@@ -138,8 +133,7 @@ export default function EnvWaitingView({ env, hubUrl, onRecoverEnv, onStartReque
   const label = STATUS_LABELS[status] || status;
   const harness = env.harness;
   const authBadge = getEnvAuthBadge(env);
-  const modelBadge = getEnvModelBadge(env);
-  const harnessBadge = getLeadHarnessBadge(env);
+  const displayName = getEnvDisplayName(env);
   const displayedDiagnostics = diagnostics.active ?? (showLastFailed ? diagnostics.lastFailed : null);
   const currentStepLabel = formatStepLabel(env.bootStepId ?? displayedDiagnostics?.currentStepId ?? null);
 
@@ -168,18 +162,6 @@ export default function EnvWaitingView({ env, hubUrl, onRecoverEnv, onStartReque
     setShowLastFailed(false);
   }, [env.slug, diagnostics.active?.opId]);
 
-  const run = async (fn: () => Promise<unknown>) => {
-    setBusy(true);
-    try {
-      await fn();
-    } catch (err) {
-      console.error("[tiller] env action failed:", err);
-      alert(err instanceof Error ? err.message : "Environment action failed. Please try again.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const copyDiagnostics = async () => {
     if (!displayedDiagnostics) return;
     try {
@@ -202,9 +184,9 @@ export default function EnvWaitingView({ env, hubUrl, onRecoverEnv, onStartReque
           <span className={`w-2.5 h-2.5 rounded-full ${dotColor}`} />
           <div>
             <div className="flex items-center gap-2">
-              <h2 className="text-sm font-semibold text-[#24292f]">{env.slug}</h2>
+              <h2 className="text-sm font-semibold text-[#24292f]">{displayName}</h2>
               <span className="rounded border border-[#d0d7de] bg-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a]">
-                {env.backend}
+                {getBackendBadgeLabel(env.backend)}
               </span>
               <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getHarnessBadgeClass(harness)}`}>
                 {getHarnessBadgeLabel(harness)}
@@ -214,22 +196,9 @@ export default function EnvWaitingView({ env, hubUrl, onRecoverEnv, onStartReque
                   {authBadge.label}
                 </span>
               )}
-              {modelBadge && (
-                <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${modelBadge.className}`}>
-                  {modelBadge.label}
-                </span>
-              )}
-              {harnessBadge && (
-                <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${harnessBadge.className}`}>
-                  {harnessBadge.label}
-                </span>
-              )}
             </div>
-            <p className="text-xs text-[#0969da]">
-              {env.repoUrl.replace(/^https?:\/\/(www\.)?github\.com\//, "")}
-            </p>
-            <p className="mt-0.5 text-[11px] text-[#57606a]">
-              Plan: {env.startupPlanId ? "Selected" : "None"}
+            <p className="text-xs text-[#57606a]">
+              {label}
             </p>
           </div>
         </div>
@@ -253,54 +222,13 @@ export default function EnvWaitingView({ env, hubUrl, onRecoverEnv, onStartReque
           {isStopped && (
             <button
               onClick={() => onStartRequest?.(env.slug)}
-              disabled={busy}
-              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40 transition-colors"
+              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
             >
               Start
             </button>
           )}
-          {(isRunning || isStarting) && (
-            <button
-              onClick={() => run(async () => {
-                const res = await stopEnv(hubUrl, env.slug);
-                onRecoverEnv?.(env.slug, res.status);
-              })}
-              disabled={busy}
-              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40 transition-colors"
-            >
-              Stop
-            </button>
-          )}
-          {!isDeleting && (
-            <button
-              onClick={async () => {
-                if (confirm(`Delete environment "${env.slug}"? This will destroy the container and wipe R2 storage.`)) {
-                  setBusy(true);
-                  try {
-                    await deleteEnv(hubUrl, env.slug);
-                    onRecoverEnv?.(env.slug, "deleting");
-                  } catch (err) {
-                    console.error("[tiller] delete failed:", err);
-                    alert(err instanceof Error ? err.message : "Failed to delete environment. Please try again.");
-                  } finally {
-                    setBusy(false);
-                  }
-                }
-              }}
-              disabled={busy}
-              className="text-xs px-2.5 py-1 rounded border border-red-200 bg-white hover:bg-red-50 text-red-600 disabled:opacity-40 transition-colors"
-            >
-              Delete
-            </button>
-          )}
         </div>
       </div>
-
-      {env.authWarning && (
-        <div className="border-b border-amber-200 bg-amber-50 px-4 py-2">
-          <p className="text-xs text-amber-800">{env.authWarning}</p>
-        </div>
-      )}
 
       <div className="flex-1 overflow-y-auto bg-[#ffffff]">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-8">

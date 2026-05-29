@@ -286,15 +286,21 @@ export default function PlanView({
         <div className="flex items-center justify-between border-b border-[#d0d7de] bg-[#f6f8fa] px-4 py-2.5">
           <div className="flex min-w-0 items-center gap-2">
             <span className="truncate text-sm font-medium text-[#24292f]">{getRepoLabel(repoUrl)}</span>
-            <span className="rounded border border-[#bbf7d0] bg-[#f0fdf4] px-1.5 py-0.5 text-xs text-[#15803d]">
-              Plan
-            </span>
           </div>
-          {!chatgptAvailable && (
-            <span className="max-w-md truncate text-xs text-[#92400e]">
-              {chatgptUnavailableReason ?? "Writer requires ChatGPT planning availability."}
-            </span>
-          )}
+          <div className="flex shrink-0 items-center gap-3">
+            {!chatgptAvailable && (
+              <span className="max-w-md truncate text-xs text-[#92400e]">
+                {chatgptUnavailableReason ?? "Writer requires ChatGPT planning availability."}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => void handleNewPlan()}
+              className="rounded bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860c4]"
+            >
+              New Plan
+            </button>
+          </div>
         </div>
 
         <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_minmax(340px,0.9fr)]">
@@ -360,7 +366,6 @@ export default function PlanView({
         repoMainCommit={repoMainCommit}
         loading={artifactsLoading}
         onSelect={selectPlan}
-        onNewPlan={() => void handleNewPlan()}
         onMove={(plan, status) => void handleMovePlan(plan, status)}
         onDiscard={(plan) => void handleDiscardPlan(plan)}
       />

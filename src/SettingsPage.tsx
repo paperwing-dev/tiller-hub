@@ -1,9 +1,15 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { useToast } from "./Toast";
-import type { GitHubAccessTestResult, HubUpdateRepoCandidate, SetupStatus, VerifyModelAuthResult } from "./api";
-import { detectSelfUpdateRepo, fetchSetupStatus, returnToHostedTiller, saveGitHubAppConfig, selectSelfUpdateRepo, submitSetup, testGitHubAppAccess, verifyModelAuth } from "./api";
-import { githubRepositoryKey, useGitHubRepositories } from "./useGitHubRepositories";
+import type { HubUpdateRepoCandidate, SetupStatus, VerifyModelAuthResult } from "./api";
+import { detectSelfUpdateRepo, fetchSetupStatus, returnToHostedTiller, selectSelfUpdateRepo, submitSetup, verifyModelAuth } from "./api";
+import { useGitHubRepositories } from "./useGitHubRepositories";
+
+// Legacy GitHub App controls are commented out inside GitHubAppSettings. If they
+// are restored, also restore these imports:
+// import type { GitHubAccessTestResult } from "./api";
+// import { saveGitHubAppConfig, testGitHubAppAccess } from "./api";
+// import { githubRepositoryKey } from "./useGitHubRepositories";
 
 const HUB_URL = window.location.origin;
 const CODEX_IMPORT_COMMAND = "tiller auth import codex";
@@ -336,7 +342,7 @@ function hostGatewayStatus(status: SetupStatus): {
 
 interface CredentialDef {
   label: string;
-  description: string;
+  description?: string;
   secretKey: string;
   configured: boolean;
   testable: boolean;
@@ -412,7 +418,7 @@ function CredentialRowFrame({
   children,
 }: {
   label: string;
-  description: string;
+  description?: string;
   status: "configured" | "partial" | "missing";
   testResult: VerifyModelAuthResult | null;
   okText: string;
@@ -433,7 +439,7 @@ function CredentialRowFrame({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-sm font-semibold text-[#24292f]">{label}</p>
-          <p className="mt-0.5 text-xs text-[#57606a]">{description}</p>
+          {description && <p className="mt-0.5 text-xs text-[#57606a]">{description}</p>}
           <div className="mt-2 flex items-center gap-2">
             <span className={`inline-flex items-center gap-1.5 text-xs ${statusChip.textClassName}`}>
               <span className={`inline-block h-2 w-2 rounded-full ${statusChip.dotClassName}`} />
@@ -599,10 +605,16 @@ function CodexSubscriptionRow({
   status,
   codexStatus,
   onImport,
+  importDisabled,
+  onCheckStatus,
+  checkingStatus,
 }: {
   status: SetupStatus;
   codexStatus: ReturnType<typeof codexSubscriptionStatus>;
   onImport: () => void;
+  importDisabled: boolean;
+  onCheckStatus: () => void;
+  checkingStatus: boolean;
 }) {
   return (
     <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] px-4 py-3">
@@ -620,88 +632,48 @@ function CodexSubscriptionRow({
       </p>
       <p className="mt-1 text-xs text-[#57606a]">{codexStatus.detail}</p>
 
-      <div className="mt-3 rounded-lg border border-[#d0d7de] bg-white px-3 py-2">
-        <p className="text-xs font-semibold text-[#24292f]">Import or replace</p>
-        <div className="mt-2 flex flex-wrap gap-2">
-          <button
-            type="button"
-            className="rounded border border-[#0969da] bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0860ca] disabled:opacity-50"
-            onClick={onImport}
-          >
-            Import Codex Login
-          </button>
-        </div>
-        <p className="mt-2 text-xs text-[#57606a]">
-          Run the copied import script on the computer where Codex is already logged in. If Tiller is installed there,
-          you can use the Tiller command instead.
-        </p>
-        {!status.hostConnected && (
-          <p className="mt-2 text-xs text-[#9a6700]">
-            Keep <code>tiller host</code> running when you want Tiller Self Host Codex environments or the OpenAI
-            planner to use this subscription route.
-          </p>
-        )}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={onCheckStatus}
+          disabled={checkingStatus}
+          className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+        >
+          {checkingStatus ? "Checking..." : "Check status"}
+        </button>
+        <button
+          type="button"
+          className="rounded border border-[#0969da] bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0860ca] disabled:cursor-not-allowed disabled:border-[#d0d7de] disabled:bg-[#f6f8fa] disabled:text-[#8c959f]"
+          onClick={onImport}
+          disabled={importDisabled}
+          title={importDisabled ? "Codex login is already imported. Check status to refresh the connection state." : undefined}
+        >
+          Import Codex Login
+        </button>
       </div>
+      <p className="mt-2 text-xs text-[#57606a]">
+        {importDisabled
+          ? "Codex login is already imported. Use Check status to refresh the connection state."
+          : "Run the import from the computer where Codex is already logged in."}
+      </p>
+      {!status.hostConnected && (
+        <p className="mt-2 text-xs text-[#9a6700]">
+          Keep <code>tiller host</code> running when you want Tiller Self Host Codex environments or the OpenAI planner
+          to use this subscription route.
+        </p>
+      )}
     </div>
   );
 }
 
-function CodexImportDialog({
-  onClose,
-  onRefresh,
-}: {
-  onClose: () => void;
-  onRefresh: () => Promise<void>;
-}) {
+function CodexImportDialog({ onClose }: { onClose: () => void }) {
   const [copied, setCopied] = useState<"script" | "command" | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const addToast = useToast();
   const script = buildCodexImportScript(HUB_URL);
 
   async function copy(value: string, kind: "script" | "command") {
     await navigator.clipboard.writeText(value);
     setCopied(kind);
     window.setTimeout(() => setCopied((current) => (current === kind ? null : current)), 1800);
-  }
-
-  async function handleRefresh() {
-    setRefreshing(true);
-    try {
-      const latest = await fetchSetupStatus(HUB_URL);
-      await onRefresh();
-      if (latest.chatgptAuthStatus === "connected" || latest.chatgptAuthStatus === "refreshing") {
-        const active = latest.openaiPlannerAvailable && latest.openaiPlannerRoute === "subscription-gateway";
-        addToast({
-          title: active ? "Subscription active" : "Subscription imported",
-          body: active
-            ? "The OpenAI planner can use the imported Codex subscription."
-            : latest.openaiPlannerReason ?? "The subscription is imported. Tiller Self Host may still need the Subscription Gateway.",
-          variant: active ? "success" : "warning",
-        });
-      } else if (latest.chatgptAuthStatus === "needs_reconnect") {
-        addToast({
-          title: "Subscription still needs re-import",
-          body: "Run the import script again on the computer where Codex is logged in.",
-          variant: "warning",
-          duration: 8000,
-        });
-      } else {
-        addToast({
-          title: "Subscription not imported",
-          body: "Run the import script on the computer where Codex is logged in, then check again.",
-          variant: "warning",
-          duration: 8000,
-        });
-      }
-    } catch (err) {
-      addToast({
-        title: "Status refresh failed",
-        body: err instanceof Error ? err.message : String(err),
-        variant: "error",
-      });
-    } finally {
-      setRefreshing(false);
-    }
   }
 
   return (
@@ -739,14 +711,6 @@ function CodexImportDialog({
         </div>
 
         <div className="flex flex-wrap justify-end gap-2 border-t border-[#d0d7de] px-5 py-3">
-          <button
-            type="button"
-            onClick={() => void handleRefresh()}
-            disabled={refreshing}
-            className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
-          >
-            {refreshing ? "Checking..." : "Check status"}
-          </button>
           <button
             type="button"
             onClick={onClose}
@@ -994,33 +958,193 @@ function GitHubAppSettings({
   status: SetupStatus;
   onRefresh: () => Promise<void>;
 }) {
-  const [manualOpen, setManualOpen] = useState(false);
-  const [selectedRepoKey, setSelectedRepoKey] = useState("");
   const [waitingForCreation, setWaitingForCreation] = useState(false);
-  const [testing, setTesting] = useState(false);
   const [detectingUpdateRepo, setDetectingUpdateRepo] = useState(false);
-  const [lastTest, setLastTest] = useState<GitHubAccessTestResult | null>(null);
-  const [appId, setAppId] = useState("");
-  const [clientId, setClientId] = useState("");
-  const [slug, setSlug] = useState("");
-  const [privateKey, setPrivateKey] = useState("");
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const addToast = useToast();
   const createUrl = `${HUB_URL}/api/github/manifest/setup`;
-  const manifestCallbackUrl = `${HUB_URL}/api/github/manifest/callback`;
-  const installCallbackUrl = `${HUB_URL}/api/github/install/callback`;
   const configured = status.githubAppConfigured;
-  const installUrl = status.githubAppInstallUrl ?? lastTest?.installUrl ?? null;
-  const manageUrl = status.githubAppManageUrl ?? lastTest?.manageUrl ?? "https://github.com/settings/installations";
+  const installUrl = status.githubAppInstallUrl ?? null;
   const githubRepositories = useGitHubRepositories(HUB_URL, {
     enabled: configured && !status.githubAppPublicHubDisabled,
   });
   const repoSelections = githubRepositories.repositories;
   const loadingRepos = githubRepositories.loading;
-  const selectedRepo = repoSelections.find((selection) => githubRepositoryKey(selection) === selectedRepoKey) ?? null;
   const selfUpdateRepo = status.selfUpdateRepo ?? { status: "not_checked" as const, lastDetectedAt: null };
   const showSelfUpdateRepo = status.buildDiagnostics.channel === "release";
+  const repositorySelection = githubRepositories.repositorySelection;
+  const allRepositoriesAvailable = configured && repositorySelection === "all" && repoSelections.length > 0;
+  const visibleUpdateRepoOwners = visibleGitHubOwnersForUpdateRepo(selfUpdateRepo);
+  const githubAppUrl = status.githubAppSlug ? `https://github.com/apps/${encodeURIComponent(status.githubAppSlug)}` : null;
+
+  /*
+   * Legacy GitHub App controls, commented out for possible reintroduction.
+   *
+   * const [manualOpen, setManualOpen] = useState(false);
+   * const [selectedRepoKey, setSelectedRepoKey] = useState("");
+   * const [testing, setTesting] = useState(false);
+   * const [lastTest, setLastTest] = useState<GitHubAccessTestResult | null>(null);
+   * const [appId, setAppId] = useState("");
+   * const [clientId, setClientId] = useState("");
+   * const [slug, setSlug] = useState("");
+   * const [privateKey, setPrivateKey] = useState("");
+   * const [saving, setSaving] = useState(false);
+   * const manifestCallbackUrl = `${HUB_URL}/api/github/manifest/callback`;
+   * const installCallbackUrl = `${HUB_URL}/api/github/install/callback`;
+   * const installUrl = status.githubAppInstallUrl ?? lastTest?.installUrl ?? null;
+   * const manageUrl = status.githubAppManageUrl ?? lastTest?.manageUrl ?? "https://github.com/settings/installations";
+   * const selectedRepo = repoSelections.find((selection) => githubRepositoryKey(selection) === selectedRepoKey) ?? null;
+   *
+   * useEffect(() => {
+   *   setSelectedRepoKey(repoSelections[0] ? githubRepositoryKey(repoSelections[0]) : "");
+   * }, [repoSelections]);
+   *
+   * useEffect(() => {
+   *   if (!githubRepositories.error) return;
+   *   setLastTest({
+   *     ok: false,
+   *     status: "github_error",
+   *     message: githubRepositories.error,
+   *     repo: null,
+   *     installUrl,
+   *     manageUrl,
+   *   });
+   * }, [githubRepositories.error, installUrl, manageUrl]);
+   *
+   * async function handleSave() {
+   *   if (!appId.trim() || !clientId.trim() || !slug.trim() || !privateKey.trim()) {
+   *     setError("App ID, client ID, slug, and private key are required.");
+   *     return;
+   *   }
+   *   setSaving(true);
+   *   setError(null);
+   *   try {
+   *     await saveGitHubAppConfig(HUB_URL, {
+   *       appId: appId.trim(),
+   *       clientId: clientId.trim(),
+   *       slug: slug.trim(),
+   *       privateKey: privateKey.trim(),
+   *     });
+   *     setAppId("");
+   *     setClientId("");
+   *     setSlug("");
+   *     setPrivateKey("");
+   *     setManualOpen(false);
+   *     await onRefresh();
+   *     addToast({ title: "GitHub App saved", variant: "success" });
+   *   } catch (err) {
+   *     setError(err instanceof Error ? err.message : String(err));
+   *   } finally {
+   *     setSaving(false);
+   *   }
+   * }
+   *
+   * async function handleTestAccess() {
+   *   if (!selectedRepo) {
+   *     setLastTest({
+   *       ok: false,
+   *       status: "invalid_repo",
+   *       message: "Select a repository from the GitHub App repository list.",
+   *       repo: null,
+   *       installUrl,
+   *       manageUrl,
+   *     });
+   *     return;
+   *   }
+   *
+   *   setTesting(true);
+   *   setError(null);
+   *   try {
+   *     const result = await testGitHubAppAccess(HUB_URL, selectedRepo);
+   *     setLastTest(result);
+   *     if (result.ok) {
+   *       if (showSelfUpdateRepo) {
+   *         await detectSelfUpdateRepo(HUB_URL).catch(() => null);
+   *       }
+   *       await onRefresh();
+   *       addToast({ title: "GitHub repo access ready", variant: "success" });
+   *     }
+   *   } catch (err) {
+   *     setLastTest({
+   *       ok: false,
+   *       status: "github_error",
+   *       message: err instanceof Error ? err.message : String(err),
+   *       repo: selectedRepo.fullName,
+   *       installUrl,
+   *       manageUrl,
+   *     });
+   *   } finally {
+   *     setTesting(false);
+   *   }
+   * }
+   *
+   * function accessResultCopy(result: GitHubAccessTestResult): { title: string; detail: string; tone: "success" | "warning" | "error" } {
+   *   switch (result.status) {
+   *     case "ready":
+   *       return {
+   *         title: "Repository access ready",
+   *         detail: result.repo ? `Tiller can use the GitHub App with ${result.repo}.` : result.message,
+   *         tone: "success",
+   *       };
+   *     case "missing_permissions":
+   *       return {
+   *         title: "Permissions need updating",
+   *         detail: "This app was created with read-only permissions. Create a replacement app with pull request permissions, then install it on this repository.",
+   *         tone: "warning",
+   *       };
+   *     case "missing_installation":
+   *       return {
+   *         title: "App not installed for this owner",
+   *         detail: "Install the GitHub App on the owner account, then select the repository Tiller should use.",
+   *         tone: "warning",
+   *       };
+   *     case "repo_not_selected":
+   *       return {
+   *         title: "Repository not selected",
+   *         detail: "Edit the GitHub App installation and select this repository.",
+   *         tone: "warning",
+   *       };
+   *     case "not_configured":
+   *       return {
+   *         title: "GitHub App not created",
+   *         detail: "Create the GitHub App first, then install it on repositories.",
+   *         tone: "warning",
+   *       };
+   *     case "invalid_repo":
+   *       return {
+   *         title: "Repository format needs fixing",
+   *         detail: result.message,
+   *         tone: "error",
+   *       };
+   *     case "invalid_config":
+   *       return {
+   *         title: "GitHub App config is invalid",
+   *         detail: "Replace the app config from Advanced, or create a fresh app with the guided flow.",
+   *         tone: "error",
+   *       };
+   *     case "public_hub_disabled":
+   *       return {
+   *         title: "Private repo access is unavailable",
+   *         detail: "Publish and protect this hub, or use a localhost hub.",
+   *         tone: "warning",
+   *       };
+   *     case "github_error":
+   *     default:
+   *       return {
+   *         title: "GitHub access check failed",
+   *         detail: result.message,
+   *         tone: "error",
+   *       };
+   *   }
+   * }
+   *
+   * const testCopy = lastTest ? accessResultCopy(lastTest) : null;
+   * const resultClasses = testCopy?.tone === "success"
+   *   ? "border-[#1a7f37]/25 bg-[#f0fff4] text-[#1a7f37]"
+   *   : testCopy?.tone === "warning"
+   *     ? "border-[#d4a72c]/30 bg-[#fff8c5] text-[#9a6700]"
+   *     : "border-[#cf222e]/25 bg-[#fff1f1] text-[#cf222e]";
+   */
 
   useEffect(() => {
     if (!waitingForCreation || configured) {
@@ -1041,89 +1165,6 @@ function GitHubAppSettings({
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
   }, [onRefresh]);
-
-  useEffect(() => {
-    setSelectedRepoKey(repoSelections[0] ? githubRepositoryKey(repoSelections[0]) : "");
-  }, [repoSelections]);
-
-  useEffect(() => {
-    if (!githubRepositories.error) return;
-    setLastTest({
-      ok: false,
-      status: "github_error",
-      message: githubRepositories.error,
-      repo: null,
-      installUrl,
-      manageUrl,
-    });
-  }, [githubRepositories.error, installUrl, manageUrl]);
-
-  async function handleSave() {
-    if (!appId.trim() || !clientId.trim() || !slug.trim() || !privateKey.trim()) {
-      setError("App ID, client ID, slug, and private key are required.");
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      await saveGitHubAppConfig(HUB_URL, {
-        appId: appId.trim(),
-        clientId: clientId.trim(),
-        slug: slug.trim(),
-        privateKey: privateKey.trim(),
-      });
-      setAppId("");
-      setClientId("");
-      setSlug("");
-      setPrivateKey("");
-      setManualOpen(false);
-      await onRefresh();
-      addToast({ title: "GitHub App saved", variant: "success" });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleTestAccess() {
-    if (!selectedRepo) {
-      setLastTest({
-        ok: false,
-        status: "invalid_repo",
-        message: "Select a repository from the GitHub App repository list.",
-        repo: null,
-        installUrl,
-        manageUrl,
-      });
-      return;
-    }
-
-    setTesting(true);
-    setError(null);
-    try {
-      const result = await testGitHubAppAccess(HUB_URL, selectedRepo);
-      setLastTest(result);
-      if (result.ok) {
-        if (showSelfUpdateRepo) {
-          await detectSelfUpdateRepo(HUB_URL).catch(() => null);
-        }
-        await onRefresh();
-        addToast({ title: "GitHub repo access ready", variant: "success" });
-      }
-    } catch (err) {
-      setLastTest({
-        ok: false,
-        status: "github_error",
-        message: err instanceof Error ? err.message : String(err),
-        repo: selectedRepo.fullName,
-        installUrl,
-        manageUrl,
-      });
-    } finally {
-      setTesting(false);
-    }
-  }
 
   async function handleDetectSelfUpdateRepo() {
     setDetectingUpdateRepo(true);
@@ -1169,73 +1210,59 @@ function GitHubAppSettings({
     }
   }
 
-  function accessResultCopy(result: GitHubAccessTestResult): { title: string; detail: string; tone: "success" | "warning" | "error" } {
-    switch (result.status) {
-      case "ready":
-        return {
-          title: "Repository access ready",
-          detail: result.repo ? `Tiller can use the GitHub App with ${result.repo}.` : result.message,
-          tone: "success",
-        };
-      case "missing_permissions":
-        return {
-          title: "Permissions need updating",
-          detail: "This app was created with read-only permissions. Create a replacement app with pull request permissions, then install it on this repository.",
-          tone: "warning",
-        };
-      case "missing_installation":
-        return {
-          title: "App not installed for this owner",
-          detail: "Install the GitHub App on the owner account, then select the repository Tiller should use.",
-          tone: "warning",
-        };
-      case "repo_not_selected":
-        return {
-          title: "Repository not selected",
-          detail: "Edit the GitHub App installation and select this repository.",
-          tone: "warning",
-        };
-      case "not_configured":
-        return {
-          title: "GitHub App not created",
-          detail: "Create the GitHub App first, then install it on repositories.",
-          tone: "warning",
-        };
-      case "invalid_repo":
-        return {
-          title: "Repository format needs fixing",
-          detail: result.message,
-          tone: "error",
-        };
-      case "invalid_config":
-        return {
-          title: "GitHub App config is invalid",
-          detail: "Replace the app config from Advanced, or create a fresh app with the guided flow.",
-          tone: "error",
-        };
-      case "public_hub_disabled":
-        return {
-          title: "Private repo access is unavailable",
-          detail: "Publish and protect this hub, or use a localhost hub.",
-          tone: "warning",
-        };
-      case "github_error":
-      default:
-        return {
-          title: "GitHub access check failed",
-          detail: result.message,
-          tone: "error",
-        };
-    }
-  }
-
-  const testCopy = lastTest ? accessResultCopy(lastTest) : null;
-  const visibleUpdateRepoOwners = visibleGitHubOwnersForUpdateRepo(selfUpdateRepo);
-  const resultClasses = testCopy?.tone === "success"
-    ? "border-[#1a7f37]/25 bg-[#f0fff4] text-[#1a7f37]"
-    : testCopy?.tone === "warning"
-      ? "border-[#d4a72c]/30 bg-[#fff8c5] text-[#9a6700]"
-      : "border-[#cf222e]/25 bg-[#fff1f1] text-[#cf222e]";
+  const selfUpdateRepoPanel = configured && showSelfUpdateRepo && selfUpdateRepo.status !== "not_checked" ? (
+    <div className="rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold text-[#24292f]">Self-update repo</p>
+          <p className="mt-1 text-xs text-[#57606a]">
+            {selfUpdateRepo.status === "detected"
+              ? `${selfUpdateRepo.fullName} · ${selfUpdateRepo.branch}`
+              : selfUpdateRepo.status === "ambiguous"
+                ? "Multiple selected repositories look like Tiller hubs."
+                : "Auto-detected when a selected GitHub App repository contains Tiller deploy-button metadata."}
+          </p>
+        </div>
+        {selfUpdateRepo.status !== "detected" && (
+          <button
+            type="button"
+            onClick={() => void handleDetectSelfUpdateRepo()}
+            disabled={detectingUpdateRepo}
+            className="rounded border border-[#0969da] bg-white px-2.5 py-1 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
+          >
+            {detectingUpdateRepo ? "Checking..." : "Connect self-update repo"}
+          </button>
+        )}
+      </div>
+      {selfUpdateRepo.status === "ambiguous" && (
+        <div className="mt-3 grid gap-2">
+          {selfUpdateRepo.candidates.map((candidate) => (
+            <button
+              key={`${candidate.repoId}:${candidate.branch}`}
+              type="button"
+              onClick={() => void handleSelectSelfUpdateRepo(candidate)}
+              disabled={detectingUpdateRepo}
+              className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-left text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+            >
+              {candidate.label}
+            </button>
+          ))}
+        </div>
+      )}
+      {selfUpdateRepo.status === "missing" && (
+        <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
+          <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
+          <p className="mt-1 text-xs leading-5 text-[#57606a]">
+            Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
+            {visibleUpdateRepoOwners.length > 0
+              ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
+              : " Tiller cannot currently see any selected GitHub App repositories."}
+            {" "}Open Cloudflare Worker Settings &gt; Builds and compare the connected repo owner.
+          </p>
+        </div>
+      )}
+    </div>
+  ) : null;
 
   if (status.githubAppPublicHubDisabled) {
     return (
@@ -1248,40 +1275,111 @@ function GitHubAppSettings({
     );
   }
 
+  if (configured && status.githubAppReady) {
+    return (
+      <div className="grid gap-3">
+        <div className="grid gap-2">
+          <p className="text-sm font-semibold text-[#1a7f37]">GitHub App configured</p>
+          <p className="text-xs leading-5 text-[#57606a]">
+            Tiller can use the repositories selected in this GitHub App installation for private repository access and pull request permissions.
+          </p>
+          {githubAppUrl ? (
+            <div className="mt-1 border-t border-[#d0d7de] pt-3">
+              <p className="text-xs font-semibold text-[#24292f]">GitHub App URL</p>
+              <a
+                href={githubAppUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-1 inline-block break-all text-xs font-medium text-[#0969da] hover:underline"
+              >
+                {githubAppUrl}
+              </a>
+              <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                This is the GitHub App Tiller created for this hub. It is not a repository URL; GitHub uses it to manage which repositories Tiller can access.
+              </p>
+            </div>
+          ) : null}
+        </div>
+        {selfUpdateRepoPanel}
+        {error && <p className="text-xs text-[#cf222e]">{error}</p>}
+      </div>
+    );
+  }
+
+  const stepBoxClasses = {
+    success: "border-[#1a7f37]/25 bg-[#f0fff4]",
+    warning: "border-[#d4a72c]/30 bg-[#fff8c5]",
+    error: "border-[#cf222e]/25 bg-[#fff1f1]",
+    neutral: "border-[#d0d7de] bg-[#f6f8fa]",
+  };
+  const repositoryAccessReady = configured && !loadingRepos && !githubRepositories.error && repoSelections.length > 0;
+  const repositoryStep = !configured
+    ? {
+        label: "Waiting for app",
+        detail: "Create the GitHub App before choosing repository access.",
+        tone: "neutral" as const,
+      }
+    : loadingRepos
+      ? {
+          label: "Checking repositories",
+          detail: "Loading GitHub App repository access.",
+          tone: "neutral" as const,
+        }
+      : githubRepositories.error
+        ? {
+            label: "Repository access needs attention",
+            detail: githubRepositories.error,
+            tone: "error" as const,
+          }
+        : repoSelections.length === 0
+          ? {
+              label: "No repositories available",
+              detail: githubRepositories.warnings[0]?.message ?? "No repositories are selected in the configured GitHub App installation.",
+              tone: "warning" as const,
+            }
+          : allRepositoriesAvailable
+            ? {
+                label: "All repositories available",
+                detail: status.githubAppSlug ? `${status.githubAppSlug} is installed for all repositories.` : "The GitHub App is installed for all repositories.",
+                tone: "success" as const,
+              }
+            : {
+                label: `${repoSelections.length} selected ${repoSelections.length === 1 ? "repository" : "repositories"} available`,
+                detail: "The GitHub App can use the repositories selected during installation.",
+                tone: "success" as const,
+              };
+  const readyStep = repositoryAccessReady
+    ? {
+        label: "Ready for private repos",
+        detail: "Tiller will use this GitHub App automatically for private repository access and pull request permissions.",
+        tone: "success" as const,
+      }
+    : configured
+      ? {
+          label: "Waiting for repository access",
+          detail: "This completes automatically once GitHub reports at least one available repository.",
+          tone: githubRepositories.error || repoSelections.length === 0 ? "warning" as const : "neutral" as const,
+        }
+      : {
+          label: "Waiting for setup",
+          detail: "This completes after the app is created and repositories are available.",
+          tone: "neutral" as const,
+        };
+  const createStepTone = configured ? "success" : waitingForCreation ? "warning" : "neutral";
+
   return (
     <div className="grid gap-3 rounded-xl border border-[#d0d7de] bg-white px-4 py-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 max-w-2xl">
-          <p className="text-sm font-semibold text-[#24292f]">Connect GitHub</p>
-          <p className="mt-1 text-xs leading-5 text-[#57606a]">
-            Tiller creates a GitHub App that you own. The app can only access repositories you select during installation,
-            and Tiller stores the generated app credentials in this hub.
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-[#24292f]">
+            {configured ? "GitHub App configured" : "GitHub App not set up"}
           </p>
+          {configured && status.githubAppSlug && (
+            <p className="mt-1 text-xs text-[#57606a]">{status.githubAppSlug}</p>
+          )}
         </div>
+        {/*
         <div className="flex flex-wrap justify-end gap-2">
-          {!configured && (
-            <a
-              href={createUrl}
-              target="_blank"
-              rel="noreferrer"
-              onClick={() => {
-                setWaitingForCreation(true);
-              }}
-              className="rounded border border-[#0969da] bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
-            >
-              Create GitHub App
-            </a>
-          )}
-          {configured && installUrl && (
-            <a
-              href={installUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="rounded border border-[#0969da] bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
-            >
-              Install more repos
-            </a>
-          )}
           {configured && (
             <a
               href={manageUrl}
@@ -1303,8 +1401,66 @@ function GitHubAppSettings({
             {manualOpen ? "Close advanced" : "Advanced"}
           </button>
         </div>
+        */}
       </div>
 
+      <div className="grid gap-2">
+        <div className={`rounded-lg border px-3 py-2 ${stepBoxClasses[createStepTone]}`}>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold text-[#24292f]">1. Create GitHub App</p>
+              <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                {configured
+                  ? status.githubAppSlug
+                    ? `Created: ${status.githubAppSlug}`
+                    : "Created"
+                  : waitingForCreation
+                    ? "Waiting for GitHub to return app config."
+                    : "Create the app owned by this GitHub account."}
+              </p>
+            </div>
+            {!configured && (
+              <a
+                href={createUrl}
+                target="_blank"
+                rel="noreferrer"
+                onClick={() => {
+                  setWaitingForCreation(true);
+                }}
+                className="rounded border border-[#0969da] bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
+              >
+                Create GitHub App
+              </a>
+            )}
+          </div>
+        </div>
+
+        <div className={`rounded-lg border px-3 py-2 ${stepBoxClasses[repositoryStep.tone]}`}>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold text-[#24292f]">2. Install repositories</p>
+              <p className="mt-1 text-xs leading-5 text-[#57606a]">{repositoryStep.label}: {repositoryStep.detail}</p>
+            </div>
+            {configured && installUrl && !allRepositoriesAvailable && (
+              <a
+                href={installUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded border border-[#0969da] bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
+              >
+                {repoSelections.length > 0 ? "Install more repos" : "Install repositories"}
+              </a>
+            )}
+          </div>
+        </div>
+
+        <div className={`rounded-lg border px-3 py-2 ${stepBoxClasses[readyStep.tone]}`}>
+          <p className="text-xs font-semibold text-[#24292f]">3. Use in Tiller</p>
+          <p className="mt-1 text-xs leading-5 text-[#57606a]">{readyStep.label}: {readyStep.detail}</p>
+        </div>
+      </div>
+
+      {/*
       <div className="grid gap-2 md:grid-cols-3">
         <div className={`rounded-lg border px-3 py-2 ${configured ? "border-[#1a7f37]/25 bg-[#f0fff4]" : "border-[#d0d7de] bg-[#f6f8fa]"}`}>
           <p className="text-xs font-semibold text-[#24292f]">1. Create app</p>
@@ -1329,6 +1485,7 @@ function GitHubAppSettings({
           </p>
         </div>
       </div>
+      */}
 
       {waitingForCreation && !configured && (
         <div className="rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
@@ -1339,6 +1496,7 @@ function GitHubAppSettings({
         </div>
       )}
 
+      {/*
       {configured && (
         <div className="grid gap-2 rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
           <div className="flex flex-wrap items-end gap-2">
@@ -1403,61 +1561,10 @@ function GitHubAppSettings({
           )}
         </div>
       )}
+      */}
 
-      {configured && showSelfUpdateRepo && (
-        <div className="rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold text-[#24292f]">Self-update repo</p>
-              <p className="mt-1 text-xs text-[#57606a]">
-                {selfUpdateRepo.status === "detected"
-                  ? `${selfUpdateRepo.fullName} · ${selfUpdateRepo.branch}`
-                  : selfUpdateRepo.status === "ambiguous"
-                    ? "Multiple selected repositories look like Tiller hubs."
-                    : "Auto-detected when a selected GitHub App repository contains Tiller deploy-button metadata."}
-              </p>
-            </div>
-            {selfUpdateRepo.status !== "detected" && (
-              <button
-                type="button"
-                onClick={() => void handleDetectSelfUpdateRepo()}
-                disabled={detectingUpdateRepo}
-                className="rounded border border-[#0969da] bg-white px-2.5 py-1 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
-              >
-                {detectingUpdateRepo ? "Checking..." : "Connect self-update repo"}
-              </button>
-            )}
-          </div>
-          {selfUpdateRepo.status === "ambiguous" && (
-            <div className="mt-3 grid gap-2">
-              {selfUpdateRepo.candidates.map((candidate) => (
-                <button
-                  key={`${candidate.repoId}:${candidate.branch}`}
-                  type="button"
-                  onClick={() => void handleSelectSelfUpdateRepo(candidate)}
-                  disabled={detectingUpdateRepo}
-                  className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-left text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
-                >
-                  {candidate.label}
-                </button>
-              ))}
-            </div>
-          )}
-          {selfUpdateRepo.status === "missing" && (
-            <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
-              <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
-              <p className="mt-1 text-xs leading-5 text-[#57606a]">
-                Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
-                {visibleUpdateRepoOwners.length > 0
-                  ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
-                  : " Tiller cannot currently see any selected GitHub App repositories."}
-                {" "}Open Cloudflare Worker Settings &gt; Builds and compare the connected repo owner.
-              </p>
-            </div>
-          )}
-        </div>
-      )}
-
+      {selfUpdateRepoPanel}
+      {/*
       {manualOpen && (
         <div className="grid gap-3 rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
           <div>
@@ -1513,6 +1620,8 @@ function GitHubAppSettings({
           {error && <p className="text-xs text-[#cf222e]">{error}</p>}
         </div>
       )}
+      */}
+      {error && <p className="text-xs text-[#cf222e]">{error}</p>}
     </div>
   );
 }
@@ -1536,8 +1645,9 @@ function HostingStatusCards({
   const command = selfHostSetupCommand(status);
   const selfHostActive = status.deploymentMode === "self-host";
   const setupInProgress = status.selfHostStatus === "setup-in-progress";
-  const activeClasses = statusToneClasses(selfHostActive && status.selfHostStatus === "ready" ? "success" : "warning");
-  const showTechnicalDetails = selfHostActive || setupInProgress;
+  const selfHostHealthy = selfHostActive && status.selfHostStatus === "ready";
+  const activeClasses = statusToneClasses(selfHostHealthy ? "success" : "warning");
+  const showTechnicalDetails = setupInProgress || (selfHostActive && !selfHostHealthy);
 
   async function handleReturnToHosted() {
     const confirmation = window.prompt('Type "return to hosted" to restore Hosted Tiller on the protected workers.dev URL.');
@@ -1668,8 +1778,11 @@ function HostingStatusCards({
 export default function SettingsPage({ status, onDone, onRefresh }: SettingsPageProps) {
   const [testResults, setTestResults] = useState<Map<string, VerifyModelAuthResult>>(new Map());
   const [codexImportOpen, setCodexImportOpen] = useState(false);
+  const [codexStatusRefreshing, setCodexStatusRefreshing] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const addToast = useToast();
   const codexStatus = codexSubscriptionStatus(status);
+  const codexImportDisabled = status.hasChatGPTAuth && status.chatgptAuthStatus !== "needs_reconnect";
   const selfHostFeaturesVisible = status.isLocalDev || status.deploymentMode === "self-host";
   const codexVisible =
     status.enabledHarnesses.includes("codex") || status.hasOpenAIKey || (selfHostFeaturesVisible && status.hasChatGPTAuth);
@@ -1691,8 +1804,7 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
   ];
   const apiCredentials: CredentialDef[] = [
     {
-      label: "Anthropic API key",
-      description: "Use API-billed Claude access. Required for headless container environments.",
+      label: "Claude API key",
       secretKey: "ANTHROPIC_API_KEY",
       configured: status.hasAnthropicKey,
       testable: true,
@@ -1700,8 +1812,7 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
     ...(codexVisible
       ? [
           {
-            label: "API key",
-            description: "Use API-billed Codex access for Cloudflare Containers.",
+            label: "Codex API key",
             secretKey: "OPENAI_API_KEY",
             configured: status.hasOpenAIKey,
             testable: true,
@@ -1742,13 +1853,51 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
     }
   }
 
+  async function handleCodexStatusRefresh() {
+    setCodexStatusRefreshing(true);
+    try {
+      const latest = await fetchSetupStatus(HUB_URL);
+      await onRefresh();
+      if (latest.chatgptAuthStatus === "connected" || latest.chatgptAuthStatus === "refreshing") {
+        const active = latest.openaiPlannerAvailable && latest.openaiPlannerRoute === "subscription-gateway";
+        addToast({
+          title: active ? "Subscription active" : "Subscription imported",
+          body: active
+            ? "The OpenAI planner can use the imported Codex subscription."
+            : latest.openaiPlannerReason ??
+              "The subscription is imported. Tiller Self Host may still need the Subscription Gateway.",
+          variant: active ? "success" : "warning",
+        });
+      } else if (latest.chatgptAuthStatus === "needs_reconnect") {
+        addToast({
+          title: "Subscription still needs re-import",
+          body: "Run the import script again on the computer where Codex is logged in.",
+          variant: "warning",
+          duration: 8000,
+        });
+      } else {
+        addToast({
+          title: "Subscription not imported",
+          body: "Run the import script on the computer where Codex is logged in, then check again.",
+          variant: "warning",
+          duration: 8000,
+        });
+      }
+    } catch (err) {
+      addToast({
+        title: "Status refresh failed",
+        body: err instanceof Error ? err.message : String(err),
+        variant: "error",
+      });
+    } finally {
+      setCodexStatusRefreshing(false);
+    }
+  }
+
   return (
     <div className="flex-1 overflow-y-auto bg-[#f6f8fa]">
       {codexImportOpen && (
-        <CodexImportDialog
-          onClose={() => setCodexImportOpen(false)}
-          onRefresh={onRefresh}
-        />
+        <CodexImportDialog onClose={() => setCodexImportOpen(false)} />
       )}
       <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 px-6 py-8">
         <div className="flex items-start justify-between gap-4">
@@ -1784,7 +1933,7 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
               ? "Manage your Claude and Codex credentials. OpenCode uses the built-in Workers AI proxy."
               : codexVisible || opencodeVisible
                 ? "Add Claude or Codex credentials when you want those harnesses. OpenCode uses the built-in Workers AI proxy."
-                : "Add an Anthropic API key or Claude subscription token. This is the only required setup item."
+                : "Add a Claude API key or Claude subscription token. This is the only required setup item."
           }
           tone={status.modelAuthConfigured ? "success" : "warning"}
         >
@@ -1825,36 +1974,14 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
                     status={status}
                     codexStatus={codexStatus}
                     onImport={() => setCodexImportOpen(true)}
+                    importDisabled={codexImportDisabled}
+                    onCheckStatus={() => void handleCodexStatusRefresh()}
+                    checkingStatus={codexStatusRefreshing}
                   />
                 )}
               </div>
             </div>
             ) : null}
-          </div>
-        </Card>
-
-        <Card
-          title="Environment auto-stop"
-          description="Automatically stop idle Cloudflare containers to save resources."
-          tone="default"
-        >
-          <div className="grid gap-3">
-            <IdleTimeoutRow
-              currentMinutes={status.idleTimeoutMinutes}
-              onSave={async (minutes) => {
-                await submitSetup(HUB_URL, { IDLE_TIMEOUT_MINUTES: String(minutes) });
-                await onRefresh();
-                addToast({ title: "Idle timeout updated", variant: "success" });
-              }}
-            />
-            <CanonicalMainBootstrapDepthRow
-              currentDepth={status.canonicalMainBootstrapDepth}
-              onSave={async (depth) => {
-                await submitSetup(HUB_URL, { CANONICAL_MAIN_BOOTSTRAP_DEPTH: String(depth) });
-                await onRefresh();
-                addToast({ title: "Canonical history depth updated", variant: "success" });
-              }}
-            />
           </div>
         </Card>
 
@@ -1865,6 +1992,48 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
         >
           <GitHubAppSettings status={status} onRefresh={onRefresh} />
         </Card>
+
+        <section className="rounded-2xl border border-[#d0d7de] bg-white p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold text-[#24292f]">Advanced</h3>
+              <p className="mt-1 text-sm text-[#57606a]">Less common environment lifecycle and repository bootstrap settings.</p>
+            </div>
+            <button
+              type="button"
+              aria-expanded={advancedOpen}
+              onClick={() => setAdvancedOpen((value) => !value)}
+              className="rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
+            >
+              {advancedOpen ? "Hide advanced" : "Show advanced"}
+            </button>
+          </div>
+          {advancedOpen && (
+            <div className="mt-4 grid gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">Environment auto-stop</p>
+                <div className="mt-3 grid gap-3">
+                  <IdleTimeoutRow
+                    currentMinutes={status.idleTimeoutMinutes}
+                    onSave={async (minutes) => {
+                      await submitSetup(HUB_URL, { IDLE_TIMEOUT_MINUTES: String(minutes) });
+                      await onRefresh();
+                      addToast({ title: "Idle timeout updated", variant: "success" });
+                    }}
+                  />
+                  <CanonicalMainBootstrapDepthRow
+                    currentDepth={status.canonicalMainBootstrapDepth}
+                    onSave={async (depth) => {
+                      await submitSetup(HUB_URL, { CANONICAL_MAIN_BOOTSTRAP_DEPTH: String(depth) });
+                      await onRefresh();
+                      addToast({ title: "Canonical history depth updated", variant: "success" });
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
 
         {status.isLocalDev && (
           <Card

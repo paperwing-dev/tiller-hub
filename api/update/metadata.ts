@@ -116,6 +116,22 @@ export async function fetchLatestReleaseUpdateMetadata(): Promise<{
   update: TillerUpdateMetadata;
   releaseNotesUrl: string;
 }> {
+  const latestRelease = await fetchLatestPublicHubReleaseRef();
+  const update = await fetchPublicUpdateMetadataAtRef(latestRelease.tagName);
+  if (normalizeVersionTag(update.version) !== normalizeVersionTag(latestRelease.tagName)) {
+    throw new Error(`${UPDATE_METADATA_PATH} version ${update.version} does not match release tag ${latestRelease.tagName}.`);
+  }
+
+  return {
+    update,
+    releaseNotesUrl: latestRelease.releaseNotesUrl,
+  };
+}
+
+export async function fetchLatestPublicHubReleaseRef(): Promise<{
+  tagName: string;
+  releaseNotesUrl: string;
+}> {
   const releaseResponse = await fetch(LATEST_RELEASE_URL, {
     headers: {
       Accept: "application/vnd.github+json",
@@ -132,13 +148,8 @@ export async function fetchLatestReleaseUpdateMetadata(): Promise<{
     throw new Error("GitHub latest release is missing a valid tag name.");
   }
 
-  const update = await fetchPublicUpdateMetadataAtRef(tagName);
-  if (normalizeVersionTag(update.version) !== normalizeVersionTag(tagName)) {
-    throw new Error(`${UPDATE_METADATA_PATH} version ${update.version} does not match release tag ${tagName}.`);
-  }
-
   return {
-    update,
+    tagName,
     releaseNotesUrl: release.html_url || `https://github.com/${PUBLIC_HUB_REPO}/releases/tag/${encodeURIComponent(tagName)}`,
   };
 }

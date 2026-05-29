@@ -107,4 +107,29 @@ describe("SessionList promote actions", () => {
     expect(html).not.toContain("Promote Preview");
     expect(html).not.toContain("Promote to Main");
   });
+
+  it("links repository headers to GitHub", () => {
+    const html = render(makeEnv());
+
+    expect(html).toContain('href="https://github.com/test/repo"');
+    expect(html).toContain(">test/repo</a>");
+  });
+
+  it("hides branch, plan-name, and duplicate repo details from env cards", () => {
+    const html = render(makeEnv({
+      startupPlanId: "plan-1",
+      status: "running",
+    }));
+
+    expect(html).toContain("Running");
+    expect(html).toContain("Cloudflare Containers");
+    expect(html).toContain("Claude Code");
+    expect(html).not.toContain("New Plan");
+    expect(html).not.toContain("Workspace");
+    expect(html).not.toContain("No Plan");
+    expect(html).not.toContain("Branch:");
+    expect(html).not.toContain("tiller/demo-env");
+    expect(html).not.toContain("Plan: Selected");
+    expect(html).not.toContain("test/repo</p>");
+  });
 });

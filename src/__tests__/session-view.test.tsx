@@ -60,7 +60,31 @@ function makeSession() {
 }
 
 describe("SessionView", () => {
-  it("shows a Stop control for interactive env-backed sessions", () => {
+  it("does not render the legacy message composer", () => {
+    const html = renderToString(
+      <SessionView
+        session={makeSession()}
+        env={{
+          slug: "demo-env",
+          status: "running",
+          harness: "codex",
+        }}
+        hubUrl="https://example.com"
+        onWsMessage={{ current: null }}
+        wsSend={{ current: null }}
+        connected
+        updateLastSeq={() => undefined}
+        permissions={[]}
+        onPermissionResolved={() => undefined}
+        onRecoverEnv={() => undefined}
+      />,
+    );
+
+    expect(html).not.toContain("Type a message");
+    expect(html).not.toContain(">Send<");
+  });
+
+  it("does not render a duplicate Stop control for interactive env-backed sessions", () => {
     const html = renderToString(
       <SessionView
         session={makeSession()}
@@ -80,10 +104,10 @@ describe("SessionView", () => {
       />,
     );
 
-    expect(html).toContain("Stop");
+    expect(html).not.toContain(">Stop<");
   });
 
-  it("still shows Stop while the env metadata is catching up from starting", () => {
+  it("does not render a duplicate Stop control while the env metadata is catching up from starting", () => {
     const html = renderToString(
       <SessionView
         session={makeSession()}
@@ -103,10 +127,10 @@ describe("SessionView", () => {
       />,
     );
 
-    expect(html).toContain("Stop");
+    expect(html).not.toContain(">Stop<");
   });
 
-  it("still shows Stop when the session activity bit lags behind a running env", () => {
+  it("does not render a duplicate Stop control when the session activity bit lags behind a running env", () => {
     const html = renderToString(
       <SessionView
         session={{
@@ -129,7 +153,7 @@ describe("SessionView", () => {
       />,
     );
 
-    expect(html).toContain("Stop");
+    expect(html).not.toContain(">Stop<");
   });
 
   it("hides the Stop control once the env is saving changes", () => {

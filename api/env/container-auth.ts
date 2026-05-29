@@ -120,16 +120,19 @@ export async function resolveContainerAuth(
   env: Env,
   options?: { requested?: string | null; stored?: string | null; backend?: RunnerBackendKind },
 ): Promise<ResolvedContainerAuth> {
+  const backend = options?.backend;
   const authMode = resolveClaudeAuthMode(options);
   const oauthToken = await getSecret(env, "CLAUDE_CODE_OAUTH_TOKEN");
   const apiKey = await getSecret(env, "ANTHROPIC_API_KEY");
-  const backend = options?.backend;
 
   if (authMode === "subscription") {
     if (backend === "cf") {
       throw new Error("Claude subscription auth is only supported on Tiller Self Host environments. Cloudflare Containers must use ANTHROPIC_API_KEY.");
     }
     if (!oauthToken) {
+      if (backend === "host") {
+        throw new Error("Claude subscription auth requested, but CLAUDE_CODE_OAUTH_TOKEN is not configured. Use auto auth to allow ANTHROPIC_API_KEY fallback.");
+      }
       throw new Error("Claude subscription auth requested, but CLAUDE_CODE_OAUTH_TOKEN is not configured");
     }
     return {
@@ -157,7 +160,6 @@ export async function resolveContainerAuth(
     return {
       authMode,
       resolvedAuthMode: "api",
-      authWarning: "Cloudflare Containers use the Anthropic API key.",
       envVars: { ANTHROPIC_API_KEY: apiKey },
     };
   }
@@ -174,12 +176,15 @@ export async function resolveContainerAuth(
     return {
       authMode,
       resolvedAuthMode: "api",
-      authWarning: "This environment is using the Anthropic API key.",
       envVars: { ANTHROPIC_API_KEY: apiKey },
     };
   }
 
-  throw new Error("No auth configured for container: set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY as a Wrangler secret");
+  throw new Error(
+    backend === "host"
+      ? "Claude Code on Tiller Self Host requires either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY."
+      : "No auth configured for container: set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY as a Wrangler secret",
+  );
 }
 
 export async function resolveCodexContainerAuth(
@@ -225,12 +230,11 @@ export async function resolveCodexContainerAuth(
           authPreference,
           resolvedAuthMode: "api-key",
           modelRoute: "api-fallback",
-          authWarning: "Subscription auth needs reconnect; using the API key.",
           envVars: { OPENAI_API_KEY: apiKey },
         };
       }
 
-      throw new Error("Codex subscription auth requires an imported Codex subscription login in Tiller.");
+      throw new Error("Codex requires an imported Codex subscription login in Tiller or OPENAI_API_KEY.");
     }
     return {
       authPreference,
@@ -261,15 +265,14 @@ export async function resolveCodexContainerAuth(
         authPreference,
         resolvedAuthMode: "api-key",
         modelRoute: "api-fallback",
-        authWarning: "Subscription gateway route is unavailable; using the API key.",
         envVars: { OPENAI_API_KEY: gatewayRoute.openaiApiKey },
       };
     }
 
     throw new Error(
       options?.backend === "host"
-        ? "Codex requires a connected Subscription Gateway or an API key."
-        : "Codex requires a running Subscription Gateway or an API key.",
+        ? "Codex on Tiller Self Host requires a connected Subscription Gateway or OPENAI_API_KEY."
+        : "Codex requires a running Subscription Gateway or OPENAI_API_KEY.",
     );
   }
 
@@ -277,9 +280,6 @@ export async function resolveCodexContainerAuth(
     authPreference,
     resolvedAuthMode: "api-key",
     modelRoute: "api-fallback",
-    ...(authPreference === "auto"
-      ? { authWarning: "Subscription gateway route is unavailable; using the API key." }
-      : {}),
     envVars: { OPENAI_API_KEY: apiKey },
   };
 }

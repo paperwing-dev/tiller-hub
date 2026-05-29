@@ -6,6 +6,8 @@ import { SerializeAddon } from "@xterm/addon-serialize";
 import type { StoredSession } from "../api/types";
 import { fetchMessages } from "./api";
 
+export const TERMINAL_MINIMUM_CONTRAST_RATIO = 4.5;
+
 // LRU cache for serialized terminal state (max 8 sessions)
 const MAX_CACHE = 8;
 const terminalCache = new Map<string, { serialized: string; lastSeq: number }>();
@@ -32,6 +34,32 @@ interface TerminalViewProps {
   interactive?: boolean;
   onInput?: (data: string) => void;
   onResize?: (cols: number, rows: number) => void;
+}
+
+export function getTerminalTheme() {
+  return {
+    background: "#ffffff",
+    foreground: "#24292f",
+    cursor: "#0969da",
+    cursorAccent: "#ffffff",
+    selectionBackground: "rgba(9, 105, 218, 0.15)",
+    black: "#24292f",
+    red: "#cf222e",
+    green: "#1a7f37",
+    yellow: "#9a6700",
+    blue: "#0969da",
+    magenta: "#8250df",
+    cyan: "#0969da",
+    white: "#6e7781",
+    brightBlack: "#57606a",
+    brightRed: "#a40e26",
+    brightGreen: "#116329",
+    brightYellow: "#7d4e00",
+    brightBlue: "#218bff",
+    brightMagenta: "#a475f9",
+    brightCyan: "#3192aa",
+    brightWhite: "#24292f",
+  };
 }
 
 export default forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
@@ -98,29 +126,8 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
     const term = new Terminal({
       cols: 120,
       rows: 40,
-      theme: {
-        background: "#ffffff",
-        foreground: "#24292f",
-        cursor: "#0969da",
-        cursorAccent: "#ffffff",
-        selectionBackground: "rgba(9, 105, 218, 0.15)",
-        black: "#24292f",
-        red: "#cf222e",
-        green: "#1a7f37",
-        yellow: "#9a6700",
-        blue: "#0969da",
-        magenta: "#8250df",
-        cyan: "#0969da",
-        white: "#6e7781",
-        brightBlack: "#57606a",
-        brightRed: "#a40e26",
-        brightGreen: "#116329",
-        brightYellow: "#7d4e00",
-        brightBlue: "#218bff",
-        brightMagenta: "#a475f9",
-        brightCyan: "#3192aa",
-        brightWhite: "#24292f",
-      },
+      theme: getTerminalTheme(),
+      minimumContrastRatio: TERMINAL_MINIMUM_CONTRAST_RATIO,
       scrollback: 10000,
       convertEol: false,
       disableStdin: false,
@@ -293,7 +300,7 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
     <div className="flex-1 min-h-0 overflow-hidden relative">
       <div
         ref={containerRef}
-        className="absolute inset-0 px-2 py-1"
+        className="absolute inset-0 px-2 py-1 bg-white"
       />
       {loading && (
         <div className="absolute inset-0 flex items-center justify-center text-[#57606a] text-sm pointer-events-none">

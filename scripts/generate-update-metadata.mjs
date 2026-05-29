@@ -91,7 +91,7 @@ async function resolveVersion(args) {
     || process.env.TILLER_BUILD_VERSION?.trim();
   if (explicit) return normalizeVersion(explicit);
 
-  const packageJsonPath = path.resolve(packageRoot, "../tiller/package.json");
+  const packageJsonPath = path.resolve(packageRoot, "package.json");
   const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8"));
   if (typeof packageJson.version === "string" && packageJson.version.trim()) {
     return normalizeVersion(packageJson.version);

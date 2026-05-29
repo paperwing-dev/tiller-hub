@@ -504,6 +504,7 @@ githubRoutes.get("/api/github/repositories", async (c) => {
         code: blockingWarning?.code ?? "github_app_no_usable_repositories",
         repositories: [],
         warnings: result.warnings,
+        repositorySelection: result.repositorySelection,
       }, 409);
     }
     return c.json(result);
@@ -514,6 +515,7 @@ githubRoutes.get("/api/github/repositories", async (c) => {
         ...normalized.body,
         repositories: [],
         warnings: [],
+        repositorySelection: "unknown",
       },
       normalized.status as any,
     );

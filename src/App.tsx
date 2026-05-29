@@ -37,6 +37,8 @@ import UpdateDialog from './UpdateDialog';
 import { dismissUpdate, isUpdateDismissed } from './update-storage';
 import { isLoopbackHostname } from '../shared/local-dev';
 import { isRepoMainReady } from './repo-status';
+import { getBackendBadgeLabel, getEnvDisplayName } from './env-display';
+import { getHarnessBadgeLabel } from './env-harness';
 import type { DashboardSelection as Selection } from './live-sync-store';
 import { reconcileSelectionAfterRunningEnv } from './live-sync-store';
 import { useLiveSyncStore } from './useLiveSyncStore';
@@ -350,18 +352,10 @@ export default function Dashboard() {
       const env = await createEnv(HUB_URL, repoId, backend, harness, undefined, codexAuthPreference);
       upsertEnv(env);
       addToast({
-        title: 'Environment created',
-        body: `${env.slug} (${backend}, ${harness})`,
+        title: `${getEnvDisplayName(env)} created`,
+        body: `${getBackendBadgeLabel(backend)}, ${getHarnessBadgeLabel(harness)}`,
         variant: 'success',
       });
-      if (env.authWarning) {
-        addToast({
-          title: env.harness === 'codex' ? 'Codex auth' : 'Claude auth',
-          body: env.authWarning,
-          variant: 'warning',
-          duration: 8000,
-        });
-      }
       setSelection({ type: 'env', envSlug: env.slug });
       setNewEnvTarget(null);
     },
@@ -684,12 +678,6 @@ export default function Dashboard() {
     : [];
   const isLocalDev = setupStatus?.isLocalDev ?? false;
 
-  // Compute per-session permission counts for SessionList
-  const permissionCounts: Record<string, number> = {};
-  for (const [sid, perms] of permissions) {
-    if (perms.length > 0) permissionCounts[sid] = perms.length;
-  }
-
   // Setup check: loading or needs first-run setup
   if (!setupChecked) {
     return (
@@ -710,13 +698,29 @@ export default function Dashboard() {
 
   return (
     <div className="flex h-screen relative">
-      <UpdateButton
-        status={updateStatus}
-        issue={updateIssue}
-        dismissed={updateDismissed}
-        isChecking={isCheckingUpdate}
-        onOpen={() => setSelection({ type: 'update' })}
-      />
+      <div className="absolute right-4 top-3 z-20 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setSelection({ type: 'settings' })}
+          className={`inline-flex h-8 w-8 items-center justify-center rounded-md border text-base leading-none transition-colors ${
+            selection.type === 'settings'
+              ? 'border-[#0969da] bg-[#ddf4ff] text-[#0969da]'
+              : 'border-[#d0d7de] bg-white text-[#57606a] hover:bg-[#f6f8fa] hover:text-[#24292f]'
+          }`}
+          title="Settings"
+          aria-label="Settings"
+          aria-current={selection.type === 'settings' ? 'page' : undefined}
+        >
+          <span aria-hidden="true">&#9881;</span>
+        </button>
+        <UpdateButton
+          status={updateStatus}
+          issue={updateIssue}
+          dismissed={updateDismissed}
+          isChecking={isCheckingUpdate}
+          onOpen={() => setSelection({ type: 'update' })}
+        />
+      </div>
 
       {/* Sidebar */}
       <div
@@ -728,17 +732,11 @@ export default function Dashboard() {
               TILLER
             </span>
             <div className="flex items-center gap-2">
-              <button
-                onClick={() => setSelection({ type: 'settings' })}
-                className="text-[#57606a] hover:text-[#24292f] text-sm leading-none"
-                title="Settings"
-              >
-                &#9881;
-              </button>
               <ConnectionsBadge
                 hubUrl={HUB_URL}
                 hubConnected={connected}
                 hostRefreshNonce={hostRefreshNonce}
+                showHost={setupStatus?.isLocalDev === true || setupStatus?.deploymentMode === "self-host"}
               />
               <button
                 onClick={() => setSidebarOpen(false)}
@@ -763,7 +761,6 @@ export default function Dashboard() {
           sessions={sessions}
           selectedId={selectedId}
           onSelect={handleSessionSelect}
-          permissionCounts={permissionCounts}
           envs={envs}
           hubUrl={HUB_URL}
           onRecoverEnv={recoverEnv}
@@ -937,6 +934,11 @@ export default function Dashboard() {
           deploymentMode={setupStatus?.deploymentMode ?? 'hosted'}
           hostConnected={setupStatus?.hostConnected ?? false}
           hostGatewayAvailable={setupStatus?.hostGatewayAvailable ?? false}
+          hasClaudeSubscription={setupStatus?.hasClaudeSubscription ?? false}
+          hasAnthropicKey={setupStatus?.hasAnthropicKey ?? false}
+          hasChatGPTAuth={setupStatus?.hasChatGPTAuth ?? false}
+          hasOpenAIKey={setupStatus?.hasOpenAIKey ?? false}
+          workersAiConfigured={setupStatus?.workersAiConfigured ?? false}
           enabledHarnesses={setupStatus?.enabledHarnesses ?? ['claude-code']}
           repo={newEnvRepo}
           onCreate={handleCreateEnv}

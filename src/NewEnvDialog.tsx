@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import type { CodexAuthPreference, EnvHarness, RepoMeta } from "../api/types";
 import type { GitHubRepositorySelection } from "./api";
 import { getHarnessBadgeLabel } from "./env-harness";
@@ -6,6 +6,36 @@ import { getRepoMainStatusDetail, getRepoMainStatusLabel, isRepoMainReady } from
 import { githubRepositoryKey, useGitHubRepositories } from "./useGitHubRepositories";
 
 // ── NewRepoDialog ────────────────────────────────────────────────
+
+export const REPOSITORY_PAGE_SIZE = 5;
+
+export function getRepositoryPagination(
+  totalItems: number,
+  requestedPage: number,
+  pageSize = REPOSITORY_PAGE_SIZE,
+): {
+  page: number;
+  totalPages: number;
+  startIndex: number;
+  endIndex: number;
+  hasPrevious: boolean;
+  hasNext: boolean;
+} {
+  const safePageSize = Math.max(1, Math.floor(pageSize));
+  const safeTotal = Math.max(0, totalItems);
+  const totalPages = Math.max(1, Math.ceil(safeTotal / safePageSize));
+  const page = Math.min(Math.max(1, Math.floor(requestedPage) || 1), totalPages);
+  const startIndex = Math.min((page - 1) * safePageSize, safeTotal);
+  const endIndex = Math.min(startIndex + safePageSize, safeTotal);
+  return {
+    page,
+    totalPages,
+    startIndex,
+    endIndex,
+    hasPrevious: page > 1,
+    hasNext: page < totalPages,
+  };
+}
 
 interface NewRepoDialogProps {
   onClose: () => void;
@@ -16,25 +46,53 @@ interface NewRepoDialogProps {
 
 export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialogProps) {
   const [query, setQuery] = useState("");
+  const [page, setPage] = useState(1);
   const [selectedKey, setSelectedKey] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const githubRepositories = useGitHubRepositories(hubUrl);
   const { repositories, warnings, loading: loadingRepositories } = githubRepositories;
-  const existingRepoIds = new Set(repos.map((repo) => repo.repoId));
-  const visibleRepositories = repositories.filter((repo) =>
-    repo.fullName.toLowerCase().includes(query.trim().toLowerCase()),
+  const existingRepoIds = useMemo(() => new Set(repos.map((repo) => repo.repoId)), [repos]);
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleRepositories = useMemo(
+    () => repositories.filter((repo) => repo.fullName.toLowerCase().includes(normalizedQuery)),
+    [repositories, normalizedQuery],
   );
-  const selected = repositories.find((repo) => repoKey(repo) === selectedKey) ?? null;
+  const pagination = getRepositoryPagination(visibleRepositories.length, page);
+  const pageRepositories = useMemo(
+    () => visibleRepositories.slice(pagination.startIndex, pagination.endIndex),
+    [pagination.endIndex, pagination.startIndex, visibleRepositories],
+  );
+  const selected = pageRepositories.find((repo) => repoKey(repo) === selectedKey) ?? null;
+  const canPage = !loading && !loadingRepositories;
+
+  useEffect(() => {
+    setPage((current) => getRepositoryPagination(visibleRepositories.length, current).page);
+  }, [visibleRepositories.length]);
+
+  useEffect(() => {
+    const currentSelection = pageRepositories.find((repo) => repoKey(repo) === selectedKey);
+    if (currentSelection && !existingRepoIds.has(String(currentSelection.repositoryId))) return;
+
+    const firstAvailable = pageRepositories.find((repo) => !existingRepoIds.has(String(repo.repositoryId)));
+    setSelectedKey(firstAvailable ? repoKey(firstAvailable) : "");
+  }, [existingRepoIds, pageRepositories, selectedKey]);
+
+  const handleQueryChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setQuery(e.target.value);
+    setPage(1);
+  };
+
+  const goToPreviousPage = () => {
+    setPage(getRepositoryPagination(visibleRepositories.length, pagination.page - 1).page);
+  };
+  const goToNextPage = () => {
+    setPage(getRepositoryPagination(visibleRepositories.length, pagination.page + 1).page);
+  };
 
   useEffect(() => {
     setError(githubRepositories.error);
   }, [githubRepositories.error]);
-
-  useEffect(() => {
-    const firstAvailable = repositories.find((repo) => !existingRepoIds.has(String(repo.repositoryId)));
-    setSelectedKey(firstAvailable ? repoKey(firstAvailable) : "");
-  }, [repositories, repos.map((repo) => repo.repoId).join("\n")]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -64,7 +122,7 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
           <input
             type="text"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={handleQueryChange}
             placeholder="Search selected repositories"
             autoFocus
             disabled={loading || loadingRepositories}
@@ -74,7 +132,7 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
             {loadingRepositories ? (
               <div className="px-3 py-3 text-xs text-[#57606a]">Loading repositories...</div>
             ) : visibleRepositories.length > 0 ? (
-              visibleRepositories.map((repo) => {
+              pageRepositories.map((repo) => {
                 const key = repoKey(repo);
                 const alreadyAdded = existingRepoIds.has(String(repo.repositoryId));
                 return (
@@ -105,6 +163,34 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
               </div>
             )}
           </div>
+          {visibleRepositories.length > 0 && pagination.totalPages > 1 && (
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-[#57606a]">
+              <span>
+                {pagination.startIndex + 1}-{pagination.endIndex} of {visibleRepositories.length}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={goToPreviousPage}
+                  disabled={!canPage || !pagination.hasPrevious}
+                  className="rounded border border-[#d0d7de] bg-white px-2 py-1 text-[#57606a] transition-colors hover:bg-[#f6f8fa] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Previous
+                </button>
+                <span className="whitespace-nowrap">
+                  Page {pagination.page} of {pagination.totalPages}
+                </span>
+                <button
+                  type="button"
+                  onClick={goToNextPage}
+                  disabled={!canPage || !pagination.hasNext}
+                  className="rounded border border-[#d0d7de] bg-white px-2 py-1 text-[#57606a] transition-colors hover:bg-[#f6f8fa] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
           {warnings.length > 0 && (
             <p className="mt-2 text-xs text-amber-700">
               {warnings[0]?.message}
@@ -148,6 +234,11 @@ interface NewEnvDialogProps {
   deploymentMode: "hosted" | "self-host";
   hostConnected: boolean;
   hostGatewayAvailable?: boolean;
+  hasClaudeSubscription?: boolean;
+  hasAnthropicKey?: boolean;
+  hasChatGPTAuth?: boolean;
+  hasOpenAIKey?: boolean;
+  workersAiConfigured?: boolean;
   enabledHarnesses: EnvHarness[];
   repo: RepoMeta;
   onCreate: (
@@ -169,12 +260,63 @@ export function getInitialEnvBackendSelection(
   return options.isLocalDev || (options.hostConnected && gatewayAvailable) ? "host" : "cf";
 }
 
+export function getEffectiveCodexAuthPreference(
+  options: {
+    backend: "cf" | "host";
+    deploymentMode: "hosted" | "self-host";
+  },
+): CodexAuthPreference {
+  if (options.backend === "host") return "auto";
+  if (options.deploymentMode === "hosted") return "api-key";
+  return "auto";
+}
+
+export function getHarnessCredentialError(options: {
+  harness: EnvHarness;
+  backend: "cf" | "host";
+  deploymentMode: "hosted" | "self-host";
+  hasClaudeSubscription?: boolean;
+  hasAnthropicKey?: boolean;
+  hasChatGPTAuth?: boolean;
+  hasOpenAIKey?: boolean;
+  workersAiConfigured?: boolean;
+}): string | null {
+  if (options.harness === "claude-code") {
+    if (options.backend === "cf") {
+      return options.hasAnthropicKey ? null : "Claude Code requires ANTHROPIC_API_KEY for Cloudflare Containers.";
+    }
+    return options.hasClaudeSubscription || options.hasAnthropicKey
+      ? null
+      : "Claude Code requires CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY.";
+  }
+
+  if (options.harness === "codex") {
+    if (options.deploymentMode === "hosted") {
+      return options.hasOpenAIKey ? null : "Codex requires OPENAI_API_KEY for Hosted Tiller.";
+    }
+    return options.hasChatGPTAuth || options.hasOpenAIKey
+      ? null
+      : "Codex requires a Codex subscription login or OPENAI_API_KEY.";
+  }
+
+  if (options.harness === "opencode") {
+    return options.workersAiConfigured ? null : "OpenCode requires the Workers AI binding.";
+  }
+
+  return null;
+}
+
 export function NewEnvDialog({
   onClose,
   isLocalDev,
   deploymentMode,
   hostConnected,
   hostGatewayAvailable = hostConnected,
+  hasClaudeSubscription = false,
+  hasAnthropicKey = false,
+  hasChatGPTAuth = false,
+  hasOpenAIKey = false,
+  workersAiConfigured = false,
   enabledHarnesses,
   repo,
   onCreate,
@@ -183,11 +325,21 @@ export function NewEnvDialog({
   const [backend, setBackend] = useState<"cf" | "host">(
     getInitialEnvBackendSelection({ isLocalDev, deploymentMode, hostConnected, hostGatewayAvailable }),
   );
-  const [codexAuthPreference, setCodexAuthPreference] = useState<CodexAuthPreference>("auto");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const repoMainReady = isRepoMainReady(repo);
   const repoMainDetail = getRepoMainStatusDetail(repo);
+  const credentialError = getHarnessCredentialError({
+    harness,
+    backend,
+    deploymentMode,
+    hasClaudeSubscription,
+    hasAnthropicKey,
+    hasChatGPTAuth,
+    hasOpenAIKey,
+    workersAiConfigured,
+  });
+  const visibleError = error ?? credentialError;
 
   useEffect(() => {
     if (!enabledHarnesses.includes(harness)) {
@@ -206,18 +358,20 @@ export function NewEnvDialog({
   }, [deploymentMode, hostConnected, hostGatewayAvailable, isLocalDev]);
 
   useEffect(() => {
-    if (deploymentMode === "hosted") {
-      setCodexAuthPreference("api-key");
-    }
-  }, [deploymentMode]);
+    setError(null);
+  }, [backend, harness]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (credentialError) return;
 
     setLoading(true);
     setError(null);
     try {
-      await onCreate(backend, harness, harness === "codex" ? codexAuthPreference : undefined);
+      const effectiveCodexAuthPreference = harness === "codex"
+        ? getEffectiveCodexAuthPreference({ backend, deploymentMode })
+        : undefined;
+      await onCreate(backend, harness, effectiveCodexAuthPreference);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -291,45 +445,8 @@ export function NewEnvDialog({
               </option>
             ))}
           </select>
-          {harness === "codex" ? (
-            <div className="mt-2 grid gap-2">
-              <label className="block text-xs font-medium text-[#57606a]">
-                Codex Auth
-              </label>
-              <select
-                value={codexAuthPreference}
-                onChange={(e) => setCodexAuthPreference(e.target.value as CodexAuthPreference)}
-                disabled={loading}
-                className="w-full bg-white border border-[#d0d7de] rounded px-3 py-2 text-sm text-[#24292f] disabled:opacity-50 focus:outline-none focus:border-[#0969da] focus:ring-1 focus:ring-[#0969da]/30"
-              >
-                <option value="auto" disabled={deploymentMode === "hosted"}>Auto</option>
-                <option value="subscription" disabled={deploymentMode === "hosted"}>Subscription Gateway</option>
-                <option value="api-key">API key</option>
-              </select>
-              <div className="rounded border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2 text-[11px] text-[#6e7781]">
-                {deploymentMode === "hosted"
-                  ? "Hosted Tiller uses OPENAI_API_KEY for Codex containers."
-                  : codexAuthPreference === "subscription"
-                  ? "Requires connected subscription auth and a healthy Subscription Gateway route."
-                  : codexAuthPreference === "api-key"
-                    ? "Uses only the configured API key."
-                    : "Prefers subscription auth through the Subscription Gateway, then falls back to the API key with a warning."}
-              </div>
-            </div>
-          ) : harness === "opencode" ? (
-            <div className="mt-2 rounded border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2 text-[11px] text-[#6e7781]">
-              OpenCode environments use Tiller&apos;s built-in Workers AI hub proxy and stay pinned to Kimi K2.5.
-              Choose the backend explicitly based on whether you want Cloudflare Containers or your connected Tiller
-              Tiller Self Host.
-            </div>
-          ) : (
-            <div className="mt-2 rounded border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2 text-[11px] text-[#6e7781]">
-              Claude environments choose auth automatically from your configured subscription token or Anthropic API
-              key.
-            </div>
-          )}
-          {error && (
-            <p className="mt-2 text-xs text-red-600">{error}</p>
+          {visibleError && (
+            <p className="mt-2 text-xs text-red-600">{visibleError}</p>
           )}
           <div className="flex justify-end gap-2 mt-4">
             <button
@@ -342,7 +459,7 @@ export function NewEnvDialog({
             </button>
             <button
               type="submit"
-              disabled={loading || !repoMainReady}
+              disabled={loading || !repoMainReady || Boolean(credentialError)}
               className="text-xs px-3 py-1.5 rounded bg-[#0969da] hover:bg-[#0a5bc4] text-white font-medium transition-colors disabled:opacity-40"
             >
               {loading ? "Creating..." : !repoMainReady ? "Waiting for Main..." : "Create"}

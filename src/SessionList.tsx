@@ -5,11 +5,10 @@ import { getDisplayEnvBranchStatus } from "./env-state";
 import type { RecoverEntitiesOptions } from "./live-sync-store";
 import {
   getEnvAuthBadge,
-  getEnvModelBadge,
-  getLeadHarnessBadge,
   getHarnessBadgeClass,
   getHarnessBadgeLabel,
 } from "./env-harness";
+import { getBackendBadgeLabel, getEnvDisplayName } from "./env-display";
 import { canStopEnvStatus, isEnvRunningStatus } from "./env-runtime";
 import { getRepoMainStatusDetail, getRepoMainStatusLabel, isRepoMainReady } from "./repo-status";
 import { pickPrimaryEnvSession } from "./session-attachment";
@@ -19,7 +18,6 @@ interface SessionListProps {
   sessions: StoredSession[];
   selectedId: string | null;
   onSelect: (id: string) => void;
-  permissionCounts?: Record<string, number>;
   envs?: EnvMeta[];
   hubUrl?: string;
   onRecoverEnv?: (slug: string, status?: string) => void;
@@ -41,7 +39,6 @@ export default function SessionList({
   sessions,
   selectedId,
   onSelect,
-  permissionCounts = {},
   envs = [],
   hubUrl = "",
   onRecoverEnv,
@@ -105,7 +102,6 @@ export default function SessionList({
             ) : (
               repoEnvs.map((env) => {
                 const session = envSessionMap.get(env.slug);
-                const permCount = session ? (permissionCounts[session.id] || 0) : 0;
                 const isSelected =
                   planRepoId === repo.repoId ||
                   (session ? session.id === selectedId : selectedEnvSlug === env.slug);
@@ -116,7 +112,6 @@ export default function SessionList({
                     key={env.slug}
                     env={env}
                     repo={repo}
-                    permCount={permCount}
                     hubUrl={hubUrl}
                     onRecoverEnv={onRecoverEnv}
                     onSelect={(slug) => onEnvSelect?.(slug)}
@@ -155,7 +150,6 @@ const STATUS_COLORS: Record<string, string> = {
 function EnvCard({
   env,
   repo,
-  permCount,
   hubUrl,
   onRecoverEnv,
   onSelect,
@@ -166,7 +160,6 @@ function EnvCard({
 }: {
   env: EnvMeta;
   repo: RepoMeta;
-  permCount: number;
   hubUrl: string;
   onRecoverEnv?: (slug: string, status?: string) => void;
   onSelect?: (slug: string) => void;
@@ -226,8 +219,8 @@ function EnvCard({
 
   const harness = env.harness;
   const authBadge = getEnvAuthBadge(env);
-  const modelBadge = getEnvModelBadge(env);
-  const harnessBadge = getLeadHarnessBadge(env);
+  const displayName = getEnvDisplayName(env);
+  const changeStatus = formatChangeStatus(branchStatus);
 
   return (
     <div className={`px-3 py-2.5 border-b border-[#e1e4e8] hover:bg-white transition-colors cursor-pointer ${
@@ -235,9 +228,8 @@ function EnvCard({
     }`} onClick={() => onSelect?.(env.slug)}>
       <div className="flex items-center gap-2">
         <span className={`w-2 h-2 rounded-full flex-shrink-0 ${dotColor}`} />
-        <span className="text-sm font-medium truncate flex-1 text-[#24292f]">{env.slug}</span>
         <span className="flex-shrink-0 rounded border border-[#d0d7de] bg-[#f6f8fa] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a]">
-          {env.backend}
+          {getBackendBadgeLabel(env.backend)}
         </span>
         <span className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getHarnessBadgeClass(harness)}`}>
           {getHarnessBadgeLabel(harness)}
@@ -247,32 +239,13 @@ function EnvCard({
             {authBadge.label}
           </span>
         )}
-        {modelBadge && (
-          <span className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${modelBadge.className}`}>
-            {modelBadge.label}
-          </span>
-        )}
-        {harnessBadge && (
-          <span className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${harnessBadge.className}`}>
-            {harnessBadge.label}
-          </span>
-        )}
-        {permCount > 0 && (
-          <span className="flex-shrink-0 bg-amber-100 text-amber-700 text-xs font-medium px-1.5 py-0.5 rounded-full border border-amber-200">
-            {permCount}
-          </span>
-        )}
-        <span className="text-xs text-[#6e7781]">{label}</span>
       </div>
-      <p className="text-xs text-[#0969da] mt-0.5 ml-4 truncate">
-        {repoLabel(env.repoUrl)}
+      <p className="text-xs text-[#57606a] mt-0.5 ml-4 truncate">
+        {label}
       </p>
 
       <p className="text-[11px] text-[#57606a] mt-0.5 ml-4">
-        Plan: {env.startupPlanId ? "Selected" : "None"}
-      </p>
-      <p className="text-[11px] text-[#57606a] mt-0.5 ml-4">
-        {`Branch: ${env.branchName || env.slug} · ${formatBranchStatus(branchStatus)}`}
+        {changeStatus}
       </p>
       {syncDetailText(env, repo) && (
         <p className="text-[11px] text-[#6e7781] mt-0.5 ml-4">
@@ -362,7 +335,7 @@ function EnvCard({
         {canRepoAction && (branchStatus === "ready-to-merge" || branchStatus === "needs-attention" || branchStatus === "behind-main") && (
           <button
             onClick={() => {
-              if (!confirm(`Reset "${env.slug}" to main? This will discard unpromoted changes.`)) {
+              if (!confirm(`Reset "${displayName}" to main? This will discard unpromoted changes.`)) {
                 return;
               }
               void run(async () => {
@@ -380,7 +353,7 @@ function EnvCard({
         {!isDeleting && (
           <button
             onClick={async () => {
-              if (confirm(`Delete environment "${env.slug}"? This will destroy the container and wipe R2 storage.`)) {
+              if (confirm(`Delete environment "${displayName}"? This will destroy the container and wipe R2 storage.`)) {
                 setBusy(true);
                 setActionError(null);
                 try {
@@ -436,7 +409,14 @@ function RepoGroupHeader({
 
   return (
     <div className={`px-3 py-1.5 text-xs font-semibold text-[#57606a] ${planRepoId === repo.repoId ? "bg-white" : "bg-[#f6f8fa]"}`}>
-      <div className="truncate mb-1">{repoLabel(repo.repoUrl)}</div>
+      <a
+        href={githubRepoHref(repo.repoUrl)}
+        target="_blank"
+        rel="noreferrer"
+        className="mb-1 block truncate text-[#0969da] hover:underline"
+      >
+        {repoLabel(repo.repoUrl)}
+      </a>
       <div className="mb-1 flex items-center gap-2">
         <span
           className={`rounded border px-2 py-0.5 text-[10px] uppercase tracking-wide ${
@@ -514,11 +494,24 @@ function repoLabel(repoUrl: string): string {
   return repoUrl.replace(/^https?:\/\/(www\.)?github\.com\//, "");
 }
 
-function formatBranchStatus(status: string): string {
+function githubRepoHref(repoUrl: string): string {
+  try {
+    const parsed = new URL(repoUrl);
+    if (parsed.hostname === "github.com" || parsed.hostname === "www.github.com") {
+      return `https://github.com${parsed.pathname.replace(/\.git$/, "").replace(/\/+$/, "")}`;
+    }
+  } catch {
+    // Fall through to the GitHub label-based URL below.
+  }
+  const label = repoLabel(repoUrl).replace(/^github\.com\//, "").replace(/\.git$/, "").replace(/\/+$/, "");
+  return `https://github.com/${label}`;
+}
+
+function formatChangeStatus(status: string): string {
   if (status === "behind-main") return "Behind main";
   if (status === "ready-to-merge") return "Ready to promote";
   if (status === "needs-attention") return "Needs attention";
-  return "Up to date";
+  return "No changes";
 }
 
 function formatScmOperationLabel(type?: string | null): string {
