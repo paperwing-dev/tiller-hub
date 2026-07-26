@@ -15,6 +15,7 @@ type MemoryStorage = {
   get: <T>(key: string) => Promise<T | null>;
   put: (key: string, value: unknown) => Promise<void>;
   delete: (key: string) => Promise<void>;
+  transaction: <T>(callback: (txn: MemoryStorage) => Promise<T>) => Promise<T>;
   getAlarm: () => Promise<number | null>;
   setAlarm: (time: number) => Promise<void>;
   deleteAlarm: () => Promise<void>;
@@ -23,7 +24,7 @@ type MemoryStorage = {
 function createMemoryStorage(): MemoryStorage {
   const data = new Map<string, unknown>();
   let alarmAt: number | null = null;
-  return {
+  const storage: MemoryStorage = {
     async get<T>(key: string) {
       return (data.get(key) as T | undefined) ?? null;
     },
@@ -32,6 +33,9 @@ function createMemoryStorage(): MemoryStorage {
     },
     async delete(key: string) {
       data.delete(key);
+    },
+    async transaction<T>(callback: (txn: MemoryStorage) => Promise<T>) {
+      return callback(storage);
     },
     async getAlarm() {
       return alarmAt;
@@ -43,6 +47,7 @@ function createMemoryStorage(): MemoryStorage {
       alarmAt = null;
     },
   };
+  return storage;
 }
 
 function createSubject() {
@@ -62,9 +67,14 @@ async function readMutableState(subject: EnvLifecycleDO): Promise<EnvMutableStat
 function metaWithWorkspace(overrides: Partial<EnvMeta> = {}): EnvMeta {
   return {
     slug: "env-test",
+    incarnationId: "incarnation-1",
     repoUrl: "https://github.com/example/repo",
+    repoId: "repo-1",
+    scmModel: "github",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
+    harnessSettings: null,
     createdAt: "2026-04-01T00:00:00.000Z",
     updatedAt: "2026-04-01T00:00:00.000Z",
     status: "running",
@@ -119,43 +129,6 @@ describe("Mutable state isolation (regression)", () => {
     expect(state.leadHarnessError).toBe("harness crashed");
   });
 
-  it("workspace-sync state survives a later SCM projection change", async () => {
-    const subject = createSubject();
-    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
-
-    await subject.setScmProjection({
-      type: "merge-into-main",
-      operationId: "op-42",
-      phase: "Downloading artifacts",
-    });
-    const state = await readMutableState(subject);
-
-    expect(state.workspaceDirty).toBe(true);
-    expect(state.workspaceLastSyncedAt).toBe("2026-04-01T00:10:00.000Z");
-    expect(state.branchStatus).toBe("ready-to-merge");
-    expect(state.scmOperationType).toBe("merge-into-main");
-    expect(state.scmOperationId).toBe("op-42");
-  });
-
-  it("SCM clear preserves lifecycle and workspace-sync fields", async () => {
-    const subject = createSubject();
-    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
-    await subject.setScmProjection({
-      type: "merge-into-main",
-      operationId: "op-42",
-      phase: "Downloading artifacts",
-    });
-
-    await subject.clearScmProjection({ completedAt: "2026-04-01T00:20:00.000Z" });
-    const state = await readMutableState(subject);
-
-    expect(state.scmOperationType).toBeNull();
-    expect(state.scmOperationId).toBeNull();
-    expect(state.scmLastCompletedAt).toBe("2026-04-01T00:20:00.000Z");
-    expect(state.workspaceDirty).toBe(true);
-    expect(state.branchStatus).toBe("ready-to-merge");
-  });
-
   it("idle auto-stop (requestStop + clearError) cannot erase fresh workspace metadata", async () => {
     const subject = createSubject();
     await subject.initializeMutableStateFromMeta(metaWithWorkspace());
@@ -183,24 +156,6 @@ describe("Mutable state isolation (regression)", () => {
     expect(state.error).toBe("persistence error");
   });
 
-  it("stale SCM clear cannot erase unrelated lifecycle or workspace fields", async () => {
-    const subject = createSubject();
-    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
-    await subject.setScmProjection({
-      type: "merge-into-main",
-      operationId: "op-merge-1",
-      phase: "Staging",
-    });
-
-    await subject.clearScmProjection();
-    const state = await readMutableState(subject);
-
-    expect(state.scmOperationType).toBeNull();
-    expect(state.scmOperationId).toBeNull();
-    expect(state.workspaceDirty).toBe(true);
-    expect(state.branchStatus).toBe("ready-to-merge");
-  });
-
   it("setRunnerBinding updates only binding fields, leaves workspace alone", async () => {
     const subject = createSubject();
     await subject.initializeMutableStateFromMeta(metaWithWorkspace());
@@ -213,30 +168,6 @@ describe("Mutable state isolation (regression)", () => {
     expect(state.runnerId).toBe("new-runner");
     expect(state.workspaceDirty).toBe(true);
     expect(state.workspaceLastSyncedAt).toBe("2026-04-01T00:10:00.000Z");
-  });
-
-  it("setAuthWarning leaves workspace untouched", async () => {
-    const subject = createSubject();
-    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
-
-    await subject.setAuthWarning("token near expiry");
-    const state = await readMutableState(subject);
-
-    expect(state.authWarning).toBe("token near expiry");
-    expect(state.workspaceDirty).toBe(true);
-    expect(state.workspaceLastSyncedAt).toBe("2026-04-01T00:10:00.000Z");
-  });
-
-  it("clearing auth warning leaves workspace untouched", async () => {
-    const subject = createSubject();
-    await subject.initializeMutableStateFromMeta(metaWithWorkspace());
-    await subject.setAuthWarning("token near expiry");
-
-    await subject.setAuthWarning(null);
-    const state = await readMutableState(subject);
-
-    expect(state.authWarning).toBeNull();
-    expect(state.workspaceDirty).toBe(true);
   });
 
   it("recordStopWorkspaceSynced overwrites workspace fields but preserves unrelated state", async () => {
@@ -262,15 +193,10 @@ describe("Mutable state isolation (regression)", () => {
     expect(state.leadHarnessError).toBe("crashed");
   });
 
-  it("clearError leaves workspace and SCM fields untouched", async () => {
+  it("clearError leaves workspace fields untouched", async () => {
     const subject = createSubject();
     await subject.initializeMutableStateFromMeta(metaWithWorkspace());
     await subject.setError("transient failure");
-    await subject.setScmProjection({
-      type: "merge-into-main",
-      operationId: "op-3",
-      phase: "starting",
-    });
 
     await subject.clearError();
     const state = await readMutableState(subject);
@@ -278,7 +204,5 @@ describe("Mutable state isolation (regression)", () => {
     expect(state.error).toBeNull();
     expect(state.errorAt).toBeNull();
     expect(state.workspaceDirty).toBe(true);
-    expect(state.scmOperationType).toBe("merge-into-main");
-    expect(state.scmOperationId).toBe("op-3");
   });
 });

@@ -12,22 +12,10 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     needsSetup: true,
     setupPhase: "protect-hub",
     isLocalDev: false,
-    currentOrigin: "https://demo.preview.workers.dev",
-    hubUrl: "https://tiller.example.com",
-    deploymentMode: "hosted",
-    selfHostStatus: "not-enabled",
-    selfHostSetupAttemptId: null,
     workersDevHubUrl: "https://demo.preview.workers.dev",
-    routeKind: "custom-domain",
-    workerServiceName: "tiller-hub",
     modelAuthConfigured: false,
-    modelAuthMode: null,
-    hostedInfrastructureReady: false,
-    hostedBlockingReasons: ["Protect this hub with Cloudflare Access."],
-    hostedModelReady: false,
-    hostedModelBlockingReasons: ["Configure model credentials for Hosted Tiller models."],
-    selfHostReady: false,
-    selfHostBlockingReasons: [],
+    claudeBillingMode: null,
+    openaiBillingMode: null,
     workersAiConfigured: false,
     hasClaudeSubscription: false,
     hasAnthropicKey: false,
@@ -39,30 +27,13 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     openaiPlannerAvailable: false,
     openaiPlannerRoute: null,
     openaiPlannerReason: null,
+    codexBackendReadiness: { cf: "unavailable", host: "environment_not_connected" },
     hostRegistered: false,
-    hostRegisteredMode: "none",
-    hostGatewayAvailable: false,
-    hostGatewayConfigured: false,
-    hostGatewayMode: "none",
     enabledHarnesses: ["claude-code"],
     protectionMode: "public",
-    protectionCanAutomate: false,
-    serviceTokenConfigured: false,
-    gatewayHostname: null,
-    browserProtected: false,
-    gatewayProvisioned: false,
-    gatewayTunnelConfigured: false,
-    gatewaySupportAvailable: false,
-    gatewaySupportReason: null,
-    workersDevCutoverPending: false,
-    unsupportedProtectionConfig: false,
-    workersDevAliasDisabled: false,
-    protectionAppDomain: null,
-    accessConfigured: false,
-    accessIssuer: null,
-    accessJwksUrl: null,
+    tokenExpiresAt: null,
+    renewalRecommended: false,
     hostConnected: false,
-    hostConnectionMode: "none",
     idleTimeoutMinutes: 10,
     canonicalMainBootstrapDepth: 0,
     githubAppAvailable: false,
@@ -118,19 +89,24 @@ describe("SetupWizard protect-hub", () => {
       <SetupWizard status={baseStatus()} onRefresh={async () => undefined} />,
     );
 
-    expect(html).toContain("Protect this hub");
+    expect(html).toContain("Connect Cloudflare and protect Tiller");
+    expect(html).toContain("Tiller uses Cloudflare OAuth");
+    expect(html).not.toContain("Paperwing uses Cloudflare OAuth");
     expect(html).toContain("Step <!-- -->1<!-- --> of 2");
     expect(html).toContain("Connect GitHub");
     expect(html).toContain("demo.preview.workers.dev");
-    expect(html).toContain("Enable Access in Cloudflare");
-    expect(html).toContain("Domains");
-    expect(html).toContain("Open Domains");
-    expect(html).toContain("Cloudflare Access can take about <!-- -->15<!-- --> seconds");
-    expect(html).toContain("automatic reload");
-    expect(html).toContain("Reload automatically, then verify");
-    expect(html).toContain("Reload now");
-    expect(html).toContain("Verify Access");
-    expect(html).toContain("workers/services/view/tiller-hub/production/domains");
+    expect(html).toContain("Tiller callbacks");
+    expect(html).toContain("Tiller Hub");
+    expect(html).toContain("Owner sign-in");
+    expect(html).toContain("Tiller owner sign-in");
+    expect(html).toContain("attaches it only to Tiller Hub");
+    expect(html).toContain("Existing identity providers");
+    expect(html).toContain("/api/github/webhook");
+    expect(html).toContain("/api/setup/workers-dev-access/broker/proof");
+    expect(html).toContain("/api/setup/workers-dev-access/broker/complete");
+    expect(html).not.toContain("Open Domains");
+    expect(html).not.toContain("Reload now");
+    expect(html).not.toContain("Verify Access");
     expect(html).not.toContain("Manage Cloudflare Access");
     expect(html).not.toContain("Open Workers");
     expect(html).not.toContain("Automatic setup");
@@ -146,7 +122,6 @@ describe("SetupWizard protect-hub", () => {
       <SetupWizard
         status={baseStatus({
           setupPhase: "github-app",
-          accessConfigured: true,
           protectionMode: "cf-access",
           githubAppPublicHubDisabled: false,
         })}
@@ -160,5 +135,23 @@ describe("SetupWizard protect-hub", () => {
     expect(html).toContain("Create GitHub App");
     expect(html).toContain("/api/github/manifest/setup");
     expect(html).not.toContain("Add model keys");
+  });
+
+  it("offers an OpenAI API key for OpenAI-backed OpenCode models", async () => {
+    const { default: SetupWizard } = await import("../SetupWizard");
+    const html = renderToString(
+      <SetupWizard
+        status={baseStatus({
+          setupPhase: "model-access",
+          enabledHarnesses: ["opencode"],
+          protectionMode: "cf-access",
+        })}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain("OpenAI API key");
+    expect(html).toContain("For Codex and OpenAI-backed OpenCode models.");
+    expect(html).toContain("Add a key for Claude, Codex, or OpenAI-backed OpenCode models.");
   });
 });

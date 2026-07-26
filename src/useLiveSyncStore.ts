@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Dispatch, MutableRefObject, SetStateAction } from "react";
-import type { EnvMeta, RepoMeta, StoredSession } from "../api/types";
+import type { Dispatch, SetStateAction } from "react";
+import type { EnvMeta, RepoMeta } from "../api/types";
 import { fetchEnv, fetchEnvs, fetchRepo, fetchRepos } from "./api";
 import {
   requireExplicitEnvMeta,
@@ -11,18 +11,19 @@ import {
   upsertRepoMeta,
 } from "./env-state";
 import {
-  type DashboardSelection,
   type NewEnvTarget,
   type RecoverEntitiesOptions,
   reconcileFetchedEnvSnapshot,
   reconcileFetchedRepoSnapshot,
-  reconcileSelectionAfterEnvRefresh,
-  reconcileSelectionAfterEnvRemove,
-  reconcileSelectionAfterRepoRefresh,
-  reconcileSelectionAfterRepoRemove,
-  reconcileSelectionAfterStoppedEnv,
 } from "./live-sync-store";
 import { isEnvTransitioning, isRepoTransitioning } from "../api/scm/model";
+import {
+  getMockDashboardEnv,
+  getMockDashboardEnvs,
+  getMockDashboardRepo,
+  getMockDashboardRepos,
+  shouldUseLocalDashboardMock,
+} from "./mock-dashboard";
 
 const WATCHDOG_DELAYS_MS = [10_000, 30_000, 60_000, 120_000];
 
@@ -34,19 +35,16 @@ type WatchdogEntry = {
 
 interface UseLiveSyncStoreOptions {
   hubUrl: string;
-  sessionsRef: MutableRefObject<StoredSession[]>;
-  setSelection: Dispatch<SetStateAction<DashboardSelection>>;
   setStartDialogSlug: Dispatch<SetStateAction<string | null>>;
   setNewEnvTarget: Dispatch<SetStateAction<NewEnvTarget | null>>;
 }
 
 export function useLiveSyncStore({
   hubUrl,
-  sessionsRef,
-  setSelection,
   setStartDialogSlug,
   setNewEnvTarget,
 }: UseLiveSyncStoreOptions) {
+  const useLocalMock = shouldUseLocalDashboardMock(hubUrl);
   const [envs, setEnvs] = useState<EnvMeta[]>([]);
   const [repos, setRepos] = useState<RepoMeta[]>([]);
   const envsRef = useRef<EnvMeta[]>([]);
@@ -85,10 +83,7 @@ export function useLiveSyncStore({
     if (changed) {
       updateEnvStore(items);
     }
-    setSelection((current) =>
-      reconcileSelectionAfterEnvRemove(current, sessionsRef.current, slug),
-    );
-  }, [clearEnvWatchdog, sessionsRef, setSelection, setStartDialogSlug, updateEnvStore]);
+  }, [clearEnvWatchdog, setStartDialogSlug, updateEnvStore]);
 
   const removeRepo = useCallback((repoId: string) => {
     clearRepoWatchdog(repoId);
@@ -97,8 +92,7 @@ export function useLiveSyncStore({
     if (changed) {
       updateRepoStore(items);
     }
-    setSelection((current) => reconcileSelectionAfterRepoRemove(current, repoId));
-  }, [clearRepoWatchdog, setNewEnvTarget, setSelection, updateRepoStore]);
+  }, [clearRepoWatchdog, setNewEnvTarget, updateRepoStore]);
 
   const upsertEnv = useCallback((incoming: EnvMeta) => {
     const env = requireExplicitEnvMeta(incoming);
@@ -109,11 +103,8 @@ export function useLiveSyncStore({
     if (!isEnvTransitioning(env)) {
       clearEnvWatchdog(env.slug);
     }
-    setSelection((current) =>
-      reconcileSelectionAfterStoppedEnv(current, sessionsRef.current, env),
-    );
     return env;
-  }, [clearEnvWatchdog, sessionsRef, setSelection, updateEnvStore]);
+  }, [clearEnvWatchdog, updateEnvStore]);
 
   const upsertRepo = useCallback((incoming: RepoMeta) => {
     const repo = requireExplicitRepoMeta(incoming);
@@ -128,6 +119,11 @@ export function useLiveSyncStore({
   }, [clearRepoWatchdog, updateRepoStore]);
 
   const refreshEnvEntity = useCallback(async (slug: string): Promise<EnvMeta | null> => {
+    const mockEnv = useLocalMock ? getMockDashboardEnv(slug) : null;
+    if (mockEnv) {
+      return upsertEnv(mockEnv);
+    }
+
     try {
       return upsertEnv(await fetchEnv(hubUrl, slug));
     } catch (err) {
@@ -138,9 +134,14 @@ export function useLiveSyncStore({
       console.error("[tiller] Failed to fetch env:", err);
       return envsRef.current.find((env) => env.slug === slug) ?? null;
     }
-  }, [hubUrl, removeEnv, upsertEnv]);
+  }, [hubUrl, removeEnv, upsertEnv, useLocalMock]);
 
   const refreshRepoEntity = useCallback(async (repoId: string): Promise<RepoMeta | null> => {
+    const mockRepo = useLocalMock ? getMockDashboardRepo(repoId) : null;
+    if (mockRepo) {
+      return upsertRepo(mockRepo);
+    }
+
     try {
       return upsertRepo(await fetchRepo(hubUrl, repoId));
     } catch (err) {
@@ -151,12 +152,16 @@ export function useLiveSyncStore({
       console.error("[tiller] Failed to fetch repo:", err);
       return reposRef.current.find((repo) => repo.repoId === repoId) ?? null;
     }
-  }, [hubUrl, removeRepo, upsertRepo]);
+  }, [hubUrl, removeRepo, upsertRepo, useLocalMock]);
 
-  const refreshEnvs = useCallback(async () => {
+  const refreshEnvs = useCallback(async (): Promise<boolean> => {
     try {
-      const list = (await fetchEnvs(hubUrl)).map((env) => requireExplicitEnvMeta(env));
-      const { items, missingSlugs, previousEnvSlugs } = reconcileFetchedEnvSnapshot(
+      const fetched = await fetchEnvs(hubUrl);
+      const source = useLocalMock && fetched.length === 0
+        ? getMockDashboardEnvs()
+        : fetched;
+      const list = source.map((env) => requireExplicitEnvMeta(env));
+      const { items, missingSlugs } = reconcileFetchedEnvSnapshot(
         () => envsRef.current,
         list,
       );
@@ -169,22 +174,20 @@ export function useLiveSyncStore({
       const nextEnvs = envsRef.current;
       const nextSlugs = new Set(nextEnvs.map((env) => env.slug));
       setStartDialogSlug((current) => (current && !nextSlugs.has(current) ? null : current));
-      setSelection((current) =>
-        reconcileSelectionAfterEnvRefresh(
-          current,
-          sessionsRef.current,
-          previousEnvSlugs,
-          nextEnvs,
-        ),
-      );
+      return true;
     } catch (err) {
       console.error("[tiller] Failed to fetch envs:", err);
+      return false;
     }
-  }, [hubUrl, refreshEnvEntity, sessionsRef, setSelection, setStartDialogSlug, updateEnvStore]);
+  }, [hubUrl, refreshEnvEntity, setStartDialogSlug, updateEnvStore, useLocalMock]);
 
-  const refreshRepos = useCallback(async () => {
+  const refreshRepos = useCallback(async (): Promise<boolean> => {
     try {
-      const list = (await fetchRepos(hubUrl)).map((repo) => requireExplicitRepoMeta(repo));
+      const fetched = await fetchRepos(hubUrl);
+      const source = useLocalMock && fetched.length === 0
+        ? getMockDashboardRepos()
+        : fetched;
+      const list = source.map((repo) => requireExplicitRepoMeta(repo));
       const { items, missingRepoIds } = reconcileFetchedRepoSnapshot(
         () => reposRef.current,
         list,
@@ -197,11 +200,12 @@ export function useLiveSyncStore({
 
       const nextRepoIds = new Set(reposRef.current.map((repo) => repo.repoId));
       setNewEnvTarget((current) => (current && !nextRepoIds.has(current.repoId) ? null : current));
-      setSelection((current) => reconcileSelectionAfterRepoRefresh(current, nextRepoIds));
+      return true;
     } catch (err) {
       console.error("[tiller] Failed to fetch repos:", err);
+      return false;
     }
-  }, [hubUrl, refreshRepoEntity, setNewEnvTarget, setSelection, updateRepoStore]);
+  }, [hubUrl, refreshRepoEntity, setNewEnvTarget, updateRepoStore, useLocalMock]);
 
   const scheduleEnvWatchdog = useCallback((slug: string, attempt: number, updatedAt: string) => {
     clearEnvWatchdog(slug);
@@ -283,20 +287,18 @@ export function useLiveSyncStore({
 
   const recoverEnv = useCallback((slug: string, status?: string) => {
     if (status) {
+      const nextStatus = status as EnvMeta["status"];
       const current = envsRef.current;
       const idx = current.findIndex((e) => e.slug === slug);
-      if (idx !== -1 && current[idx].status !== status) {
+      if (idx !== -1 && current[idx].status !== nextStatus) {
         const next = [...current];
-        next[idx] = { ...current[idx], status };
+        next[idx] = { ...current[idx], status: nextStatus };
         updateEnvStore(next);
-        setSelection((selection) =>
-          reconcileSelectionAfterStoppedEnv(selection, sessionsRef.current, next[idx]),
-        );
       }
     } else {
       void refreshEnvEntity(slug);
     }
-  }, [refreshEnvEntity, setSelection, sessionsRef, updateEnvStore]);
+  }, [refreshEnvEntity, updateEnvStore]);
 
   const recoverEntities = useCallback((options?: RecoverEntitiesOptions) => {
     if (options?.slug) {

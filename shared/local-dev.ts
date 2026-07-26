@@ -23,11 +23,8 @@ export function isLoopbackUrl(url: string | URL): boolean {
 }
 
 export function isLocalDevMode(options: {
-  localDevOnlyBackend?: string | null;
+  enabled?: string | null;
   url?: string | URL | null;
 }): boolean {
-  return (
-    isEnabledFlag(options.localDevOnlyBackend) ||
-    (options.url ? isLoopbackUrl(options.url) : false)
-  );
+  return isEnabledFlag(options.enabled) && Boolean(options.url && isLoopbackUrl(options.url));
 }

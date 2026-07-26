@@ -110,28 +110,20 @@ function createArtifactStoreStub() {
     savePlan(input: {
       id: string;
       repoId: string;
-      expectedVersion: number;
       markdown: string;
-      title?: string;
-      currentMainCommit: string | null;
     }) {
       const existing = artifacts.get(input.id);
       if (!existing || existing.repoId !== input.repoId || existing.type !== "plan") {
         throw new Error("Plan artifact not found");
       }
-      if ((existing.version ?? 1) !== input.expectedVersion) {
-        return { status: "conflict" as const, currentVersion: existing.version ?? 1 };
-      }
       const next: Artifact = {
         ...existing,
-        title: input.title ?? existing.title,
         body: { markdown: input.markdown },
-        basis: { ...existing.basis, mainCommit: input.currentMainCommit },
         version: (existing.version ?? 1) + 1,
         updatedAt: "2026-04-12T00:01:00.000Z",
       };
       artifacts.set(next.id, next);
-      return { status: "ok" as const, version: next.version ?? 1, artifact: next };
+      return next;
     },
   };
 }
@@ -236,7 +228,7 @@ describe("hosted tools", () => {
     expect(String(listResult.output)).toContain("Review the monorepo");
   });
 
-  it("saves a mutable plan and updates expected version within the turn", async () => {
+  it("saves a mutable plan without rebasing its frozen basis", async () => {
     const workspace = new FakeWorkspace({}) as unknown as Workspace;
     const artifactStore = createArtifactStoreStub();
     const plan = artifactStore.createArtifact({
@@ -257,13 +249,10 @@ describe("hosted tools", () => {
       savePlanDefaults: {
         repoId: "repo-123",
         planArtifactId: plan.id,
-        expectedVersion: 1,
-        currentMainCommit: "def456",
       },
     });
 
     const saveResult = await executeHostedTool(registry, "save_plan", {
-      title: "Updated plan",
       markdown: "Updated body",
     });
     expect(saveResult.ok).toBe(true);
@@ -276,9 +265,14 @@ describe("hosted tools", () => {
     expect(conflict.ok).toBe(true);
     if (!conflict.ok) throw new Error("expected second save_plan success");
     expect(conflict.output).toEqual({ status: "ok", version: 3 });
+    expect(artifactStore.getArtifact(plan.id)).toMatchObject({
+      title: "Mutable plan",
+      basis: { mainCommit: "abc123" },
+      body: { markdown: "Second update in the same turn" },
+    });
   });
 
-  it("returns save_plan conflicts as ok tool results", async () => {
+  it("uses last-write-wins for repeated save_plan calls", async () => {
     const workspace = new FakeWorkspace({}) as unknown as Workspace;
     const artifactStore = createArtifactStoreStub();
     const plan = artifactStore.createArtifact({
@@ -299,8 +293,6 @@ describe("hosted tools", () => {
       savePlanDefaults: {
         repoId: "repo-123",
         planArtifactId: plan.id,
-        expectedVersion: 1,
-        currentMainCommit: "abc123",
       },
     });
 
@@ -308,16 +300,16 @@ describe("hosted tools", () => {
       markdown: "Stale update",
     });
     expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error("expected conflict result to stay ok");
-    expect(result.output).toMatchObject({ status: "conflict", currentVersion: 2 });
+    if (!result.ok) throw new Error("expected save result to stay ok");
+    expect(result.output).toEqual({ status: "ok", version: 3 });
 
     const retry = await executeHostedTool(registry, "save_plan", {
       markdown: "Retry with stale update",
     });
     expect(retry.ok).toBe(true);
-    if (!retry.ok) throw new Error("expected retry conflict result to stay ok");
-    expect(retry.output).toMatchObject({ status: "conflict", currentVersion: 2 });
-    expect(artifactStore.getArtifact(plan.id)?.body).toEqual({ markdown: "Initial" });
+    if (!retry.ok) throw new Error("expected retry result to stay ok");
+    expect(retry.output).toEqual({ status: "ok", version: 4 });
+    expect(artifactStore.getArtifact(plan.id)?.body).toEqual({ markdown: "Retry with stale update" });
   });
 
   it("rejects unsupported artifact types", async () => {

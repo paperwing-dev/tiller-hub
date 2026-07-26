@@ -22,7 +22,7 @@ vi.mock("../PlanView", () => ({
   default: () => null,
 }));
 
-vi.mock("../ChangesView", () => ({
+vi.mock("../ShipView", () => ({
   default: () => null,
 }));
 
@@ -36,6 +36,10 @@ vi.mock("../StartPlanDialog", () => ({
 }));
 
 vi.mock("../SettingsPage", () => ({
+  default: () => null,
+}));
+
+vi.mock("../RepoSettingsPage", () => ({
   default: () => null,
 }));
 
@@ -73,7 +77,7 @@ vi.mock("../api", () => ({
   fetchPendingPermissions: vi.fn(async () => []),
   createReconnectingWebSocket: vi.fn(() => ({
     close() {},
-    send() {},
+    send() { return true; },
     reconnect() {},
   })),
   fetchEnvs: vi.fn(async () => []),
@@ -83,11 +87,9 @@ vi.mock("../api", () => ({
   fetchSetupStatus: vi.fn(async () => ({
     needsSetup: false,
     isLocalDev: false,
-    currentOrigin: "https://example.com",
   })),
   createEnv: vi.fn(),
   createRepo: vi.fn(),
-  bootstrapRepoGitArtifact: vi.fn(),
   checkForUpdate: vi.fn(async () => null),
 }));
 
@@ -138,8 +140,10 @@ describe("Dashboard", () => {
   });
 
   it("renders without touching uninitialized callbacks", async () => {
-    const { default: Dashboard } = await import("../App");
-    expect(() => renderToString(React.createElement(Dashboard))).not.toThrow();
+    const { RouterProvider, createMemoryRouter } = await import("react-router-dom");
+    const { dashboardRoutes } = await import("../App");
+    const router = createMemoryRouter(dashboardRoutes, { initialEntries: ["/"] });
+    expect(() => renderToString(React.createElement(RouterProvider, { router }))).not.toThrow();
   });
 
   it("refreshes sessions alongside envs, repos, and setup status after hub reconnect", async () => {

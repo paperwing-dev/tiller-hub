@@ -1,16 +1,18 @@
 import { createRemoteJWKSet, decodeJwt, jwtVerify, type JWTPayload } from "jose";
 import { createMiddleware } from "hono/factory";
 import type { HonoEnv, Env } from "./types";
-import { getSecret, invalidateConfigCache } from "./setup/config";
-import { getLocationHintOptions } from "./helpers";
 import {
-  getRouteKind,
   resolveProtectionState,
   isLocalDevRequest,
   type ProtectionState,
 } from "./protection";
 import { requiresWorkersDevAccessProtection } from "./setup/protect-hub";
-import { readSelfHostState } from "./self-host/state";
+import {
+  normalizeOwnerEmail,
+  readCanonicalWorkersDevAccessTrust,
+  readWorkersDevAccessTrust,
+} from "./workers-dev-access/records";
+import type { AccessPrincipal, WorkersDevAccessTrustV1 } from "./workers-dev-access/types";
 
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
@@ -26,82 +28,25 @@ export function accessCertsUrl(issuer: string): string {
   return `${issuer.replace(/\/+$/, "")}/cdn-cgi/access/certs`;
 }
 
-export function normalizeAccessUrl(value: string): string {
-  const trimmed = value.trim().replace(/\/+$/, "");
-  if (!trimmed) return "";
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
-}
-
-function normalizeCloudflareAccessIssuer(value: unknown): string {
-  if (typeof value !== "string") return "";
-  const trimmed = value.trim().replace(/\/+$/, "");
-  if (!trimmed) return "";
-
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    return "";
-  }
-
-  if (url.protocol !== "https:") return "";
-  if (url.username || url.password || url.port || url.search || url.hash) return "";
-  if (url.pathname && url.pathname !== "/") return "";
-  if (!/^[a-z0-9-]+\.cloudflareaccess\.com$/i.test(url.hostname)) return "";
-  return `https://${url.hostname.toLowerCase()}`;
-}
-
-function inferSingleAudience(payload: JWTPayload): string {
-  const aud = payload.aud;
-  if (typeof aud === "string") return aud.trim();
-  if (Array.isArray(aud) && aud.length === 1 && typeof aud[0] === "string") {
-    return aud[0].trim();
-  }
-  return "";
-}
-
 function assertAccessAppPayload(payload: JWTPayload): void {
   if ((payload as Record<string, unknown>).type !== "app") {
     throw new Error("JWT is not a Cloudflare Access application token");
   }
 }
 
-export function inferCloudflareAccessJwtConfig(token: string): {
-  audience: string;
-  issuer: string;
-} {
-  let payload: JWTPayload;
-  try {
-    payload = decodeJwt(token);
-  } catch {
-    throw new Error("Malformed JWT");
-  }
-
-  const issuer = normalizeCloudflareAccessIssuer(payload.iss);
-  if (!issuer) {
-    throw new Error("JWT issuer is not a Cloudflare Access team domain");
-  }
-  assertAccessAppPayload(payload);
-
-  const audience = inferSingleAudience(payload);
-  if (!audience) {
-    throw new Error("JWT must contain exactly one Access audience");
-  }
-
-  return { audience, issuer };
-}
-
-async function resolveAccessJwtValidationConfig(env: Env): Promise<{
+async function resolveAccessJwtValidationConfig(request: Request, env: Env): Promise<{
   audience: string;
   issuer: string | null;
   jwksUrl: string | null;
 }> {
-  const audience = (await getSecret(env, "CF_ACCESS_AUD"))?.trim() ?? "";
-  if (!audience) throw new Error("CF_ACCESS_AUD not configured");
-  const issuer = normalizeAccessUrl((await getSecret(env, "CF_ACCESS_TEAM_DOMAIN")) ?? "") || null;
-  const jwksUrl = normalizeAccessUrl((await getSecret(env, "CF_ACCESS_JWKS_URL")) ?? "")
-    || (issuer ? accessCertsUrl(issuer) : null);
-  return { audience, issuer, jwksUrl };
+  const url = new URL(request.url);
+  const trust = await readWorkersDevAccessTrust(env, url.hostname);
+  if (!trust) throw new Error("Canonical workers.dev Access trust is not configured");
+  return {
+    audience: trust.audience,
+    issuer: trust.issuer,
+    jwksUrl: accessCertsUrl(trust.issuer),
+  };
 }
 
 function assertAudience(payload: JWTPayload, audience: string): void {
@@ -110,6 +55,19 @@ function assertAudience(payload: JWTPayload, audience: string): void {
     ? aud.includes(audience)
     : aud === audience;
   if (!valid) throw new Error("Invalid audience");
+}
+
+function assertAccessTimeClaims(payload: JWTPayload): void {
+  const now = Math.floor(Date.now() / 1_000);
+  if (!Number.isFinite(payload.iat) || !Number.isFinite(payload.exp)) {
+    throw new Error("Cloudflare Access JWT is missing required time claims");
+  }
+  if (payload.iat! > now + 60 || payload.exp! <= now) {
+    throw new Error("Cloudflare Access JWT time claims are invalid");
+  }
+  if (payload.nbf !== undefined && (!Number.isFinite(payload.nbf) || payload.nbf > now + 60)) {
+    throw new Error("Cloudflare Access JWT time claims are invalid");
+  }
 }
 
 export async function verifyCloudflareAccessToken(
@@ -131,21 +89,11 @@ export async function verifyCloudflareAccessToken(
     });
     assertAccessAppPayload(verified.payload);
     assertAudience(verified.payload, validation.audience);
+    assertAccessTimeClaims(verified.payload);
     return verified.payload;
   } catch {
     throw new Error("Invalid JWT");
   }
-}
-
-export async function verifyInferredCloudflareAccessToken(
-  token: string,
-  config: { audience: string; issuer: string },
-): Promise<void> {
-  await verifyCloudflareAccessToken(token, {
-    audience: config.audience,
-    issuer: config.issuer,
-    jwksUrl: accessCertsUrl(config.issuer),
-  });
 }
 
 /**
@@ -155,7 +103,7 @@ export async function verifyInferredCloudflareAccessToken(
  * checks are not sufficient because a Worker may still be reachable outside the
  * Access application during route cutovers.
  */
-export async function verifyCfAccessJwt(request: Request, env: Env): Promise<void> {
+export async function verifyCfAccessJwt(request: Request, env: Env): Promise<JWTPayload> {
   const token = request.headers.get("Cf-Access-Jwt-Assertion");
   if (!token) throw new Error("Missing Cf-Access-Jwt-Assertion");
 
@@ -165,36 +113,59 @@ export async function verifyCfAccessJwt(request: Request, env: Env): Promise<voi
     throw new Error("Malformed JWT");
   }
 
-  const validation = await resolveAccessJwtValidationConfig(env);
-  await verifyCloudflareAccessToken(token, validation);
+  const validation = await resolveAccessJwtValidationConfig(request, env);
+  return verifyCloudflareAccessToken(token, validation);
 }
 
-export async function verifyCfAccessServiceToken(request: Request, env: Env): Promise<void> {
-  const clientId = request.headers.get("CF-Access-Client-Id")?.trim() ?? "";
-  const clientSecret = request.headers.get("CF-Access-Client-Secret")?.trim() ?? "";
-  if (!clientId || !clientSecret) {
-    throw new Error("Missing Cloudflare Access service token");
-  }
+function classifyWorkersDevPrincipal(
+  payload: JWTPayload,
+  trust: WorkersDevAccessTrustV1,
+): AccessPrincipal {
+  const rawEmail = typeof payload.email === "string" ? payload.email : "";
+  const email = normalizeOwnerEmail(rawEmail);
+  const commonName = typeof payload.common_name === "string" ? payload.common_name.trim() : "";
 
-  const expectedClientId = (await getSecret(env, "CF_ACCESS_CLIENT_ID"))?.trim() ?? "";
-  const expectedClientSecret = (await getSecret(env, "CF_ACCESS_CLIENT_SECRET"))?.trim() ?? "";
-  if (!expectedClientId || !expectedClientSecret) {
-    throw new Error("Cloudflare Access service token is not configured");
+  if (email && !commonName && email === trust.ownerEmail) {
+    return { kind: "owner", email };
   }
-  if (clientId !== expectedClientId || clientSecret !== expectedClientSecret) {
-    throw new Error("Invalid Cloudflare Access service token");
+  if (!email && commonName && commonName === trust.serviceClientId) {
+    return { kind: "service" };
   }
+  throw new Error("Cloudflare Access principal is not authorized for this Hub");
 }
 
-export async function maybeVerifyCfAccessRequest(request: Request, env: Env): Promise<void> {
-  const protection = await resolveProtectionState(env, request.url);
-  if (protection.protectionMode !== "cf-access") return;
-  if (isLocalDevRequest(env, request)) return;
-  if (request.headers.get("Cf-Access-Jwt-Assertion")) {
-    await verifyCfAccessJwt(request, env);
-    return;
+export async function authenticateAccessRequest(
+  request: Request,
+  env: Env,
+): Promise<AccessPrincipal> {
+  if (isLocalDevRequest(env, request)) return { kind: "local-dev" };
+
+  const hostname = new URL(request.url).hostname;
+  const trust = await readWorkersDevAccessTrust(env, hostname);
+  if (!trust) throw new Error("Canonical workers.dev Access trust is not configured");
+  const token = request.headers.get("Cf-Access-Jwt-Assertion")?.trim() ?? "";
+  if (!token) throw new Error("Missing Cf-Access-Jwt-Assertion");
+  const payload = await verifyCfAccessJwt(request, env);
+  return classifyWorkersDevPrincipal(payload, trust);
+}
+
+export async function authenticateCanonicalOwner(
+  request: Request,
+  env: Env,
+): Promise<Extract<AccessPrincipal, { kind: "owner" | "local-dev" }>> {
+  const principal = await authenticateAccessRequest(request, env);
+  if (principal.kind === "local-dev") {
+    if (!isLocalDevRequest(env, request)) {
+      throw new Error("Owner authentication is required");
+    }
+    return principal;
   }
-  await verifyCfAccessServiceToken(request, env);
+  if (principal.kind !== "owner") throw new Error("Owner authentication is required");
+  const trust = await readCanonicalWorkersDevAccessTrust(env);
+  if (!trust || principal.email !== trust.ownerEmail) {
+    throw new Error("Owner authentication is required");
+  }
+  return principal;
 }
 
 export async function resolveAuthGuardState(
@@ -207,13 +178,11 @@ export async function resolveAuthGuardState(
 }> {
   const isLocalDev = isLocalDevRequest(env, request);
   const protection = await resolveProtectionState(env, request.url);
-  const currentRouteKind = getRouteKind(request.url);
   return {
     isLocalDev,
     protection,
     protectHubRequired: requiresWorkersDevAccessProtection({
       isLocalDev,
-      currentRouteKind,
       accessConfigured: protection.accessConfigured,
     }),
   };
@@ -222,123 +191,79 @@ export async function resolveAuthGuardState(
 type RouteAuthMode =
   | "normal"
   | "public"
-  | "browser-jwt"
-  | "self-host-pending-custom-jwt"
-  | "workers-dev-browser"
-  | "service-token";
+  | "owner";
 
 interface RouteAuthPolicy {
   path: string;
   method?: string;
   mode: RouteAuthMode;
   protectHubAllowlisted?: boolean;
-  workersDevRollback?: boolean;
-}
-
-type WorkersDevAccessConfigStore = {
-  claimWorkersDevAccessConfig(input: {
-    audience: string;
-    teamDomain: string;
-  }): {
-    claimed: boolean;
-    audience: string | null;
-    teamDomain: string | null;
-  } | Promise<{
-    claimed: boolean;
-    audience: string | null;
-    teamDomain: string | null;
-  }>;
-};
-
-function getWorkersDevAccessConfigStore(env: Env): WorkersDevAccessConfigStore | null {
-  const namespace = (env as unknown as {
-    HUB?: {
-      idFromName(name: string): unknown;
-      get(id: unknown, options?: unknown): unknown;
-    };
-  }).HUB;
-  if (!namespace) return null;
-  const id = namespace.idFromName("hub");
-  return namespace.get(id, getLocationHintOptions(env)) as WorkersDevAccessConfigStore;
-}
-
-async function tryClaimWorkersDevAccessConfigFromJwt(request: Request, env: Env): Promise<boolean> {
-  if (getRouteKind(request.url) !== "workers-dev") return false;
-  const token = request.headers.get("Cf-Access-Jwt-Assertion")?.trim() ?? "";
-  if (!token) return false;
-
-  const store = getWorkersDevAccessConfigStore(env);
-  if (!store) return false;
-
-  try {
-    const inferred = inferCloudflareAccessJwtConfig(token);
-    await verifyInferredCloudflareAccessToken(token, inferred);
-    const claim = await store.claimWorkersDevAccessConfig({
-      audience: inferred.audience,
-      teamDomain: inferred.issuer,
-    });
-    if (!claim.claimed) return false;
-    invalidateConfigCache();
-    return true;
-  } catch {
-    return false;
-  }
+  canonicalAccessBootstrap?: boolean;
 }
 
 const ROUTE_AUTH_POLICIES: RouteAuthPolicy[] = [
   { path: "/health", mode: "public", protectHubAllowlisted: true },
-  { path: "/api/setup/status", method: "GET", mode: "normal", protectHubAllowlisted: true, workersDevRollback: true },
-  { path: "/api/setup/workers-dev-access", method: "POST", mode: "normal", protectHubAllowlisted: true },
-  { path: "/api/setup/verify-cloudflare-token", method: "POST", mode: "public" },
-  { path: "/cli/self-host-setup", method: "GET", mode: "workers-dev-browser", workersDevRollback: true },
-  { path: "/api/setup/self-host/prepare", method: "POST", mode: "workers-dev-browser", workersDevRollback: true },
-  { path: "/cli/self-host-promote", method: "GET", mode: "self-host-pending-custom-jwt" },
-  { path: "/api/setup/self-host/promote", method: "POST", mode: "self-host-pending-custom-jwt" },
-  { path: "/api/setup/self-host/progress", method: "POST", mode: "service-token" },
-  { path: "/api/setup/self-host/lifecycle", method: "GET", mode: "browser-jwt" },
-  { path: "/api/setup/self-host/enable", method: "POST", mode: "service-token" },
-  { path: "/api/setup/self-host/return-to-hosted", method: "POST", mode: "workers-dev-browser", workersDevRollback: true },
+  { path: "/api/setup/status", method: "GET", mode: "normal", protectHubAllowlisted: true, canonicalAccessBootstrap: true },
+  { path: "/api/setup/workers-dev-access/oauth/start", method: "POST", mode: "normal", protectHubAllowlisted: true },
+  { path: "/api/setup/workers-dev-access/broker/proof", method: "POST", mode: "public" },
+  { path: "/api/setup/workers-dev-access/broker/complete", method: "POST", mode: "public" },
+  { path: "/api/settings/workers-dev-access/oauth/start", method: "POST", mode: "owner" },
+  { path: "/api/execution/status", method: "GET", mode: "owner" },
+  { path: "/api/cli/connect-package", method: "POST", mode: "owner" },
+  { path: "/api/github/app-config", method: "POST", mode: "owner" },
+  { path: "/api/github/manifest/setup", method: "GET", mode: "owner" },
+  { path: "/api/github/manifest/callback", method: "GET", mode: "owner" },
+  { path: "/api/github/install", method: "GET", mode: "owner" },
+  { path: "/api/github/install/callback", method: "GET", mode: "owner" },
+  { path: "/api/github/manage", method: "GET", mode: "owner" },
+  { path: "/api/update/hub-repo/detect", method: "POST", mode: "owner" },
+  { path: "/api/update/hub-repo/select", method: "POST", mode: "owner" },
+  { path: "/api/update/apply", method: "POST", mode: "owner" },
+  { path: "/api/update/repair/cloudflare-redeploy", method: "POST", mode: "owner" },
+  { path: "/cli/bootstrap", method: "GET", mode: "public" },
+  { path: "/api/github/webhook", method: "POST", mode: "public" },
+  { path: "/api/mcp/cloudflare", method: "GET", mode: "public" },
+  { path: "/api/mcp/cloudflare", method: "POST", mode: "public" },
+  { path: "/api/mcp/cloudflare", method: "DELETE", mode: "public" },
 ];
 
 function resolveRouteAuthPolicy(path: string, method: string): RouteAuthPolicy {
-  return ROUTE_AUTH_POLICIES.find((policy) => {
+  if (
+    method === "POST" &&
+    /^\/api\/envs\/[^/]+\/github\/publish-draft-pr\/[^/]+\/result$/.test(path)
+  ) {
+    return { path, method, mode: "public" };
+  }
+  const explicit = ROUTE_AUTH_POLICIES.find((policy) => {
     return policy.path === path && (!policy.method || policy.method === method);
-  }) ?? { path, method, mode: "normal" };
-}
-
-export async function verifyWorkersDevRollbackAccess(request: Request, env: Env): Promise<void> {
-  if (getRouteKind(request.url) !== "workers-dev") {
-    throw new Error("workers.dev rollback Access only applies to workers.dev requests");
-  }
-  const state = await readSelfHostState(env);
-  if (!state || (state.phase !== "promoted" && state.phase !== "enabled")) {
-    throw new Error("No promoted or enabled Self Host state is available for workers.dev rollback");
-  }
-  const rollback = state?.rollback.browserAccess;
-  if (!rollback) {
-    throw new Error("Workers.dev rollback Access metadata is not available");
-  }
-
-  const token = request.headers.get("Cf-Access-Jwt-Assertion")?.trim() ?? "";
-  if (!token) {
-    throw new Error("Missing Cf-Access-Jwt-Assertion");
-  }
-  const audience = rollback.aud.trim();
-  const issuer = normalizeAccessUrl(rollback.issuer ?? "");
-  const jwksUrl = normalizeAccessUrl(rollback.jwksUrl ?? "") || (issuer ? accessCertsUrl(issuer) : "");
-  if (!audience || !jwksUrl) {
-    throw new Error("Workers.dev rollback Access metadata is incomplete");
-  }
-  await verifyCloudflareAccessToken(token, {
-    audience,
-    issuer: issuer || null,
-    jwksUrl,
   });
+  if (explicit) return explicit;
+  if (path === "/api/setup" || path.startsWith("/api/setup/")) {
+    return { path, method, mode: "owner" };
+  }
+  if (path === "/api/settings" || path.startsWith("/api/settings/")) {
+    return { path, method, mode: "owner" };
+  }
+  return { path, method, mode: "normal" };
 }
 
-async function tryVerifyWorkersDevRollbackAccess(request: Request, env: Env): Promise<boolean> {
+async function verifyCanonicalAccessBootstrap(request: Request, env: Env): Promise<void> {
+  const hostname = new URL(request.url).hostname;
+  const trust = await readWorkersDevAccessTrust(env, hostname);
+  if (!trust) throw new Error("Canonical workers.dev Access trust is not available");
+  const token = request.headers.get("Cf-Access-Jwt-Assertion")?.trim() ?? "";
+  if (!token) throw new Error("Missing Cf-Access-Jwt-Assertion");
+  const payload = await verifyCloudflareAccessToken(token, {
+    audience: trust.audience,
+    issuer: trust.issuer,
+    jwksUrl: accessCertsUrl(trust.issuer),
+  });
+  classifyWorkersDevPrincipal(payload, trust);
+}
+
+async function tryVerifyCanonicalAccessBootstrap(request: Request, env: Env): Promise<boolean> {
   try {
-    await verifyWorkersDevRollbackAccess(request, env);
+    await verifyCanonicalAccessBootstrap(request, env);
     return true;
   } catch {
     return false;
@@ -359,7 +284,7 @@ function unauthorizedResponse(): Response {
 
 function isPublicSetupApiAllowed(path: string, method: string): boolean {
   return (path === "/api/setup/status" && method === "GET")
-    || (path === "/api/setup/verify-cloudflare-token" && method === "POST");
+    || (path === "/api/setup/workers-dev-access/oauth/start" && method === "POST");
 }
 
 export async function hubAuthGuardResponse(
@@ -370,35 +295,20 @@ export async function hubAuthGuardResponse(
   const path = new URL(request.url).pathname;
   const policy = resolveRouteAuthPolicy(path, request.method);
   if (policy.mode === "public") return null;
-  if (policy.mode === "self-host-pending-custom-jwt") return null;
 
   const state = await resolveAuthGuardState(request, env);
   if (state.protectHubRequired) {
     if (policy.protectHubAllowlisted) {
-      await tryClaimWorkersDevAccessConfigFromJwt(request, env);
       return null;
     }
-    if (await tryClaimWorkersDevAccessConfigFromJwt(request, env)) return null;
     return setupProtectionRequiredResponse();
   }
 
   if (state.isLocalDev) return null;
 
-  if (policy.mode === "browser-jwt") {
-    if (!request.headers.get("Cf-Access-Jwt-Assertion")?.trim()) {
-      return unauthorizedResponse();
-    }
+  if (policy.mode === "owner") {
     try {
-      await verifyCfAccessJwt(request, env);
-      return null;
-    } catch {
-      return unauthorizedResponse();
-    }
-  }
-
-  if (policy.mode === "service-token") {
-    try {
-      await verifyCfAccessServiceToken(request, env);
+      await authenticateCanonicalOwner(request, env);
       return null;
     } catch {
       return unauthorizedResponse();
@@ -406,33 +316,10 @@ export async function hubAuthGuardResponse(
   }
 
   if (
-    policy.mode === "workers-dev-browser"
-    && getRouteKind(request.url) === "workers-dev"
-    && !request.headers.get("Cf-Access-Jwt-Assertion")?.trim()
-  ) {
-    return unauthorizedResponse();
-  }
-
-  if (
-    policy.workersDevRollback
-    && await tryVerifyWorkersDevRollbackAccess(request, env)
+    policy.canonicalAccessBootstrap
+    && await tryVerifyCanonicalAccessBootstrap(request, env)
   ) {
     return null;
-  }
-
-  if (
-    policy.workersDevRollback
-    && getRouteKind(request.url) === "workers-dev"
-    && !request.headers.get("Cf-Access-Jwt-Assertion")?.trim()
-    && (
-      request.headers.get("CF-Access-Client-Id")?.trim()
-      || request.headers.get("CF-Access-Client-Secret")?.trim()
-    )
-  ) {
-    const selfHostState = await readSelfHostState(env);
-    if (selfHostState?.phase === "promoted" || selfHostState?.phase === "enabled") {
-      return unauthorizedResponse();
-    }
   }
 
   if (options.skipNormalAuthForWebSocket && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -447,7 +334,7 @@ export async function hubAuthGuardResponse(
   }
 
   try {
-    await maybeVerifyCfAccessRequest(request, env);
+    await authenticateAccessRequest(request, env);
     return null;
   } catch {
     return unauthorizedResponse();

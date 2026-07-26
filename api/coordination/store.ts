@@ -6,7 +6,6 @@ import type {
   ArtifactRef,
   CreateArtifactInput,
   PlanArtifact,
-  PlanArtifactBody,
   ReviewArtifact,
   ReviewArtifactBody,
 } from "./types";
@@ -22,31 +21,6 @@ export async function loadRepoArtifacts(
   return {
     artifacts,
     refs,
-  };
-}
-
-export function createPlanArtifactInput(options: {
-  repo: Pick<RepoMeta, "repoId" | "mainCommit">;
-  title: string;
-  body: PlanArtifactBody;
-  createdBy?: string;
-  createdAt?: string;
-  parentArtifactId?: string;
-  supersedesArtifactId?: string;
-}): CreateArtifactInput<PlanArtifactBody> {
-  return {
-    repoId: options.repo.repoId,
-    type: "plan",
-    basis: {
-      repoId: options.repo.repoId,
-      mainCommit: options.repo.mainCommit,
-    },
-    title: options.title,
-    body: options.body,
-    ...(options.createdBy ? { createdBy: options.createdBy } : {}),
-    ...(options.createdAt ? { createdAt: options.createdAt } : {}),
-    ...(options.parentArtifactId ? { parentArtifactId: options.parentArtifactId } : {}),
-    ...(options.supersedesArtifactId ? { supersedesArtifactId: options.supersedesArtifactId } : {}),
   };
 }
 

@@ -90,9 +90,7 @@ export interface ModelTarget {
   defaultModel?: string;
 }
 
-export type HostedAgentId =
-  | "plan-chat"
-  | "reviewer-chat";
+export type HostedAgentId = "reviewer-chat";
 
 export interface HostedAgentMetadata {
   id: HostedAgentId;

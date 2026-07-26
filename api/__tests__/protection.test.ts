@@ -1,9 +1,14 @@
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { authMiddleware, dynamicEntrypointAuthResponse, maybeVerifyCfAccessRequest } from "../auth";
+import { authenticateAccessRequest, authMiddleware, dynamicEntrypointAuthResponse } from "../auth";
 import { hasEnabledHarnessModelAuth, resolveModelAuthState, resolveProtectionState } from "../protection";
 import voiceRoutes from "../voice/routes";
 import type { Env, HonoEnv } from "../types";
+import { clearWorkersDevAccessTrustCache } from "../workers-dev-access/records";
+import type {
+  WorkersDevAccessCredentialV1,
+  WorkersDevAccessTrustV1,
+} from "../workers-dev-access/types";
 
 const { getOpenAIAuthStatus } = vi.hoisted(() => ({
   getOpenAIAuthStatus: vi.fn(async () => ({ authenticated: false, status: "missing" })),
@@ -18,9 +23,50 @@ vi.mock("../openai-auth", () => ({
   getStatus: getOpenAIAuthStatus,
 }));
 
-function mockEnv(overrides: Record<string, unknown> = {}): Env {
+const canonicalTrust: WorkersDevAccessTrustV1 = {
+  version: 1,
+  ownerEmail: "owner@example.com",
+  accountId: "account-1",
+  workerName: "demo",
+  workersDevHostname: "demo.preview.workers.dev",
+  issuer: "https://team.cloudflareaccess.com",
+  audience: "aud",
+  serviceTokenId: "token-1",
+  serviceClientId: "client-id.access",
+  configuredAt: "2026-07-16T00:00:00.000Z",
+};
+
+const canonicalCredential: WorkersDevAccessCredentialV1 = {
+  version: 1,
+  currentSecret: "client-secret",
+  tokenExpiresAt: "2027-07-16T00:00:00.000Z",
+  updatedAt: "2026-07-16T00:00:00.000Z",
+};
+
+function mockEnv(
+  overrides: Record<string, unknown> = {},
+  access: { trust?: WorkersDevAccessTrustV1 | null; credential?: WorkersDevAccessCredentialV1 | null } = {},
+): Env {
   const fetchSpy = vi.fn(async () => new Response("ok", { status: 200 }));
+  const trust = access.trust ?? null;
+  const credential = access.credential ?? null;
   return {
+    HUB: {
+      idFromName: vi.fn(() => "hub-id"),
+      get: vi.fn(() => ({
+        getConfig: vi.fn(async () => undefined),
+        getWorkersDevAccessTrust: vi.fn(async (hostname: string) => (
+          trust?.workersDevHostname === hostname ? trust : null
+        )),
+        getWorkersDevAccessCredential: vi.fn(async () => credential),
+        getWorkersDevAccessLifecycle: vi.fn(async () => ({
+          configured: Boolean(trust && credential),
+          workersDevHostname: trust?.workersDevHostname ?? null,
+          tokenExpiresAt: credential?.tokenExpiresAt ?? null,
+          renewalRecommended: false,
+        })),
+      })),
+    },
     TILLER_VOICE: {
       idFromName: vi.fn(() => "voice-id"),
       get: vi.fn(() => ({ fetch: fetchSpy })),
@@ -28,6 +74,8 @@ function mockEnv(overrides: Record<string, unknown> = {}): Env {
     ...overrides,
   } as unknown as Env;
 }
+
+beforeEach(() => clearWorkersDevAccessTrustCache());
 
 describe("resolveModelAuthState", () => {
   beforeEach(() => {
@@ -37,19 +85,18 @@ describe("resolveModelAuthState", () => {
   it("treats either Claude subscription or Anthropic API auth as configured", async () => {
     await expect(resolveModelAuthState(mockEnv({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token" }))).resolves.toMatchObject({
       configured: true,
-      mode: "subscription",
+      hasClaudeSubscription: true,
     });
 
     await expect(resolveModelAuthState(mockEnv({ ANTHROPIC_API_KEY: "api-key" }))).resolves.toMatchObject({
       configured: true,
-      mode: "api",
+      hasAnthropicKey: true,
     });
   });
 
   it("tracks OpenAI credentials separately", async () => {
     await expect(resolveModelAuthState(mockEnv({ OPENAI_API_KEY: "openai-key" }))).resolves.toMatchObject({
       configured: true,
-      mode: "api-key",
       hasOpenAIKey: true,
     });
   });
@@ -64,7 +111,6 @@ describe("resolveModelAuthState", () => {
       ),
     ).resolves.toMatchObject({
       configured: false,
-      mode: null,
     });
   });
 
@@ -73,7 +119,6 @@ describe("resolveModelAuthState", () => {
 
     await expect(resolveModelAuthState(mockEnv())).resolves.toMatchObject({
       configured: true,
-      mode: "subscription",
       hasChatGPTAuth: true,
     });
   });
@@ -83,7 +128,12 @@ describe("hasEnabledHarnessModelAuth", () => {
   it("requires a Claude credential when only claude-code is enabled", () => {
     expect(
       hasEnabledHarnessModelAuth(
-        { hasClaudeSubscription: false, hasAnthropicKey: false, hasChatGPTAuth: false, hasOpenAIKey: true },
+        {
+          hasClaudeSubscription: false,
+          hasAnthropicKey: false,
+          hasChatGPTAuth: false,
+          hasOpenAIKey: true,
+        },
         ["claude-code"],
       ),
     ).toBe(false);
@@ -92,7 +142,12 @@ describe("hasEnabledHarnessModelAuth", () => {
   it("accepts an OpenAI key when codex is enabled", () => {
     expect(
       hasEnabledHarnessModelAuth(
-        { hasClaudeSubscription: false, hasAnthropicKey: false, hasChatGPTAuth: false, hasOpenAIKey: true },
+        {
+          hasClaudeSubscription: false,
+          hasAnthropicKey: false,
+          hasChatGPTAuth: false,
+          hasOpenAIKey: true,
+        },
         ["claude-code", "codex"],
       ),
     ).toBe(true);
@@ -127,7 +182,7 @@ describe("hasEnabledHarnessModelAuth", () => {
     ).toBe(false);
   });
 
-  it("accepts built-in OpenCode access when opencode is enabled", () => {
+  it("requires a real OpenCode credential route when opencode is enabled", () => {
     expect(
       hasEnabledHarnessModelAuth(
         {
@@ -135,6 +190,29 @@ describe("hasEnabledHarnessModelAuth", () => {
           hasAnthropicKey: false,
           hasChatGPTAuth: false,
           hasOpenAIKey: false,
+        },
+        ["opencode"],
+      ),
+    ).toBe(false);
+    expect(
+      hasEnabledHarnessModelAuth(
+        {
+          hasClaudeSubscription: false,
+          hasAnthropicKey: false,
+          hasChatGPTAuth: false,
+          hasOpenAIKey: true,
+        },
+        ["opencode"],
+      ),
+    ).toBe(true);
+    expect(
+      hasEnabledHarnessModelAuth(
+        {
+          hasClaudeSubscription: false,
+          hasAnthropicKey: false,
+          hasChatGPTAuth: false,
+          hasOpenAIKey: false,
+          workersAiConfigured: true,
         },
         ["opencode"],
       ),
@@ -154,42 +232,27 @@ describe("resolveProtectionState", () => {
     await expect(
       resolveProtectionState(env, "https://demo.preview.workers.dev/api/setup/status"),
     ).resolves.toMatchObject({
-      hostKind: "workers-dev",
-      routeKind: "workers-dev",
       protectionMode: "public",
-      protectionCanAutomate: false,
-      serviceTokenConfigured: true,
-      unsupportedProtectionConfig: true,
-      workersDevAliasDisabled: false,
-      protectionAppDomain: null,
+      serviceTokenConfigured: false,
+      accessConfigured: false,
     });
   });
 
   it("supports Access-protected workers.dev routes", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
-      CF_ACCESS_CONFIGURED: "true",
-      CF_ACCESS_AUD: "aud",
-      CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
-    });
+    const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     await expect(
       resolveProtectionState(env, "https://demo.preview.workers.dev/api/setup/status"),
     ).resolves.toMatchObject({
-      routeKind: "workers-dev",
-      hostKind: "workers-dev",
       protectionMode: "cf-access",
-      protectionCanAutomate: false,
+      serviceTokenConfigured: true,
       accessConfigured: true,
-      accessIssuer: "https://team.cloudflareaccess.com",
-      accessJwksUrl: null,
     });
   });
 
-  it("treats custom domains with CF_ACCESS_AUD as protected", async () => {
+  it("does not trust legacy custom-domain Access configuration", async () => {
     const env = mockEnv({
       HUB_PUBLIC_URL: "https://tiller.example.com",
-      WORKERS_DEV_ALIAS_DISABLED: "true",
       CF_ACCESS_AUD: "aud",
       CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
       CF_ACCESS_CLIENT_ID: "client-id",
@@ -199,20 +262,15 @@ describe("resolveProtectionState", () => {
     await expect(
       resolveProtectionState(env, "https://tiller.example.com/api/setup/status"),
     ).resolves.toMatchObject({
-      hostKind: "custom-domain",
-      routeKind: "custom-domain",
-      protectionMode: "cf-access",
-      protectionCanAutomate: true,
-      serviceTokenConfigured: true,
-      unsupportedProtectionConfig: false,
-      workersDevAliasDisabled: true,
-      protectionAppDomain: null,
+      protectionMode: "public",
+      serviceTokenConfigured: false,
+      accessConfigured: false,
     });
   });
 });
 
-describe("maybeVerifyCfAccessRequest", () => {
-  it("rejects malformed JWTs for protected custom domains", async () => {
+describe("authenticateAccessRequest", () => {
+  it("rejects assertions on legacy custom domains", async () => {
     const env = mockEnv({
       CF_ACCESS_AUD: "aud",
       CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
@@ -221,43 +279,12 @@ describe("maybeVerifyCfAccessRequest", () => {
       headers: { "Cf-Access-Jwt-Assertion": "not-a-jwt" },
     });
 
-    await expect(maybeVerifyCfAccessRequest(request, env)).rejects.toThrow("Malformed JWT");
-  });
-
-  it("accepts matching service token headers for protected custom domains", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://tiller.example.com",
-      CF_ACCESS_AUD: "aud",
-      CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
-      CF_ACCESS_CLIENT_ID: "client-id.access",
-      CF_ACCESS_CLIENT_SECRET: "client-secret",
-    });
-    const request = new Request("https://tiller.example.com/api/sessions", {
-      headers: {
-        "CF-Access-Client-Id": "client-id.access",
-        "CF-Access-Client-Secret": "client-secret",
-      },
-    });
-
-    await expect(maybeVerifyCfAccessRequest(request, env)).resolves.toBeUndefined();
-  });
-
-  it("rejects missing credentials for protected custom domains", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://tiller.example.com",
-      CF_ACCESS_AUD: "aud",
-      CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
-      CF_ACCESS_CLIENT_ID: "client-id.access",
-      CF_ACCESS_CLIENT_SECRET: "client-secret",
-    });
-    const request = new Request("https://tiller.example.com/api/sessions");
-
-    await expect(maybeVerifyCfAccessRequest(request, env)).rejects.toThrow(
-      "Missing Cloudflare Access service token",
+    await expect(authenticateAccessRequest(request, env)).rejects.toThrow(
+      "Canonical workers.dev Access trust is not configured",
     );
   });
 
-  it("skips incomplete Access config on workers.dev", async () => {
+  it("fails closed when canonical workers.dev trust is missing", async () => {
     const env = mockEnv({
       HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
       CF_ACCESS_AUD: "aud",
@@ -266,21 +293,18 @@ describe("maybeVerifyCfAccessRequest", () => {
       headers: { "Cf-Access-Jwt-Assertion": "not-a-jwt" },
     });
 
-    await expect(maybeVerifyCfAccessRequest(request, env)).resolves.toBeUndefined();
+    await expect(authenticateAccessRequest(request, env)).rejects.toThrow(
+      "Canonical workers.dev Access trust is not configured",
+    );
   });
 
   it("validates workers.dev Access JWTs when Access is configured", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
-      CF_ACCESS_CONFIGURED: "true",
-      CF_ACCESS_AUD: "aud",
-      CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
-    });
+    const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
     const request = new Request("https://demo.preview.workers.dev/api/sessions", {
       headers: { "Cf-Access-Jwt-Assertion": "not-a-jwt" },
     });
 
-    await expect(maybeVerifyCfAccessRequest(request, env)).rejects.toThrow("Malformed JWT");
+    await expect(authenticateAccessRequest(request, env)).rejects.toThrow("Malformed JWT");
   });
 });
 
@@ -289,8 +313,7 @@ describe("authMiddleware protect-hub guard", () => {
     const app = new Hono<HonoEnv>();
     app.use("/api/*", authMiddleware);
     app.get("/api/setup/status", (c) => c.json({ ok: true }));
-    app.post("/api/setup/workers-dev-access", (c) => c.json({ ok: true }));
-    app.post("/api/setup/verify-cloudflare-token", (c) => c.json({ ok: true }));
+    app.post("/api/setup/workers-dev-access/oauth/start", (c) => c.json({ ok: true }));
     app.post("/api/setup", (c) => c.json({ ok: true }));
     app.get("/api/envs", (c) => c.json([]));
     return app;
@@ -335,7 +358,7 @@ describe("authMiddleware protect-hub guard", () => {
     });
   });
 
-  it("allows only setup status and workers.dev Access claim during protect-hub", async () => {
+  it("allows only setup status and workers.dev OAuth start during protect-hub", async () => {
     const app = createProtectedApp();
     const env = mockEnv({
       HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
@@ -346,7 +369,7 @@ describe("authMiddleware protect-hub guard", () => {
     ).resolves.toMatchObject({ status: 200 });
     await expect(
       app.request(
-        "https://demo.preview.workers.dev/api/setup/workers-dev-access",
+        "https://demo.preview.workers.dev/api/setup/workers-dev-access/oauth/start",
         { method: "POST" },
         env as any,
       ),
@@ -358,7 +381,7 @@ describe("authMiddleware protect-hub guard", () => {
     const res = await app.request(
       "http://localhost:5173/api/setup",
       { method: "POST" },
-      mockEnv() as any,
+      mockEnv({ LOCAL_DEV_ONLY_BACKEND: "1" }) as any,
     );
 
     expect(res.status).toBe(200);
@@ -370,6 +393,7 @@ describe("authMiddleware protect-hub guard", () => {
       "http://localhost:5173/api/envs",
       { method: "GET" },
       mockEnv({
+        LOCAL_DEV_ONLY_BACKEND: "1",
         CF_ACCESS_AUD: "aud",
         CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
       }) as any,
@@ -378,7 +402,7 @@ describe("authMiddleware protect-hub guard", () => {
     expect(res.status).toBe(200);
   });
 
-  it("blocks deployed public setup writes on custom domains", async () => {
+  it("fails closed for setup writes on unsupported custom domains", async () => {
     const app = createProtectedApp();
     const res = await app.request(
       "https://tiller.example.com/api/setup",
@@ -388,20 +412,7 @@ describe("authMiddleware protect-hub guard", () => {
       }) as any,
     );
 
-    expect(res.status).toBe(401);
-  });
-
-  it("allows public custom-domain Cloudflare token verification bootstrap", async () => {
-    const app = createProtectedApp();
-    const res = await app.request(
-      "https://tiller.example.com/api/setup/verify-cloudflare-token",
-      { method: "POST" },
-      mockEnv({
-        HUB_PUBLIC_URL: "https://tiller.example.com",
-      }) as any,
-    );
-
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(403);
   });
 
   it("blocks non-API dynamic entrypoints during protect-hub", async () => {
@@ -410,7 +421,7 @@ describe("authMiddleware protect-hub guard", () => {
     });
 
     const agentsBlocked = await dynamicEntrypointAuthResponse(
-      new Request("https://demo.preview.workers.dev/agents/plan-chat/default"),
+      new Request("https://demo.preview.workers.dev/agents/reviewer-chat/default"),
       env,
     );
     expect(agentsBlocked?.status).toBe(403);
@@ -425,23 +436,16 @@ describe("authMiddleware protect-hub guard", () => {
   });
 
   it("requires normal Access auth for non-API dynamic entrypoints after Access is configured", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
-      CF_ACCESS_CONFIGURED: "true",
-      CF_ACCESS_AUD: "aud",
-      CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
-      CF_ACCESS_CLIENT_ID: "client-id.access",
-      CF_ACCESS_CLIENT_SECRET: "client-secret",
-    });
+    const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     const missing = await dynamicEntrypointAuthResponse(
-      new Request("https://demo.preview.workers.dev/agents/plan-chat/default"),
+      new Request("https://demo.preview.workers.dev/agents/reviewer-chat/default"),
       env,
     );
     expect(missing?.status).toBe(401);
 
     const authed = await dynamicEntrypointAuthResponse(
-      new Request("https://demo.preview.workers.dev/agents/plan-chat/default", {
+      new Request("https://demo.preview.workers.dev/agents/reviewer-chat/default", {
         headers: {
           "CF-Access-Client-Id": "client-id.access",
           "CF-Access-Client-Secret": "client-secret",
@@ -449,19 +453,12 @@ describe("authMiddleware protect-hub guard", () => {
       }),
       env,
     );
-    expect(authed).toBeNull();
+    expect(authed?.status).toBe(401);
   });
 
   it("requires normal Access auth for setup writes after workers.dev Access is configured", async () => {
     const app = createProtectedApp();
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
-      CF_ACCESS_CONFIGURED: "true",
-      CF_ACCESS_AUD: "aud",
-      CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
-      CF_ACCESS_CLIENT_ID: "client-id.access",
-      CF_ACCESS_CLIENT_SECRET: "client-secret",
-    });
+    const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     const missing = await app.request(
       "https://demo.preview.workers.dev/api/setup",
@@ -481,19 +478,12 @@ describe("authMiddleware protect-hub guard", () => {
       },
       env as any,
     );
-    expect(authed.status).toBe(200);
+    expect(authed.status).toBe(401);
   });
 
   it("requires normal Access auth for setup status after Access is configured", async () => {
     const app = createProtectedApp();
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
-      CF_ACCESS_CONFIGURED: "true",
-      CF_ACCESS_AUD: "aud",
-      CF_ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com",
-      CF_ACCESS_CLIENT_ID: "client-id.access",
-      CF_ACCESS_CLIENT_SECRET: "client-secret",
-    });
+    const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     const missing = await app.request(
       "https://demo.preview.workers.dev/api/setup/status",
@@ -513,7 +503,7 @@ describe("authMiddleware protect-hub guard", () => {
       },
       env as any,
     );
-    expect(authed.status).toBe(200);
+    expect(authed.status).toBe(401);
   });
 });
 
@@ -524,6 +514,19 @@ describe("voice access auth", () => {
   beforeEach(() => {
     stubFetch = vi.fn(async () => new Response("ok", { status: 200 }));
     env = {
+      HUB: {
+        idFromName: vi.fn(() => "hub-id"),
+        get: vi.fn(() => ({
+          getWorkersDevAccessTrust: vi.fn(async () => null),
+          getWorkersDevAccessCredential: vi.fn(async () => null),
+          getWorkersDevAccessLifecycle: vi.fn(async () => ({
+            configured: false,
+            workersDevHostname: null,
+            tokenExpiresAt: null,
+            renewalRecommended: false,
+          })),
+        })),
+      },
       TILLER_VOICE: {
         idFromName: vi.fn(() => "voice-id"),
         get: vi.fn(() => ({ fetch: stubFetch })),
@@ -551,7 +554,7 @@ describe("voice access auth", () => {
     expect(stubFetch).not.toHaveBeenCalled();
   });
 
-  it("allows workers.dev requests through without Access config", async () => {
+  it("fails closed for workers.dev voice requests without Access config", async () => {
     const res = await voiceRoutes.request(
       "https://demo.preview.workers.dev/api/voice/session?sessionId=session-1",
       {
@@ -562,7 +565,7 @@ describe("voice access auth", () => {
       env as unknown as Record<string, unknown>,
     );
 
-    expect(res.status).toBe(200);
-    expect(stubFetch).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(401);
+    expect(stubFetch).not.toHaveBeenCalled();
   });
 });

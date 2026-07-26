@@ -2,11 +2,21 @@ import { Hono, type Context } from "hono";
 import type { HonoEnv } from "../types";
 import { getSecret } from "../setup/config";
 import { OPENCODE_PROXY_TOKEN_KEY } from "../env/container-auth";
+import { getHarnessModel, KIMI_K2_7_CODE } from "../../shared/harness-catalog";
 
-const FIXED_MODEL = "@cf/moonshotai/kimi-k2.5";
+const kimiCatalogModel = getHarnessModel("opencode", KIMI_K2_7_CODE.id);
+if (kimiCatalogModel?.binding.kind !== "opencode" || kimiCatalogModel.binding.provider !== "cloudflare-workers-ai") {
+  throw new Error("The OpenCode Workers AI proxy requires the catalog's Kimi model binding.");
+}
+const FIXED_MODEL = kimiCatalogModel.binding.model;
 const NO_STORE = "no-store";
 
 type JsonRecord = Record<string, unknown>;
+
+async function runFixedModel(ai: Ai, input: unknown): Promise<unknown> {
+  const run = ai.run as unknown as (model: string, request: unknown) => Promise<unknown>;
+  return run.call(ai, FIXED_MODEL, input);
+}
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null;
@@ -479,7 +489,7 @@ opencodeRoutes.post("/api/opencode/v1/chat/completions", async (c) => {
   c.header("Cache-Control", NO_STORE);
 
   if (body.stream === true) {
-    const stream = await c.env.AI.run(FIXED_MODEL, input as AiModels[typeof FIXED_MODEL]["inputs"]);
+    const stream = await runFixedModel(c.env.AI, input);
     if (!(stream instanceof ReadableStream)) {
       return c.json(normalizeChatCompletionResponse(stream), 200);
     }
@@ -500,7 +510,7 @@ opencodeRoutes.post("/api/opencode/v1/chat/completions", async (c) => {
     );
   }
 
-  const output = await c.env.AI.run(FIXED_MODEL, input as AiModels[typeof FIXED_MODEL]["inputs"]);
+  const output = await runFixedModel(c.env.AI, input);
   return c.json(normalizeChatCompletionResponse(output), 200);
 });
 

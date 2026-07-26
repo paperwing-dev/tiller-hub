@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { getEnvAuthBadge, getEnvModelBadge, getHarnessBadgeClass, getHarnessBadgeLabel, getLeadHarnessBadge } from "../env-harness";
+import { getEnvAuthBadge, getEnvModelBadge, getEnvModelLabel, getHarnessBadgeClass, getHarnessBadgeLabel, getLeadHarnessBadge } from "../env-harness";
 
 describe("getEnvAuthBadge", () => {
+  it("keeps Codex auth neutral until the current mode is known", () => {
+    expect(
+      getEnvAuthBadge({
+        harness: "codex",
+      }),
+    ).toBeNull();
+  });
+
   it("returns the recorded auth badge for Codex envs", () => {
     expect(
       getEnvAuthBadge({
@@ -26,7 +34,6 @@ describe("getEnvAuthBadge", () => {
     expect(
       getEnvAuthBadge({
         harness: "opencode",
-        opencodeProvider: "cloudflare-workers-ai",
       }),
     ).toBeNull();
   });
@@ -44,13 +51,24 @@ describe("getEnvAuthBadge", () => {
 });
 
 describe("getEnvModelBadge", () => {
-  it("does not add model-specific badges", () => {
+  it("uses committed harness settings for the current model badge", () => {
     expect(
       getEnvModelBadge({
         harness: "opencode",
-        opencodeModel: "@cf/moonshotai/kimi-k2.5",
+        harnessSettings: { model: "kimi-k2.7-code", effort: "high" },
       }),
-    ).toBeNull();
+    ).toMatchObject({ label: "Kimi K2.7 Code" });
+  });
+
+  it("does not infer current model state from legacy metadata", () => {
+    expect(getEnvModelBadge({ harness: "opencode", harnessSettings: null })).toBeNull();
+  });
+
+  it("shares the committed model label projection with non-badge displays", () => {
+    expect(getEnvModelLabel({
+      harness: "codex",
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
+    })).toBe("GPT-5.6 Sol");
   });
 });
 

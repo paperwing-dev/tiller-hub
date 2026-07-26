@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { validateManagedSelfHostRuntime } from "./self-host-runtime-contract.mjs";
 
 const packageRoot = path.resolve(import.meta.dirname, "..");
 const metadataPath = path.join(packageRoot, "tiller-update.json");
@@ -155,6 +156,9 @@ function assertValidMarker(marker) {
   if (typeof marker.version !== "string" || !marker.version.trim()) throw new Error("version is required");
   if (typeof marker.label !== "string" || !marker.label.trim()) throw new Error("label is required");
   assertValidManagedFiles(marker.managedFiles);
+  if (marker.selfHostRuntime !== undefined) {
+    validateManagedSelfHostRuntime(marker.selfHostRuntime);
+  }
 }
 
 function assertValidPreviousManagedFiles(marker) {
@@ -223,14 +227,45 @@ async function readPreviousMarker(args, sourceRepo) {
   return fetchPreviousMarker(sourceRepo);
 }
 
-function assertAppendOnlyManagedFiles(previous, next) {
+function resolveAllowedManagedFileRemovals(args) {
+  const raw = args["allow-managed-file-removal"]?.trim();
+  if (!raw) return new Set();
+
+  const allowed = new Set();
+  for (const managedPath of raw.split(",").map((value) => value.trim()).filter(Boolean)) {
+    if (!isSafeManagedPath(managedPath)) {
+      throw new Error(`Unsafe allowed managed file removal: ${managedPath}`);
+    }
+    allowed.add(managedPath);
+  }
+  return allowed;
+}
+
+export function assertManagedFileRemovalPolicy(previous, next, allowedRemovals = new Set()) {
   if (!previous) return;
   assertValidPreviousManagedFiles(previous);
   const latest = new Set(next.managedFiles);
   const removed = previous.managedFiles.filter((managedPath) => !latest.has(managedPath));
-  if (removed.length > 0) {
-    throw new Error(`managedFiles is append-only for schema v1; removed path(s): ${removed.join(", ")}`);
+  const unexpected = removed.filter((managedPath) => !allowedRemovals.has(managedPath));
+  if (unexpected.length > 0) {
+    throw new Error(`managedFiles removed without an explicit cutover allowance: ${unexpected.join(", ")}`);
   }
+}
+
+function resolveSelfHostRuntime(args) {
+  const imageSourceId = args["self-host-runtime-image-source-id"]?.trim()
+    || process.env.TILLER_SELF_HOST_RUNTIME_IMAGE_SOURCE_ID?.trim();
+  const sandboxImage = args["self-host-runtime-sandbox-image"]?.trim()
+    || process.env.TILLER_SELF_HOST_RUNTIME_SANDBOX_IMAGE?.trim();
+
+  if (!imageSourceId && !sandboxImage) {
+    return undefined;
+  }
+
+  return validateManagedSelfHostRuntime({
+    imageSourceId: imageSourceId || "",
+    sandboxImage: sandboxImage || "",
+  });
 }
 
 export async function buildUpdateMetadata(args = {}) {
@@ -241,6 +276,7 @@ export async function buildUpdateMetadata(args = {}) {
 
   const sourceId = resolveSourceId(args);
   const version = await resolveVersion(args);
+  const selfHostRuntime = resolveSelfHostRuntime(args);
   const managedFiles = [...new Set(await collectManagedFiles())].sort((left, right) => left.localeCompare(right));
   assertValidManagedFiles(managedFiles);
 
@@ -253,10 +289,15 @@ export async function buildUpdateMetadata(args = {}) {
     version,
     label: args.label?.trim() || formatVersionLabel(version),
     managedFiles,
+    ...(selfHostRuntime ? { selfHostRuntime } : {}),
   };
 
   assertValidMarker(metadata);
-  assertAppendOnlyManagedFiles(await readPreviousMarker(args, sourceRepo), metadata);
+  assertManagedFileRemovalPolicy(
+    await readPreviousMarker(args, sourceRepo),
+    metadata,
+    resolveAllowedManagedFileRemovals(args),
+  );
   return metadata;
 }
 

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { Button } from '@cloudflare/kumo/components/button';
 import { applyUpdate, checkForUpdate, detectSelfUpdateRepo, selectSelfUpdateRepo } from './api';
 import type { HubUpdateRepoCandidate, UpdateCheckResult } from './api';
 import { useToast } from './Toast';
@@ -27,6 +28,7 @@ interface UpdateDialogProps {
   issue: string | null;
   issueCode?: string | null;
   isChecking: boolean;
+  hasExecutionMachine: boolean;
   onDismiss: () => void;
   onOpenSettings: () => void;
   onRetryCheck: () => void;
@@ -74,6 +76,7 @@ export default function UpdateDialog({
   issue,
   issueCode,
   isChecking,
+  hasExecutionMachine,
   onDismiss,
   onOpenSettings,
   onRetryCheck,
@@ -274,18 +277,18 @@ export default function UpdateDialog({
   if (!status) {
     const accessRequired = issueCode === 'setup_protection_required';
     return (
-      <div className="flex-1 overflow-auto bg-[#f6f8fa]">
+      <div className="flex-1 overflow-auto bg-kumo-recessed">
         <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
-          <section className="rounded-2xl border border-[#d0d7de] bg-white p-6 shadow-sm">
+          <section className="rounded-2xl border border-kumo-line bg-kumo-base p-6 shadow-sm">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#57606a]">
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
                   Self-Update
                 </p>
-                <h1 className="mt-2 text-2xl font-semibold text-[#24292f]">
+                <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">
                   {accessRequired ? 'Access verification required' : 'Update check unavailable'}
                 </h1>
-                <p className="mt-2 text-sm text-[#57606a]">
+                <p className="mt-2 text-sm text-kumo-subtle">
                   {accessRequired
                     ? 'Tiller Hub blocked the self-update check because this workers.dev deployment has not saved its Cloudflare Access configuration yet.'
                     : 'Tiller Hub could not determine the latest upstream update metadata, so the update prompt is unavailable. This does not block normal hub usage.'}
@@ -293,18 +296,18 @@ export default function UpdateDialog({
               </div>
             </div>
 
-            <div className="mt-6 rounded-xl border border-[#cf222e]/20 bg-[#ffebe9] px-4 py-3">
-              <p className="text-sm font-semibold text-[#24292f]">Issue</p>
-              <p className="mt-1 text-sm text-[#cf222e]">
+            <div className="mt-6 rounded-xl border border-kumo-danger/20 bg-kumo-danger-tint px-4 py-3">
+              <p className="text-sm font-semibold text-kumo-default">Issue</p>
+              <p className="mt-1 text-sm text-kumo-danger">
                 {issue ?? 'Self-update check failed.'}
               </p>
             </div>
 
-            <div className="mt-4 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] px-4 py-3">
-              <p className="text-sm font-semibold text-[#24292f]">
+            <div className="mt-4 rounded-xl border border-kumo-line bg-kumo-recessed px-4 py-3">
+              <p className="text-sm font-semibold text-kumo-default">
                 {accessRequired ? 'What to do' : 'Likely cause'}
               </p>
-              <p className="mt-1 text-sm text-[#57606a]">
+              <p className="mt-1 text-sm text-kumo-subtle">
                 {accessRequired
                   ? 'Open Settings, reload through Cloudflare Access, then verify Access. After Tiller saves the Access JWT metadata, retry the update check.'
                   : 'If the public deploy-button repo is temporarily unavailable, this warning is expected.'}
@@ -313,29 +316,21 @@ export default function UpdateDialog({
 
             <div className="mt-6 flex flex-wrap items-center gap-3">
               {accessRequired && (
-                <button
-                  type="button"
-                  onClick={onOpenSettings}
-                  className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black"
-                >
+                <Button type="button" variant="primary" onClick={onOpenSettings}>
                   Open Settings
-                </button>
+                </Button>
               )}
-              <button
+              <Button
                 type="button"
+                variant={accessRequired ? 'secondary' : 'primary'}
                 onClick={onRetryCheck}
-                disabled={isChecking}
-                className={`${accessRequired ? 'border border-[#d0d7de] bg-white text-[#24292f] hover:bg-[#f6f8fa]' : 'bg-[#24292f] text-white hover:bg-black'} rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50`}
+                loading={isChecking}
               >
                 {isChecking ? 'Checking...' : 'Retry check'}
-              </button>
-              <button
-                type="button"
-                onClick={onDismiss}
-                className="rounded-lg border border-[#d0d7de] bg-white px-4 py-2 text-sm font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
-              >
+              </Button>
+              <Button type="button" variant="secondary" onClick={onDismiss}>
                 Close
-              </button>
+              </Button>
             </div>
           </section>
         </div>
@@ -349,20 +344,19 @@ export default function UpdateDialog({
   const showProgress = stage !== 'idle';
   const sameUpdateName = currentUpdateName === latestUpdateName;
   const isDevelopmentBuild = status.buildDiagnostics.channel === 'development';
-
   return (
-    <div className="flex-1 overflow-auto bg-[#f6f8fa]">
+    <div className="flex-1 overflow-auto bg-kumo-recessed">
       <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
-        <section className="rounded-2xl border border-[#d0d7de] bg-white p-6 shadow-sm">
+        <section className="rounded-2xl border border-kumo-line bg-kumo-base p-6 shadow-sm">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#57606a]">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
                 Self-Update
               </p>
-              <h1 className="mt-2 text-2xl font-semibold text-[#24292f]">
+              <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">
                 Upgrade Tiller Hub
               </h1>
-              <p className="mt-2 text-sm text-[#57606a]">
+              <p className="mt-2 text-sm text-kumo-subtle">
                 {status.updateAvailable && sameUpdateName ? (
                   <>
                     This deployment is running <strong>{currentUpdateName}</strong>.
@@ -384,40 +378,40 @@ export default function UpdateDialog({
               href={status.releaseNotesUrl}
               target="_blank"
               rel="noreferrer"
-              className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
+              className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint"
             >
               Source repo
             </a>
           </div>
 
           {isDevelopmentBuild && (
-            <div className="mt-6 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] px-4 py-3">
-              <p className="text-sm font-semibold text-[#24292f]">Development build</p>
-              <p className="mt-1 text-sm text-[#57606a]">
+            <div className="mt-6 rounded-xl border border-kumo-line bg-kumo-recessed px-4 py-3">
+              <p className="text-sm font-semibold text-kumo-default">Development build</p>
+              <p className="mt-1 text-sm text-kumo-subtle">
                 Dogfood deployments use the development deploy path. Release self-update is disabled for this build.
               </p>
             </div>
           )}
 
           {!isDevelopmentBuild && (
-            <div className="mt-6 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-4">
+            <div className="mt-6 rounded-xl border border-kumo-line bg-kumo-recessed p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                  <p className="text-sm font-semibold text-[#24292f]">Update source</p>
-                  <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                  <p className="text-sm font-semibold text-kumo-default">Update source</p>
+                  <p className="mt-1 text-xs leading-5 text-kumo-subtle">
                     Tiller updates by committing the latest hub source into the deploy-button repo connected to Cloudflare Builds.
                   </p>
                 </div>
                 {status.hubRepo.status === 'detected' && (
-                  <span className="w-fit rounded-full border border-[#1a7f37]/20 bg-[#dafbe1] px-2 py-0.5 text-xs font-medium text-[#1a7f37]">
+                  <span className="w-fit rounded-full border border-kumo-success/20 bg-kumo-success-tint px-2 py-0.5 text-xs font-medium text-kumo-success">
                     Connected
                   </span>
                 )}
               </div>
 
-              <div className="mt-4 border-t border-[#d0d7de] pt-3">
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">Repository</p>
-                <p className="mt-1 text-xs leading-5 text-[#57606a]">
+              <div className="mt-4 border-t border-kumo-line pt-3">
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">Repository</p>
+                <p className="mt-1 text-xs leading-5 text-kumo-subtle">
                   {status.hubRepo.status === 'detected'
                     ? `${status.hubRepo.fullName} · ${status.hubRepo.branch}`
                     : status.hubRepo.status === 'ambiguous'
@@ -432,7 +426,7 @@ export default function UpdateDialog({
                         type="button"
                         onClick={() => void handleSelectCandidate(candidate)}
                         disabled={isApplying}
-                        className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-left text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+                        className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-left text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint disabled:opacity-50"
                       >
                         {candidate.label}
                       </button>
@@ -440,9 +434,9 @@ export default function UpdateDialog({
                   </div>
                 )}
                 {status.hubRepo.status === 'missing' && (
-                  <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
-                    <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
-                    <p className="mt-1 text-xs leading-5 text-[#57606a]">
+                  <div className="mt-3 rounded-lg border border-kumo-warning/30 bg-kumo-warning-tint px-3 py-2">
+                    <p className="text-xs font-semibold text-kumo-warning">Check the GitHub account</p>
+                    <p className="mt-1 text-xs leading-5 text-kumo-subtle">
                       Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
                       {visibleUpdateRepoOwners.length > 0
                         ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
@@ -452,29 +446,40 @@ export default function UpdateDialog({
                   </div>
                 )}
                 {status.hubRepo.status !== 'detected' && (
-                  <button
+                  <Button
                     type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="mt-3"
                     onClick={() => void handleDetectRepo()}
                     disabled={isApplying}
-                    className="mt-3 rounded border border-[#0969da] bg-white px-3 py-1.5 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
                   >
                     Check GitHub repos
-                  </button>
+                  </Button>
                 )}
               </div>
             </div>
           )}
 
+          {hasExecutionMachine && !isDevelopmentBuild && (
+            <div className="mt-5 rounded-xl border border-kumo-warning/30 bg-kumo-warning-tint px-4 py-3">
+              <p className="text-sm font-semibold text-kumo-default">Execution machine</p>
+              <p className="mt-1 text-sm leading-5 text-kumo-subtle">
+                Update the Tiller CLI on your machine if needed, then run tiller host update.
+              </p>
+            </div>
+          )}
+
           {showProgress && (
-            <div className="mt-5 rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
-              <p className="text-sm font-semibold text-[#24292f]">Progress</p>
-              <p className="mt-1 text-sm text-[#57606a]">
+            <div className="mt-5 rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
+              <p className="text-sm font-semibold text-kumo-default">Progress</p>
+              <p className="mt-1 text-sm text-kumo-subtle">
                 {stage === 'complete' && autoReloadScheduled
                   ? 'Update complete. Reloading to start serving the new build.'
                   : formatStage(stage)}
               </p>
               {error && (
-                <p className="mt-3 rounded-lg border border-[#cf222e]/20 bg-[#ffebe9] px-3 py-2 text-sm text-[#cf222e]">
+                <p className="mt-3 rounded-lg border border-kumo-danger/20 bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger">
                   {error}
                 </p>
               )}
@@ -482,29 +487,26 @@ export default function UpdateDialog({
           )}
 
           {error && !showProgress && (
-            <p className="mt-5 rounded-lg border border-[#cf222e]/20 bg-[#ffebe9] px-3 py-2 text-sm text-[#cf222e]">
+            <p className="mt-5 rounded-lg border border-kumo-danger/20 bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger">
               {error}
             </p>
           )}
 
           <div className="mt-6 flex flex-wrap items-center gap-3">
             {!isDevelopmentBuild && (
-              <button
+              <Button
                 type="button"
+                variant="primary"
                 onClick={() => void handleGitHubRepoUpdate()}
+                loading={isApplying}
                 disabled={isApplying || stage === 'complete'}
-                className="rounded-lg bg-[#24292f] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isApplying ? 'Updating...' : 'Update'}
-              </button>
+              </Button>
             )}
-            <button
-              type="button"
-              onClick={onDismiss}
-              className="rounded-lg border border-[#d0d7de] bg-white px-4 py-2 text-sm font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
-            >
+            <Button type="button" variant="secondary" onClick={onDismiss}>
               Dismiss
-            </button>
+            </Button>
           </div>
         </section>
       </div>

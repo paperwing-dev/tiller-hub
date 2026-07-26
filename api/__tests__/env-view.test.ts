@@ -62,14 +62,26 @@ function storeRepo(kv: ReturnType<typeof createMemoryKV>, repo: RepoMeta = makeR
 
 beforeEach(() => {
   vi.resetAllMocks();
-  mocks.getEnvLifecycleStub.mockReturnValue({
-    peekMutableState: vi.fn(async () => makeMutableState()),
-  });
+  mocks.getEnvLifecycleStub.mockImplementation((_env: unknown, slug: string) => ({
+    getOwnedEnvView: vi.fn(async () => ({
+      ...makeSummaryCacheRow({
+        slug,
+        incarnationId: "incarnation-1",
+        status: "running",
+        runnerId: "runner-1",
+        workspaceDirty: false,
+      }),
+      repoUrl: "https://github.com/example/repo",
+    })),
+    peekVisibleMutableState: vi.fn(async (incarnationId: string) => (
+      incarnationId === "incarnation-1" ? makeMutableState() : null
+    )),
+  }));
   mocks.getWorkspaceStub.mockReset();
 });
 
 describe("env authoritative views", () => {
-  it("composes env metadata from definition, mutable state, and repo metadata without summary KV", async () => {
+  it("reads the exact lifecycle-owned projection without summary KV", async () => {
     const kv = createMemoryKV();
     storeEnvDefinition(kv, makeEnvDefinition({ slug: "env-1", repoId: "repo-1" }));
     storeRepo(kv, makeRepoMeta({ repoId: "repo-1", repoUrl: "https://github.com/example/repo" }));
@@ -105,24 +117,72 @@ describe("env authoritative views", () => {
     });
   });
 
-  it("returns an in-memory unknown view when mutable state is missing", async () => {
+  it("does not synthesize a view when lifecycle-owned state is missing", async () => {
     mocks.getEnvLifecycleStub.mockReturnValue({
-      peekMutableState: vi.fn(async () => null),
+      getOwnedEnvView: vi.fn(async () => null),
     });
     const kv = createMemoryKV();
     storeEnvDefinition(kv, makeEnvDefinition({ slug: "env-1" }));
     storeRepo(kv);
     const env = { ENVS_KV: kv } as any;
 
-    const meta = await loadEnvView(env, "env-1");
-
-    expect(meta).toMatchObject({
-      slug: "env-1",
-      status: "unknown",
-      updatedAt: "2026-04-01T00:00:00.000Z",
-    });
-    expect(meta).not.toHaveProperty("runnerId");
+    await expect(loadEnvView(env, "env-1")).resolves.toBeNull();
     expect(kv.put).not.toHaveBeenCalled();
+  });
+
+  it("reads incarnation publication and mutable state through one owner snapshot", async () => {
+    const ownedView = {
+      ...makeSummaryCacheRow({ status: "stopped", runnerId: undefined }),
+      repoUrl: "https://github.com/example/repo",
+    };
+    const getOwnedEnvView = vi.fn(async () => ownedView as any);
+    const peekMutableState = vi.fn(async () => makeMutableState({ status: "running" }));
+    mocks.getEnvLifecycleStub.mockReturnValue({
+      getOwnedEnvView,
+      peekMutableState,
+    });
+    const kv = createMemoryKV();
+    storeEnvDefinition(kv, makeEnvDefinition({
+      slug: "env-1",
+      incarnationId: "incarnation-1",
+    }));
+    storeRepo(kv);
+
+    await expect(loadEnvView({ ENVS_KV: kv } as any, "env-1")).resolves.toMatchObject({
+      status: "stopped",
+    });
+    expect(getOwnedEnvView).toHaveBeenCalledOnce();
+    expect(peekMutableState).not.toHaveBeenCalled();
+  });
+
+  it("does not synthesize fallback state for an unpublished incarnation", async () => {
+    mocks.getEnvLifecycleStub.mockReturnValue({
+      getOwnedEnvView: vi.fn(async () => null),
+      peekMutableState: vi.fn(async () => makeMutableState()),
+    });
+    const kv = createMemoryKV();
+    storeEnvDefinition(kv, makeEnvDefinition({
+      slug: "env-1",
+      incarnationId: "incarnation-1",
+    }));
+    storeRepo(kv);
+
+    await expect(loadEnvView({ ENVS_KV: kv } as any, "env-1")).resolves.toBeNull();
+  });
+
+  it("keeps an unpublished incarnation hidden without consulting its repo projection", async () => {
+    mocks.getEnvLifecycleStub.mockReturnValue({
+      getOwnedEnvView: vi.fn(async () => null),
+    });
+    const kv = createMemoryKV();
+    storeEnvDefinition(kv, makeEnvDefinition({
+      slug: "env-1",
+      repoId: "repo-not-published",
+      incarnationId: "incarnation-1",
+    }));
+
+    await expect(loadEnvView({ ENVS_KV: kv } as any, "env-1")).resolves.toBeNull();
+    expect(mocks.getWorkspaceStub).not.toHaveBeenCalled();
   });
 
   it("returns null when no env definition exists", async () => {
@@ -130,16 +190,6 @@ describe("env authoritative views", () => {
 
     await expect(loadEnvView(env, "missing")).resolves.toBeNull();
     expect(mocks.getEnvLifecycleStub).not.toHaveBeenCalled();
-  });
-
-  it("throws when repo metadata is missing", async () => {
-    const kv = createMemoryKV();
-    storeEnvDefinition(kv, makeEnvDefinition({ slug: "env-1", repoId: "repo-missing" }));
-    const env = { ENVS_KV: kv } as any;
-
-    await expect(loadEnvView(env, "env-1")).rejects.toThrow(
-      "Environment env-1 references missing repo repo-missing.",
-    );
   });
 
   it("throws when an env definition row contains a mismatched slug", async () => {
@@ -159,7 +209,7 @@ describe("env authoritative views", () => {
     const kv = createMemoryKV();
     storeEnvDefinition(kv, makeEnvDefinition({ slug: "z-env", repoId: "repo-1" }));
     storeEnvDefinition(kv, makeEnvDefinition({ slug: "a-env", repoId: "repo-1" }));
-    storeEnvDefinition(kv, makeEnvDefinition({ slug: "bad-env", repoId: "missing-repo" }));
+    kv.data.set("envdef:bad-env", JSON.stringify({ slug: "bad-env", backend: "cf" }));
     kv.data.set("envdef:mismatched-env", JSON.stringify(makeEnvDefinition({ slug: "other-env" })));
     storeRepo(kv);
     const env = { ENVS_KV: kv } as any;
@@ -169,7 +219,7 @@ describe("env authoritative views", () => {
     expect(views.map((view) => view.slug)).toEqual(["a-env", "z-env"]);
     expect(warn).toHaveBeenCalledWith(
       "[envs] Skipping invalid env bad-env:",
-      expect.stringContaining("references missing repo missing-repo"),
+      expect.stringContaining("missing explicit environment schema fields"),
     );
     expect(warn).toHaveBeenCalledWith(
       "[envs] Skipping invalid env mismatched-env:",
@@ -178,7 +228,7 @@ describe("env authoritative views", () => {
     warn.mockRestore();
   });
 
-  it("checks existence from env definitions and treats corrupt definitions as missing", async () => {
+  it("distinguishes missing environments from unreadable definitions", async () => {
     const kv = createMemoryKV({
       "envdef:good-env": JSON.stringify(makeEnvDefinition({ slug: "good-env" })),
       "envdef:bad-env": JSON.stringify({ slug: "bad-env", backend: "cf" }),
@@ -188,7 +238,14 @@ describe("env authoritative views", () => {
 
     await expect(envExists(env, "good-env")).resolves.toBe(true);
     await expect(envExists(env, "missing-env")).resolves.toBe(false);
-    await expect(envExists(env, "bad-env")).resolves.toBe(false);
-    await expect(envExists(env, "mismatched-env")).resolves.toBe(false);
+    await expect(envExists(env, "bad-env")).rejects.toThrow("missing explicit environment schema fields");
+    await expect(envExists(env, "mismatched-env")).rejects.toThrow("has mismatched slug");
+  });
+
+  it("propagates environment state read failures", async () => {
+    const kv = createMemoryKV();
+    kv.get.mockRejectedValueOnce(new Error("KV unavailable"));
+
+    await expect(envExists({ ENVS_KV: kv } as any, "env-1")).rejects.toThrow("KV unavailable");
   });
 });

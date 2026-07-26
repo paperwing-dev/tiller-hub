@@ -44,6 +44,7 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
     })).toEqual({
       title: "Update unavailable: Latest tiller-hub release is not accessible.",
+      tooltip: "Update unavailable: Latest tiller-hub release is not accessible.",
       enabled: false,
     });
   });
@@ -56,6 +57,7 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
     })).toEqual({
       title: "Update available: v0.1.0 -> v0.2.0",
+      tooltip: "Update available",
       enabled: true,
     });
   });
@@ -68,6 +70,7 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
     })).toEqual({
       title: "No update available",
+      tooltip: "No update available",
       enabled: false,
     });
 
@@ -78,6 +81,7 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
     })).toEqual({
       title: "Update dismissed",
+      tooltip: "Update dismissed",
       enabled: false,
     });
   });
@@ -90,6 +94,7 @@ describe("describeUpdateButtonState", () => {
       isChecking: true,
     })).toEqual({
       title: "Checking for updates",
+      tooltip: "Checking for updates",
       enabled: false,
     });
 
@@ -107,6 +112,7 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
     })).toEqual({
       title: "Development build",
+      tooltip: "Development build",
       enabled: false,
     });
   });

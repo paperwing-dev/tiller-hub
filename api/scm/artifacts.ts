@@ -1,14 +1,8 @@
 import {
   ENV_SNAPSHOTS_PREFIX,
-  REPO_GIT_ARTIFACTS_PREFIX,
   SCM_ARTIFACT_CONTENT_TYPE,
   SCM_ARTIFACT_SUFFIX,
 } from "./constants";
-
-export interface RepoGitArtifactRef {
-  repoId: string;
-  generationId: string;
-}
 
 export interface EnvSnapshotRef {
   envSlug: string;
@@ -17,14 +11,6 @@ export interface EnvSnapshotRef {
 
 function createArtifactId(prefix: string): string {
   return `${prefix}${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
-}
-
-export function buildRepoGitArtifactsPrefix(repoId: string): string {
-  return `${REPO_GIT_ARTIFACTS_PREFIX}/${repoId}/git-artifacts/`;
-}
-
-export function buildRepoGitArtifactKey(ref: RepoGitArtifactRef): string {
-  return `${buildRepoGitArtifactsPrefix(ref.repoId)}${ref.generationId}${SCM_ARTIFACT_SUFFIX}`;
 }
 
 export function buildEnvSnapshotKey(ref: EnvSnapshotRef): string {
@@ -45,20 +31,12 @@ export function parseEnvSnapshotIdFromKey(key: string, envSlug: string): string 
   return snapshotId || null;
 }
 
-export function createRepoGitArtifactId(): string {
-  return createArtifactId("g");
-}
-
 export function createEnvSnapshotId(): string {
   return createArtifactId("s");
 }
 
 export function buildEnvBranchName(slug: string): string {
   return `env/${slug}`;
-}
-
-export function buildRepoGitBootstrapSlug(repoId: string): string {
-  return `repo-git-${repoId}`;
 }
 
 function normalizeMetadataValue(

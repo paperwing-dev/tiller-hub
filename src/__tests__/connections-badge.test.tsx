@@ -1,30 +1,30 @@
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import type { HostStatus } from "../api";
+import type { ExecutionStatus } from "../api";
 import ConnectionsBadge, { HostConnectionDetails } from "../ConnectionsBadge";
 
 vi.mock("../api", () => ({
-  fetchHostStatus: vi.fn(),
+  fetchExecutionStatus: vi.fn(),
 }));
 
-const readyHostStatus: HostStatus = {
-  registered: true,
-  connected: true,
-  gatewayConfigured: true,
-  gatewayAvailable: true,
-  state: "gateway-available",
-  machine: {
-    machineId: "tiller-host-1234567890",
-    connectedAt: "2026-05-29T00:00:00.000Z",
-    gatewayUrl: "https://gateway.example.com",
-    codexSubscription: true,
-    claudeSubscription: true,
+const readyExecutionStatus: ExecutionStatus = {
+  selected: { target: "host", machineId: "machine-1234567890" },
+  selectedHost: {
+    state: "ready",
+    machineId: "machine-1234567890",
+    displayName: "studio-mac",
   },
+  candidate: {
+    state: "ready",
+    machineId: "tiller-host-1234567890",
+    displayName: "studio-mac",
+  },
+  executionReady: true,
 };
 
 describe("ConnectionsBadge", () => {
-  it("hides the host chip in Hosted Tiller mode", () => {
+  it("can hide the machine chip", () => {
     const html = renderToStaticMarkup(
       <ConnectionsBadge
         hubUrl="https://hub.example.com"
@@ -35,10 +35,10 @@ describe("ConnectionsBadge", () => {
     );
 
     expect(html).toContain("Hub");
-    expect(html).not.toContain("Host");
+    expect(html).not.toContain("Machine");
   });
 
-  it("shows the host chip when Self Host is active", () => {
+  it("shows the machine chip when machine status is requested", () => {
     const html = renderToStaticMarkup(
       <ConnectionsBadge
         hubUrl="https://hub.example.com"
@@ -49,22 +49,22 @@ describe("ConnectionsBadge", () => {
     );
 
     expect(html).toContain("Hub");
-    expect(html).toContain("Host");
+    expect(html).toContain("Machine");
   });
 
-  it("omits gateway URLs and subscription auth details from host details", () => {
+  it("omits runtime capabilities and subscription auth details from host details", () => {
     const html = renderToStaticMarkup(
       <HostConnectionDetails
-        hostStatus={readyHostStatus}
+        execution={readyExecutionStatus}
         hostError={null}
-        now={Date.parse("2026-05-29T00:00:30.000Z")}
       />,
     );
 
     expect(html).toContain("Machine");
-    expect(html).toContain("Since");
-    expect(html).not.toContain("Gateway");
-    expect(html).not.toContain("https://gateway.example.com");
+    expect(html).toContain("Name");
+    expect(html).toContain("studio-mac");
+    expect(html).not.toContain("Protocol");
+    expect(html).not.toContain("tiller-sandbox");
     expect(html).not.toContain("Auth");
     expect(html).not.toContain("Codex");
     expect(html).not.toContain("Claude");

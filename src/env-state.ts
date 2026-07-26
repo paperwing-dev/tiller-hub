@@ -1,5 +1,6 @@
 import {
   hasExplicitEnvScmFields,
+  hasExplicitRepoGitHubPublishFields,
   hasExplicitRepoScmFields,
   isEnvStatus,
   isRepoGitStatus,
@@ -7,6 +8,7 @@ import {
   type RepoMeta,
 } from "../api/types";
 import {
+  deriveGitHubEnvBranchStatus,
   getEffectiveEnvBranchStatus,
 } from "../api/scm/model";
 
@@ -41,6 +43,12 @@ function assertExplicitRepoScm(repo: RepoMeta): void {
   }
 }
 
+function assertExplicitRepoGitHubPublish(repo: RepoMeta): void {
+  if (!hasExplicitRepoGitHubPublishFields(repo)) {
+    throw new Error(`Repo summary has invalid GitHub publish metadata for ${repo.repoId}`);
+  }
+}
+
 function parseTimestamp(value: string): number {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) {
@@ -68,6 +76,7 @@ export function requireExplicitEnvMeta<T extends EnvMeta>(env: T): T {
 export function requireExplicitRepoMeta<T extends RepoMeta>(repo: T): T {
   assertExplicitRepoSummary(repo);
   assertExplicitRepoScm(repo);
+  assertExplicitRepoGitHubPublish(repo);
   return repo;
 }
 
@@ -149,8 +158,10 @@ export function getDisplayEnvBranchStatus(
   env: EnvMeta,
   repo: RepoMeta | null | undefined,
 ): NonNullable<EnvMeta["branchStatus"]> {
-  return getEffectiveEnvBranchStatus(
-    requireExplicitEnvMeta(env),
-    repo ? requireExplicitRepoMeta(repo) : null,
-  );
+  const explicitEnv = requireExplicitEnvMeta(env);
+  const explicitRepo = repo ? requireExplicitRepoMeta(repo) : null;
+  if (explicitEnv.scmModel === "github") {
+    return deriveGitHubEnvBranchStatus(explicitEnv, explicitRepo);
+  }
+  return getEffectiveEnvBranchStatus(explicitEnv, explicitRepo);
 }

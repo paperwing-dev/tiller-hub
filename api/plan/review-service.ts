@@ -2,13 +2,10 @@ import { generateText, stepCountIs } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import {
   buildSystemPrompt,
-  createCodexResponsesProviderOptions,
   createHostedToolRegistry,
   createWorkspaceAccess,
   getAgentSpec,
   getHostedToolsForAgent,
-  resolveCodexLanguageModel,
-  resolveAgentModel,
   toAiSdkTools,
 } from "../agent-core";
 import type {
@@ -30,7 +27,6 @@ import {
   buildPlanReviewPrompt,
   buildPlanReviewRepairPrompt,
   filterPlanReviewIssues,
-  isWorkersAIPlanModel,
   parsePlanReviewResponse,
   PLAN_REVIEW_MODELS,
   summarizeFilteredReview,
@@ -155,37 +151,6 @@ async function runCodeAwareReview(options: {
       retriedForToolUse,
     },
   };
-}
-
-async function generateIsolatedPlannerText(options: {
-  env: Env;
-  selectedModel: string;
-  systemPrompt: string;
-  prompt: string;
-}): Promise<string> {
-  if (isWorkersAIPlanModel(options.selectedModel)) {
-    const workersAI = createWorkersAI({ binding: options.env.AI });
-    const result = await generateText({
-      model: workersAI.chat(options.selectedModel),
-      system: options.systemPrompt,
-      prompt: options.prompt,
-    });
-    return result.text.trim();
-  }
-
-  const spec = getAgentSpec("plan");
-  const { model, promptCacheKey } = await resolveCodexLanguageModel(options.env, {
-    chatSessionId: `plan-review:${crypto.randomUUID()}`,
-    model: resolveAgentModel(options.env, spec, options.selectedModel),
-  });
-  const result = await generateText({
-    model,
-    system: options.systemPrompt,
-    prompt: options.prompt,
-    providerOptions: createCodexResponsesProviderOptions(promptCacheKey),
-  });
-
-  return result.text.trim();
 }
 
 function createReviewWorkspace(planWorkspace: WorkspaceDO, draft: PlanArtifact): WorkspaceContextAccess {

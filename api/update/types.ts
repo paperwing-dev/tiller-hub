@@ -18,6 +18,12 @@ export interface TillerUpdateMetadata {
   version: string;
   label: string;
   managedFiles: string[];
+  selfHostRuntime?: SelfHostRuntimeMetadata;
+}
+
+export interface SelfHostRuntimeMetadata {
+  imageSourceId: string;
+  sandboxImage: string;
 }
 
 export interface UpdateBuildDiagnostics {

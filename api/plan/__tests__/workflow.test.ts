@@ -43,8 +43,8 @@ describe("resolvePlanModel", () => {
     expect(resolvePlanModel("@cf/nvidia/nemotron-3-120b-a12b")).toBe(
       "@cf/nvidia/nemotron-3-120b-a12b",
     );
-    expect(resolvePlanModel("@cf/moonshotai/kimi-k2.5")).toBe(
-      "@cf/moonshotai/kimi-k2.5",
+    expect(resolvePlanModel("@cf/moonshotai/kimi-k2.7-code")).toBe(
+      "@cf/moonshotai/kimi-k2.7-code",
     );
   });
 });

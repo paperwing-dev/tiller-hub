@@ -1,5 +1,6 @@
 import type {
   EnvDefinition,
+  EnvHarnessPresentation,
   EnvInfraState,
   EnvLifecycleDesiredState,
   EnvLifecyclePhase,
@@ -7,6 +8,10 @@ import type {
   EnvMutableState,
   EnvStatus,
 } from "../types";
+import {
+  getHarnessModel,
+  validateHarnessSettings,
+} from "../../shared/harness-catalog";
 import {
   assertExplicitEnvScmFields,
   assertExplicitEnvSummaryFields,
@@ -86,6 +91,16 @@ export function createEmptyMutableState(overrides: Partial<EnvMutableState> = {}
   const updatedAt = overrides.updatedAt ?? new Date().toISOString();
   return {
     status: overrides.status ?? "unknown",
+    scmModel: overrides.scmModel ?? "github",
+    harnessSettings: overrides.harnessSettings ?? null,
+    startClaudeAuthMode: overrides.startClaudeAuthMode === "subscription" || overrides.startClaudeAuthMode === "api"
+      ? overrides.startClaudeAuthMode
+      : null,
+    startCodexAuthPreference: overrides.startCodexAuthPreference === "subscription"
+      || overrides.startCodexAuthPreference === "api-key"
+      ? overrides.startCodexAuthPreference
+      : null,
+    ...(overrides.scheduledRun ? { scheduledRun: overrides.scheduledRun } : {}),
     lifecyclePhase: overrides.lifecyclePhase ?? null,
     lifecycleOpId: overrides.lifecycleOpId ?? null,
     lifecycleOperation: overrides.lifecycleOperation ?? null,
@@ -96,10 +111,8 @@ export function createEmptyMutableState(overrides: Partial<EnvMutableState> = {}
     lifecycleRuntimeReady: overrides.lifecycleRuntimeReady ?? false,
     lifecycleUpdatedAt: overrides.lifecycleUpdatedAt ?? null,
     runnerId: overrides.runnerId ?? null,
-    runnerMachineId: overrides.runnerMachineId ?? null,
     bootMessage: overrides.bootMessage ?? null,
     bootStepId: overrides.bootStepId ?? null,
-    authWarning: overrides.authWarning ?? null,
     branchStatus: overrides.branchStatus ?? null,
     workspaceDirty: overrides.workspaceDirty ?? null,
     workspaceNeedsAttention: overrides.workspaceNeedsAttention ?? null,
@@ -114,6 +127,20 @@ export function createEmptyMutableState(overrides: Partial<EnvMutableState> = {}
     scmLastCompletedAt: overrides.scmLastCompletedAt ?? null,
     scmLastDurationMs: overrides.scmLastDurationMs ?? null,
     scmLastTimings: overrides.scmLastTimings ?? null,
+    githubBaseBranch: overrides.githubBaseBranch ?? null,
+    githubBaseCommitSha: overrides.githubBaseCommitSha ?? null,
+    githubBranch: overrides.githubBranch ?? null,
+    githubHeadCommitSha: overrides.githubHeadCommitSha ?? null,
+    githubPrNumber: overrides.githubPrNumber ?? null,
+    githubPrUrl: overrides.githubPrUrl ?? null,
+    githubPrState: overrides.githubPrState ?? null,
+    githubMergedAt: overrides.githubMergedAt ?? null,
+    githubPublishStatus: overrides.githubPublishStatus ?? "idle",
+    githubPublishOperationId: overrides.githubPublishOperationId ?? null,
+    githubPublishError: overrides.githubPublishError ?? null,
+    githubLastPublishedAt: overrides.githubLastPublishedAt ?? null,
+    githubLastPublishedWorkspaceHash: overrides.githubLastPublishedWorkspaceHash ?? null,
+    githubPendingPublish: overrides.githubPendingPublish ?? null,
     leadHarnessStatus: overrides.leadHarnessStatus ?? null,
     leadHarnessError: overrides.leadHarnessError ?? null,
     leadHarnessUpdatedAt: overrides.leadHarnessUpdatedAt ?? null,
@@ -135,6 +162,9 @@ export function buildMutableStateFromMeta(meta: EnvMeta): EnvMutableState {
 
   return normalizeMutableState({
     status: meta.status,
+    scmModel: meta.scmModel,
+    harnessSettings: meta.harnessSettings ?? null,
+    ...(meta.scheduledRun ? { scheduledRun: meta.scheduledRun } : {}),
     lifecyclePhase,
     lifecycleOpId: meta.lifecycleOpId ?? null,
     lifecycleOperation: meta.lifecycleOperation ?? null,
@@ -149,10 +179,8 @@ export function buildMutableStateFromMeta(meta: EnvMeta): EnvMutableState {
         : inferRuntimeReady(lifecyclePhase, meta.status),
     lifecycleUpdatedAt,
     runnerId: meta.runnerId ?? null,
-    runnerMachineId: meta.runnerMachineId ?? null,
     bootMessage: meta.bootMessage ?? null,
     bootStepId: meta.bootStepId ?? null,
-    authWarning: meta.authWarning ?? null,
     branchStatus: meta.branchStatus,
     workspaceDirty: meta.workspaceDirty,
     workspaceNeedsAttention: meta.workspaceNeedsAttention,
@@ -167,6 +195,20 @@ export function buildMutableStateFromMeta(meta: EnvMeta): EnvMutableState {
     scmLastCompletedAt: meta.scmLastCompletedAt,
     scmLastDurationMs: meta.scmLastDurationMs,
     scmLastTimings: meta.scmLastTimings,
+    githubBaseBranch: meta.githubBaseBranch ?? null,
+    githubBaseCommitSha: meta.githubBaseCommitSha ?? null,
+    githubBranch: meta.githubBranch ?? null,
+    githubHeadCommitSha: meta.githubHeadCommitSha ?? null,
+    githubPrNumber: meta.githubPrNumber ?? null,
+    githubPrUrl: meta.githubPrUrl ?? null,
+    githubPrState: meta.githubPrState ?? null,
+    githubMergedAt: meta.githubMergedAt ?? null,
+    githubPublishStatus: meta.githubPublishStatus ?? "idle",
+    githubPublishOperationId: meta.githubPublishOperationId ?? null,
+    githubPublishError: meta.githubPublishError ?? null,
+    githubLastPublishedAt: meta.githubLastPublishedAt ?? null,
+    githubLastPublishedWorkspaceHash: meta.githubLastPublishedWorkspaceHash ?? null,
+    githubPendingPublish: meta.githubPendingPublish ?? null,
     leadHarnessStatus: meta.leadHarnessStatus ?? null,
     leadHarnessError: meta.leadHarnessError ?? null,
     leadHarnessUpdatedAt: meta.leadHarnessUpdatedAt ?? null,
@@ -176,11 +218,25 @@ export function buildMutableStateFromMeta(meta: EnvMeta): EnvMutableState {
   });
 }
 
-export function createFallbackMutableState(definition: EnvDefinition): EnvMutableState {
-  return createEmptyMutableState({
-    status: "unknown",
-    updatedAt: definition.createdAt,
-  });
+function buildHarnessPresentation(
+  definition: EnvDefinition,
+  mutableState: EnvMutableState,
+): EnvHarnessPresentation | undefined {
+  const settings = validateHarnessSettings(definition.harness, mutableState.harnessSettings);
+  if (!settings) return undefined;
+
+  const model = getHarnessModel(definition.harness, settings.model);
+  if (!model) return undefined;
+  const providerKind = model.binding.kind === "opencode"
+    ? model.binding.provider
+    : model.binding.kind;
+
+  return {
+    modelLabel: model.label,
+    credentialRequirement: model.credential,
+    providerKind,
+    providerLabel: model.binding.providerLabel,
+  };
 }
 
 export function buildEnvMetaFromLayers(
@@ -188,22 +244,23 @@ export function buildEnvMetaFromLayers(
   mutableState: EnvMutableState,
   repoUrl: string,
 ): EnvMeta {
+  const harnessPresentation = buildHarnessPresentation(definition, mutableState);
   const next: EnvMeta = {
     slug: definition.slug,
+    ...(definition.incarnationId ? { incarnationId: definition.incarnationId } : {}),
+    ...(definition.sidebarSlot ? { sidebarSlot: definition.sidebarSlot } : {}),
     repoUrl,
     repoId: definition.repoId,
-    backend: definition.backend,
+    scmModel: definition.scmModel,
+    backend: definition.executionPlacement.backend,
+    executionPlacement: definition.executionPlacement,
     ...(mutableState.runnerId ? { runnerId: mutableState.runnerId } : {}),
-    ...(mutableState.runnerMachineId ? { runnerMachineId: mutableState.runnerMachineId } : {}),
     harness: definition.harness,
-    ...(definition.authMode ? { authMode: definition.authMode } : {}),
+    harnessSettings: mutableState.harnessSettings,
+    ...(harnessPresentation ? { harnessPresentation } : {}),
+    ...(mutableState.scheduledRun ? { scheduledRun: mutableState.scheduledRun } : {}),
     ...(definition.resolvedAuthMode ? { resolvedAuthMode: definition.resolvedAuthMode } : {}),
-    ...(definition.codexAuthPreference ? { codexAuthPreference: definition.codexAuthPreference } : {}),
     ...(definition.codexAuthMode ? { codexAuthMode: definition.codexAuthMode } : {}),
-    ...(definition.opencodeProvider ? { opencodeProvider: definition.opencodeProvider } : {}),
-    ...(definition.opencodeModel ? { opencodeModel: definition.opencodeModel } : {}),
-    ...(definition.modelRoute ? { modelRoute: definition.modelRoute } : {}),
-    ...(mutableState.authWarning ? { authWarning: mutableState.authWarning } : {}),
     createdAt: definition.createdAt,
     updatedAt: mutableState.updatedAt,
     status: mutableState.status,
@@ -225,6 +282,20 @@ export function buildEnvMetaFromLayers(
     scmLastCompletedAt: mutableState.scmLastCompletedAt,
     scmLastDurationMs: mutableState.scmLastDurationMs,
     scmLastTimings: mutableState.scmLastTimings,
+    githubBaseBranch: mutableState.githubBaseBranch,
+    githubBaseCommitSha: mutableState.githubBaseCommitSha,
+    githubBranch: mutableState.githubBranch,
+    githubHeadCommitSha: mutableState.githubHeadCommitSha,
+    githubPrNumber: mutableState.githubPrNumber,
+    githubPrUrl: mutableState.githubPrUrl,
+    githubPrState: mutableState.githubPrState,
+    githubMergedAt: mutableState.githubMergedAt,
+    githubPublishStatus: mutableState.githubPublishStatus,
+    githubPublishOperationId: mutableState.githubPublishOperationId,
+    githubPublishError: mutableState.githubPublishError,
+    githubLastPublishedAt: mutableState.githubLastPublishedAt,
+    githubLastPublishedWorkspaceHash: mutableState.githubLastPublishedWorkspaceHash,
+    githubPendingPublish: mutableState.githubPendingPublish,
     lifecyclePhase: mutableState.lifecyclePhase,
     lifecycleOpId: mutableState.lifecycleOpId,
     lifecycleOperation: mutableState.lifecycleOperation,

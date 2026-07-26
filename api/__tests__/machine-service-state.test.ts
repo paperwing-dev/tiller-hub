@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  clearMachineServiceKeys,
   mergeMachineServiceState,
   parseMachineServiceState,
 } from "../machine-service-state";
@@ -10,11 +9,11 @@ describe("machine service state helpers", () => {
     const current = parseMachineServiceState({
       host: {
         machineId: "host-1",
+        displayName: "old-host",
         connectedAt: "2026-04-07T00:00:00.000Z",
         dockerAvailable: true,
-        codexSubscription: false,
+        runnerAvailable: true,
         claudeSubscription: true,
-        gatewayPort: 8777,
         transport: "session",
       },
     });
@@ -23,94 +22,47 @@ describe("machine service state helpers", () => {
       mergeMachineServiceState(current, {
         host: {
           machineId: "host-2",
+          displayName: "new-host",
           connectedAt: "2026-04-07T00:01:00.000Z",
+          runnerCommandProtocol: 1,
+          codexRuntimeAuthProtocol: 1,
           dockerAvailable: true,
-          codexSubscription: true,
-          codexGatewayAuth: "session-token",
+          runnerAvailable: true,
           claudeSubscription: false,
-          gatewayPort: 8788,
-          gatewayUrl: "https://gateway.example.com",
-          gatewayTunnelType: "named",
+          localRunnerImage: " docker.io/jamieatlason/tiller-sandbox:0123456789abcdef0123456789abcdef01234567 ",
+          localRunnerImageSourceId: " 0123456789abcdef0123456789abcdef01234567 ",
           transport: "session",
         },
       }),
     ).toEqual({
       host: {
         machineId: "host-2",
+        displayName: "new-host",
         connectedAt: "2026-04-07T00:01:00.000Z",
+        runnerCommandProtocol: 1,
+        codexRuntimeAuthProtocol: 1,
         dockerAvailable: true,
-        codexSubscription: true,
-        codexGatewayAuth: "session-token",
+        runnerAvailable: true,
         claudeSubscription: false,
-        gatewayPort: 8788,
-        gatewayUrl: "https://gateway.example.com",
-        gatewayTunnelType: "named",
+        localRunnerImage: "docker.io/jamieatlason/tiller-sandbox:0123456789abcdef0123456789abcdef01234567",
+        localRunnerImageSourceId: "0123456789abcdef0123456789abcdef01234567",
         transport: "session",
       },
     });
   });
 
-  it("parses invalid legacy service keys as empty", () => {
-    expect(
-      parseMachineServiceState({
-        runner: {
-          machineId: "runner-1",
-          connectedAt: "2026-04-07T00:00:00.000Z",
-        },
-        gateway: {
-          connectedAt: "2026-04-07T00:00:00.000Z",
-        },
-      }),
-    ).toEqual({});
-  });
-
-  it("drops legacy runner ingress fields from host state", () => {
-    expect(
-      parseMachineServiceState({
-        host: {
-          machineId: "host-1",
-          connectedAt: "2026-04-07T00:00:00.000Z",
-          dockerAvailable: true,
-          codexSubscription: true,
-          claudeSubscription: false,
-          gatewayPort: 8788,
-          gatewayUrl: "https://gateway.example.com",
-          gatewayTunnelType: "named",
-          runnerIngressUrl: "https://runner.example.com",
-          transport: "session",
-        },
-      }),
-    ).toEqual({
+  it("accepts only the known runner command protocol capability", () => {
+    expect(parseMachineServiceState({
       host: {
         machineId: "host-1",
+        displayName: "host-1",
         connectedAt: "2026-04-07T00:00:00.000Z",
+        runnerCommandProtocol: 2,
         dockerAvailable: true,
-        codexSubscription: true,
-        claudeSubscription: false,
-        gatewayPort: 8788,
-        gatewayUrl: "https://gateway.example.com",
-        gatewayTunnelType: "named",
+        runnerAvailable: true,
+        claudeSubscription: true,
         transport: "session",
       },
-    });
-  });
-
-  it("clears the host service key", () => {
-    expect(
-      clearMachineServiceKeys(
-        parseMachineServiceState({
-          host: {
-            machineId: "host-1",
-            connectedAt: "2026-04-07T00:01:00.000Z",
-            dockerAvailable: true,
-            codexSubscription: true,
-            claudeSubscription: true,
-            gatewayPort: 8788,
-            transport: "session",
-          },
-        }),
-        ["host"],
-      ),
-    ).toEqual({});
+    }).host?.runnerCommandProtocol).toBeUndefined();
   });
 });

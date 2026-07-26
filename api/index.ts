@@ -5,33 +5,44 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { HonoEnv, Env, StoredSession } from "./types";
 import type { HubDO } from "./hub";
 import { parseRpcError } from "./errors";
-import { getLocationHintOptions } from "./helpers";
+import { getArtifactStoreStub, getLocationHintOptions } from "./helpers";
 import { authMiddleware, dynamicEntrypointAuthResponse } from "./auth";
 import { DEFAULT_OPENAI_MODEL, listHostedAgentMetadata } from "./agent-core";
 import { getStatus as getOpenAIStatus, validateAndSeedTokens } from "./openai-auth";
-import { exchangeCodexGatewaySessionToken } from "./gateway-session";
 import setupRoutes from "./setup/routes";
-import accessRoutes from "./access/routes";
-import selfHostRoutes from "./self-host/routes";
 import cliRoutes from "./cli/routes";
-import hostRoutes from "./host/routes";
+import workersDevAccessRoutes from "./workers-dev-access/routes";
+import executionRoutes from "./execution/routes";
 import opencodeRoutes from "./opencode/routes";
 import voiceRoutes from "./voice/routes";
 import envRoutes from "./env/routes";
+import envReviewRoutes from "./env-review/routes";
+import envReviewRuntimeRoutes from "./env-review/runtime-routes";
 import repoRoutes from "./repo/routes";
+import plannerRoutes from "./planner/routes";
+import plannerRuntimeRoutes from "./planner/runtime-routes";
 import githubRoutes from "./github/routes";
 import workspaceRoutes from "./workspace/routes";
 import updateRoutes from "./update/routes";
+import cloudflareMcpRoutes from "./cloudflare-mcp-routes";
 import { envExists } from "./env/view";
 import {
+  filterRoutableActiveManagedSessions,
   partitionManagedSessionsByLookup,
   readManagedEnvSlugFromMetadata,
   readManagedEnvSlugFromStoredSession,
   readManagedRoleFromStoredSession,
   readManagedRoleFromMetadata,
+  readTerminalScopeFromMetadata,
+  readTerminalScopeFromStoredSession,
 } from "./session-attachment";
+import { planWriterTerminalId } from "./planner/plan-writer-contract";
+import { canonicalIngressResponse } from "./canonical-origin";
+import { loadTrackedRepo } from "./repo/access";
 export { TillerVoice } from "./voice/agent";
 export { EnvLifecycleDO } from "./env-lifecycle-do";
+export { ScheduledRunCapacityDO } from "./scheduled-run-capacity-do";
+export { EnvReviewDO } from "./env-review/env-review-do";
 export { ArtifactStoreDO } from "./coordination";
 
 // ── DO stub helper ──────────────────────────────────────────────────
@@ -42,6 +53,7 @@ type HubStub = Pick<
   | "getSession"
   | "getSessions"
   | "getAllSessions"
+  | "getRoutableSessionIds"
   | "updateSessionMetadata"
   | "updateSessionAgentState"
   | "updateSessionTodos"
@@ -59,6 +71,7 @@ type HubStub = Pick<
   | "waitForPermission"
   | "addSessionAllowedTool"
   | "getAllConfig"
+  | "getBillingSelections"
   | "setConfig"
 >;
 
@@ -82,12 +95,12 @@ app.use("/api/*", authMiddleware);
 
 // Setup routes (auth skips these when unconfigured — see auth.ts)
 app.route("/", setupRoutes);
-app.route("/", accessRoutes);
-app.route("/", selfHostRoutes);
 app.route("/", cliRoutes);
-app.route("/", hostRoutes);
+app.route("/", workersDevAccessRoutes);
+app.route("/", executionRoutes);
 app.route("/", githubRoutes);
 app.route("/", opencodeRoutes);
+app.route("/", cloudflareMcpRoutes);
 app.route("/", updateRoutes);
 
 // ── Health ──────────────────────────────────────────────────────────
@@ -118,6 +131,12 @@ async function requireManagedSession(
     return c.json({ error: "Session not found" }, 404);
   }
 
+  // Plan-writer terminals live outside environment lifecycle routes. Never
+  // mistake them for environment orphans and prune their retained history.
+  if (readTerminalScopeFromStoredSession(session)?.kind === "plan-writer") {
+    return c.json({ error: "Session not found" }, 404);
+  }
+
   const envSlug = readManagedEnvSlugFromStoredSession(session);
   const role = readManagedRoleFromStoredSession(session);
   if (!envSlug || !role || !(await managedEnvExists(c.env, envSlug))) {
@@ -126,6 +145,36 @@ async function requireManagedSession(
   }
 
   return { session, envSlug };
+}
+
+async function requireTerminalHistorySession(
+  c: { env: Env; json: (body: unknown, status?: ContentfulStatusCode) => Response },
+  hub: HubStub,
+  sessionId: string,
+): Promise<{ session: StoredSession } | Response> {
+  const session = await hub.getSession(sessionId);
+  if (!session) return c.json({ error: "Session not found" }, 404);
+  const scope = readTerminalScopeFromStoredSession(session);
+  if (scope?.kind !== "plan-writer") {
+    const managed = await requireManagedSession(c, hub, sessionId);
+    return managed instanceof Response ? managed : { session: managed.session };
+  }
+  if (planWriterTerminalId(scope.repoId, scope.planArtifactId, scope.generation) !== sessionId) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+  const loadedRepo = await loadTrackedRepo(c.env, scope.repoId);
+  if (!loadedRepo.ok) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+  const writer = await getArtifactStoreStub(
+    c.env,
+    scope.repoId,
+    loadedRepo.repo.meta.artifactStoreGeneration,
+  ).getPlanWriter(scope.repoId, scope.planArtifactId);
+  if (!writer || (writer.generation ?? 0) < scope.generation) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+  return { session };
 }
 
 app.get("/api/sessions", async (c) => {
@@ -138,7 +187,10 @@ app.get("/api/sessions", async (c) => {
   if (orphanSessionIds.length > 0) {
     await Promise.all(orphanSessionIds.map(async (sessionId) => pruneOrphanSession(hub, sessionId)));
   }
-  return c.json(managedSessions.filter((session) => session.active === 1));
+  return c.json(filterRoutableActiveManagedSessions(
+    managedSessions,
+    await hub.getRoutableSessionIds(),
+  ));
 });
 
 app.post("/api/sessions", async (c) => {
@@ -149,6 +201,47 @@ app.post("/api/sessions", async (c) => {
     machine_id?: string;
     metadata?: unknown;
   }>();
+  const terminalScope = readTerminalScopeFromMetadata(body.metadata ?? null);
+  if (terminalScope?.kind === "plan-writer") {
+    const id = body.id ?? "";
+    if (id !== planWriterTerminalId(terminalScope.repoId, terminalScope.planArtifactId, terminalScope.generation)) {
+      return c.json({ error: "Plan writer terminal ID does not match its deterministic scope." }, 400);
+    }
+    const loadedRepo = await loadTrackedRepo(c.env, terminalScope.repoId);
+    if (!loadedRepo.ok) {
+      return c.json({ error: "Plan writer generation is no longer active." }, 409);
+    }
+    const writer = await getArtifactStoreStub(
+      c.env,
+      terminalScope.repoId,
+      loadedRepo.repo.meta.artifactStoreGeneration,
+    ).getPlanWriter(
+      terminalScope.repoId,
+      terminalScope.planArtifactId,
+    );
+    if (
+      !writer
+      || writer.stoppedAt
+      || writer.generation !== terminalScope.generation
+      || !writer.runtime
+    ) {
+      return c.json({ error: "Plan writer generation is no longer active." }, 409);
+    }
+    const existing = await hub.getSession(id);
+    if (existing) {
+      const existingScope = readTerminalScopeFromStoredSession(existing);
+      if (
+        existingScope?.kind !== "plan-writer"
+        || existingScope.repoId !== terminalScope.repoId
+        || existingScope.planArtifactId !== terminalScope.planArtifactId
+        || existingScope.generation !== terminalScope.generation
+        || existingScope.revokedAt
+      ) return c.json({ error: "Plan writer terminal identity is already unavailable." }, 409);
+      return c.json(existing);
+    }
+    const session = await hub.createSession(id, body.tag || "Plan Writer", body.machine_id ?? null, body.metadata ?? {});
+    return c.json(session, 201);
+  }
   const envSlug = readManagedEnvSlugFromMetadata(body.metadata ?? null);
   if (!envSlug) {
     return c.json({ error: "sessions must include metadata.envSlug" }, 400);
@@ -261,8 +354,8 @@ app.post("/api/sessions/:id/archive", async (c) => {
 
 app.get("/api/sessions/:id/messages", async (c) => {
   const hub = getHub(c.env);
-  const managedSession = await requireManagedSession(c, hub, c.req.param("id"));
-  if (managedSession instanceof Response) return managedSession;
+  const terminalSession = await requireTerminalHistorySession(c, hub, c.req.param("id"));
+  if (terminalSession instanceof Response) return terminalSession;
   const limitRaw = c.req.query("limit");
   const beforeSeqRaw = c.req.query("before_seq");
   const afterSeqRaw = c.req.query("after_seq");
@@ -438,6 +531,14 @@ app.get("/api/machines", async (c) => {
   return c.json(await hub.getMachines());
 });
 
+app.get("/api/machines/:machineId/execution-status", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const machineId = c.req.param("machineId")?.trim() ?? "";
+  if (!machineId) return c.json({ error: "machineId is required" }, 400);
+  const hub = getHub(c.env);
+  return c.json(await hub.getMachineExecutionStatus(machineId));
+});
+
 app.post("/api/machines", async (c) => {
   const hub = getHub(c.env);
   const body = await c.req.json<{
@@ -497,43 +598,15 @@ app.get("/api/auth/openai/status", async (c) => {
   });
 });
 
-app.post("/api/auth/openai/gateway-access", async (c) => {
-  const body = await c.req.json<{
-    gateway_session_token?: string;
-  }>().catch((): { gateway_session_token?: string } => ({}));
-  const gatewayMachineId = c.req.header("X-Tiller-Gateway-Machine-Id")?.trim() || null;
-  const gatewayServiceToken = c.req.header("X-Tiller-Gateway-Service-Token")?.trim() || null;
-  const gatewaySessionToken = body.gateway_session_token?.trim() ?? "";
-
-  if (!gatewaySessionToken) {
-    return c.json({ error: "gateway_session_token is required" }, 400);
-  }
-
-  try {
-    const exchanged = await exchangeCodexGatewaySessionToken(c.env, {
-      token: gatewaySessionToken,
-      gatewayMachineId,
-      gatewayServiceToken,
-    });
-    return c.json({
-      access_token: exchanged.accessToken,
-      account_id: exchanged.accountId,
-      expires_at: exchanged.expiresAt,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (/auth|refresh|reconnect|seeded/i.test(message)) {
-      return c.json({ error: "Codex subscription login needs re-import", code: "needs_reconnect" }, 409);
-    }
-    return c.json({ error: message }, 401);
-  }
-});
-
 app.get("/api/agents", (c) => {
   return c.json(listHostedAgentMetadata(c.env));
 });
 
 app.route("/", envRoutes);
+app.route("/", envReviewRoutes);
+app.route("/", plannerRoutes);
+app.route("/", plannerRuntimeRoutes);
+app.route("/", envReviewRuntimeRoutes);
 app.route("/", repoRoutes);
 
 // ── Workspace files ──────────────────────────────────────────────────
@@ -543,6 +616,9 @@ app.route("/", workspaceRoutes);
 // ── Voice session WebSocket ──────────────────────────────────────────
 
 app.route("/", voiceRoutes);
+
+// Unknown and removed API endpoints must never fall through to the SPA.
+app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 
 // ── WebSocket upgrade via partyserver ───────────────────────────────
 
@@ -568,6 +644,8 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
+    const ingress = await canonicalIngressResponse(req, env);
+    if (ingress) return ingress;
     const url = new URL(req.url);
     if (url.pathname.startsWith("/agents/")) {
       const blocked = await dynamicEntrypointAuthResponse(req, env);
@@ -592,11 +670,9 @@ export default {
 
 // Export Durable Object classes for wrangler
 export { HubDO } from "./hub";
-export { PlanChatAgent } from "./agents/plan-chat-agent";
 export { ReviewerChatAgent } from "./agents/reviewer-chat-agent";
 export { ArtifactStoreDO as RepoArtifactStoreDO, ThreadDO } from "./coordination";
-export { RepoMergeLockDO } from "./scm/repo-merge-lock-do";
+export { GitHubJobDO } from "./github-job-do";
 export { SandboxDO } from "./sandbox-do";
-export { ScmBootstrapDO } from "./scm-bootstrap-do";
-export { ScmOperationDO } from "./scm-operation-do";
+export { PlannerRunDO } from "./planner-run-do";
 export { WorkspaceDO } from "./workspace/do";

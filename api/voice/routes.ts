@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { maybeVerifyCfAccessRequest } from "../auth";
+import { authenticateAccessRequest } from "../auth";
 import { getLocationHintOptions } from "../helpers";
 import type { HonoEnv } from "../types";
 
@@ -20,7 +20,7 @@ voiceApp.get("/api/voice/session", async (c) => {
   }
 
   try {
-    await maybeVerifyCfAccessRequest(c.req.raw, c.env);
+    await authenticateAccessRequest(c.req.raw, c.env);
   } catch {
     return c.json({ error: "Unauthorized" }, 401);
   }

@@ -2,70 +2,70 @@ import { describe, expect, it } from "vitest";
 import { getRepoMainStatusDetail, getRepoMainStatusLabel, isRepoMainReady } from "../repo-status";
 
 describe("repo-status helpers", () => {
-  it("treats ready repos as ready only when all main git fields exist", () => {
+  it("treats GitHub repos as ready only when the default branch head is known", () => {
     expect(
       isRepoMainReady({
+        scmModel: "github",
         gitStatus: "ready",
-        gitArtifactId: "g-current",
-        mainCommit: "abc123",
+        githubDefaultBranchHeadSha: "abc123",
       }),
     ).toBe(true);
 
     expect(
       isRepoMainReady({
+        scmModel: "github",
         gitStatus: "ready",
-        gitArtifactId: null,
-        mainCommit: "abc123",
+        githubDefaultBranchHeadSha: null,
       }),
     ).toBe(false);
   });
 
-  it("describes pending repo bootstrap clearly", () => {
+  it("describes pending GitHub default branch reads clearly", () => {
     expect(
       getRepoMainStatusLabel({
+        scmModel: "github",
         gitStatus: "pending",
-        gitArtifactId: null,
-        mainCommit: null,
+        githubDefaultBranchHeadSha: null,
       }),
-    ).toBe("Preparing main");
+    ).toBe("Reading GitHub default branch");
 
     expect(
       getRepoMainStatusDetail({
+        scmModel: "github",
         gitStatus: "pending",
-        gitArtifactId: null,
-        mainCommit: null,
-        gitProgressPhase: "Cloning canonical main",
+        githubDefaultBranchHeadSha: null,
+        gitProgressPhase: "Reading GitHub default branch",
       }),
-    ).toContain("Cloning canonical main");
+    ).toContain("Reading GitHub default branch");
   });
 
-  it("describes repair-required repos distinctly", () => {
+  it("describes repair-required GitHub repos distinctly", () => {
     expect(
       getRepoMainStatusLabel({
+        scmModel: "github",
         gitStatus: "repair-required",
-        gitArtifactId: "g-bad",
-        mainCommit: "abc123",
+        githubDefaultBranchHeadSha: "abc123",
       }),
-    ).toBe("Main needs repair");
+    ).toBe("GitHub access needs repair");
 
     expect(
       getRepoMainStatusDetail({
+        scmModel: "github",
         gitStatus: "repair-required",
-        gitArtifactId: "g-bad",
-        mainCommit: "abc123",
+        githubDefaultBranchHeadSha: "abc123",
         gitError: "git clone failed",
       }),
     ).toBe("git clone failed");
   });
 
-  it("surfaces bootstrap timing once canonical main is ready", () => {
+  it("surfaces the default branch name once GitHub is ready", () => {
     expect(
       getRepoMainStatusDetail({
+        scmModel: "github",
         gitStatus: "ready",
-        gitArtifactId: "g-current",
-        mainCommit: "abc123",
-        gitLastBootstrapDurationMs: 1425,
+        githubDefaultBranch: "main",
+        githubDefaultBranchHeadSha: "abc123",
       }),
-    ).toContain("1.4s");
+    ).toContain("main");
   });
 });

@@ -4,21 +4,13 @@ const {
   getSecret,
   isLocalDevRequest,
   resolveProtectionState,
-  resolveCodexModelRoute,
   resolveCodexContainerAuth,
 } = vi.hoisted(() => ({
   getSecret: vi.fn(async () => undefined),
   isLocalDevRequest: vi.fn(() => false),
   resolveProtectionState: vi.fn(async () => ({ protectionMode: "public" })),
-  resolveCodexModelRoute: vi.fn(async () => ({
-    kind: "unavailable",
-    reason: "gateway offline",
-    codexRouteStatus: "gateway_offline",
-  })),
   resolveCodexContainerAuth: vi.fn(async () => ({
-    authPreference: "api-key",
     resolvedAuthMode: "api-key",
-    modelRoute: "api-fallback",
     envVars: {
       OPENAI_API_KEY: "openai-key",
     },
@@ -34,25 +26,13 @@ vi.mock("../api/protection", () => ({
   resolveProtectionState,
 }));
 
-vi.mock("../api/model-route", () => ({
-  resolveCodexModelRoute,
-}));
-
 vi.mock("../api/env/hub-url", () => ({
   resolveContainerHubUrl: vi.fn(async () => "https://hub.example.com"),
   buildEnvWorkspaceApiBaseUrl: vi.fn((_hubUrl: string, slug: string) => `https://hub.example.com/api/workspace/${slug}`),
-  buildRepoGitArtifactUrl: vi.fn((_hubUrl: string, repoId: string, artifactId: string) =>
-    `https://hub.example.com/api/repos/${repoId}/git-artifacts/${artifactId}`),
-  buildEnvScmOperationResultUrl: vi.fn(),
-  buildEnvScmOperationHeartbeatUrl: vi.fn(),
-  buildEnvScmOperationFailedUrl: vi.fn(),
-  buildEnvScmConflictResolutionUrl: vi.fn(),
-  buildRepoGitArtifactStagingUrl: vi.fn(),
 }));
 
 vi.mock("../api/env/container-auth", () => ({
   resolveContainerAuth: vi.fn(async () => ({
-    authMode: "auto",
     resolvedAuthMode: "api",
     envVars: {
       ANTHROPIC_API_KEY: "anthropic-key",
@@ -65,10 +45,20 @@ vi.mock("../api/env/container-auth", () => ({
 const {
   STARTUP_PLAN_IMPLEMENTATION_PREAMBLE,
   buildContainerLaunchConfig,
-  buildGitOperationEnvVars,
   buildStartupPlanDocument,
   materializeStartupPlan,
 } = await import("../api/env/launch-config");
+
+function createLaunchEnv(repoSessionEnvVars: Record<string, string> = {}) {
+  return {
+    HUB: {
+      idFromName: vi.fn().mockReturnValue("hub-id"),
+      get: vi.fn().mockReturnValue({
+        resolveRepoSessionEnvVars: vi.fn().mockResolvedValue(repoSessionEnvVars),
+      }),
+    },
+  } as any;
+}
 
 describe("buildContainerLaunchConfig", () => {
   beforeEach(() => {
@@ -80,13 +70,12 @@ describe("buildContainerLaunchConfig", () => {
 
   it("emits REPO_SLUG as the only runtime slug env var", async () => {
     const launchConfig = await buildContainerLaunchConfig(
-      {} as any,
+      createLaunchEnv(),
       "https://hub.example.com/api/envs",
       "demo-env",
       "https://github.com/example/repo",
       {
         repoId: "repo-1",
-        gitArtifactId: "artifact-1",
       },
       {
         slug: "demo-env",
@@ -94,8 +83,10 @@ describe("buildContainerLaunchConfig", () => {
         repoId: "repo-1",
         backend: "cf",
         harness: "claude-code",
+        harnessSettings: { model: "claude-opus-4.8", effort: "xhigh" },
         createdAt: "2026-04-13T00:00:00.000Z",
       },
+      { startAuthClaim: { claudeAuthMode: "api", codexAuthPreference: null } },
     );
 
     expect(launchConfig.envVars).toMatchObject({
@@ -107,11 +98,45 @@ describe("buildContainerLaunchConfig", () => {
     expect(launchConfig.envVars.NODE_OPTIONS).not.toContain("no-network-family-autoselection");
     expect(Object.keys(launchConfig.envVars)).not.toContain("ENV_SLUG");
     expect(Object.keys(launchConfig.envVars)).not.toContain("TILLER_HARNESS_VERSION");
+    expect(launchConfig.envVars.TILLER_MANAGED_ENV_NAMES).toContain("REPO_SLUG");
+    expect(launchConfig.envVars.TILLER_SESSION_ENV_NAMES).toBe("");
+  });
+
+  it("injects repo session env first so Tiller launch vars win collisions", async () => {
+    const launchConfig = await buildContainerLaunchConfig(
+      createLaunchEnv({
+        USER_FLAG: "enabled",
+        REPO_URL: "https://github.com/attacker/repo",
+        ANTHROPIC_API_KEY: "repo-key",
+      }),
+      "https://hub.example.com/api/envs",
+      "demo-env",
+      "https://github.com/example/repo",
+      {
+        repoId: "repo-1",
+      },
+      {
+        slug: "demo-env",
+        repoUrl: "https://github.com/example/repo",
+        repoId: "repo-1",
+        backend: "cf",
+        harness: "claude-code",
+        harnessSettings: { model: "claude-opus-4.8", effort: "xhigh" },
+        createdAt: "2026-04-13T00:00:00.000Z",
+      },
+      { startAuthClaim: { claudeAuthMode: "api", codexAuthPreference: null } },
+    );
+
+    expect(launchConfig.envVars.USER_FLAG).toBe("enabled");
+    expect(launchConfig.envVars.REPO_URL).toBe("https://github.com/example/repo");
+    expect(launchConfig.envVars.ANTHROPIC_API_KEY).toBe("anthropic-key");
+    expect(launchConfig.envVars.TILLER_MANAGED_ENV_NAMES).toContain("USER_FLAG");
+    expect(launchConfig.envVars.TILLER_SESSION_ENV_NAMES).toBe("USER_FLAG");
   });
 
   it("does not resolve subscription routes for explicit Codex API key preference", async () => {
     const launchConfig = await buildContainerLaunchConfig(
-      {} as any,
+      { OPENAI_API_KEY: "openai-key" } as any,
       "https://hub.example.com/api/envs",
       "demo-env",
       "https://github.com/example/repo",
@@ -121,71 +146,21 @@ describe("buildContainerLaunchConfig", () => {
         repoUrl: "https://github.com/example/repo",
         backend: "cf",
         harness: "codex",
-        codexAuthPreference: "api-key",
+        harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
         createdAt: "2026-04-13T00:00:00.000Z",
       },
+      { startAuthClaim: { claudeAuthMode: null, codexAuthPreference: "api-key" } },
     );
 
-    expect(resolveCodexModelRoute).not.toHaveBeenCalled();
-    expect(resolveCodexContainerAuth).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+    expect(resolveCodexContainerAuth).toHaveBeenCalledWith(expect.anything(), {
       authPreference: "api-key",
-      gatewayRoute: undefined,
-      gatewaySessionToken: null,
-    }));
+    });
     expect(launchConfig.envVars).toMatchObject({
-      TILLER_CODEX_AUTH_PREFERENCE: "api-key",
       TILLER_CODEX_AUTH_MODE: "api-key",
-      TILLER_CODEX_MODEL_ROUTE: "api-fallback",
       OPENAI_API_KEY: "openai-key",
     });
   });
 
-  it("passes HUB_URL with GitHub bridge vars to SCM jobs", async () => {
-    resolveProtectionState.mockResolvedValue({ protectionMode: "cf-access" });
-    const put = vi.fn().mockResolvedValue(undefined);
-    const envVars = await buildGitOperationEnvVars(
-      {
-        ENVS_KV: { put },
-      } as any,
-      "https://hub.example.com/api/envs/demo-env/scm",
-      {
-        meta: {
-          repoId: "repo-1",
-          repoUrl: "https://github.com/Example/Repo.git",
-          githubInstallationId: 98765,
-          githubFullName: "example/repo",
-          gitArtifactId: "artifact-1",
-        },
-      } as any,
-      {
-        slug: "demo-env",
-        repoUrl: "https://github.com/example/repo",
-        repoId: "repo-1",
-        backend: "cf",
-        harness: "claude-code",
-        branchName: "demo-env",
-        createdAt: "2026-04-13T00:00:00.000Z",
-        status: "running",
-      } as any,
-      {
-        operationId: "operation-12345678",
-        operationType: "update-from-main",
-      },
-    );
-
-    expect(envVars).toMatchObject({
-      TILLER_BOOTSTRAP_MODE: "scm-operation",
-      HUB_URL: "https://hub.example.com",
-      TILLER_GITHUB_BRIDGE_ID: expect.any(String),
-      TILLER_GITHUB_BRIDGE_SECRET: expect.any(String),
-      TILLER_GITHUB_ALLOWED_REPO: "example/repo",
-    });
-    expect(put).toHaveBeenCalledWith(
-      expect.stringMatching(/^github-bridge:/),
-      expect.stringContaining("\"type\":\"scm-operation\""),
-      expect.objectContaining({ expirationTtl: expect.any(Number) }),
-    );
-  });
 });
 
 describe("startup plan materialization", () => {

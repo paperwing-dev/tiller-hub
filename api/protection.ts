@@ -1,10 +1,13 @@
 import type { ChatGPTAuthStatus, Env, EnvHarness } from "./types";
 import { getStatus as getOpenAIAuthStatus } from "./openai-auth";
 import { getSecret } from "./setup/config";
-import { isEnabledFlag, isLocalDevMode } from "../shared/local-dev";
+import { isLocalDevMode } from "../shared/local-dev";
+import { listHarnessModels } from "../shared/harness-catalog";
+import {
+  readWorkersDevAccessCredential,
+  readWorkersDevAccessTrust,
+} from "./workers-dev-access/records";
 
-export type HostKind = "workers-dev" | "custom-domain";
-export type RouteKind = HostKind;
 export type ProtectionMode = "public" | "cf-access";
 
 export interface ModelAuthState {
@@ -14,57 +17,32 @@ export interface ModelAuthState {
   chatgptAuthStatus: ChatGPTAuthStatus;
   hasOpenAIKey: boolean;
   configured: boolean;
-  mode: "subscription" | "api" | "api-key" | null;
 }
 
 export interface ProtectionState {
   currentOrigin: string;
   hubUrl: string;
-  routeKind: RouteKind;
-  hostKind: HostKind;
   protectionMode: ProtectionMode;
-  protectionCanAutomate: boolean;
   serviceTokenConfigured: boolean;
-  unsupportedProtectionConfig: boolean;
-  workersDevAliasDisabled: boolean;
-  protectionAppDomain: string | null;
   accessConfigured: boolean;
-  accessIssuer: string | null;
-  accessJwksUrl: string | null;
 }
-
-function normalizeConfiguredUrl(value: string | undefined): string | null {
-  const trimmed = value?.trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/\/+$/, "");
-}
-
-function parseStoredBoolean(value: string | undefined): boolean {
-  return isEnabledFlag(value);
-}
-
-export function getHostKind(url: string): HostKind {
-  return new URL(url).hostname.endsWith(".workers.dev") ? "workers-dev" : "custom-domain";
-}
-
-export const getRouteKind = getHostKind;
 
 export function isLocalDevRequest(
   env: Pick<Env, "LOCAL_DEV_ONLY_BACKEND">,
   request: Request,
 ): boolean {
   return isLocalDevMode({
-    localDevOnlyBackend: env.LOCAL_DEV_ONLY_BACKEND,
+    enabled: env.LOCAL_DEV_ONLY_BACKEND,
     url: request.url,
   });
 }
 
 export async function resolveModelAuthState(env: Env): Promise<ModelAuthState> {
-  const hasClaudeSubscription = Boolean((await getSecret(env, "CLAUDE_CODE_OAUTH_TOKEN"))?.trim());
-  const hasAnthropicKey = Boolean((await getSecret(env, "ANTHROPIC_API_KEY"))?.trim());
+  const hasClaudeSubscription = Boolean((await getSecret(env, "CLAUDE_CODE_OAUTH_TOKEN", { fresh: true }))?.trim());
+  const hasAnthropicKey = Boolean((await getSecret(env, "ANTHROPIC_API_KEY", { fresh: true }))?.trim());
   const openAIAuthStatus = await getOpenAIAuthStatus(env);
   const hasChatGPTAuth = openAIAuthStatus.authenticated;
-  const hasOpenAIKey = Boolean((await getSecret(env, "OPENAI_API_KEY"))?.trim());
+  const hasOpenAIKey = Boolean((await getSecret(env, "OPENAI_API_KEY", { fresh: true }))?.trim());
 
   return {
     hasClaudeSubscription,
@@ -73,62 +51,69 @@ export async function resolveModelAuthState(env: Env): Promise<ModelAuthState> {
     chatgptAuthStatus: openAIAuthStatus.status,
     hasOpenAIKey,
     configured: hasClaudeSubscription || hasAnthropicKey || hasChatGPTAuth || hasOpenAIKey,
-    mode: hasClaudeSubscription
-      ? "subscription"
-      : hasAnthropicKey
-        ? "api"
-        : hasChatGPTAuth
-          ? "subscription"
-          : hasOpenAIKey
-            ? "api-key"
-            : null,
   };
 }
 
 export function hasEnabledHarnessModelAuth(
   modelAuth: Pick<ModelAuthState, "hasClaudeSubscription" | "hasAnthropicKey" | "hasChatGPTAuth" | "hasOpenAIKey">
-    & { hasLocalCodexAuth?: boolean },
+    & {
+      hasLocalCodexAuth?: boolean;
+      workersAiConfigured?: boolean;
+    },
   enabledHarnesses: readonly EnvHarness[],
+  backend: "cf" | "host" = "host",
 ): boolean {
-  return (
-    (enabledHarnesses.includes("claude-code") && (modelAuth.hasClaudeSubscription || modelAuth.hasAnthropicKey))
-    || (enabledHarnesses.includes("codex") && (modelAuth.hasChatGPTAuth || modelAuth.hasOpenAIKey))
-    || enabledHarnesses.includes("opencode")
-  );
+  // Onboarding remains credential-presence based. It deliberately does not
+  // infer or activate a billing selection; model availability does that later.
+  return enabledHarnesses.some((harness) => listHarnessModels(harness).some((entry) => {
+    switch (entry.credential) {
+      case "claude-auth":
+        return backend === "host"
+          ? modelAuth.hasClaudeSubscription || modelAuth.hasAnthropicKey
+          : modelAuth.hasAnthropicKey;
+      case "anthropic-api-key":
+        return modelAuth.hasAnthropicKey;
+      case "codex-auth":
+        return backend === "host"
+          ? modelAuth.hasChatGPTAuth || modelAuth.hasOpenAIKey
+          : modelAuth.hasOpenAIKey;
+      case "openai-api-key":
+        return modelAuth.hasOpenAIKey;
+      case "workers-ai":
+        return Boolean(modelAuth.workersAiConfigured);
+    }
+  }));
 }
 
 export async function resolveProtectionState(env: Env, requestUrl: string): Promise<ProtectionState> {
   const currentOrigin = new URL(requestUrl).origin.replace(/\/+$/, "");
-  const hubUrl = normalizeConfiguredUrl(await getSecret(env, "HUB_PUBLIC_URL")) ?? currentOrigin;
-  const routeKind = getRouteKind(hubUrl);
-  const hasCfAccessAud = Boolean((await getSecret(env, "CF_ACCESS_AUD"))?.trim());
-  const hasCfAccessClientId = Boolean((await getSecret(env, "CF_ACCESS_CLIENT_ID"))?.trim());
-  const hasCfAccessClientSecret = Boolean((await getSecret(env, "CF_ACCESS_CLIENT_SECRET"))?.trim());
-  const accessIssuer = normalizeConfiguredUrl(await getSecret(env, "CF_ACCESS_TEAM_DOMAIN"));
-  const accessJwksUrl = normalizeConfiguredUrl(await getSecret(env, "CF_ACCESS_JWKS_URL"));
-  const accessConfiguredFlag = parseStoredBoolean(await getSecret(env, "CF_ACCESS_CONFIGURED"));
-  const workersDevAliasDisabled = parseStoredBoolean(await getSecret(env, "WORKERS_DEV_ALIAS_DISABLED"));
-  const protectionAppDomain = normalizeConfiguredUrl(await getSecret(env, "CF_ACCESS_APP_DOMAIN"));
-  const hasVerifiableAccessJwtConfig = Boolean(accessIssuer || accessJwksUrl);
-  const accessConfigured = Boolean(
-    hasCfAccessAud
-      && hasVerifiableAccessJwtConfig
-      && (routeKind === "custom-domain" || accessConfiguredFlag),
-  );
+  if (isLocalDevMode({
+    enabled: env.LOCAL_DEV_ONLY_BACKEND,
+    url: requestUrl,
+  })) {
+    return {
+      currentOrigin,
+      hubUrl: currentOrigin,
+      protectionMode: "public",
+      serviceTokenConfigured: false,
+      accessConfigured: false,
+    };
+  }
+
+  const hostname = new URL(currentOrigin).hostname;
+  const [trust, credential] = hostname.endsWith(".workers.dev")
+    ? await Promise.all([
+        readWorkersDevAccessTrust(env, hostname),
+        readWorkersDevAccessCredential(env),
+      ])
+    : [null, null] as const;
+  const accessConfigured = Boolean(trust && credential);
 
   return {
     currentOrigin,
-    hubUrl,
-    routeKind,
-    hostKind: routeKind,
+    hubUrl: currentOrigin,
     protectionMode: accessConfigured ? "cf-access" : "public",
-    protectionCanAutomate: routeKind === "custom-domain",
-    serviceTokenConfigured: hasCfAccessClientId && hasCfAccessClientSecret,
-    unsupportedProtectionConfig: hasCfAccessAud && !hasVerifiableAccessJwtConfig,
-    workersDevAliasDisabled: routeKind === "custom-domain" ? workersDevAliasDisabled : false,
-    protectionAppDomain,
+    serviceTokenConfigured: Boolean(trust && credential?.currentSecret),
     accessConfigured,
-    accessIssuer,
-    accessJwksUrl,
   };
 }

@@ -1,6 +1,5 @@
 import { Hono } from "hono";
 import type { HonoEnv, Env } from "../types";
-import { getLocationHintOptions } from "../helpers";
 import { invalidateConfigCache } from "../setup/config";
 import {
   GitHubAppError,
@@ -8,26 +7,71 @@ import {
   getGitHubAppInstallUrl,
   getGitHubAppManageUrl,
   getOrCreateGitHubManifestSigningKey,
+  getOrCreateGitHubWebhookSecret,
   isGitHubAppAllowedForRequest,
   listGitHubAppRepositories,
   mintGitHubInstallationToken,
   resolveGitHubAppRepositorySelection,
   saveGitHubAppConfig,
 } from "./app";
-import { validateGitHubBridgeRequest } from "./bridge";
+import { githubBridgeTokenAccess, validateGitHubBridgeRequest } from "./bridge";
+import { handleGitHubWebhook } from "./webhook-service";
+import { resolveCanonicalRequestOrigin } from "../canonical-origin";
 
 const githubRoutes = new Hono<HonoEnv>();
 const GITHUB_APP_NAME_MAX_LENGTH = 32;
+export const MAX_GITHUB_WEBHOOK_BODY_BYTES = 25_000_000;
 
-type HubConfigWriter = {
-  setConfig(key: string, value: string): void | Promise<void>;
-};
+class GitHubWebhookBodyTooLargeError extends Error {}
+
+async function readBoundedWebhookBody(request: Request): Promise<ArrayBuffer> {
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength !== null) {
+    const declaredLength = Number(contentLength);
+    if (
+      !Number.isFinite(declaredLength)
+      || declaredLength < 0
+      || declaredLength > MAX_GITHUB_WEBHOOK_BODY_BYTES
+    ) {
+      throw new GitHubWebhookBodyTooLargeError();
+    }
+  }
+  if (!request.body) return new ArrayBuffer(0);
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > MAX_GITHUB_WEBHOOK_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new GitHubWebhookBodyTooLargeError();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body.buffer;
+}
 
 interface GitHubManifestConversionResponse {
   id?: number;
   client_id?: string;
   slug?: string;
   pem?: string;
+  webhook_secret?: string;
 }
 
 type GitHubAccessTestStatus =
@@ -40,11 +84,6 @@ type GitHubAccessTestStatus =
   | "invalid_config"
   | "github_error"
   | "public_hub_disabled";
-
-function getHubConfigWriter(env: Env): HubConfigWriter {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as HubConfigWriter;
-}
 
 function jsonError(error: unknown): { body: Record<string, unknown>; status: number } {
   if (error instanceof GitHubAppError) {
@@ -113,8 +152,9 @@ async function verifyManifestState(env: Env, state: string): Promise<boolean> {
   }
 }
 
-function buildManifest(request: Request) {
-  const url = new URL(request.url);
+async function buildManifest(env: Env, request: Request) {
+  const origin = await resolveCanonicalRequestOrigin(env, request);
+  const url = new URL(origin);
   return {
     name: buildGitHubAppName(url.hostname),
     url: url.origin,
@@ -122,12 +162,16 @@ function buildManifest(request: Request) {
     setup_url: `${url.origin}/api/github/install/callback`,
     setup_on_update: true,
     public: false,
+    hook_attributes: {
+      url: `${url.origin}/api/github/webhook`,
+      active: true,
+    },
     default_permissions: {
       metadata: "read",
       contents: "write",
       pull_requests: "write",
     },
-    default_events: [],
+    default_events: ["pull_request", "push"],
     request_oauth_on_install: false,
   };
 }
@@ -197,29 +241,6 @@ function manifestSetupForm(actionUrl: string, manifest: object): string {
 </html>`;
 }
 
-function finishPage(title: string, message: string): string {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${title}</title>
-  <style>
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #24292f; background: #f6f8fa; }
-    main { width: min(420px, calc(100vw - 32px)); border: 1px solid #d0d7de; border-radius: 12px; background: #fff; padding: 24px; box-shadow: 0 16px 40px rgba(31, 35, 40, 0.08); }
-    h1 { margin: 0; font-size: 20px; line-height: 1.3; }
-    p { margin: 10px 0 0; color: #57606a; font-size: 14px; line-height: 1.5; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>${title}</h1>
-    <p>${message}</p>
-  </main>
-</body>
-</html>`;
-}
-
 async function convertManifestCode(code: string): Promise<GitHubManifestConversionResponse> {
   const response = await fetch(`https://api.github.com/app-manifests/${encodeURIComponent(code)}/conversions`, {
     method: "POST",
@@ -237,8 +258,8 @@ async function convertManifestCode(code: string): Promise<GitHubManifestConversi
     body = {};
   }
   if (!response.ok) {
-    const message = typeof body.message === "string"
-      ? body.message
+    const message = typeof (body as Record<string, unknown>).message === "string"
+      ? String((body as Record<string, unknown>).message)
       : `GitHub manifest conversion failed with HTTP ${response.status}.`;
     throw new GitHubAppError(message, "github_app_manifest_conversion_failed", 502);
   }
@@ -257,6 +278,8 @@ async function statusPayload(env: Env, request: Request) {
     slug: config?.slug ?? null,
     installUrl: config ? getGitHubAppInstallUrl(config.slug) : null,
     manageUrl: getGitHubAppManageUrl(),
+    webhookConfigured: config?.webhookConfigured === true,
+    webhookUrl: `${await resolveCanonicalRequestOrigin(env, request)}/api/github/webhook`,
     disabledReason: allowed ? null : "GitHub App private repo access is only available on protected hubs and localhost.",
   };
 }
@@ -323,18 +346,27 @@ githubRoutes.post("/api/github/app-config", async (c) => {
     }, 403);
   }
 
-  const body = await c.req.json<{
+  const body: {
     appId?: string;
     clientId?: string;
     slug?: string;
     privateKey?: string;
+    webhookSecret?: string;
+  } = await c.req.json<{
+    appId?: string;
+    clientId?: string;
+    slug?: string;
+    privateKey?: string;
+    webhookSecret?: string;
   }>().catch(() => ({}));
   try {
+    const webhookSecret = body.webhookSecret?.trim() || await getOrCreateGitHubWebhookSecret(c.env);
     await saveGitHubAppConfig(c.env, {
       appId: body.appId ?? "",
       clientId: body.clientId ?? "",
       slug: body.slug ?? "",
       privateKey: body.privateKey ?? "",
+      webhookSecret,
     });
     invalidateConfigCache();
     return c.json({ ok: true, status: await statusPayload(c.env, c.req.raw) });
@@ -353,8 +385,7 @@ githubRoutes.get("/api/github/manifest/setup", async (c) => {
   }
 
   const state = await createManifestState(c.env);
-  invalidateConfigCache();
-  const manifest = buildManifest(c.req.raw);
+  const manifest = await buildManifest(c.env, c.req.raw);
   const account = c.req.query("account")?.trim();
   const baseUrl = account
     ? `https://github.com/organizations/${encodeURIComponent(account)}/settings/apps/new`
@@ -380,20 +411,29 @@ githubRoutes.get("/api/github/manifest/callback", async (c) => {
 
   try {
     const converted = await convertManifestCode(code);
-    if (!converted.id || !converted.client_id || !converted.slug || !converted.pem) {
+    if (
+      !converted.id
+      || !converted.client_id
+      || !converted.slug
+      || !converted.pem
+      || !converted.webhook_secret
+    ) {
       return c.json({ error: "GitHub manifest conversion response was incomplete.", code: "github_app_manifest_incomplete" }, 502);
     }
-    const hub = getHubConfigWriter(c.env);
-    await hub.setConfig("GITHUB_APP_ID", String(converted.id));
-    await hub.setConfig("GITHUB_APP_CLIENT_ID", converted.client_id);
-    await hub.setConfig("GITHUB_APP_SLUG", converted.slug);
-    await hub.setConfig("GITHUB_APP_PRIVATE_KEY", converted.pem);
+    await saveGitHubAppConfig(c.env, {
+      appId: String(converted.id),
+      clientId: converted.client_id,
+      slug: converted.slug,
+      privateKey: converted.pem,
+      webhookSecret: converted.webhook_secret,
+      webhookConfigured: true,
+    });
     invalidateConfigCache();
 
     if (c.req.header("Accept")?.includes("application/json")) {
       return c.json({ ok: true, status: await statusPayload(c.env, c.req.raw) });
     }
-    return c.html(finishPage("GitHub App created", "Return to Tiller to install the app on your repositories."));
+    return c.redirect(`${await resolveCanonicalRequestOrigin(c.env, c.req.raw)}/`, 303);
   } catch (error) {
     const normalized = jsonError(error);
     return c.json(normalized.body, normalized.status as any);
@@ -407,7 +447,7 @@ githubRoutes.get("/api/github/install/callback", async (c) => {
       code: "github_app_public_hub_disabled",
     }, 403);
   }
-  return c.html(finishPage("Installation updated", "Return to Tiller to test repository access."));
+  return c.redirect(`${await resolveCanonicalRequestOrigin(c.env, c.req.raw)}/`, 303);
 });
 
 githubRoutes.get("/api/github/install", async (c) => {
@@ -445,7 +485,11 @@ githubRoutes.post("/api/github/test-access", async (c) => {
     ));
   }
 
-  const body = await c.req.json<{
+  const body: {
+    repositoryId?: unknown;
+    installationId?: unknown;
+    fullName?: unknown;
+  } = await c.req.json<{
     repositoryId?: unknown;
     installationId?: unknown;
     fullName?: unknown;
@@ -464,10 +508,13 @@ githubRoutes.post("/api/github/test-access", async (c) => {
   }
 
   try {
+    const repositoryId = body.repositoryId as number;
+    const installationId = body.installationId as number;
+    const fullName = body.fullName;
     const selection = await resolveGitHubAppRepositorySelection(c.env, {
-      repositoryId: body.repositoryId,
-      installationId: body.installationId,
-      fullName: body.fullName,
+      repositoryId,
+      installationId,
+      fullName,
     });
     return c.json(accessTestResponse(
       "ready",
@@ -477,7 +524,7 @@ githubRoutes.post("/api/github/test-access", async (c) => {
     ));
   } catch (error) {
     const normalized = accessTestStatusForError(error);
-    return c.json(accessTestResponse(normalized.status, normalized.message, urls, typeof body.fullName === "string" ? body.fullName : null));
+    return c.json(accessTestResponse(normalized.status, normalized.message, urls, typeof body.fullName === "string" ? body.fullName : undefined));
   }
 });
 
@@ -536,7 +583,9 @@ githubRoutes.get("/api/github/token", async (c) => {
   }
 
   try {
-    const token = await mintGitHubInstallationToken(c.env, validation.repo);
+    const token = await mintGitHubInstallationToken(c.env, validation.repo, {
+      access: githubBridgeTokenAccess(validation.record),
+    });
     return c.json({
       token: token.token,
       expiresAt: token.expiresAt,
@@ -548,6 +597,26 @@ githubRoutes.get("/api/github/token", async (c) => {
     const normalized = jsonError(error);
     return c.json(normalized.body, normalized.status as any);
   }
+});
+
+githubRoutes.post("/api/github/webhook", async (c) => {
+  let rawBody: ArrayBuffer;
+  try {
+    rawBody = await readBoundedWebhookBody(c.req.raw);
+  } catch (error) {
+    if (error instanceof GitHubWebhookBodyTooLargeError) {
+      return c.json({
+        error: "GitHub webhook payload is too large.",
+        code: "github_webhook_payload_too_large",
+      }, 413);
+    }
+    return c.json({
+      error: "GitHub webhook request could not be read.",
+      code: "github_webhook_request_invalid",
+    }, 400);
+  }
+  const result = await handleGitHubWebhook(c.env, c.req.raw, rawBody);
+  return c.json(result.body, result.status as any);
 });
 
 export default githubRoutes;

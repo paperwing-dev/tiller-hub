@@ -1,49 +1,26 @@
-import React, { useEffect, useState } from "react";
-import type { EnvMeta, StartupDiagnosticLogTails, StartupDiagnosticsSnapshot } from "../api/types";
-import {
-  fetchEnvStartupDiagnostics,
-  type StartupDiagnosticsState,
-} from "./api";
-import {
-  getEnvAuthBadge,
-  getHarnessBadgeClass,
-  getHarnessBadgeLabel,
-} from "./env-harness";
-import { getBackendBadgeLabel, getEnvDisplayName } from "./env-display";
+import React, { useEffect, useRef, useState } from "react";
+import { Button } from "@cloudflare/kumo/components/button";
+import type {
+  EnvMeta,
+  StartupDiagnosticLogTails,
+  StartupDiagnosticsSnapshot,
+  StartupDiagnosticsState,
+} from "../api/types";
+import { fetchEnvStartupDiagnostics } from "./api";
+import SailingScene from "./SailingScene";
+import { getEnvWaitingPresentation } from "./env-waiting-presentation";
 
-const STATUS_COLORS: Record<string, string> = {
-  running: "bg-green-500",
-  starting: "bg-yellow-400 animate-pulse",
-  saving: "bg-yellow-400 animate-pulse",
-  stopping: "bg-yellow-400 animate-pulse",
-  creating: "bg-blue-400 animate-pulse",
-  deleting: "bg-red-400 animate-pulse",
-  stopped: "bg-[#d0d7de]",
-  created: "bg-blue-400",
-  destroyed: "bg-red-400",
-  failed: "bg-red-500",
-};
-
-const STATUS_LABELS: Record<string, string> = {
-  running: "Running",
-  starting: "Starting...",
-  saving: "Saving changes...",
-  stopping: "Stopping...",
-  creating: "Creating...",
-  deleting: "Deleting...",
-  stopped: "Stopped",
-  created: "Created",
-  destroyed: "Destroyed",
-  failed: "Failed",
-  unknown: "Unknown",
+const EMPTY_DIAGNOSTICS: StartupDiagnosticsState = {
+  active: null,
+  lastFailed: null,
 };
 
 const STEP_LABELS: Record<string, string> = {
   "workspace-sync": "Workspace Sync",
   "stop-control": "Stop Control",
-  "prereq-check": "Prereq Check",
+  "prereq-check": "Prerequisite Check",
   "harness-launch": "Harness Launch",
-  "hub-connect": "Hub Connect",
+  "hub-connect": "Hub Connection",
   "runner-ready": "Runner Ready",
   "startup-failed": "Startup Failed",
 };
@@ -53,6 +30,21 @@ interface EnvWaitingViewProps {
   hubUrl: string;
   onRecoverEnv?: (slug: string, status?: string) => void;
   onStartRequest?: (slug: string) => void;
+}
+
+interface DiagnosticsResult {
+  envIdentity: string;
+  value: StartupDiagnosticsState;
+}
+
+interface DetailsState {
+  operationKey: string;
+  open: boolean;
+}
+
+interface CopyStatus {
+  opId: string | null;
+  state: "idle" | "copied" | "failed";
 }
 
 function formatStepLabel(stepId?: string | null): string | null {
@@ -72,29 +64,15 @@ function formatTimestamp(value?: string | null): string | null {
   });
 }
 
-function describeCurrentState(env: EnvMeta, diagnostics: StartupDiagnosticsSnapshot | null): string {
-  if (diagnostics?.currentStepMessage) {
-    return diagnostics.currentStepMessage;
-  }
-  if (env.bootMessage) {
-    return env.bootMessage;
-  }
-  if (env.status === "saving") {
-    return "Persisting workspace changes before shutdown...";
-  }
-  if (env.status === "stopping") {
-    return "Workspace saved. Waiting for the container to stop...";
-  }
-  if (env.status === "starting") {
-    return "Container is booting...";
-  }
-  if (env.status === "creating") {
-    return "Preparing environment...";
-  }
-  if (env.status === "failed") {
-    return env.error?.trim() || "Startup failed.";
-  }
-  return "Container is stopped";
+function formatElapsedTime(elapsedMs: number): string {
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
 function hasLogTail(logTails?: StartupDiagnosticLogTails | null): boolean {
@@ -104,267 +82,379 @@ function hasLogTail(logTails?: StartupDiagnosticLogTails | null): boolean {
 function renderLogTail(title: string, value: string | null) {
   if (!value) return null;
   return (
-    <div className="rounded border border-[#30363d] bg-[#0d1117]">
-      <div className="border-b border-[#30363d] px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-[#8b949e]">
+    <div className="rounded-lg border border-kumo-line bg-kumo-contrast">
+      <div className="border-b border-kumo-line px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-kumo-inverse opacity-70">
         {title}
       </div>
-      <pre className="overflow-x-auto whitespace-pre-wrap px-3 py-2 font-mono text-xs leading-5 text-[#c9d1d9]">
+      <pre className="overflow-x-auto whitespace-pre-wrap px-3 py-2 font-mono text-xs leading-5 text-kumo-inverse">
         {value}
       </pre>
     </div>
   );
 }
 
-export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaitingViewProps) {
-  const [diagnostics, setDiagnostics] = useState<StartupDiagnosticsState>({ active: null, lastFailed: null });
-  const [showLastFailed, setShowLastFailed] = useState(false);
-  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
+function DiagnosticsPanel({
+  snapshot,
+  copyStatus,
+  onCopy,
+}: {
+  snapshot: StartupDiagnosticsSnapshot;
+  copyStatus: CopyStatus;
+  onCopy: (snapshot: StartupDiagnosticsSnapshot) => void;
+}) {
+  const copyLabel = copyStatus.opId === snapshot.opId
+    ? copyStatus.state === "copied"
+      ? "Copied"
+      : copyStatus.state === "failed"
+        ? "Copy Failed"
+        : "Copy Diagnostics"
+    : "Copy Diagnostics";
 
-  const status = env.status || "unknown";
-  const isCreating = status === "creating";
-  const isStarting = status === "starting";
-  const isSaving = status === "saving";
-  const isStopping = status === "stopping";
-  const isDeleting = status === "deleting";
-  const isFailed = status === "failed";
-  const isStoppedState = status === "stopped" || status === "unknown";
-  const isStopped = isStoppedState || isFailed;
-  const dotColor = STATUS_COLORS[status] || "bg-[#d0d7de]";
-  const label = STATUS_LABELS[status] || status;
-  const harness = env.harness;
-  const authBadge = getEnvAuthBadge(env);
-  const displayName = getEnvDisplayName(env);
-  const displayedDiagnostics = diagnostics.active ?? (showLastFailed ? diagnostics.lastFailed : null);
-  const currentStepLabel = formatStepLabel(env.bootStepId ?? displayedDiagnostics?.currentStepId ?? null);
+  return (
+    <section
+      aria-label={`Startup diagnostics for operation ${snapshot.opId}`}
+      className="overflow-hidden rounded-lg border border-kumo-line bg-kumo-elevated"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-kumo-line bg-kumo-recessed px-4 py-3">
+        <div>
+          <h3 className="text-sm font-semibold text-kumo-strong">Startup diagnostics</h3>
+          <p className="mt-0.5 text-[11px] text-kumo-subtle">
+            Operation {snapshot.opId} · {snapshot.backend.toUpperCase()} · started {formatTimestamp(snapshot.startedAt) ?? snapshot.startedAt} · updated {formatTimestamp(snapshot.updatedAt) ?? snapshot.updatedAt}
+          </p>
+        </div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={() => onCopy(snapshot)}
+        >
+          {copyLabel}
+        </Button>
+      </div>
+
+      <div className="grid gap-4 p-4 md:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)]">
+        <div className="space-y-4">
+          <div className="rounded border border-kumo-line">
+            <div className="border-b border-kumo-line px-3 py-2 text-xs font-medium uppercase tracking-wide text-kumo-subtle">
+              Timeline
+            </div>
+            <div className="max-h-80 overflow-y-auto px-3 py-2 font-mono text-xs">
+              {snapshot.events.length === 0 ? (
+                <p className="text-kumo-subtle">No events reported yet.</p>
+              ) : (
+                snapshot.events.map((event, index) => (
+                  <div
+                    key={`${event.at}-${index}`}
+                    className="border-b border-kumo-hairline py-2 last:border-b-0"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-kumo-subtle">{formatTimestamp(event.at) ?? event.at}</span>
+                      <span className="rounded bg-kumo-recessed px-1.5 py-0.5 text-[10px] font-medium text-kumo-subtle">
+                        {formatStepLabel(event.stepId)}
+                      </span>
+                      <span
+                        className={`text-[10px] font-semibold uppercase tracking-wide ${
+                          event.severity === "error"
+                            ? "text-kumo-danger"
+                            : event.severity === "warn"
+                              ? "text-kumo-warning"
+                              : "text-kumo-subtle"
+                        }`}
+                      >
+                        {event.severity}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-kumo-default">{event.message}</p>
+                    {event.detail && (
+                      <p className="mt-1 whitespace-pre-wrap text-kumo-subtle">{event.detail}</p>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {hasLogTail(snapshot.logTails) && (
+            <div className="space-y-3">
+              {renderLogTail("Harness Log Tail", snapshot.logTails.harness)}
+              {renderLogTail("Stop-Control Log Tail", snapshot.logTails.stopControl)}
+              {renderLogTail("Bootstrap Log Tail", snapshot.logTails.bootstrap)}
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-4">
+          <div className="rounded border border-kumo-line bg-kumo-recessed p-3">
+            <p className="text-xs font-medium uppercase tracking-wide text-kumo-subtle">Current step</p>
+            <p className="mt-2 text-sm font-medium text-kumo-default">
+              {formatStepLabel(snapshot.currentStepId) ?? "Waiting for diagnostics"}
+            </p>
+            <p className="mt-1 whitespace-pre-wrap text-sm text-kumo-subtle">
+              {snapshot.currentStepMessage ?? "No step message yet."}
+            </p>
+          </div>
+
+          <div className="rounded border border-kumo-line bg-kumo-recessed p-3">
+            <p className="text-xs font-medium uppercase tracking-wide text-kumo-subtle">Failure</p>
+            <p className="mt-2 whitespace-pre-wrap text-sm text-kumo-default">
+              {snapshot.failure?.message ?? "No startup failure recorded."}
+            </p>
+            {snapshot.failure?.lastStepId && (
+              <p className="mt-1 text-xs text-kumo-subtle">
+                Last step: {formatStepLabel(snapshot.failure.lastStepId)}
+              </p>
+            )}
+            {(snapshot.failure?.exitCode != null || snapshot.failure?.signal) && (
+              <p className="mt-1 text-xs text-kumo-subtle">
+                exit={snapshot.failure?.exitCode ?? "n/a"} signal={snapshot.failure?.signal ?? "n/a"}
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaitingViewProps) {
+  const envIdentity = env.incarnationId ?? env.slug;
+  const operationKey = `${envIdentity}:${env.lifecycleOpId ?? "no-operation"}`;
+  const [diagnosticsResult, setDiagnosticsResult] = useState<DiagnosticsResult>(() => ({
+    envIdentity,
+    value: EMPTY_DIAGNOSTICS,
+  }));
+  const [detailsState, setDetailsState] = useState<DetailsState>(() => ({
+    operationKey,
+    open: false,
+  }));
+  const [elapsedMs, setElapsedMs] = useState<number | null>(null);
+  const [copyStatus, setCopyStatus] = useState<CopyStatus>({ opId: null, state: "idle" });
+  const autoOpenedOperationKeysRef = useRef(new Set<string>());
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const diagnostics = diagnosticsResult.envIdentity === envIdentity
+    ? diagnosticsResult.value
+    : EMPTY_DIAGNOSTICS;
+  const presentation = getEnvWaitingPresentation(env, diagnostics);
+  const detailsOpen = detailsState.operationKey === operationKey && detailsState.open;
+  const activeDiagnostics = diagnostics.active;
+  const previousFailure = diagnostics.lastFailed?.opId === activeDiagnostics?.opId
+    ? null
+    : diagnostics.lastFailed;
+
+  const matchingStartedAt = presentation.elapsedTimeEligible
+    && Boolean(env.lifecycleOpId)
+    && activeDiagnostics?.opId === env.lifecycleOpId
+    ? activeDiagnostics.startedAt
+    : null;
 
   useEffect(() => {
     let cancelled = false;
-    setCopyStatus("idle");
+    setCopyStatus({ opId: null, state: "idle" });
+
     fetchEnvStartupDiagnostics(hubUrl, env.slug)
       .then((next) => {
         if (!cancelled) {
-          setDiagnostics(next);
+          setDiagnosticsResult({ envIdentity, value: next });
         }
       })
       .catch((error) => {
         if (!cancelled) {
           console.warn("[tiller] Failed to fetch startup diagnostics:", error);
-          setDiagnostics({ active: null, lastFailed: null });
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [hubUrl, env.slug, env.updatedAt, env.status, env.lifecycleOpId]);
+  }, [envIdentity, env.lifecycleOpId, env.slug, env.status, env.updatedAt, hubUrl]);
 
   useEffect(() => {
-    setShowLastFailed(false);
-  }, [env.slug, diagnostics.active?.opId]);
+    if (presentation.displayState !== "startup-failure") return;
+    if (autoOpenedOperationKeysRef.current.has(operationKey)) return;
 
-  const copyDiagnostics = async () => {
-    if (!displayedDiagnostics) return;
+    autoOpenedOperationKeysRef.current.add(operationKey);
+    setDetailsState({ operationKey, open: true });
+  }, [operationKey, presentation.displayState]);
+
+  useEffect(() => {
+    if (!matchingStartedAt) {
+      setElapsedMs(null);
+      return undefined;
+    }
+
+    const startedAtMs = Date.parse(matchingStartedAt);
+    const updateElapsedTime = () => {
+      const nextElapsedMs = Date.now() - startedAtMs;
+      setElapsedMs(
+        Number.isFinite(startedAtMs) && nextElapsedMs >= 0
+          ? nextElapsedMs
+          : null,
+      );
+    };
+
+    updateElapsedTime();
+    const timer = setInterval(updateElapsedTime, 1000);
+    return () => clearInterval(timer);
+  }, [matchingStartedAt, operationKey]);
+
+  useEffect(() => () => {
+    if (copyResetTimerRef.current) {
+      clearTimeout(copyResetTimerRef.current);
+    }
+  }, []);
+
+  const copyDiagnostics = async (snapshot: StartupDiagnosticsSnapshot) => {
+    if (copyResetTimerRef.current) {
+      clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = null;
+    }
+
     try {
       if (!globalThis.navigator?.clipboard?.writeText) {
         throw new Error("Clipboard API unavailable");
       }
-      await globalThis.navigator.clipboard.writeText(JSON.stringify(displayedDiagnostics, null, 2));
-      setCopyStatus("copied");
-      setTimeout(() => setCopyStatus("idle"), 1200);
+      await globalThis.navigator.clipboard.writeText(JSON.stringify(snapshot, null, 2));
+      setCopyStatus({ opId: snapshot.opId, state: "copied" });
+      copyResetTimerRef.current = setTimeout(() => {
+        setCopyStatus({ opId: null, state: "idle" });
+        copyResetTimerRef.current = null;
+      }, 1200);
     } catch (error) {
       console.error("[tiller] Failed to copy diagnostics:", error);
-      setCopyStatus("failed");
+      setCopyStatus({ opId: snapshot.opId, state: "failed" });
     }
   };
 
+  const primaryActionLabel = presentation.primaryAction === "start"
+    ? "Start environment"
+    : presentation.primaryAction === "retry"
+      ? "Try again"
+      : null;
+
   return (
-    <div className="flex-1 flex flex-col">
-      <div className="px-4 py-2.5 border-b border-[#d0d7de] flex items-center justify-between bg-[#f6f8fa]">
-        <div className="flex items-center gap-3">
-          <span className={`w-2.5 h-2.5 rounded-full ${dotColor}`} />
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-sm font-semibold text-[#24292f]">{displayName}</h2>
-              <span className="rounded border border-[#d0d7de] bg-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a]">
-                {getBackendBadgeLabel(env.backend)}
-              </span>
-              <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getHarnessBadgeClass(harness)}`}>
-                {getHarnessBadgeLabel(harness)}
-              </span>
-              {authBadge && (
-                <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${authBadge.className}`}>
-                  {authBadge.label}
+    <div className="flex flex-1 flex-col">
+      <div className="flex-1 overflow-y-auto bg-kumo-base">
+        <main className="mx-auto flex min-h-full w-full max-w-4xl flex-col items-center px-4 py-8 sm:px-6 sm:py-12">
+          <div className="flex w-full flex-col items-center text-center">
+            <h1 className="text-2xl font-semibold tracking-tight text-kumo-strong sm:text-3xl">
+              {presentation.heading}
+            </h1>
+
+            <p className="mt-3 flex min-h-6 flex-wrap items-baseline justify-center gap-x-2 text-sm text-kumo-subtle sm:text-base">
+              <span aria-live="polite" aria-atomic="true">{presentation.actionText}</span>
+              {elapsedMs != null && (
+                <span data-testid="startup-elapsed" className="tabular-nums text-kumo-subtle">
+                  Elapsed {formatElapsedTime(elapsedMs)}
                 </span>
               )}
-            </div>
-            <p className="text-xs text-[#57606a]">
-              {label}
             </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {displayedDiagnostics && (
-            <button
-              onClick={() => void copyDiagnostics()}
-              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
-            >
-              {copyStatus === "copied" ? "Copied" : copyStatus === "failed" ? "Copy Failed" : "Copy Diagnostics"}
-            </button>
-          )}
-          {!diagnostics.active && diagnostics.lastFailed && (
-            <button
-              onClick={() => setShowLastFailed((value) => !value)}
-              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
-            >
-              {showLastFailed ? "Hide Recent Failure" : "Show Recent Failure"}
-            </button>
-          )}
-          {isStopped && (
-            <button
-              onClick={() => onStartRequest?.(env.slug)}
-              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
-            >
-              Start
-            </button>
-          )}
-        </div>
-      </div>
 
-      <div className="flex-1 overflow-y-auto bg-[#ffffff]">
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-8">
-          <div className="rounded-lg border border-[#d0d7de] bg-white p-5 shadow-sm">
-            <div className="flex items-center gap-2">
-              <span className={`h-3 w-3 rounded-full ${dotColor}`} />
-              <span className="text-sm font-medium text-[#24292f]">{label}</span>
-              {currentStepLabel && (
-                <span className="rounded bg-[#f6f8fa] px-2 py-0.5 text-[11px] font-medium text-[#57606a]">
-                  {currentStepLabel}
-                </span>
-              )}
+            <div className="mt-7 flex w-full justify-center sm:mt-9">
+              <SailingScene motionVariant={presentation.motionVariant} />
             </div>
 
-            <div className="mt-3 flex flex-col gap-3">
-              {(isCreating || isStarting || isSaving || isStopping || isDeleting) && (
-                <div className="flex items-center gap-3">
-                  <Spinner />
-                  <p className="text-sm text-[#57606a]">{describeCurrentState(env, displayedDiagnostics)}</p>
-                </div>
-              )}
+            {primaryActionLabel && (
+              <Button
+                type="button"
+                variant="primary"
+                size="lg"
+                className="mt-7"
+                onClick={() => onStartRequest?.(env.slug)}
+              >
+                {primaryActionLabel}
+              </Button>
+            )}
 
-              {isFailed && (
-                <div className="rounded border border-red-200 bg-red-50 px-3 py-2">
-                  <p className="text-sm font-medium text-red-700">
-                    {displayedDiagnostics?.failure?.message ?? env.error?.trim() ?? "Startup failed."}
-                  </p>
-                  {displayedDiagnostics?.failure?.lastStepId && (
-                    <p className="mt-1 text-xs text-red-700">
-                      Failed at {formatStepLabel(displayedDiagnostics.failure.lastStepId)}
-                    </p>
-                  )}
-                </div>
-              )}
+            <details
+              key={operationKey}
+              open={detailsOpen}
+              onToggle={(event) => {
+                setDetailsState({
+                  operationKey,
+                  open: event.currentTarget.open,
+                });
+              }}
+              className="mt-8 w-full rounded-xl border border-kumo-line bg-kumo-elevated text-left shadow-sm"
+            >
+              <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-kumo-default sm:px-5">
+                Technical details
+              </summary>
 
-              {isStoppedState && !isFailed && (
-                <p className="text-sm text-[#57606a]">Container is stopped.</p>
-              )}
-            </div>
-          </div>
-
-          {displayedDiagnostics && (
-            <div className="rounded-lg border border-[#d0d7de] bg-white shadow-sm overflow-hidden">
-              <div className="flex items-center justify-between border-b border-[#d0d7de] bg-[#f6f8fa] px-4 py-2.5">
-                <div>
-                  <p className="text-sm font-semibold text-[#24292f]">Startup Diagnostics</p>
-                  <p className="text-[11px] text-[#57606a]">
-                    Op {displayedDiagnostics.opId} · {displayedDiagnostics.backend.toUpperCase()} · updated {formatTimestamp(displayedDiagnostics.updatedAt) ?? displayedDiagnostics.updatedAt}
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid gap-4 p-4 md:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)]">
-                <div className="space-y-4">
-                  <div className="rounded border border-[#d0d7de]">
-                    <div className="border-b border-[#d0d7de] px-3 py-2 text-xs font-medium uppercase tracking-wide text-[#57606a]">
-                      Timeline
+              <div className="space-y-4 border-t border-kumo-line p-4 sm:p-5">
+                <section aria-labelledby="environment-metadata-heading">
+                  <h2 id="environment-metadata-heading" className="text-xs font-semibold uppercase tracking-wide text-kumo-subtle">
+                    Environment metadata
+                  </h2>
+                  <dl className="mt-2 grid gap-2 rounded-lg border border-kumo-line bg-kumo-recessed p-3 text-xs sm:grid-cols-2">
+                    <div>
+                      <dt className="font-medium text-kumo-subtle">Status</dt>
+                      <dd className="mt-0.5 font-mono text-kumo-default">{env.status}</dd>
                     </div>
-                    <div className="max-h-80 overflow-y-auto px-3 py-2 font-mono text-xs">
-                      {displayedDiagnostics.events.length === 0 ? (
-                        <p className="text-[#57606a]">No events reported yet.</p>
-                      ) : (
-                        displayedDiagnostics.events.map((event, index) => (
-                          <div key={`${event.at}-${index}`} className="border-b border-[#f6f8fa] py-2 last:border-b-0">
-                            <div className="flex items-center gap-2">
-                              <span className="text-[#8b949e]">{formatTimestamp(event.at) ?? event.at}</span>
-                              <span className="rounded bg-[#f6f8fa] px-1.5 py-0.5 text-[10px] font-medium text-[#57606a]">
-                                {formatStepLabel(event.stepId)}
-                              </span>
-                              <span className={`text-[10px] font-semibold uppercase tracking-wide ${
-                                event.severity === "error"
-                                  ? "text-red-600"
-                                  : event.severity === "warn"
-                                    ? "text-amber-600"
-                                    : "text-[#57606a]"
-                              }`}
-                              >
-                                {event.severity}
-                              </span>
-                            </div>
-                            <p className="mt-1 text-[#24292f]">{event.message}</p>
-                            {event.detail && (
-                              <p className="mt-1 whitespace-pre-wrap text-[#57606a]">{event.detail}</p>
-                            )}
-                          </div>
-                        ))
-                      )}
+                    <div>
+                      <dt className="font-medium text-kumo-subtle">Operation ID</dt>
+                      <dd className="mt-0.5 break-all font-mono text-kumo-default">{env.lifecycleOpId ?? "Not reported"}</dd>
                     </div>
-                  </div>
-
-                  {hasLogTail(displayedDiagnostics.logTails) && (
-                    <div className="space-y-3">
-                      {renderLogTail("Harness Log Tail", displayedDiagnostics.logTails.harness)}
-                      {renderLogTail("Stop-Control Log Tail", displayedDiagnostics.logTails.stopControl)}
-                      {renderLogTail("Bootstrap Log Tail", displayedDiagnostics.logTails.bootstrap)}
+                    <div>
+                      <dt className="font-medium text-kumo-subtle">Lifecycle operation</dt>
+                      <dd className="mt-0.5 font-mono text-kumo-default">{env.lifecycleOperation ?? "Not reported"}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-medium text-kumo-subtle">Desired state</dt>
+                      <dd className="mt-0.5 font-mono text-kumo-default">{env.lifecycleDesiredState ?? "Not reported"}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-medium text-kumo-subtle">Startup step</dt>
+                      <dd className="mt-0.5 font-mono text-kumo-default">{env.bootStepId ?? "Not reported"}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-medium text-kumo-subtle">Last updated</dt>
+                      <dd className="mt-0.5 font-mono text-kumo-default">{formatTimestamp(env.updatedAt) ?? env.updatedAt}</dd>
+                    </div>
+                  </dl>
+                  {(env.bootMessage || env.error) && (
+                    <div className="mt-2 rounded-lg border border-kumo-line bg-kumo-recessed p-3 text-xs">
+                      <p className="font-medium text-kumo-subtle">Raw environment message</p>
+                      {env.bootMessage && <p className="mt-1 whitespace-pre-wrap text-kumo-default">{env.bootMessage}</p>}
+                      {env.error && <p className="mt-1 whitespace-pre-wrap text-kumo-danger">{env.error}</p>}
                     </div>
                   )}
-                </div>
+                </section>
 
-                <div className="space-y-4">
-                  <div className="rounded border border-[#d0d7de] bg-[#f6f8fa] p-3">
-                    <p className="text-xs font-medium uppercase tracking-wide text-[#57606a]">Current Step</p>
-                    <p className="mt-2 text-sm font-medium text-[#24292f]">
-                      {formatStepLabel(displayedDiagnostics.currentStepId) ?? "Waiting for diagnostics"}
-                    </p>
-                    <p className="mt-1 text-sm text-[#57606a]">
-                      {displayedDiagnostics.currentStepMessage ?? "No step message yet."}
-                    </p>
-                  </div>
+                {activeDiagnostics ? (
+                  <DiagnosticsPanel
+                    snapshot={activeDiagnostics}
+                    copyStatus={copyStatus}
+                    onCopy={(snapshot) => void copyDiagnostics(snapshot)}
+                  />
+                ) : (
+                  <p className="rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-xs text-kumo-subtle">
+                    No active startup diagnostics are available.
+                  </p>
+                )}
 
-                  <div className="rounded border border-[#d0d7de] bg-[#f6f8fa] p-3">
-                    <p className="text-xs font-medium uppercase tracking-wide text-[#57606a]">Failure</p>
-                    <p className="mt-2 text-sm text-[#24292f]">
-                      {displayedDiagnostics.failure?.message ?? "No startup failure recorded."}
-                    </p>
-                    {(displayedDiagnostics.failure?.exitCode != null || displayedDiagnostics.failure?.signal) && (
-                      <p className="mt-1 text-xs text-[#57606a]">
-                        exit={displayedDiagnostics.failure?.exitCode ?? "n/a"} signal={displayedDiagnostics.failure?.signal ?? "n/a"}
-                      </p>
-                    )}
-                  </div>
-                </div>
+                {previousFailure && (
+                  <details
+                    key={`${envIdentity}:last-failed:${previousFailure.opId}`}
+                    className="rounded-lg border border-kumo-line bg-kumo-base"
+                  >
+                    <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-kumo-default">
+                      Previous startup failure
+                    </summary>
+                    <div className="border-t border-kumo-line p-3">
+                      <DiagnosticsPanel
+                        snapshot={previousFailure}
+                        copyStatus={copyStatus}
+                        onCopy={(snapshot) => void copyDiagnostics(snapshot)}
+                      />
+                    </div>
+                  </details>
+                )}
               </div>
-            </div>
-          )}
-        </div>
+            </details>
+          </div>
+        </main>
       </div>
     </div>
-  );
-}
-
-function Spinner() {
-  return (
-    <svg className="animate-spin h-5 w-5 text-[#57606a]" viewBox="0 0 24 24" fill="none">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-    </svg>
   );
 }

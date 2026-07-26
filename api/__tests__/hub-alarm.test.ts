@@ -71,7 +71,20 @@ class FakeSqlStorage {
 
 class FakeStorage {
   readonly sql = new FakeSqlStorage();
+  private readonly values = new Map<string, unknown>();
   private alarm: number | null = null;
+
+  async list<T>(options: { prefix?: string } = {}): Promise<Map<string, T>> {
+    return new Map([...this.values.entries()]
+      .filter(([key]) => !options.prefix || key.startsWith(options.prefix))) as Map<string, T>;
+  }
+
+  async delete(keys: string | string[]): Promise<boolean> {
+    const pending = Array.isArray(keys) ? keys : [keys];
+    let deleted = false;
+    for (const key of pending) deleted = this.values.delete(key) || deleted;
+    return deleted;
+  }
 
   async setAlarm(timestamp: number): Promise<void> {
     this.alarm = timestamp;
@@ -167,6 +180,34 @@ describe("HubDO alarm cleanup", () => {
     expect(subject.getSession("stale-session")).toBeNull();
     expect(observer.sent.map((payload) => JSON.parse(payload))).toEqual([
       { type: "session-deleted", sessionId: "inactive-session" },
+    ]);
+
+    storage.close();
+  });
+
+  it("does not count explicit viewer session connections as live session references", async () => {
+    const { subject, storage, connections } = createSubject();
+
+    subject.createSession("viewer-session", "demo-env", null, {});
+    subject.setSessionActive("viewer-session", false);
+
+    const viewer = createConnection("viewer", {
+      sessionId: "viewer-session",
+      sessionLifecycle: "viewer",
+    });
+    const observer = createConnection("observer");
+    connections.set(viewer.id, viewer);
+    connections.set(observer.id, observer);
+
+    await subject.onAlarm();
+
+    expect(subject.getSession("viewer-session")).toMatchObject({
+      id: "viewer-session",
+      active: 0,
+    });
+    expect(subject.getSession("viewer-session")?.ended_at).not.toBeNull();
+    expect(observer.sent.map((payload) => JSON.parse(payload))).toEqual([
+      { type: "session-deleted", sessionId: "viewer-session" },
     ]);
 
     storage.close();

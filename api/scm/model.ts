@@ -1,4 +1,4 @@
-import type { EnvBranchStatus, EnvMeta, RepoMeta } from "../types";
+import type { EnvBranchStatus, EnvMeta, GitHubEnvPendingPublishProjection, RepoMeta } from "../types";
 import { buildEnvBranchName } from "./artifacts";
 import { SCM_FORMAT_VERSION } from "./constants";
 
@@ -11,6 +11,11 @@ export function parseScmBooleanFlag(value?: string | null): boolean {
 
 export function createInitialRepoScmState(): Pick<
   RepoMeta,
+  | "scmModel"
+  | "githubDefaultBranch"
+  | "githubDefaultBranchHeadSha"
+  | "githubWebhookConfigured"
+  | "githubWebhookError"
   | "mainCommit"
   | "gitArtifactId"
   | "gitStatus"
@@ -23,6 +28,11 @@ export function createInitialRepoScmState(): Pick<
   | "gitLastBootstrapTimings"
 > {
   return {
+    scmModel: "github",
+    githubDefaultBranch: null,
+    githubDefaultBranchHeadSha: null,
+    githubWebhookConfigured: false,
+    githubWebhookError: null,
     mainCommit: null,
     gitArtifactId: null,
     gitStatus: "pending",
@@ -41,8 +51,11 @@ export function createInitialEnvScmState(args: {
   startupPlanId?: string | null;
   branchName?: string | null;
   mainCommit?: string | null;
+  githubBaseBranch?: string | null;
+  githubBaseCommitSha?: string | null;
 }): Pick<
   EnvMeta,
+  | "scmModel"
   | "startupPlanId"
   | "branchName"
   | "branchStatus"
@@ -59,8 +72,23 @@ export function createInitialEnvScmState(args: {
   | "scmLastCompletedAt"
   | "scmLastDurationMs"
   | "scmLastTimings"
+  | "githubBaseBranch"
+  | "githubBaseCommitSha"
+  | "githubBranch"
+  | "githubHeadCommitSha"
+  | "githubPrNumber"
+  | "githubPrUrl"
+  | "githubPrState"
+  | "githubMergedAt"
+  | "githubPublishStatus"
+  | "githubPublishOperationId"
+  | "githubPublishError"
+  | "githubLastPublishedAt"
+  | "githubLastPublishedWorkspaceHash"
+  | "githubPendingPublish"
 > {
   return {
+    scmModel: "github",
     startupPlanId: args.startupPlanId ?? null,
     branchName: args.branchName ?? buildEnvBranchName(args.slug),
     branchStatus: "up-to-date",
@@ -77,6 +105,51 @@ export function createInitialEnvScmState(args: {
     scmLastCompletedAt: null,
     scmLastDurationMs: null,
     scmLastTimings: null,
+    githubBaseBranch: args.githubBaseBranch ?? null,
+    githubBaseCommitSha: args.githubBaseCommitSha ?? null,
+    githubBranch: buildGitHubEnvBranchName(args.slug),
+    githubHeadCommitSha: null,
+    githubPrNumber: null,
+    githubPrUrl: null,
+    githubPrState: null,
+    githubMergedAt: null,
+    githubPublishStatus: "idle",
+    githubPublishOperationId: null,
+    githubPublishError: null,
+    githubLastPublishedAt: null,
+    githubLastPublishedWorkspaceHash: null,
+    githubPendingPublish: null,
+  };
+}
+
+export function buildGitHubEnvBranchName(slug: string): string {
+  return `tiller/env/${slug.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "env"}`;
+}
+
+export function createGitHubPendingPublishProjection(args: {
+  operationId: string;
+  branch: string;
+  baseCommitSha: string;
+  workspaceHash: string;
+  expectedPriorHead: string | null;
+  pushedCommitSha?: string | null;
+  status?: GitHubEnvPendingPublishProjection["status"];
+  error?: string | null;
+  startedAt?: string;
+  updatedAt?: string;
+}): GitHubEnvPendingPublishProjection {
+  const startedAt = args.startedAt ?? new Date().toISOString();
+  return {
+    operationId: args.operationId,
+    status: args.status ?? "starting",
+    branch: args.branch,
+    baseCommitSha: args.baseCommitSha,
+    workspaceHash: args.workspaceHash,
+    expectedPriorHead: args.expectedPriorHead,
+    pushedCommitSha: args.pushedCommitSha ?? null,
+    startedAt,
+    updatedAt: args.updatedAt ?? startedAt,
+    error: args.error ?? null,
   };
 }
 
@@ -93,34 +166,37 @@ export type StartupPlanSelection =
   | { mode: "specific"; artifactId: string }
   | { mode: "none" };
 
-export function normalizeStartupPlanSelection(value: unknown, fallback: StartupPlanSelection): StartupPlanSelection {
-  if (!value || typeof value !== "object") return fallback;
+export function parseStartupPlanSelection(value: unknown): StartupPlanSelection | null {
+  if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   if (record.mode === "todo") return { mode: "todo" };
   if (record.mode === "none") return { mode: "none" };
   if (record.mode === "specific" && typeof record.artifactId === "string" && record.artifactId.trim()) {
     return { mode: "specific", artifactId: record.artifactId.trim() };
   }
-  return fallback;
-}
-
-export function legacyPlanIdToSelection(planId: string | null | undefined, fallback: StartupPlanSelection): StartupPlanSelection {
-  if (planId === undefined) return fallback;
-  if (planId === null) return { mode: "none" };
-  return planId.trim() ? { mode: "specific", artifactId: planId.trim() } : { mode: "none" };
+  return null;
 }
 
 export function deriveBranchBackedEnvStatus(
   meta: Pick<
     EnvMeta,
+    | "scmModel"
     | "branchStatus"
     | "workspaceDirty"
     | "workspaceNeedsAttention"
     | "baseMainCommit"
     | "lastKnownMainCommit"
+    | "githubBaseCommitSha"
+    | "githubPublishStatus"
+    | "githubPrState"
+    | "githubMergedAt"
   >,
-  repo: Pick<RepoMeta, "mainCommit">,
+  repo: Pick<RepoMeta, "mainCommit" | "githubDefaultBranchHeadSha">,
 ): EnvBranchStatus {
+  if (meta.scmModel === "github") {
+    return deriveGitHubEnvBranchStatus(meta, repo);
+  }
+
   if (meta.branchStatus === "needs-attention" || meta.workspaceNeedsAttention) {
     return "needs-attention";
   }
@@ -143,7 +219,7 @@ export function deriveBranchBackedEnvStatus(
 
 export function withDerivedBranchBackedEnvStatus(
   meta: EnvMeta,
-  repo: Pick<RepoMeta, "mainCommit">,
+  repo: Pick<RepoMeta, "mainCommit" | "githubDefaultBranchHeadSha">,
 ): EnvMeta {
   return {
     ...meta,
@@ -154,17 +230,39 @@ export function withDerivedBranchBackedEnvStatus(
 export function getEffectiveEnvBranchStatus(
   meta: Pick<
     EnvMeta,
+    | "scmModel"
     | "branchStatus"
     | "workspaceDirty"
     | "workspaceNeedsAttention"
     | "baseMainCommit"
     | "lastKnownMainCommit"
+    | "githubBaseCommitSha"
+    | "githubPublishStatus"
+    | "githubPrState"
+    | "githubMergedAt"
   >,
-  repo: Pick<RepoMeta, "mainCommit"> | null | undefined,
+  repo: Pick<RepoMeta, "mainCommit" | "githubDefaultBranchHeadSha"> | null | undefined,
 ): EnvBranchStatus {
   return deriveBranchBackedEnvStatus(meta, {
     mainCommit: repo?.mainCommit ?? null,
+    githubDefaultBranchHeadSha: repo?.githubDefaultBranchHeadSha ?? null,
   });
+}
+
+export function deriveGitHubEnvBranchStatus(
+  meta: Pick<EnvMeta, "githubBaseCommitSha" | "githubPublishStatus" | "githubPrState" | "githubMergedAt" | "workspaceDirty" | "workspaceNeedsAttention">,
+  repo: Pick<RepoMeta, "githubDefaultBranchHeadSha"> | null | undefined,
+): EnvBranchStatus {
+  if (meta.workspaceNeedsAttention || meta.githubPublishStatus === "attention" || meta.githubPublishStatus === "failed") {
+    return "needs-attention";
+  }
+  if (meta.githubMergedAt || meta.githubPrState === "merged") {
+    return "up-to-date";
+  }
+  if (meta.githubBaseCommitSha && repo?.githubDefaultBranchHeadSha && meta.githubBaseCommitSha !== repo.githubDefaultBranchHeadSha) {
+    return "behind-main";
+  }
+  return meta.workspaceDirty ? "ready-to-merge" : "up-to-date";
 }
 
 export function hasCurrentMainBase(
@@ -175,7 +273,8 @@ export function hasCurrentMainBase(
 }
 
 export function isEnvTransitioning(
-  meta: Pick<EnvMeta, "status" | "scmOperationType">,
+  meta: Pick<EnvMeta, "status" | "scmOperationType">
+    & Partial<Pick<EnvMeta, "githubPublishStatus" | "githubPublishOperationId">>,
 ): boolean {
   return (
     meta.status === "creating" ||
@@ -183,7 +282,9 @@ export function isEnvTransitioning(
     meta.status === "saving" ||
     meta.status === "stopping" ||
     meta.status === "deleting" ||
-    !!meta.scmOperationType
+    !!meta.scmOperationType ||
+    meta.githubPublishStatus === "publishing" ||
+    !!meta.githubPublishOperationId
   );
 }
 
@@ -191,20 +292,4 @@ export function isRepoTransitioning(
   meta: Pick<RepoMeta, "gitStatus">,
 ): boolean {
   return meta.gitStatus === "pending";
-}
-
-export function resolveRequestedStartupPlanId(
-  meta: Pick<EnvMeta, "startupPlanId">,
-  requestedPlanId?: string | null,
-): string | null {
-  const requested = requestedPlanId ?? null;
-  const stored = meta.startupPlanId ?? null;
-
-  if (requested !== null && requested !== stored) {
-    throw new Error(
-      "Branch-backed environments freeze the startup plan at creation time. Create a new environment to use a different plan.",
-    );
-  }
-
-  return stored;
 }

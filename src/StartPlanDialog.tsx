@@ -1,7 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
-import type { EnvMeta } from "../api/types";
+import { Button } from "@cloudflare/kumo/components/button";
+import { Dialog } from "@cloudflare/kumo/components/dialog";
+import { Link } from "react-router-dom";
 import type { Artifact } from "../api/coordination/types";
-import { fetchRepoArtifacts, startEnv, type StartupPlanSelection } from "./api";
+import type { EnvMeta, HarnessSettings } from "../api/types";
+import type { BillingMode } from "../shared/billing";
+import {
+  getHarnessDefault,
+  getHarnessModel,
+  resolveHarnessModelAvailability,
+  validateHarnessSettings,
+} from "../shared/harness-catalog";
+import { fetchRepoArtifacts, startEnv } from "./api";
+import { planPath } from "./dashboard-paths";
+import HarnessSettingsFields from "./HarnessSettingsFields";
+import MarkdownContent from "./MarkdownContent";
 import { isPlanOutdatedForMain, listPlanArtifacts, renderArtifactBodyMarkdown } from "./plan-artifacts";
 
 interface StartPlanDialogProps {
@@ -10,9 +23,15 @@ interface StartPlanDialogProps {
   hubUrl: string;
   onClose: () => void;
   onStarted: () => void;
+  hasClaudeSubscription?: boolean;
+  hasAnthropicKey?: boolean;
+  hasChatGPTAuth?: boolean;
+  hasOpenAIKey?: boolean;
+  workersAiConfigured?: boolean;
+  chatgptAuthStatus?: "missing" | "connected" | "refreshing" | "needs_reconnect" | "temporarily_unavailable";
+  claudeBillingMode?: BillingMode | null;
+  openaiBillingMode?: BillingMode | null;
 }
-
-type PlanChoice = "specific" | "none";
 
 export default function StartPlanDialog({
   env,
@@ -20,29 +39,65 @@ export default function StartPlanDialog({
   hubUrl,
   onClose,
   onStarted,
+  hasClaudeSubscription = false,
+  hasAnthropicKey = false,
+  hasChatGPTAuth = false,
+  hasOpenAIKey = false,
+  workersAiConfigured = false,
+  chatgptAuthStatus = "missing",
+  claudeBillingMode = null,
+  openaiBillingMode = null,
 }: StartPlanDialogProps) {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(Boolean(env.startupPlanId));
   const [starting, setStarting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [choice, setChoice] = useState<PlanChoice>("none");
-  const [selectedPlanId, setSelectedPlanId] = useState("");
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
+  const [harnessSettings, setHarnessSettings] = useState<HarnessSettings>(() =>
+    validateHarnessSettings(env.harness, env.harnessSettings) ?? getHarnessDefault(env.harness),
+  );
+  const selectedCatalogModel = getHarnessModel(env.harness, harnessSettings.model);
+  const credentialStatus = {
+    hasClaudeSubscription,
+    hasAnthropicKey,
+    hasChatGPTAuth,
+    hasOpenAIKey,
+    workersAiConfigured,
+    claudeBillingMode,
+    openaiBillingMode,
+    chatgptAuthStatus,
+    // Exact stored placement is enforced by the server. Global machine
+    // readiness cannot determine whether this workload's machine is online.
+    openaiSubscriptionReady: true,
+    openaiSubscriptionUnavailableReason: null,
+  };
+  const selectedAvailability = selectedCatalogModel
+    ? resolveHarnessModelAvailability(selectedCatalogModel, env.backend, credentialStatus)
+    : null;
+  const isStartable = env.status === "stopped" || env.status === "failed" || env.status === "unknown";
 
   const planArtifacts = useMemo(() => listPlanArtifacts(artifacts), [artifacts]);
   const selectedPlan = useMemo(
-    () => planArtifacts.find((plan) => plan.id === selectedPlanId) ?? planArtifacts[0] ?? null,
-    [planArtifacts, selectedPlanId],
+    () => env.startupPlanId ? planArtifacts.find((plan) => plan.id === env.startupPlanId) ?? null : null,
+    [env.startupPlanId, planArtifacts],
   );
 
   useEffect(() => {
     let cancelled = false;
     const loadPlans = async () => {
+      if (!env.startupPlanId) {
+        setArtifacts([]);
+        setLoading(false);
+        setPlanError(null);
+        return;
+      }
+
       setLoading(true);
-      setError(null);
+      setPlanError(null);
       try {
         if (!env.repoId) {
           setArtifacts([]);
-          setError("This environment does not have a repo identity yet.");
+          setPlanError("This environment does not have a repo identity yet.");
           return;
         }
         const nextState = await fetchRepoArtifacts(hubUrl, env.repoId);
@@ -50,7 +105,7 @@ export default function StartPlanDialog({
         setArtifacts(nextState.artifacts);
       } catch (loadError) {
         if (cancelled) return;
-        setError(loadError instanceof Error ? loadError.message : "Failed to load plans");
+        setPlanError(loadError instanceof Error ? loadError.message : "Failed to load plans");
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -60,155 +115,139 @@ export default function StartPlanDialog({
     return () => {
       cancelled = true;
     };
-  }, [env.repoId, hubUrl]);
-
-  useEffect(() => {
-    setSelectedPlanId((current) => {
-      if (current && planArtifacts.some((plan) => plan.id === current)) return current;
-      return env.startupPlanId && planArtifacts.some((plan) => plan.id === env.startupPlanId)
-        ? env.startupPlanId
-        : planArtifacts[0]?.id ?? "";
-    });
-  }, [env.startupPlanId, planArtifacts]);
+  }, [env.repoId, env.startupPlanId, hubUrl]);
 
   const handleStart = async () => {
     setStarting(true);
-    setError(null);
+    setStartError(null);
     try {
-      let planSelection: StartupPlanSelection = { mode: "none" };
-      if (choice === "specific") {
-        if (!selectedPlan) {
-          throw new Error("Choose a plan before starting the container.");
-        }
-        planSelection = { mode: "specific", artifactId: selectedPlan.id };
-      }
-      await startEnv(hubUrl, env.slug, { planSelection });
+      await startEnv(hubUrl, env.slug, { harnessSettings });
       onStarted();
       onClose();
-    } catch (startError) {
-      setError(startError instanceof Error ? startError.message : "Failed to start container");
+    } catch (caughtError) {
+      setStartError(caughtError instanceof Error ? caughtError.message : "Failed to start container");
     } finally {
       setStarting(false);
     }
   };
 
-  const selectedSpecificOutdated = choice === "specific" && selectedPlan && isPlanOutdatedForMain(selectedPlan, repoMainCommit);
+  const selectedSpecificOutdated = selectedPlan && isPlanOutdatedForMain(selectedPlan, repoMainCommit);
+  const selectedPlanHref = env.startupPlanId && env.repoId ? planPath(env.repoId, env.startupPlanId) : null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="mx-4 w-full max-w-lg rounded-lg bg-white shadow-xl">
-        <div className="border-b border-[#d0d7de] px-5 py-4">
-          <h3 className="text-sm font-semibold text-[#24292f]">Start Container</h3>
-          <p className="mt-1 text-xs text-[#57606a]">
-            Start without a plan, or pick a specific saved plan.
-          </p>
+    <Dialog.Root
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-2xl flex-col overflow-hidden p-0 sm:min-w-[42rem]">
+        <div className="shrink-0 border-b border-kumo-line px-5 py-4">
+          <Dialog.Title className="text-sm font-semibold text-kumo-strong">
+            Start Container
+          </Dialog.Title>
+          <Dialog.Description className="mt-1 text-xs text-kumo-subtle">
+            The startup plan was selected when this environment was created.
+          </Dialog.Description>
         </div>
 
-        <div className="space-y-4 px-5 py-4">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
           <div>
-            <div className="text-xs font-medium text-[#57606a]">Repository</div>
-            <div className="mt-1 text-sm text-[#24292f]">
+            <div className="text-xs font-medium text-kumo-subtle">Repository</div>
+            <div className="mt-1 text-sm text-kumo-default">
               {env.repoUrl.replace(/^https?:\/\/(www\.)?github\.com\//, "")}
             </div>
           </div>
 
+          {isStartable && (
+            <HarnessSettingsFields
+              harness={env.harness}
+              backend={env.backend}
+              value={harnessSettings}
+              credentialStatus={credentialStatus}
+              disabled={starting}
+              onChange={(nextSettings) => {
+                setHarnessSettings(nextSettings);
+                setStartError(null);
+              }}
+            />
+          )}
+
           <div>
-            <div className="mb-2 text-xs font-medium text-[#57606a]">Plan</div>
-            {loading ? (
-              <div className="rounded border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2 text-sm text-[#57606a]">
-                Loading plans...
+            <div className="mb-2 text-xs font-medium text-kumo-subtle">Plan</div>
+            {!env.startupPlanId ? (
+              <div className="rounded border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-default">
+                No plan
               </div>
             ) : (
-              <div className="space-y-2">
-                <label className="flex cursor-pointer items-start gap-3 rounded border border-[#d0d7de] px-3 py-2">
-                  <input
-                    type="radio"
-                    name={`plan-choice-${env.slug}`}
-                    checked={choice === "none"}
-                    onChange={() => setChoice("none")}
-                    disabled={starting}
-                    className="mt-0.5"
-                  />
-                  <div className="min-w-0">
-                    <div className="text-sm font-medium text-[#24292f]">No plan</div>
-                    <div className="text-xs text-[#57606a]">
-                      Start the container without writing /.tiller/plan.md.
+              <div className="rounded border border-kumo-line bg-kumo-recessed px-3 py-3">
+                <div className="text-xs font-medium text-kumo-subtle">Selected plan</div>
+                {selectedPlanHref ? (
+                  <Link
+                    to={selectedPlanHref}
+                    onClick={onClose}
+                    className="mt-1 inline-flex max-w-full whitespace-normal break-words text-sm font-medium text-kumo-link hover:underline"
+                  >
+                    {selectedPlan ? selectedPlan.title || "Untitled plan" : "Selected plan"}
+                  </Link>
+                ) : (
+                  <div className="mt-1 text-sm font-medium text-kumo-default">
+                    {selectedPlan ? selectedPlan.title || "Untitled plan" : "Selected plan"}
+                  </div>
+                )}
+                {loading && (
+                  <div className="mt-1 text-xs text-kumo-subtle">Loading plan details...</div>
+                )}
+                {selectedPlan && (
+                  <>
+                    <div className="mt-1 text-xs text-kumo-subtle">
+                      Updated {formatTimestamp(selectedPlan.updatedAt)}
                     </div>
-                  </div>
-                </label>
-
-                <label className="flex cursor-pointer items-start gap-3 rounded border border-[#d0d7de] px-3 py-2">
-                  <input
-                    type="radio"
-                    name={`plan-choice-${env.slug}`}
-                    checked={choice === "specific"}
-                    onChange={() => setChoice("specific")}
-                    disabled={planArtifacts.length === 0 || starting}
-                    className="mt-0.5"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium text-[#24292f]">Choose specific plan</div>
-                    <select
-                      value={selectedPlanId}
-                      onChange={(event) => setSelectedPlanId(event.target.value)}
-                      disabled={choice !== "specific" || planArtifacts.length === 0 || starting}
-                      className="mt-2 w-full rounded border border-[#d0d7de] bg-white px-2 py-1.5 text-sm text-[#24292f] disabled:opacity-50"
+                    {selectedSpecificOutdated && (
+                      <div className="mt-2 rounded border border-kumo-warning/30 bg-kumo-warning-tint px-2 py-1.5 text-xs text-kumo-warning">
+                        This plan was saved against a different main commit.
+                      </div>
+                    )}
+                    <div
+                      aria-label="Full startup plan"
+                      data-testid="start-plan-body"
+                      className="mt-3 max-h-[min(18rem,35vh)] overflow-y-auto rounded border border-kumo-line bg-kumo-base px-3 py-3"
                     >
-                      {planArtifacts.map((plan) => (
-                        <option key={plan.id} value={plan.id}>
-                          {plan.title || "Untitled plan"}
-                          {isPlanOutdatedForMain(plan, repoMainCommit) ? " (main mismatch)" : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </label>
-
+                      <MarkdownContent>{renderArtifactBodyMarkdown(selectedPlan.body)}</MarkdownContent>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
 
-          {selectedPlan && choice === "specific" && !loading && (
-            <div className="rounded border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
-              <div className="text-xs font-medium text-[#57606a]">Selected plan</div>
-              <div className="mt-1 text-sm font-medium text-[#24292f]">{selectedPlan.title || "Untitled plan"}</div>
-              <div className="mt-1 text-xs text-[#57606a]">
-                Updated {formatTimestamp(selectedPlan.updatedAt)}
-              </div>
-              {selectedSpecificOutdated && (
-                <div className="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
-                  This plan was saved against a different main commit. You can still start with it because it was explicitly selected.
-                </div>
-              )}
-              <div className="mt-2 line-clamp-4 whitespace-pre-wrap text-sm text-[#24292f]">
-                {renderArtifactBodyMarkdown(selectedPlan.body)}
-              </div>
-            </div>
-          )}
-
-          {error && <p className="text-xs text-red-600">{error}</p>}
+          {planError && <p className="text-xs text-kumo-danger">{planError}</p>}
+          {startError && <p className="text-xs text-kumo-danger">{startError}</p>}
         </div>
 
-        <div className="flex justify-end gap-2 border-t border-[#d0d7de] px-5 py-4">
-          <button
+        <div className="flex shrink-0 justify-end gap-2 border-t border-kumo-line px-5 py-4">
+          <Button
             type="button"
+            variant="secondary"
+            size="sm"
             onClick={onClose}
             disabled={starting}
-            className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs text-[#57606a] hover:bg-[#f6f8fa] disabled:opacity-50"
           >
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
+            variant="primary"
+            size="sm"
             onClick={() => void handleStart()}
-            disabled={loading || starting}
-            className="rounded bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#0a5bc4] disabled:opacity-40"
+            loading={starting}
+            disabled={starting || !isStartable || !selectedAvailability?.available}
           >
             {starting ? "Starting..." : "Start"}
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+      </Dialog>
+    </Dialog.Root>
   );
 }
 

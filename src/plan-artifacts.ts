@@ -3,7 +3,7 @@ import type { Artifact, ArtifactRef, PlanArtifact, PlanStatus, ReviewArtifact } 
 
 export { renderArtifactBodyMarkdown } from "../api/coordination/planning";
 
-const PLAN_STATUSES: PlanStatus[] = ["draft", "todo", "completed", "archived"];
+const PLAN_STATUSES: PlanStatus[] = ["draft", "evaluating", "todo", "completed", "archived"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

@@ -1,11 +1,29 @@
-import type { GitHubRelease, TillerUpdateMetadata } from "./types";
+import type { GitHubRelease, SelfHostRuntimeMetadata, TillerUpdateMetadata } from "./types";
+import {
+  parseManagedSelfHostRuntime,
+  parseManagedSelfHostSandboxImageSourceId as parseManagedSandboxImageSourceId,
+} from "../../scripts/self-host-runtime-contract.mjs";
 
 export const PUBLIC_HUB_REPO = "paperwing-dev/tiller-hub";
 export const UPDATE_METADATA_PATH = "tiller-update.json";
 export const UPDATE_CHECK_CACHE_KEY = "tiller:update-check:v4";
-export const UPDATE_CACHE_TTL_SECONDS = 300;
+export const UPDATE_CACHE_TTL_SECONDS = 6 * 60 * 60;
+export const UPDATE_SERVICE_URL = "https://updates.paperwing.dev/tiller-hub/latest";
+export const UPDATE_SERVICE_TIMEOUT_MS = 1_500;
 
 const LATEST_RELEASE_URL = `https://api.github.com/repos/${PUBLIC_HUB_REPO}/releases/latest`;
+
+interface LatestReleaseUpdateMetadata {
+  update: TillerUpdateMetadata;
+  releaseNotesUrl: string;
+}
+
+export interface FetchLatestReleaseUpdateMetadataOptions {
+  currentVersion?: string | null;
+  channel?: "development" | "release";
+  updateServiceDisabled?: string | null;
+  timeoutMs?: number;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -20,6 +38,14 @@ export function isSafeManagedPath(value: string): boolean {
   return value === parts.join("/");
 }
 
+export function parseManagedSelfHostSandboxImageSourceId(image: string): string | null {
+  return parseManagedSandboxImageSourceId(image);
+}
+
+export function parseSelfHostRuntimeMetadata(value: unknown): SelfHostRuntimeMetadata | null {
+  return parseManagedSelfHostRuntime(value);
+}
+
 export function parseTillerUpdateMetadata(value: unknown): TillerUpdateMetadata | null {
   if (!isRecord(value)) return null;
   if (value.schemaVersion !== 1) return null;
@@ -30,6 +56,11 @@ export function parseTillerUpdateMetadata(value: unknown): TillerUpdateMetadata 
   if (typeof value.version !== "string" || !value.version.trim()) return null;
   if (typeof value.label !== "string" || !value.label.trim()) return null;
   if (!Array.isArray(value.managedFiles) || value.managedFiles.length === 0) return null;
+
+  const selfHostRuntime = value.selfHostRuntime === undefined
+    ? undefined
+    : parseSelfHostRuntimeMetadata(value.selfHostRuntime);
+  if (value.selfHostRuntime !== undefined && !selfHostRuntime) return null;
 
   const managedFiles: string[] = [];
   const seen = new Set<string>();
@@ -50,6 +81,7 @@ export function parseTillerUpdateMetadata(value: unknown): TillerUpdateMetadata 
     version: value.version.trim(),
     label: value.label.trim(),
     managedFiles,
+    ...(selfHostRuntime ? { selfHostRuntime } : {}),
   };
 }
 
@@ -95,6 +127,17 @@ function describeReleaseLookupFailure(status: number): string {
   return `GitHub release lookup failed: ${status}`;
 }
 
+function parseLatestReleaseUpdateMetadata(value: unknown): LatestReleaseUpdateMetadata | null {
+  if (!isRecord(value)) return null;
+  const update = parseTillerUpdateMetadata(value.update);
+  if (!update) return null;
+  if (typeof value.releaseNotesUrl !== "string" || !value.releaseNotesUrl.trim()) return null;
+  return {
+    update,
+    releaseNotesUrl: value.releaseNotesUrl.trim(),
+  };
+}
+
 async function fetchPublicUpdateMetadataAtRef(ref: string): Promise<TillerUpdateMetadata> {
   const response = await fetch(`https://raw.githubusercontent.com/${PUBLIC_HUB_REPO}/${encodeURIComponent(ref)}/${UPDATE_METADATA_PATH}`, {
     headers: {
@@ -112,10 +155,7 @@ async function fetchPublicUpdateMetadataAtRef(ref: string): Promise<TillerUpdate
   return parsed;
 }
 
-export async function fetchLatestReleaseUpdateMetadata(): Promise<{
-  update: TillerUpdateMetadata;
-  releaseNotesUrl: string;
-}> {
+async function fetchLatestReleaseUpdateMetadataFromGitHub(): Promise<LatestReleaseUpdateMetadata> {
   const latestRelease = await fetchLatestPublicHubReleaseRef();
   const update = await fetchPublicUpdateMetadataAtRef(latestRelease.tagName);
   if (normalizeVersionTag(update.version) !== normalizeVersionTag(latestRelease.tagName)) {
@@ -126,6 +166,51 @@ export async function fetchLatestReleaseUpdateMetadata(): Promise<{
     update,
     releaseNotesUrl: latestRelease.releaseNotesUrl,
   };
+}
+
+function isUpdateServiceDisabled(value: string | null | undefined): boolean {
+  return value?.trim() === "1";
+}
+
+async function fetchLatestReleaseUpdateMetadataFromService(
+  options: FetchLatestReleaseUpdateMetadataOptions,
+): Promise<LatestReleaseUpdateMetadata> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? UPDATE_SERVICE_TIMEOUT_MS);
+  try {
+    const response = await fetch(UPDATE_SERVICE_URL, {
+      signal: controller.signal,
+      headers: {
+        "X-Tiller-Version": options.currentVersion?.trim() || "unknown",
+        "X-Tiller-Channel": options.channel === "development" ? "development" : "release",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`Update service lookup failed: HTTP ${response.status}`);
+    }
+    const parsed = parseLatestReleaseUpdateMetadata(await response.json());
+    if (!parsed) {
+      throw new Error("Update service returned invalid metadata.");
+    }
+    return parsed;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function fetchLatestReleaseUpdateMetadata(
+  options: FetchLatestReleaseUpdateMetadataOptions = {},
+): Promise<LatestReleaseUpdateMetadata> {
+  if (!isUpdateServiceDisabled(options.updateServiceDisabled)) {
+    try {
+      return await fetchLatestReleaseUpdateMetadataFromService(options);
+    } catch {
+      // The public update service is an optimization and analytics collection
+      // point only. GitHub remains the authoritative fallback.
+    }
+  }
+
+  return fetchLatestReleaseUpdateMetadataFromGitHub();
 }
 
 export async function fetchLatestPublicHubReleaseRef(): Promise<{

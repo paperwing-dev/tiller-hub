@@ -1,25 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { fetchHostStatus, type HostStatus } from './api';
+import { fetchExecutionStatus, type ExecutionStatus } from './api';
 
 interface ConnectionsBadgeProps {
   hubUrl: string;
   hubConnected: boolean;
   hostRefreshNonce: number;
   showHost: boolean;
-}
-
-function formatRelative(iso: string, now: number): string {
-  const t = Date.parse(iso);
-  if (!Number.isFinite(t)) return iso;
-  const diffMs = Math.max(0, now - t);
-  const s = Math.floor(diffMs / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  return `${d}d ago`;
 }
 
 function truncateMid(value: string, max = 16): string {
@@ -29,50 +15,47 @@ function truncateMid(value: string, max = 16): string {
   return `${value.slice(0, head)}…${value.slice(-tail)}`;
 }
 
-function describeHostStatus(hostStatus: HostStatus | null, hostError: string | null): {
+function describeHostStatus(execution: ExecutionStatus | null, hostError: string | null): {
   title: string;
   detail: string;
   dotClassName: string;
 } {
   if (hostError) {
     return {
-      title: 'Host: status unavailable',
-      detail: 'Could not fetch host status from the hub.',
-      dotClassName: 'bg-[#d0d7de]',
+      title: 'Machine: status unavailable',
+      detail: 'Could not fetch execution status from the Hub.',
+      dotClassName: 'bg-kumo-fill',
     };
   }
 
-  switch (hostStatus?.state ?? 'not-registered') {
-    case 'registered-offline':
+  const hostStatus = execution?.selected.target === 'host'
+    ? execution.selectedHost
+    : execution?.candidate ?? null;
+  switch (hostStatus?.state ?? 'not_connected') {
+    case 'offline':
       return {
-        title: 'Host: registered, offline',
-        detail: 'The hub still has a registered host, but the live connection is offline.',
-        dotClassName: 'bg-red-500',
+        title: 'Machine: selected, offline',
+        detail: 'The selected execution machine is offline.',
+        dotClassName: 'bg-kumo-danger',
       };
-    case 'connected-no-gateway':
+    case 'incompatible':
       return {
-        title: 'Host: connected, gateway not configured',
-        detail: 'The host is connected, but it has not published a browser gateway.',
-        dotClassName: 'bg-[#d4a72c]',
+        title: 'Machine: update required',
+        detail: `Update this execution machine (${hostStatus.code.replaceAll('_', ' ')}).`,
+        dotClassName: 'bg-kumo-warning',
       };
-    case 'gateway-unavailable':
+    case 'ready':
       return {
-        title: 'Host: connected, gateway unavailable',
-        detail: 'The host is connected and has gateway config, but the live gateway is not available.',
-        dotClassName: 'bg-[#d4a72c]',
+        title: 'Machine: connected and ready',
+        detail: `${hostStatus.displayName} is ready.`,
+        dotClassName: 'bg-kumo-success',
       };
-    case 'gateway-available':
-      return {
-        title: 'Host: connected, gateway available',
-        detail: 'The host is connected and the published gateway is available.',
-        dotClassName: 'bg-green-500',
-      };
-    case 'not-registered':
+    case 'not_connected':
     default:
       return {
-        title: 'Host: not registered',
-        detail: 'No host machine has registered with this hub.',
-        dotClassName: 'bg-[#d0d7de]',
+        title: 'Machine: not connected',
+        detail: 'No execution machine is connected to this Hub.',
+        dotClassName: 'bg-kumo-fill',
       };
   }
 }
@@ -84,22 +67,21 @@ export default function ConnectionsBadge({
   showHost,
 }: ConnectionsBadgeProps) {
   const [open, setOpen] = useState(false);
-  const [hostStatus, setHostStatus] = useState<HostStatus | null>(null);
+  const [execution, setExecution] = useState<ExecutionStatus | null>(null);
   const [hostError, setHostError] = useState<string | null>(null);
-  const [now, setNow] = useState(() => Date.now());
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!showHost) {
-      setHostStatus(null);
+      setExecution(null);
       setHostError(null);
       return undefined;
     }
     let cancelled = false;
-    fetchHostStatus(hubUrl)
+    fetchExecutionStatus(hubUrl)
       .then((status) => {
         if (cancelled) return;
-        setHostStatus(status);
+        setExecution(status);
         setHostError(null);
       })
       .catch((err: unknown) => {
@@ -113,29 +95,16 @@ export default function ConnectionsBadge({
 
   useEffect(() => {
     if (!open) return;
-    const tick = setInterval(() => setNow(Date.now()), 15_000);
-    return () => clearInterval(tick);
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const handleDocClick = (e: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (!(e.target instanceof Node)) return;
-      if (!rootRef.current.contains(e.target)) setOpen(false);
-    };
     const handleEscape = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setOpen(false);
     };
-    document.addEventListener('mousedown', handleDocClick);
     document.addEventListener('keydown', handleEscape);
     return () => {
-      document.removeEventListener('mousedown', handleDocClick);
       document.removeEventListener('keydown', handleEscape);
     };
   }, [open]);
 
-  const hostState = describeHostStatus(hostStatus, hostError);
+  const hostState = describeHostStatus(execution, hostError);
 
   const title = useMemo(() => {
     const hubText = hubConnected ? 'Hub: connected' : 'Hub: offline';
@@ -145,17 +114,26 @@ export default function ConnectionsBadge({
   }, [hubConnected, hostState.title, showHost]);
 
   return (
-    <div ref={rootRef} className="relative inline-flex items-center">
+    <div
+      ref={rootRef}
+      className="relative inline-flex items-center"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+      }}
+    >
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
         title={title}
         aria-label={title}
-        className="inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a] hover:bg-[#eaeef2]"
+        aria-expanded={open}
+        className="inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-kumo-subtle hover:bg-kumo-tint"
       >
         <span className="inline-flex items-center gap-1">
           <span
-            className={`inline-block h-2 w-2 rounded-full ${hubConnected ? 'bg-green-500' : 'bg-red-500'}`}
+            className={`inline-block h-2 w-2 rounded-full ${hubConnected ? 'bg-kumo-success' : 'bg-kumo-danger'}`}
           />
           <span>Hub</span>
         </span>
@@ -164,20 +142,20 @@ export default function ConnectionsBadge({
             <span
               className={`inline-block h-2 w-2 rounded-full ${hostState.dotClassName}`}
             />
-            <span>Host</span>
+            <span>Machine</span>
           </span>
         )}
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-72 rounded-md border border-[#d0d7de] bg-white shadow-lg text-left">
-          <div className="px-3 py-2 border-b border-[#eaeef2]">
+        <div className="absolute right-0 top-full mt-1 z-20 w-72 rounded-md border border-kumo-line bg-kumo-elevated shadow-lg text-left">
+          <div className="px-3 py-2 border-b border-kumo-hairline">
             <div className="flex items-center gap-2">
               <span
-                className={`inline-block h-2 w-2 rounded-full ${hubConnected ? 'bg-green-500' : 'bg-red-500'}`}
+                className={`inline-block h-2 w-2 rounded-full ${hubConnected ? 'bg-kumo-success' : 'bg-kumo-danger'}`}
               />
-              <span className="text-xs font-semibold text-[#24292f]">Hub</span>
-              <span className="ml-auto text-[11px] text-[#57606a]">
+              <span className="text-xs font-semibold text-kumo-default">Hub</span>
+              <span className="ml-auto text-[11px] text-kumo-subtle">
                 {hubConnected ? 'Connected' : 'Offline'}
               </span>
             </div>
@@ -189,16 +167,15 @@ export default function ConnectionsBadge({
                 <span
                   className={`inline-block h-2 w-2 rounded-full ${hostState.dotClassName}`}
                 />
-                <span className="text-xs font-semibold text-[#24292f]">Host</span>
+                <span className="text-xs font-semibold text-kumo-default">Your machine</span>
               </div>
-              <p className="mt-1 text-[11px] text-[#57606a]">
+              <p className="mt-1 text-[11px] text-kumo-subtle">
                 {hostState.detail}
               </p>
 
               <HostConnectionDetails
-                hostStatus={hostStatus}
+                execution={execution}
                 hostError={hostError}
-                now={now}
               />
             </div>
           )}
@@ -209,24 +186,24 @@ export default function ConnectionsBadge({
 }
 
 export function HostConnectionDetails({
-  hostStatus,
+  execution,
   hostError,
-  now,
 }: {
-  hostStatus: HostStatus | null;
+  execution: ExecutionStatus | null;
   hostError: string | null;
-  now: number;
 }) {
-  const machine = hostStatus?.machine ?? null;
+  const machine = execution?.selectedHost?.state !== "offline"
+    ? execution?.selectedHost ?? (execution?.candidate.state !== "not_connected" ? execution.candidate : null)
+    : execution.selectedHost;
 
   return (
     <>
-      {machine && (
+      {machine && machine.state !== "not_connected" && (
         <dl className="mt-2 space-y-1 text-[11px]">
           <div className="flex items-center gap-2">
-            <dt className="w-20 text-[#57606a]">Machine</dt>
+            <dt className="w-20 text-kumo-subtle">Machine</dt>
             <dd
-              className="flex-1 font-mono text-[#24292f] truncate"
+              className="flex-1 font-mono text-kumo-default truncate"
               title={machine.machineId}
             >
               {truncateMid(machine.machineId, 20)}
@@ -236,24 +213,22 @@ export function HostConnectionDetails({
               onClick={() => {
                 void navigator.clipboard?.writeText(machine.machineId);
               }}
-              className="text-[#57606a] hover:text-[#24292f]"
+              className="text-kumo-subtle hover:text-kumo-default"
               title="Copy machine id"
             >
               ⧉
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <dt className="w-20 text-[#57606a]">Since</dt>
-            <dd className="flex-1 text-[#24292f]" title={machine.connectedAt}>
-              {formatRelative(machine.connectedAt, now)}
-            </dd>
+            <dt className="w-20 text-kumo-subtle">Name</dt>
+            <dd className="flex-1 truncate text-kumo-default">{machine.displayName}</dd>
           </div>
         </dl>
       )}
 
       {hostError && (
-        <p className="mt-2 text-[11px] text-red-600" title={hostError}>
-          Could not fetch host status.
+        <p className="mt-2 text-[11px] text-kumo-danger" title={hostError}>
+          Could not fetch execution status.
         </p>
       )}
     </>

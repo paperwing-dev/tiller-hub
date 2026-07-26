@@ -1,9 +1,34 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
+import { Badge } from "@cloudflare/kumo/components/badge";
+import { Button } from "@cloudflare/kumo/components/button";
+import { Dialog } from "@cloudflare/kumo/components/dialog";
+import { Input } from "@cloudflare/kumo/components/input";
+import { LayerCard } from "@cloudflare/kumo/components/layer-card";
+import { Select } from "@cloudflare/kumo/components/select";
 import { useToast } from "./Toast";
-import type { HubUpdateRepoCandidate, SetupStatus, VerifyModelAuthResult } from "./api";
-import { detectSelfUpdateRepo, fetchSetupStatus, returnToHostedTiller, selectSelfUpdateRepo, submitSetup, verifyModelAuth } from "./api";
+import { getStoredThemePreference, setThemePreference, type ThemePreference } from "./theme";
+import type { ExecutionStatus, HubUpdateRepoCandidate, SetupStatus, VerifyModelAuthResult } from "./api";
+import {
+  detectSelfUpdateRepo,
+  fetchExecutionStatus,
+  fetchSetupStatus,
+  renewWorkersDevAccess,
+  saveBillingMode,
+  selectSelfUpdateRepo,
+  setExecutionBackend,
+  submitSetup,
+  verifyModelAuth,
+} from "./api";
+import type { BillingMode } from "../shared/billing";
 import { useGitHubRepositories } from "./useGitHubRepositories";
+import { KIMI_K2_7_CODE } from "../shared/harness-catalog";
+import {
+  CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES,
+  CLOUDFLARE_IDLE_TIMEOUT_MAX_MINUTES,
+  CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES,
+  isCloudflareIdleTimeoutMinutes,
+} from "../shared/cloudflare-timeout";
 
 // Legacy GitHub App controls are commented out inside GitHubAppSettings. If they
 // are restored, also restore these imports:
@@ -12,7 +37,6 @@ import { useGitHubRepositories } from "./useGitHubRepositories";
 // import { githubRepositoryKey } from "./useGitHubRepositories";
 
 const HUB_URL = window.location.origin;
-const CODEX_IMPORT_COMMAND = "tiller auth import codex";
 
 interface SettingsPageProps {
   status: SetupStatus;
@@ -33,132 +57,89 @@ function Card({
 }) {
   const toneClasses =
     tone === "success"
-      ? "border-[#1a7f37]/25 bg-[#f0fff4]"
+      ? "ring-kumo-success/25 bg-kumo-success-tint"
       : tone === "warning"
-        ? "border-[#d4a72c]/30 bg-[#fff8c5]"
-        : "border-[#d0d7de] bg-white";
+        ? "ring-kumo-warning/30 bg-kumo-warning-tint"
+        : "";
 
   return (
-    <section className={`rounded-2xl border p-5 ${toneClasses}`}>
-      <h3 className="text-base font-semibold text-[#24292f]">{title}</h3>
-      <p className="mt-1 text-sm text-[#57606a]">{description}</p>
+    <LayerCard render={<section />} className={`p-5 ${toneClasses}`}>
+      <h3 className="text-base font-semibold text-kumo-strong">{title}</h3>
+      <p className="mt-1 text-sm text-kumo-subtle">{description}</p>
       <div className="mt-4">{children}</div>
-    </section>
+    </LayerCard>
   );
 }
 
-function shellSingleQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
+function AppearanceRow() {
+  const [preference, setPreference] = useState<ThemePreference>(() => getStoredThemePreference());
+
+  return (
+    <Select
+      label="Theme"
+      className="w-[200px]"
+      value={preference}
+      onValueChange={(value) => {
+        const next = (value ?? "system") as ThemePreference;
+        setPreference(next);
+        setThemePreference(next);
+      }}
+      items={{ system: "System", light: "Light", dark: "Dark" }}
+    />
+  );
 }
 
-function buildCodexImportScript(hubUrl: string): string {
-  return `bash <<'BASH'
-set -euo pipefail
+function WorkersDevAccessLifecycleCard({ status }: { status: SetupStatus }) {
+  const [renewing, setRenewing] = useState(false);
+  const addToast = useToast();
+  if (!status.tokenExpiresAt) return null;
+  const parsedExpiration = Date.parse(status.tokenExpiresAt);
+  const expiration = Number.isFinite(parsedExpiration)
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: "long" }).format(new Date(parsedExpiration))
+    : status.tokenExpiresAt;
 
-TILLER_HUB_URL=${shellSingleQuote(hubUrl)} node <<'NODE'
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-
-const REFRESH_WINDOW_SECONDS = 3600;
-
-function normalizeUrl(value) {
-  return String(value || "").trim().replace(/\\/+$/, "");
-}
-
-function readJsonFile(filePath, required) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch (error) {
-    if (!required && error && error.code === "ENOENT") return {};
-    throw new Error(\`Could not read \${filePath}: \${error.message}\`);
-  }
-}
-
-function deriveExpiresInSeconds(lastRefresh) {
-  if (typeof lastRefresh !== "string" || !lastRefresh.trim()) return undefined;
-  const refreshedAt = Date.parse(lastRefresh);
-  if (!Number.isFinite(refreshedAt)) return undefined;
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - refreshedAt) / 1000));
-  return Math.max(0, Math.min(REFRESH_WINDOW_SECONDS, REFRESH_WINDOW_SECONDS - ageSeconds));
-}
-
-async function main() {
-  if (typeof fetch !== "function") {
-    throw new Error("This script requires Node.js 18 or newer.");
-  }
-
-  const configPath = process.env.TILLER_CONFIG_PATH || path.join(os.homedir(), ".config", "tiller", "config.json");
-  const codexAuthPath = process.env.TILLER_CODEX_AUTH_PATH || path.join(os.homedir(), ".codex", "auth.json");
-  const config = readJsonFile(configPath, false);
-  const hubUrl = normalizeUrl(process.env.TILLER_HUB_URL || config.hubUrl);
-  if (!hubUrl) {
-    throw new Error("Missing hub URL.");
-  }
-
-  const codexAuth = readJsonFile(codexAuthPath, true);
-  if (codexAuth.auth_mode !== "chatgpt") {
-    throw new Error("Codex is not logged in with subscription auth. Run codex login first.");
-  }
-
-  const accessToken = typeof codexAuth.tokens?.access_token === "string" ? codexAuth.tokens.access_token.trim() : "";
-  const refreshToken = typeof codexAuth.tokens?.refresh_token === "string" ? codexAuth.tokens.refresh_token.trim() : "";
-  const idToken = typeof codexAuth.tokens?.id_token === "string" ? codexAuth.tokens.id_token.trim() : "";
-  if (!accessToken || !refreshToken) {
-    throw new Error(\`Missing Codex subscription tokens in \${codexAuthPath}.\`);
-  }
-
-  const headers = { "Content-Type": "application/json" };
-  const clientId = String(process.env.CF_ACCESS_CLIENT_ID || config.clientId || "").trim();
-  const clientSecret = String(process.env.CF_ACCESS_CLIENT_SECRET || config.clientSecret || "").trim();
-  if ((clientId && !clientSecret) || (!clientId && clientSecret)) {
-    throw new Error("Cloudflare Access credentials are incomplete. If Tiller is installed, run tiller once to refresh the saved hub config.");
-  }
-  if (clientId && clientSecret) {
-    headers["CF-Access-Client-Id"] = clientId;
-    headers["CF-Access-Client-Secret"] = clientSecret;
-  }
-
-  const expiresIn = deriveExpiresInSeconds(codexAuth.last_refresh);
-  const body = {
-    access_token: accessToken,
-    refresh_token: refreshToken,
-    ...(idToken ? { id_token: idToken } : {}),
-    ...(expiresIn != null ? { expires_in: expiresIn } : {}),
-  };
-
-  const response = await fetch(\`\${hubUrl}/api/auth/openai/seed\`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  const text = await response.text();
-  let payload = {};
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch {
-    payload = {};
-  }
-
-  if (!response.ok) {
-    const detail = typeof payload.error === "string" ? payload.error : text.slice(0, 300) || \`HTTP \${response.status}\`;
-    if (response.status === 401 || response.status === 403 || /Cloudflare Access|<html/i.test(detail)) {
-      throw new Error(\`\${detail}\\nHub access failed. If Tiller is installed, run tiller auth import codex instead.\`);
+  async function renew() {
+    setRenewing(true);
+    try {
+      const job = await renewWorkersDevAccess(HUB_URL);
+      window.location.assign(job.connectUrl);
+    } catch (error) {
+      setRenewing(false);
+      addToast({
+        title: "Cloudflare renewal could not start",
+        body: error instanceof Error ? error.message : String(error),
+        variant: "error",
+      });
     }
-    throw new Error(detail);
   }
 
-  const account = typeof payload.account_id === "string" && payload.account_id ? \` for \${payload.account_id}\` : "";
-  console.log(\`Imported Codex subscription login\${account}.\`);
+  return (
+    <Card
+      title="Cloudflare Access"
+      description={`CLI and agent access valid until ${expiration}`}
+      tone={status.renewalRecommended ? "warning" : "success"}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-kumo-default">
+            CLI and agent access valid until {expiration}
+          </p>
+          <p className={`mt-1 text-xs ${status.renewalRecommended ? "text-kumo-warning" : "text-kumo-subtle"}`}>
+            {status.renewalRecommended
+              ? "Renew within 30 days to keep existing CLI, machine, and workload connections active."
+              : "Renewal keeps the existing client ID and secret; connected machines and processes do not restart."}
+          </p>
+        </div>
+        <Button variant="primary" size="sm" onClick={() => void renew()} disabled={renewing} loading={renewing}>
+          {renewing ? "Opening Cloudflare..." : "Renew with Cloudflare"}
+        </Button>
+      </div>
+    </Card>
+  );
 }
 
-main().catch((error) => {
-  console.error(\`[tiller] \${error.message}\`);
-  process.exit(1);
-});
-NODE
-BASH`;
+export function buildCodexImportCommand(hubUrl: string): string {
+  return `npx --yes @paperwing-dev/tiller@latest auth import codex --hub-url ${hubUrl}`;
 }
 
 function codexSubscriptionStatus(status: SetupStatus): {
@@ -166,6 +147,15 @@ function codexSubscriptionStatus(status: SetupStatus): {
   detail: string;
   tone: "success" | "warning" | "neutral";
 } {
+  if (status.openaiBillingMode !== "subscription") {
+    return {
+      title: status.hasChatGPTAuth ? "Configured · inactive" : "Not configured · inactive",
+      detail: status.openaiBillingMode === "api"
+        ? "OpenAI API mode is active. The imported Codex subscription is not used by new launches."
+        : "Select OpenAI Subscription to activate this route for new launches.",
+      tone: "neutral",
+    };
+  }
   if (status.chatgptAuthStatus === "needs_reconnect") {
     return {
       title: "Subscription needs re-import",
@@ -174,96 +164,84 @@ function codexSubscriptionStatus(status: SetupStatus): {
     };
   }
 
-  if (status.openaiPlannerAvailable && status.openaiPlannerRoute === "api-key") {
+  if (status.chatgptAuthStatus === "temporarily_unavailable") {
     return {
-      title: "API key fallback active",
-      detail: "The OpenAI planner is using the configured API key.",
-      tone: "success",
+      title: "Subscription temporarily unavailable",
+      detail: "Tiller preserved the imported login and will retry without switching an active runtime to API billing.",
+      tone: "warning",
     };
   }
 
-  if (status.openaiPlannerAvailable && status.openaiPlannerRoute === "subscription-gateway") {
+  if (status.openaiPlannerAvailable && status.openaiPlannerRoute === "subscription-app-server") {
     return {
       title: "Subscription active",
-      detail: "The OpenAI planner is using the imported Codex subscription through the Subscription Gateway.",
+      detail: "New Codex launch profiles use the imported subscription through the app-server runtime.",
       tone: "success",
     };
   }
 
   if (status.hasChatGPTAuth || status.chatgptAuthStatus === "refreshing") {
-    if (!status.hostRegistered) {
+    if (status.codexRouteStatus === "runtime_update_required") {
       return {
         title: "Subscription imported",
-        detail: "The subscription route stays inactive until a Tiller Self Host registers and publishes its Subscription Gateway.",
+        detail: "The selected execution backend needs a compatible runtime update.",
         tone: "warning",
       };
     }
-
-    if (!status.hostConnected) {
+    if (status.codexRouteStatus === "backend_offline") {
       return {
         title: "Subscription imported",
-        detail: "The subscription route stays inactive until the registered Tiller Self Host reconnects.",
+        detail: "The selected execution backend is offline.",
         tone: "warning",
       };
     }
-
-    if (!status.hostGatewayConfigured) {
+    if (status.codexRouteStatus === "environment_not_connected") {
       return {
         title: "Subscription imported",
-        detail: "The subscription route stays inactive until the Subscription Gateway is configured and published.",
+        detail: "The selected execution machine is registered but not connected.",
         tone: "warning",
       };
     }
-
-    if (!status.hostGatewayAvailable) {
+    if (status.codexRouteStatus === "authentication_unavailable") {
       return {
-        title: "Subscription imported",
-        detail: "The subscription route stays inactive until the published Subscription Gateway becomes reachable.",
+        title: "Authentication unavailable",
+        detail: status.openaiPlannerReason || "The selected OpenAI authentication route is unavailable.",
         tone: "warning",
       };
     }
 
     return {
       title: "Subscription imported",
-      detail: status.openaiPlannerReason || "The subscription route stays inactive until the published Subscription Gateway is healthy.",
+      detail: status.openaiPlannerReason || "The selected Codex runtime is not ready for a new launch.",
       tone: "warning",
     };
   }
 
   if (status.hasOpenAIKey) {
     return {
-      title: "API key fallback configured",
-      detail: "Hosted Tiller Codex environments use the configured API key.",
+      title: "Subscription not imported",
+      detail: "The configured OpenAI API key is inactive while OpenAI Subscription mode is selected.",
       tone: "warning",
     };
   }
 
   return {
     title: "Subscription not imported",
-    detail: "Import an existing Codex subscription to enable the Self Host OpenAI planner through the Subscription Gateway.",
+    detail: "Import an existing Codex subscription to enable subscription-backed Codex launches.",
     tone: "neutral",
   };
 }
 
-function statusToneClasses(tone: "success" | "warning" | "neutral") {
-  if (tone === "success") {
-    return {
-      title: "text-[#1a7f37]",
-      dot: "bg-[#1a7f37]",
-    };
+function codexBackendReadinessLabel(status: SetupStatus["codexRouteStatus"]): string {
+  switch (status) {
+    case "available": return "Ready";
+    case "direct_api": return "API key ready";
+    case "backend_offline": return "Backend offline";
+    case "runtime_update_required": return "Runtime update required";
+    case "environment_not_connected": return "Environment not connected";
+    case "authentication_unavailable": return "Authentication unavailable";
+    case "unavailable": return "Unavailable";
   }
-
-  if (tone === "warning") {
-    return {
-      title: "text-[#9a6700]",
-      dot: "bg-[#d4a72c]",
-    };
-  }
-
-  return {
-    title: "text-[#24292f]",
-    dot: "bg-[#d0d7de]",
-  };
 }
 
 function visibleGitHubOwnersForUpdateRepo(status: SetupStatus["selfUpdateRepo"]): string[] {
@@ -276,68 +254,6 @@ function formatVisibleGitHubOwners(owners: string[]): string {
   return owners.join(", ");
 }
 
-function hostRuntimeStatus(status: SetupStatus): {
-  title: string;
-  detail: string;
-  tone: "success" | "warning" | "neutral";
-} {
-  if (!status.hostRegistered) {
-    return {
-      title: "Not registered",
-      detail: status.isLocalDev
-        ? "Run `tiller host` to register a host machine with this hub."
-        : "Connect a Tiller Self Host machine to this hub to make self-host environments available.",
-      tone: "neutral",
-    };
-  }
-
-  if (!status.hostConnected) {
-    return {
-      title: "Registered, offline",
-      detail: "The hub still has a registered host record, but the live host session is offline.",
-      tone: "warning",
-    };
-  }
-
-  return {
-    title: "Connected",
-    detail: "The hub currently has a live route to the registered Tiller Self Host.",
-    tone: "success",
-  };
-}
-
-function hostGatewayStatus(status: SetupStatus): {
-  title: string;
-  detail: string;
-  tone: "success" | "warning" | "neutral";
-} {
-  if (!status.hostGatewayConfigured) {
-    return {
-      title: "Not configured",
-      detail: "The Tiller Self Host is not publishing a Subscription Gateway yet.",
-      tone: status.hostConnected ? "warning" : "neutral",
-    };
-  }
-
-  if (!status.hostGatewayAvailable) {
-    return {
-      title: "Configured, unavailable",
-      detail: "A Subscription Gateway URL is configured, but it is not currently available through the live self-host connection.",
-      tone: "warning",
-    };
-  }
-
-  return {
-    title: "Available",
-    detail: status.hostGatewayMode === "named"
-      ? "The Subscription Gateway is available through a named tunnel."
-      : status.hostGatewayMode === "quick"
-        ? "The Subscription Gateway is available through a quick tunnel."
-        : "The Subscription Gateway is available.",
-    tone: "success",
-  };
-}
-
 // ── Credential row ───────────────────────────────────────────────
 
 interface CredentialDef {
@@ -345,33 +261,25 @@ interface CredentialDef {
   description?: string;
   secretKey: string;
   configured: boolean;
+  active: boolean;
   testable: boolean;
   partial?: boolean;
   help?: ReactNode;
 }
 
-function getCredentialStatusChip(state: "configured" | "partial" | "missing") {
+function getCredentialStatusChip(state: "configured" | "partial" | "missing", active: boolean): {
+  label: string;
+  variant: "success" | "warning" | "neutral";
+} {
   if (state === "configured") {
-    return {
-      label: "Configured",
-      dotClassName: "bg-[#1a7f37]",
-      textClassName: "text-[#1a7f37]",
-    };
+    return { label: `Configured · ${active ? "active" : "inactive"}`, variant: active ? "success" : "neutral" };
   }
 
   if (state === "partial") {
-    return {
-      label: "Incomplete",
-      dotClassName: "bg-[#d4a72c]",
-      textClassName: "text-[#9a6700]",
-    };
+    return { label: `Incomplete · ${active ? "active" : "inactive"}`, variant: "warning" };
   }
 
-  return {
-    label: "Not configured",
-    dotClassName: "bg-[#d0d7de]",
-    textClassName: "text-[#57606a]",
-  };
+  return { label: `Not configured · ${active ? "active" : "inactive"}`, variant: active ? "warning" : "neutral" };
 }
 
 function getCredentialTestResultText(testResult: VerifyModelAuthResult | null, fallbackOkText: string): {
@@ -385,20 +293,20 @@ function getCredentialTestResultText(testResult: VerifyModelAuthResult | null, f
   if (!testResult.ok) {
     return {
       text: `— ${testResult.error || "Invalid"}`,
-      className: "text-[#cf222e]",
+      className: "text-kumo-danger",
     };
   }
 
   if (testResult.warning) {
     return {
       text: `— ${testResult.warning}`,
-      className: "text-[#9a6700]",
+      className: "text-kumo-warning",
     };
   }
 
   return {
     text: testResult.note ? `— ${testResult.note}` : fallbackOkText,
-    className: "text-[#1a7f37]",
+    className: "text-kumo-success",
   };
 }
 
@@ -406,6 +314,7 @@ function CredentialRowFrame({
   label,
   description,
   status,
+  active,
   testResult,
   okText,
   canTest,
@@ -420,6 +329,7 @@ function CredentialRowFrame({
   label: string;
   description?: string;
   status: "configured" | "partial" | "missing";
+  active: boolean;
   testResult: VerifyModelAuthResult | null;
   okText: string;
   canTest: boolean;
@@ -431,20 +341,19 @@ function CredentialRowFrame({
   error: string | null;
   children?: ReactNode;
 }) {
-  const statusChip = getCredentialStatusChip(status);
+  const statusChip = getCredentialStatusChip(status, active);
   const testResultText = getCredentialTestResultText(testResult, okText);
 
   return (
-    <div className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
+    <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-[#24292f]">{label}</p>
-          {description && <p className="mt-0.5 text-xs text-[#57606a]">{description}</p>}
+          <p className="text-sm font-semibold text-kumo-default">{label}</p>
+          {description && <p className="mt-0.5 text-xs text-kumo-subtle">{description}</p>}
           <div className="mt-2 flex items-center gap-2">
-            <span className={`inline-flex items-center gap-1.5 text-xs ${statusChip.textClassName}`}>
-              <span className={`inline-block h-2 w-2 rounded-full ${statusChip.dotClassName}`} />
+            <Badge variant={statusChip.variant} appearance="dot">
               {statusChip.label}
-            </span>
+            </Badge>
 
             {testResultText && (
               <span className={`text-xs ${testResultText.className}`}>
@@ -456,30 +365,26 @@ function CredentialRowFrame({
 
         <div className="flex items-center gap-2 pt-0.5">
           {canTest && !editing && (
-            <button
-              type="button"
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={() => void onTest()}
-              disabled={testing}
-              className="rounded border border-[#d0d7de] bg-white px-2.5 py-1 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-40"
+              loading={testing}
             >
               {testing ? "Testing..." : "Test"}
-            </button>
+            </Button>
           )}
           {!editing && (
-            <button
-              type="button"
-              onClick={onStartEdit}
-              className="rounded border border-[#d0d7de] bg-white px-2.5 py-1 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
-            >
+            <Button variant="secondary" size="sm" onClick={onStartEdit}>
               {actionLabel}
-            </button>
+            </Button>
           )}
         </div>
       </div>
 
       {children}
 
-      {error && <p className="mt-2 text-xs text-[#cf222e]">{error}</p>}
+      {error && <p className="mt-2 text-xs text-kumo-danger">{error}</p>}
     </div>
   );
 }
@@ -533,6 +438,7 @@ function CredentialRow({
       label={def.label}
       description={def.description}
       status={def.configured ? "configured" : def.partial ? "partial" : "missing"}
+      active={def.active}
       testResult={testResult}
       okText="— Key is valid"
       canTest={def.configured && def.testable}
@@ -549,35 +455,38 @@ function CredentialRow({
       {def.help}
       {editing && (
         <div className="mt-3 flex gap-2">
-          <input
+          <Input
             type="password"
+            size="sm"
             value={value}
             onChange={(e) => setValue(e.target.value)}
             placeholder={`Paste ${def.label.toLowerCase()}`}
+            aria-label={`Paste ${def.label.toLowerCase()}`}
             autoFocus
             disabled={saving}
-            className="flex-1 rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-sm text-[#24292f] placeholder:text-[#6e7781] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+            className="flex-1"
           />
-          <button
-            type="button"
+          <Button
+            variant="primary"
+            size="sm"
             onClick={() => void handleSave()}
+            loading={saving}
             disabled={saving || !value.trim()}
-            className="rounded bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0a5bc4] disabled:opacity-40"
           >
             {saving ? "Saving..." : "Save"}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => {
               setEditing(false);
               setValue("");
               setError(null);
             }}
             disabled={saving}
-            className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#57606a] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
           >
             Cancel
-          </button>
+          </Button>
         </div>
       )}
     </CredentialRowFrame>
@@ -586,8 +495,8 @@ function CredentialRow({
 
 function ClaudeSubscriptionSetupHint() {
   return (
-    <div className="mt-3 rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2">
-      <ol className="list-decimal space-y-1 pl-4 text-xs text-[#57606a]">
+    <div className="mt-3 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2">
+      <ol className="list-decimal space-y-1 pl-4 text-xs text-kumo-subtle">
         <li>
           On a trusted machine where you can log in to Claude Code, run{" "}
           <code>claude setup-token</code>.
@@ -597,6 +506,45 @@ function ClaudeSubscriptionSetupHint() {
           token here.
         </li>
       </ol>
+    </div>
+  );
+}
+
+function BillingModeSelector({
+  provider,
+  current,
+  saving,
+  onChange,
+}: {
+  provider: "Claude" | "OpenAI";
+  current: BillingMode | null;
+  saving: boolean;
+  onChange: (mode: BillingMode) => Promise<void>;
+}) {
+  return (
+    <div className="rounded-xl border border-kumo-line bg-kumo-recessed px-4 py-3">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-kumo-default">{provider} billing mode</p>
+          <p className="mt-0.5 text-xs text-kumo-subtle">
+            {current ? `${current === "subscription" ? "Subscription" : "API"} is active for new launch claims.` : "No mode selected yet."}
+          </p>
+        </div>
+        <Select
+          aria-label={`${provider} billing mode`}
+          className="w-[180px]"
+          value={current ?? "unselected"}
+          onValueChange={(value) => {
+            if (value === "subscription" || value === "api") void onChange(value);
+          }}
+          disabled={saving}
+          renderValue={(value) => value === "subscription" ? "Subscription" : value === "api" ? "API" : "Not selected"}
+        >
+          <Select.Option value="unselected" disabled={current !== null}>Not selected</Select.Option>
+          <Select.Option value="subscription">Subscription</Select.Option>
+          <Select.Option value="api">API</Select.Option>
+        </Select>
+      </div>
     </div>
   );
 }
@@ -616,49 +564,75 @@ function CodexSubscriptionRow({
   onCheckStatus: () => void;
   checkingStatus: boolean;
 }) {
+  const credentialStatus = getCredentialStatusChip(
+    status.chatgptAuthStatus === "missing" ? "missing" : "configured",
+    status.openaiBillingMode === "subscription",
+  );
   return (
-    <div className="rounded-xl border border-[#d0d7de] bg-[#f6f8fa] px-4 py-3">
-      <p className="text-sm font-semibold text-[#24292f]">Codex Subscription Login</p>
+    <div className="rounded-xl border border-kumo-line bg-kumo-recessed px-4 py-3">
+      <p className="text-sm font-semibold text-kumo-default">Codex Subscription Login</p>
+      <div className="mt-2">
+        <Badge variant={credentialStatus.variant} appearance="dot">
+          {credentialStatus.label}
+        </Badge>
+      </div>
       <p
         className={`mt-2 text-sm font-medium ${
           codexStatus.tone === "success"
-            ? "text-[#1a7f37]"
+            ? "text-kumo-success"
             : codexStatus.tone === "warning"
-              ? "text-[#9a6700]"
-              : "text-[#24292f]"
+              ? "text-kumo-warning"
+              : "text-kumo-default"
         }`}
       >
         {codexStatus.title}
       </p>
-      <p className="mt-1 text-xs text-[#57606a]">{codexStatus.detail}</p>
+      <p className="mt-1 text-xs text-kumo-subtle">{codexStatus.detail}</p>
+
+      {status.openaiBillingMode === "subscription" && (
+        <dl className="mt-3 grid gap-1 text-xs">
+          <div className="flex items-center justify-between gap-3">
+            <dt className="text-kumo-subtle">Cloudflare Containers</dt>
+            <dd className="font-medium text-kumo-default">
+              {codexBackendReadinessLabel(status.codexBackendReadiness.cf)}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <dt className="text-kumo-subtle">Your machine</dt>
+            <dd className="font-medium text-kumo-default">
+              {codexBackendReadinessLabel(status.codexBackendReadiness.host)}
+            </dd>
+          </div>
+        </dl>
+      )}
 
       <div className="mt-3 flex flex-wrap gap-2">
-        <button
-          type="button"
+        <Button
+          variant="secondary"
+          size="sm"
           onClick={onCheckStatus}
-          disabled={checkingStatus}
-          className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+          loading={checkingStatus}
         >
           {checkingStatus ? "Checking..." : "Check status"}
-        </button>
-        <button
-          type="button"
-          className="rounded border border-[#0969da] bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0860ca] disabled:cursor-not-allowed disabled:border-[#d0d7de] disabled:bg-[#f6f8fa] disabled:text-[#8c959f]"
+        </Button>
+        <Button
+          variant="primary"
+          size="sm"
           onClick={onImport}
           disabled={importDisabled}
           title={importDisabled ? "Codex login is already imported. Check status to refresh the connection state." : undefined}
         >
           Import Codex Login
-        </button>
+        </Button>
       </div>
-      <p className="mt-2 text-xs text-[#57606a]">
+      <p className="mt-2 text-xs text-kumo-subtle">
         {importDisabled
           ? "Codex login is already imported. Use Check status to refresh the connection state."
           : "Run the import from the computer where Codex is already logged in."}
       </p>
-      {!status.hostConnected && (
-        <p className="mt-2 text-xs text-[#9a6700]">
-          Keep <code>tiller host</code> running when you want Tiller Self Host Codex environments or the OpenAI planner
+      {status.hostRegistered && !status.hostConnected && (
+        <p className="mt-2 text-xs text-kumo-warning">
+          Keep <code>tiller host</code> running when you want Codex workloads or the OpenAI planner on Your machine
           to use this subscription route.
         </p>
       )}
@@ -666,80 +640,134 @@ function CodexSubscriptionRow({
   );
 }
 
-function CodexImportDialog({ onClose }: { onClose: () => void }) {
-  const [copied, setCopied] = useState<"script" | "command" | null>(null);
-  const script = buildCodexImportScript(HUB_URL);
+export function CodexImportDialog({
+  onClose,
+  onImported,
+  hubUrl = HUB_URL,
+}: {
+  onClose: () => void;
+  onImported: () => Promise<void>;
+  hubUrl?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [importDetected, setImportDetected] = useState(false);
+  const command = buildCodexImportCommand(hubUrl);
 
-  async function copy(value: string, kind: "script" | "command") {
-    await navigator.clipboard.writeText(value);
-    setCopied(kind);
-    window.setTimeout(() => setCopied((current) => (current === kind ? null : current)), 1800);
+  useEffect(() => {
+    if (importDetected) return;
+    let disposed = false;
+    let checking = false;
+
+    async function checkForImport() {
+      if (checking || disposed) return;
+      checking = true;
+      try {
+        const latest = await fetchSetupStatus(hubUrl);
+        if (
+          !disposed
+          && latest.hasChatGPTAuth
+          && (latest.chatgptAuthStatus === "connected" || latest.chatgptAuthStatus === "refreshing")
+        ) {
+          setImportDetected(true);
+          await onImported();
+        }
+      } catch {
+        // The normal Settings status action remains available for actionable errors.
+      } finally {
+        checking = false;
+      }
+    }
+
+    const interval = window.setInterval(() => void checkForImport(), 2_000);
+    const onFocus = () => void checkForImport();
+    window.addEventListener("focus", onFocus);
+    void checkForImport();
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [hubUrl, importDetected, onImported]);
+
+  async function copy() {
+    await navigator.clipboard.writeText(command);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#24292f]/40 px-4 py-6">
-      <div className="flex max-h-full w-full max-w-3xl flex-col rounded-xl border border-[#d0d7de] bg-[#f6f8fa] shadow-xl">
-        <div className="border-b border-[#d0d7de] px-5 py-4">
-          <h3 className="text-base font-semibold text-[#24292f]">Import Codex Login</h3>
-          <p className="mt-1 text-sm text-[#57606a]">
+    <Dialog.Root
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <Dialog size="lg" className="flex max-h-full w-full max-w-3xl flex-col p-0">
+        <div className="border-b border-kumo-line px-5 py-4">
+          <Dialog.Title className="text-base font-semibold text-kumo-strong">Import Codex Login</Dialog.Title>
+          <Dialog.Description className="mt-1 text-sm text-kumo-subtle">
             Run this on the computer where Codex already works with your subscription.
-          </p>
+          </Dialog.Description>
         </div>
 
         <div className="grid gap-3 overflow-y-auto px-5 py-4">
-          <p className="text-sm text-[#57606a]">
-            Copy the import script and paste it into Terminal. It reads the local Codex login automatically, so rerun
-            {" "}<code>codex login</code> first if Codex is not already logged in on that machine.
+          <p className="text-sm text-kumo-subtle">
+            Run this exact command on the computer where Codex is already logged in. It downloads the latest Tiller CLI
+            if needed and imports the login into <code>{new URL(hubUrl).hostname}</code>.
           </p>
-          <button
-            type="button"
-            onClick={() => void copy(script, "script")}
-            className="w-fit rounded border border-[#0969da] bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
-          >
-            {copied === "script" ? "Copied" : "Copy import script"}
-          </button>
-          <p className="text-xs text-[#57606a]">
-            If Tiller is installed on that computer, you can use <code>{CODEX_IMPORT_COMMAND}</code> instead.
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
+            <code className="min-w-0 flex-1 break-all text-xs text-kumo-default">{command}</code>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => void copy()}
+            >
+              {copied ? "Copied" : "Copy command"}
+            </Button>
+          </div>
+          <p className="text-xs text-kumo-subtle">
+            The command reconnects Tiller if it was previously pointed at another Hub, then reports both the destination
+            Hub URL and Codex account. Run <code>codex login</code> first if the local login has expired.
           </p>
-          <button
-            type="button"
-            onClick={() => void copy(CODEX_IMPORT_COMMAND, "command")}
-            className="w-fit rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
+          <p
+            aria-live="polite"
+            className={`text-xs ${importDetected ? "font-medium text-kumo-success" : "text-kumo-subtle"}`}
           >
-            {copied === "command" ? "Copied" : "Copy Tiller command"}
-          </button>
+            {importDetected
+              ? `Codex subscription imported into ${new URL(hubUrl).hostname}. Settings is up to date.`
+              : "Waiting for the import to complete. This page will update automatically."}
+          </p>
         </div>
 
-        <div className="flex flex-wrap justify-end gap-2 border-t border-[#d0d7de] px-5 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded border border-[#0969da] bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
-          >
-            Done
-          </button>
+        <div className="flex flex-wrap justify-end gap-2 border-t border-kumo-line px-5 py-3">
+          <Dialog.Close
+            render={(props) => (
+              <Button {...props} variant="primary" size="sm">
+                Done
+              </Button>
+            )}
+          />
         </div>
-      </div>
-    </div>
+      </Dialog>
+    </Dialog.Root>
   );
 }
 
 function OpenCodeInfoRow() {
   return (
-    <div className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
+    <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-[#24292f]">OpenCode on Workers AI</p>
-          <p className="mt-0.5 text-xs text-[#57606a]">
-            OpenCode uses Tiller&apos;s built-in Workers AI binding through the hub proxy. No extra Cloudflare
-            credentials are required.
+          <p className="text-sm font-semibold text-kumo-default">Built-in OpenCode model</p>
+          <p className="mt-0.5 text-xs text-kumo-subtle">
+            {KIMI_K2_7_CODE.label} uses Tiller&apos;s built-in Workers AI binding through the hub proxy. OpenAI-backed
+            OpenCode models use the OpenAI API key below.
           </p>
           <div className="mt-2 flex items-center gap-2">
-            <span className="inline-flex items-center gap-1.5 text-xs text-[#1a7f37]">
-              <span className="inline-block h-2 w-2 rounded-full bg-[#1a7f37]" />
+            <Badge variant="success" appearance="dot">
               Built in
-            </span>
-            <span className="text-xs text-[#57606a]">Pinned to Kimi K2.5</span>
+            </Badge>
+            <span className="text-xs text-kumo-subtle">Pinned to {KIMI_K2_7_CODE.label}</span>
           </div>
         </div>
       </div>
@@ -749,7 +777,7 @@ function OpenCodeInfoRow() {
 
 // ── Idle timeout row ────────────────────────────────────────────
 
-function IdleTimeoutRow({
+export function IdleTimeoutRow({
   currentMinutes,
   onSave,
 }: {
@@ -762,9 +790,9 @@ function IdleTimeoutRow({
   const [error, setError] = useState<string | null>(null);
 
   async function handleSave() {
-    const parsed = parseInt(value, 10);
-    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 1440) {
-      setError("Enter a value between 1 and 1440 minutes.");
+    const parsed = Number(value);
+    if (!isCloudflareIdleTimeoutMinutes(parsed)) {
+      setError(`Enter a value between ${CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES} and ${CLOUDFLARE_IDLE_TIMEOUT_MAX_MINUTES} minutes.`);
       return;
     }
     setSaving(true);
@@ -780,71 +808,72 @@ function IdleTimeoutRow({
   }
 
   return (
-    <div className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
+    <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-[#24292f]">Idle timeout</p>
-          <p className="mt-0.5 text-xs text-[#57606a]">
-            Minutes of inactivity before containers are stopped. Default: 10.
+          <p className="text-sm font-semibold text-kumo-default">Idle timeout</p>
+          <p className="mt-0.5 text-xs text-kumo-subtle">
+            Minutes of inactivity before Cloudflare environments and newly started Cloudflare Plan Writers are stopped. Default: {CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES}.
           </p>
           <div className="mt-2 flex items-center gap-2">
-            <span className="inline-flex items-center gap-1.5 text-xs text-[#24292f]">
-              <span className="inline-block h-2 w-2 rounded-full bg-[#1a7f37]" />
+            <Badge variant="success" appearance="dot">
               {currentMinutes} {currentMinutes === 1 ? "minute" : "minutes"}
-            </span>
+            </Badge>
           </div>
         </div>
         {!editing && (
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => {
               setValue(String(currentMinutes));
               setEditing(true);
               setError(null);
             }}
-            className="rounded border border-[#d0d7de] bg-white px-2.5 py-1 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
           >
             Change
-          </button>
+          </Button>
         )}
       </div>
 
       {editing && (
         <div className="mt-3 flex gap-2">
-          <input
+          <Input
             type="number"
-            min={1}
-            max={1440}
+            size="sm"
+            min={CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES}
+            max={CLOUDFLARE_IDLE_TIMEOUT_MAX_MINUTES}
             value={value}
             onChange={(e) => setValue(e.target.value)}
+            aria-label="Idle timeout in minutes"
             autoFocus
             disabled={saving}
-            className="w-24 rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-sm text-[#24292f] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+            className="w-24"
           />
-          <span className="self-center text-xs text-[#57606a]">minutes</span>
-          <button
-            type="button"
+          <span className="self-center text-xs text-kumo-subtle">minutes</span>
+          <Button
+            variant="primary"
+            size="sm"
             onClick={() => void handleSave()}
-            disabled={saving}
-            className="rounded bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0a5bc4] disabled:opacity-40"
+            loading={saving}
           >
             {saving ? "Saving..." : "Save"}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => {
               setEditing(false);
               setError(null);
             }}
             disabled={saving}
-            className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#57606a] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
           >
             Cancel
-          </button>
+          </Button>
         </div>
       )}
 
-      {error && <p className="mt-2 text-xs text-[#cf222e]">{error}</p>}
+      {error && <p className="mt-2 text-xs text-kumo-danger">{error}</p>}
     </div>
   );
 }
@@ -880,73 +909,74 @@ function CanonicalMainBootstrapDepthRow({
   }
 
   return (
-    <div className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
+    <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-[#24292f]">Canonical main history depth</p>
-          <p className="mt-0.5 text-xs text-[#57606a]">
+          <p className="text-sm font-semibold text-kumo-default">Canonical main history depth</p>
+          <p className="mt-0.5 text-xs text-kumo-subtle">
             Full history gives repo-level merge and update jobs complete context. Set a positive value to shallow-clone for faster initial setup.
           </p>
           <div className="mt-2 flex items-center gap-2">
-            <span className="inline-flex items-center gap-1.5 text-xs text-[#24292f]">
-              <span className="inline-block h-2 w-2 rounded-full bg-[#1a7f37]" />
+            <Badge variant="success" appearance="dot">
               {currentDepth === 0
                 ? "Full history"
                 : `${currentDepth} ${currentDepth === 1 ? "commit" : "commits"}`}
-            </span>
+            </Badge>
           </div>
         </div>
         {!editing && (
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => {
               setValue(String(currentDepth));
               setEditing(true);
               setError(null);
             }}
-            className="rounded border border-[#d0d7de] bg-white px-2.5 py-1 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
           >
             Change
-          </button>
+          </Button>
         )}
       </div>
 
       {editing && (
         <div className="mt-3 flex gap-2">
-          <input
+          <Input
             type="number"
+            size="sm"
             min={0}
             max={200}
             value={value}
             onChange={(e) => setValue(e.target.value)}
+            aria-label="Canonical main history depth in commits"
             autoFocus
             disabled={saving}
-            className="w-24 rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-sm text-[#24292f] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+            className="w-24"
           />
-          <span className="self-center text-xs text-[#57606a]">commits</span>
-          <button
-            type="button"
+          <span className="self-center text-xs text-kumo-subtle">commits</span>
+          <Button
+            variant="primary"
+            size="sm"
             onClick={() => void handleSave()}
-            disabled={saving}
-            className="rounded bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0a5bc4] disabled:opacity-40"
+            loading={saving}
           >
             {saving ? "Saving..." : "Save"}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => {
               setEditing(false);
               setError(null);
             }}
             disabled={saving}
-            className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#57606a] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
           >
             Cancel
-          </button>
+          </Button>
         </div>
       )}
 
-      {error && <p className="mt-2 text-xs text-[#cf222e]">{error}</p>}
+      {error && <p className="mt-2 text-xs text-kumo-danger">{error}</p>}
     </div>
   );
 }
@@ -1140,10 +1170,10 @@ function GitHubAppSettings({
    *
    * const testCopy = lastTest ? accessResultCopy(lastTest) : null;
    * const resultClasses = testCopy?.tone === "success"
-   *   ? "border-[#1a7f37]/25 bg-[#f0fff4] text-[#1a7f37]"
+   *   ? "border-kumo-success/25 bg-kumo-success-tint text-kumo-success"
    *   : testCopy?.tone === "warning"
-   *     ? "border-[#d4a72c]/30 bg-[#fff8c5] text-[#9a6700]"
-   *     : "border-[#cf222e]/25 bg-[#fff1f1] text-[#cf222e]";
+   *     ? "border-kumo-warning/30 bg-kumo-warning-tint text-kumo-warning"
+   *     : "border-kumo-danger/25 bg-kumo-danger-tint text-kumo-danger";
    */
 
   useEffect(() => {
@@ -1211,11 +1241,11 @@ function GitHubAppSettings({
   }
 
   const selfUpdateRepoPanel = configured && showSelfUpdateRepo && selfUpdateRepo.status !== "not_checked" ? (
-    <div className="rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
+    <div className="rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-xs font-semibold text-[#24292f]">Self-update repo</p>
-          <p className="mt-1 text-xs text-[#57606a]">
+          <p className="text-xs font-semibold text-kumo-default">Self-update repo</p>
+          <p className="mt-1 text-xs text-kumo-subtle">
             {selfUpdateRepo.status === "detected"
               ? `${selfUpdateRepo.fullName} · ${selfUpdateRepo.branch}`
               : selfUpdateRepo.status === "ambiguous"
@@ -1224,14 +1254,14 @@ function GitHubAppSettings({
           </p>
         </div>
         {selfUpdateRepo.status !== "detected" && (
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => void handleDetectSelfUpdateRepo()}
-            disabled={detectingUpdateRepo}
-            className="rounded border border-[#0969da] bg-white px-2.5 py-1 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-50"
+            loading={detectingUpdateRepo}
           >
             {detectingUpdateRepo ? "Checking..." : "Connect self-update repo"}
-          </button>
+          </Button>
         )}
       </div>
       {selfUpdateRepo.status === "ambiguous" && (
@@ -1242,7 +1272,7 @@ function GitHubAppSettings({
               type="button"
               onClick={() => void handleSelectSelfUpdateRepo(candidate)}
               disabled={detectingUpdateRepo}
-              className="rounded border border-[#d0d7de] bg-white px-3 py-1.5 text-left text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-50"
+              className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-left text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint disabled:opacity-50"
             >
               {candidate.label}
             </button>
@@ -1250,9 +1280,9 @@ function GitHubAppSettings({
         </div>
       )}
       {selfUpdateRepo.status === "missing" && (
-        <div className="mt-3 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
-          <p className="text-xs font-semibold text-[#9a6700]">Check the GitHub account</p>
-          <p className="mt-1 text-xs leading-5 text-[#57606a]">
+        <div className="mt-3 rounded-lg border border-kumo-warning/30 bg-kumo-warning-tint px-3 py-2">
+          <p className="text-xs font-semibold text-kumo-warning">Check the GitHub account</p>
+          <p className="mt-1 text-xs leading-5 text-kumo-subtle">
             Cloudflare must deploy this Worker from a repo under the same GitHub user or org selected for the Tiller GitHub App.
             {visibleUpdateRepoOwners.length > 0
               ? ` Tiller can currently see ${formatVisibleGitHubOwners(visibleUpdateRepoOwners)}.`
@@ -1266,10 +1296,10 @@ function GitHubAppSettings({
 
   if (status.githubAppPublicHubDisabled) {
     return (
-      <div className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
-        <p className="text-sm font-semibold text-[#24292f]">Private repo access</p>
-        <p className="mt-1 text-xs text-[#57606a]">
-          GitHub App private repo access is available after Protect Hub or Self Host setup, or on a localhost hub.
+      <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
+        <p className="text-sm font-semibold text-kumo-default">Private repo access</p>
+        <p className="mt-1 text-xs text-kumo-subtle">
+          GitHub App private repo access is available after the workers.dev hub is protected, or on a localhost hub.
         </p>
       </div>
     );
@@ -1279,38 +1309,38 @@ function GitHubAppSettings({
     return (
       <div className="grid gap-3">
         <div className="grid gap-2">
-          <p className="text-sm font-semibold text-[#1a7f37]">GitHub App configured</p>
-          <p className="text-xs leading-5 text-[#57606a]">
+          <p className="text-sm font-semibold text-kumo-success">GitHub App configured</p>
+          <p className="text-xs leading-5 text-kumo-subtle">
             Tiller can use the repositories selected in this GitHub App installation for private repository access and pull request permissions.
           </p>
           {githubAppUrl ? (
-            <div className="mt-1 border-t border-[#d0d7de] pt-3">
-              <p className="text-xs font-semibold text-[#24292f]">GitHub App URL</p>
+            <div className="mt-1 border-t border-kumo-line pt-3">
+              <p className="text-xs font-semibold text-kumo-default">GitHub App URL</p>
               <a
                 href={githubAppUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="mt-1 inline-block break-all text-xs font-medium text-[#0969da] hover:underline"
+                className="mt-1 inline-block break-all text-xs font-medium text-kumo-link hover:underline"
               >
                 {githubAppUrl}
               </a>
-              <p className="mt-1 text-xs leading-5 text-[#57606a]">
+              <p className="mt-1 text-xs leading-5 text-kumo-subtle">
                 This is the GitHub App Tiller created for this hub. It is not a repository URL; GitHub uses it to manage which repositories Tiller can access.
               </p>
             </div>
           ) : null}
         </div>
         {selfUpdateRepoPanel}
-        {error && <p className="text-xs text-[#cf222e]">{error}</p>}
+        {error && <p className="text-xs text-kumo-danger">{error}</p>}
       </div>
     );
   }
 
   const stepBoxClasses = {
-    success: "border-[#1a7f37]/25 bg-[#f0fff4]",
-    warning: "border-[#d4a72c]/30 bg-[#fff8c5]",
-    error: "border-[#cf222e]/25 bg-[#fff1f1]",
-    neutral: "border-[#d0d7de] bg-[#f6f8fa]",
+    success: "border-kumo-success/25 bg-kumo-success-tint",
+    warning: "border-kumo-warning/30 bg-kumo-warning-tint",
+    error: "border-kumo-danger/25 bg-kumo-danger-tint",
+    neutral: "border-kumo-line bg-kumo-recessed",
   };
   const repositoryAccessReady = configured && !loadingRepos && !githubRepositories.error && repoSelections.length > 0;
   const repositoryStep = !configured
@@ -1368,14 +1398,14 @@ function GitHubAppSettings({
   const createStepTone = configured ? "success" : waitingForCreation ? "warning" : "neutral";
 
   return (
-    <div className="grid gap-3 rounded-xl border border-[#d0d7de] bg-white px-4 py-4">
+    <div className="grid gap-3 rounded-xl border border-kumo-line bg-kumo-base px-4 py-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-[#24292f]">
+          <p className="text-sm font-semibold text-kumo-default">
             {configured ? "GitHub App configured" : "GitHub App not set up"}
           </p>
           {configured && status.githubAppSlug && (
-            <p className="mt-1 text-xs text-[#57606a]">{status.githubAppSlug}</p>
+            <p className="mt-1 text-xs text-kumo-subtle">{status.githubAppSlug}</p>
           )}
         </div>
         {/*
@@ -1385,7 +1415,7 @@ function GitHubAppSettings({
               href={manageUrl}
               target="_blank"
               rel="noreferrer"
-              className="rounded border border-[#d0d7de] bg-white px-2.5 py-1 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
+              className="rounded border border-kumo-line bg-kumo-base px-2.5 py-1 text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint"
             >
               Manage GitHub Apps
             </a>
@@ -1396,7 +1426,7 @@ function GitHubAppSettings({
               setManualOpen((value) => !value);
               setError(null);
             }}
-            className="rounded border border-[#d0d7de] bg-white px-2.5 py-1 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
+            className="rounded border border-kumo-line bg-kumo-base px-2.5 py-1 text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint"
           >
             {manualOpen ? "Close advanced" : "Advanced"}
           </button>
@@ -1408,8 +1438,8 @@ function GitHubAppSettings({
         <div className={`rounded-lg border px-3 py-2 ${stepBoxClasses[createStepTone]}`}>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p className="text-xs font-semibold text-[#24292f]">1. Create GitHub App</p>
-              <p className="mt-1 text-xs leading-5 text-[#57606a]">
+              <p className="text-xs font-semibold text-kumo-default">1. Create GitHub App</p>
+              <p className="mt-1 text-xs leading-5 text-kumo-subtle">
                 {configured
                   ? status.githubAppSlug
                     ? `Created: ${status.githubAppSlug}`
@@ -1427,7 +1457,7 @@ function GitHubAppSettings({
                 onClick={() => {
                   setWaitingForCreation(true);
                 }}
-                className="rounded border border-[#0969da] bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
+                className="rounded border border-kumo-brand bg-kumo-brand px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-kumo-brand/90"
               >
                 Create GitHub App
               </a>
@@ -1438,15 +1468,15 @@ function GitHubAppSettings({
         <div className={`rounded-lg border px-3 py-2 ${stepBoxClasses[repositoryStep.tone]}`}>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p className="text-xs font-semibold text-[#24292f]">2. Install repositories</p>
-              <p className="mt-1 text-xs leading-5 text-[#57606a]">{repositoryStep.label}: {repositoryStep.detail}</p>
+              <p className="text-xs font-semibold text-kumo-default">2. Install repositories</p>
+              <p className="mt-1 text-xs leading-5 text-kumo-subtle">{repositoryStep.label}: {repositoryStep.detail}</p>
             </div>
             {configured && installUrl && !allRepositoriesAvailable && (
               <a
                 href={installUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="rounded border border-[#0969da] bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
+                className="rounded border border-kumo-brand bg-kumo-brand px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-kumo-brand/90"
               >
                 {repoSelections.length > 0 ? "Install more repos" : "Install repositories"}
               </a>
@@ -1455,16 +1485,16 @@ function GitHubAppSettings({
         </div>
 
         <div className={`rounded-lg border px-3 py-2 ${stepBoxClasses[readyStep.tone]}`}>
-          <p className="text-xs font-semibold text-[#24292f]">3. Use in Tiller</p>
-          <p className="mt-1 text-xs leading-5 text-[#57606a]">{readyStep.label}: {readyStep.detail}</p>
+          <p className="text-xs font-semibold text-kumo-default">3. Use in Tiller</p>
+          <p className="mt-1 text-xs leading-5 text-kumo-subtle">{readyStep.label}: {readyStep.detail}</p>
         </div>
       </div>
 
       {/*
       <div className="grid gap-2 md:grid-cols-3">
-        <div className={`rounded-lg border px-3 py-2 ${configured ? "border-[#1a7f37]/25 bg-[#f0fff4]" : "border-[#d0d7de] bg-[#f6f8fa]"}`}>
-          <p className="text-xs font-semibold text-[#24292f]">1. Create app</p>
-          <p className="mt-1 text-xs text-[#57606a]">
+        <div className={`rounded-lg border px-3 py-2 ${configured ? "border-kumo-success/25 bg-kumo-success-tint" : "border-kumo-line bg-kumo-recessed"}`}>
+          <p className="text-xs font-semibold text-kumo-default">1. Create app</p>
+          <p className="mt-1 text-xs text-kumo-subtle">
             {configured
               ? `Created${status.githubAppSlug ? `: ${status.githubAppSlug}` : ""}`
               : waitingForCreation
@@ -1472,15 +1502,15 @@ function GitHubAppSettings({
                 : "Opens GitHub in a new tab."}
           </p>
         </div>
-        <div className={`rounded-lg border px-3 py-2 ${configured ? "border-[#d4a72c]/30 bg-[#fff8c5]" : "border-[#d0d7de] bg-[#f6f8fa]"}`}>
-          <p className="text-xs font-semibold text-[#24292f]">2. Install on repos</p>
-          <p className="mt-1 text-xs text-[#57606a]">
+        <div className={`rounded-lg border px-3 py-2 ${configured ? "border-kumo-warning/30 bg-kumo-warning-tint" : "border-kumo-line bg-kumo-recessed"}`}>
+          <p className="text-xs font-semibold text-kumo-default">2. Install on repos</p>
+          <p className="mt-1 text-xs text-kumo-subtle">
             {configured ? "Select the repositories Tiller can use." : "Available after app creation."}
           </p>
         </div>
-        <div className={`rounded-lg border px-3 py-2 ${lastTest?.ok ? "border-[#1a7f37]/25 bg-[#f0fff4]" : "border-[#d0d7de] bg-[#f6f8fa]"}`}>
-          <p className="text-xs font-semibold text-[#24292f]">3. Test access</p>
-          <p className="mt-1 text-xs text-[#57606a]">
+        <div className={`rounded-lg border px-3 py-2 ${lastTest?.ok ? "border-kumo-success/25 bg-kumo-success-tint" : "border-kumo-line bg-kumo-recessed"}`}>
+          <p className="text-xs font-semibold text-kumo-default">3. Test access</p>
+          <p className="mt-1 text-xs text-kumo-subtle">
             {lastTest?.ok ? `Ready for ${lastTest.repo}` : "Verify selected repo access and PR permissions."}
           </p>
         </div>
@@ -1488,9 +1518,9 @@ function GitHubAppSettings({
       */}
 
       {waitingForCreation && !configured && (
-        <div className="rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2">
-          <p className="text-xs font-semibold text-[#9a6700]">Keep this tab open</p>
-          <p className="mt-1 text-xs text-[#57606a]">
+        <div className="rounded-lg border border-kumo-warning/30 bg-kumo-warning-tint px-3 py-2">
+          <p className="text-xs font-semibold text-kumo-warning">Keep this tab open</p>
+          <p className="mt-1 text-xs text-kumo-subtle">
             GitHub is open in another tab. Tiller will refresh this page state when the app is created.
           </p>
         </div>
@@ -1498,10 +1528,10 @@ function GitHubAppSettings({
 
       {/*
       {configured && (
-        <div className="grid gap-2 rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
+        <div className="grid gap-2 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
           <div className="flex flex-wrap items-end gap-2">
             <label className="grid min-w-[220px] flex-1 gap-1">
-              <span className="text-xs font-medium text-[#24292f]">Repository</span>
+              <span className="text-xs font-medium text-kumo-default">Repository</span>
               <select
                 value={selectedRepoKey}
                 onChange={(event) => {
@@ -1509,7 +1539,7 @@ function GitHubAppSettings({
                   setLastTest(null);
                 }}
                 disabled={testing || loadingRepos}
-                className="rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-sm text-[#24292f] placeholder:text-[#6e7781] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+                className="rounded-lg border border-kumo-line bg-kumo-base px-3 py-1.5 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:border-kumo-focus focus:outline-none focus:ring-1 focus:ring-kumo-focus/30 disabled:opacity-50"
               >
                 <option value="">
                   {loadingRepos ? "Loading repositories..." : repoSelections.length === 0 ? "No selected repositories" : "Select repository"}
@@ -1525,7 +1555,7 @@ function GitHubAppSettings({
               type="button"
               onClick={() => void handleTestAccess()}
               disabled={testing || loadingRepos || !selectedRepo}
-              className="rounded bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0a5bc4] disabled:opacity-40"
+              className="rounded bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-kumo-brand/90 disabled:opacity-40"
             >
               {testing ? "Testing..." : "Test access"}
             </button>
@@ -1533,13 +1563,13 @@ function GitHubAppSettings({
           {testCopy && (
             <div className={`rounded-lg border px-3 py-2 ${resultClasses}`}>
               <p className="text-xs font-semibold">{testCopy.title}</p>
-              <p className="mt-1 text-xs leading-5 text-[#57606a]">{testCopy.detail}</p>
+              <p className="mt-1 text-xs leading-5 text-kumo-subtle">{testCopy.detail}</p>
               {(lastTest?.status === "missing_permissions" || lastTest?.status === "missing_installation" || lastTest?.status === "repo_not_selected") && installUrl && (
                 <a
                   href={installUrl}
                   target="_blank"
                   rel="noreferrer"
-                  className="mt-2 inline-flex rounded border border-[#0969da] bg-white px-2.5 py-1 text-xs font-medium text-[#0969da] transition-colors hover:bg-[#f6f8fa]"
+                  className="mt-2 inline-flex rounded border border-kumo-brand bg-kumo-base px-2.5 py-1 text-xs font-medium text-kumo-link transition-colors hover:bg-kumo-tint"
                 >
                   Open GitHub installation
                 </a>
@@ -1552,7 +1582,7 @@ function GitHubAppSettings({
                   onClick={() => {
                     setWaitingForCreation(true);
                   }}
-                  className="mt-2 ml-2 inline-flex rounded border border-[#0969da] bg-[#0969da] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#0860ca]"
+                  className="mt-2 ml-2 inline-flex rounded border border-kumo-brand bg-kumo-brand px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-kumo-brand/90"
                 >
                   Create replacement app
                 </a>
@@ -1566,14 +1596,14 @@ function GitHubAppSettings({
       {selfUpdateRepoPanel}
       {/*
       {manualOpen && (
-        <div className="grid gap-3 rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-3">
+        <div className="grid gap-3 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
           <div>
-            <p className="text-xs font-semibold text-[#24292f]">Manual setup values</p>
-            <div className="mt-2 grid gap-1 text-xs text-[#57606a]">
-              <p>Homepage URL: <code className="text-[#24292f]">{HUB_URL}</code></p>
-              <p>Manifest callback URL: <code className="text-[#24292f]">{manifestCallbackUrl}</code></p>
-              <p>Setup URL: <code className="text-[#24292f]">{installCallbackUrl}</code></p>
-              <p>Required permissions: <code className="text-[#24292f]">metadata: read, contents: write, pull_requests: write</code></p>
+            <p className="text-xs font-semibold text-kumo-default">Manual setup values</p>
+            <div className="mt-2 grid gap-1 text-xs text-kumo-subtle">
+              <p>Homepage URL: <code className="text-kumo-default">{HUB_URL}</code></p>
+              <p>Manifest callback URL: <code className="text-kumo-default">{manifestCallbackUrl}</code></p>
+              <p>Setup URL: <code className="text-kumo-default">{installCallbackUrl}</code></p>
+              <p>Required permissions: <code className="text-kumo-default">metadata: read, contents: write, pull_requests: write</code></p>
             </div>
           </div>
           <div className="grid gap-2 md:grid-cols-3">
@@ -1582,21 +1612,21 @@ function GitHubAppSettings({
               onChange={(event) => setAppId(event.target.value)}
               placeholder="App ID"
               disabled={saving}
-              className="rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-sm text-[#24292f] placeholder:text-[#6e7781] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+              className="rounded-lg border border-kumo-line bg-kumo-base px-3 py-1.5 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:border-kumo-focus focus:outline-none focus:ring-1 focus:ring-kumo-focus/30 disabled:opacity-50"
             />
             <input
               value={clientId}
               onChange={(event) => setClientId(event.target.value)}
               placeholder="Client ID"
               disabled={saving}
-              className="rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-sm text-[#24292f] placeholder:text-[#6e7781] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+              className="rounded-lg border border-kumo-line bg-kumo-base px-3 py-1.5 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:border-kumo-focus focus:outline-none focus:ring-1 focus:ring-kumo-focus/30 disabled:opacity-50"
             />
             <input
               value={slug}
               onChange={(event) => setSlug(event.target.value)}
               placeholder="App slug"
               disabled={saving}
-              className="rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-sm text-[#24292f] placeholder:text-[#6e7781] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+              className="rounded-lg border border-kumo-line bg-kumo-base px-3 py-1.5 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:border-kumo-focus focus:outline-none focus:ring-1 focus:ring-kumo-focus/30 disabled:opacity-50"
             />
           </div>
           <textarea
@@ -1605,170 +1635,198 @@ function GitHubAppSettings({
             placeholder="Private key PEM"
             disabled={saving}
             rows={5}
-            className="rounded-lg border border-[#d0d7de] bg-white px-3 py-2 font-mono text-xs text-[#24292f] placeholder:text-[#6e7781] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
+            className="rounded-lg border border-kumo-line bg-kumo-base px-3 py-2 font-mono text-xs text-kumo-default placeholder:text-kumo-placeholder focus:border-kumo-focus focus:outline-none focus:ring-1 focus:ring-kumo-focus/30 disabled:opacity-50"
           />
           <div className="flex items-center justify-end gap-2">
             <button
               type="button"
               onClick={() => void handleSave()}
               disabled={saving || !appId.trim() || !clientId.trim() || !slug.trim() || !privateKey.trim()}
-              className="rounded bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0a5bc4] disabled:opacity-40"
+              className="rounded bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-kumo-brand/90 disabled:opacity-40"
             >
               {saving ? "Saving..." : "Save GitHub App"}
             </button>
           </div>
-          {error && <p className="text-xs text-[#cf222e]">{error}</p>}
+          {error && <p className="text-xs text-kumo-danger">{error}</p>}
         </div>
       )}
       */}
-      {error && <p className="text-xs text-[#cf222e]">{error}</p>}
+      {error && <p className="text-xs text-kumo-danger">{error}</p>}
     </div>
   );
 }
 
-function selfHostSetupCommand(status: SetupStatus): string {
-  const workersDevHubUrl = status.workersDevHubUrl || (status.routeKind === "workers-dev" ? status.hubUrl : "");
-  return workersDevHubUrl ? `tiller host setup --hub-url ${workersDevHubUrl}` : "tiller host setup --hub-url <workersDevHubUrl>";
-}
+function ExecutionBackendCard({ canonicalHubUrl }: { canonicalHubUrl: string }) {
+  const [execution, setExecution] = useState<ExecutionStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState<"cf" | "host" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const setupCommand = `tiller host setup --hub-url ${canonicalHubUrl}`;
 
-function HostingStatusCards({
-  status,
-  onRefresh,
-}: {
-  status: SetupStatus;
-  onRefresh: () => Promise<void>;
-}) {
-  const [setupOpen, setSetupOpen] = useState(false);
-  const addToast = useToast();
-  const hostRuntime = hostRuntimeStatus(status);
-  const gatewayStatus = hostGatewayStatus(status);
-  const command = selfHostSetupCommand(status);
-  const selfHostActive = status.deploymentMode === "self-host";
-  const setupInProgress = status.selfHostStatus === "setup-in-progress";
-  const selfHostHealthy = selfHostActive && status.selfHostStatus === "ready";
-  const activeClasses = statusToneClasses(selfHostHealthy ? "success" : "warning");
-  const showTechnicalDetails = setupInProgress || (selfHostActive && !selfHostHealthy);
-
-  async function handleReturnToHosted() {
-    const confirmation = window.prompt('Type "return to hosted" to restore Hosted Tiller on the protected workers.dev URL.');
-    if (confirmation?.trim().toLowerCase() !== "return to hosted") return;
-    const result = await returnToHostedTiller(HUB_URL);
-    addToast({ title: "Returned to Hosted Tiller", variant: "success" });
-    if (result.redirectUrl && result.redirectUrl !== window.location.origin) {
-      window.location.href = result.redirectUrl;
-      return;
+  const refresh = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setExecution(await fetchExecutionStatus(HUB_URL));
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      setLoading(false);
     }
-    await onRefresh();
-  }
+  };
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 30_000);
+    const handleFocus = () => void refresh();
+    window.addEventListener("focus", handleFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, []);
+
+  const select = async (target: "cf" | "host") => {
+    if (!execution) return;
+    setSaving(target);
+    setError(null);
+    try {
+      const next = target === "cf"
+        ? await setExecutionBackend(HUB_URL, { target: "cf" })
+        : execution.candidate.state === "ready"
+          ? await setExecutionBackend(HUB_URL, {
+              target: "host",
+              expectedMachineId: execution.candidate.machineId,
+            })
+          : null;
+      if (next) setExecution(next);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
+      await refresh();
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const candidateCopy = !execution || execution.candidate.state === "not_connected"
+    ? "No compatible machine is connected."
+    : execution.candidate.state === "ready"
+      ? `${execution.candidate.displayName} is ready.`
+      : `${execution.candidate.displayName} needs an update (${execution.candidate.code.replaceAll("_", " ")}).`;
+  const selectedHostCopy = execution?.selectedHost?.state === "offline"
+    ? `${execution.selectedHost.displayName} is selected but offline.`
+    : execution?.selectedHost?.state === "incompatible"
+      ? `${execution.selectedHost.displayName} is selected but needs an update.`
+      : execution?.selectedHost?.state === "ready"
+        ? `${execution.selectedHost.displayName} is selected and ready.`
+        : null;
+  const selectedMachineId = execution?.selected.target === "host"
+    ? execution.selected.machineId
+    : null;
+  const candidateSelected = execution?.candidate.state === "ready"
+    && execution.candidate.machineId === selectedMachineId;
 
   return (
-    <div className="grid gap-3">
-      <div className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
-        {selfHostActive ? (
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">Tiller Self Host</p>
-              <p className={`mt-2 text-sm font-semibold ${activeClasses.title}`}>
-                <span className={`mr-2 inline-block h-2 w-2 rounded-full ${activeClasses.dot}`} />
-                Tiller Self Host is active
-              </p>
-              <p className="mt-1 text-xs text-[#57606a]">
-                {status.selfHostStatus === "ready" ? "Healthy" : "Needs attention"}
-              </p>
-            </div>
-            <button
-              type="button"
-              aria-label='Return to Hosted Tiller. Type "return to hosted" to confirm.'
-              onClick={() => void handleReturnToHosted()}
-              className="rounded-lg border border-[#cf222e]/40 bg-white px-3 py-1.5 text-xs font-medium text-[#cf222e] transition-colors hover:bg-[#fff5f5]"
-            >
-              Return to Hosted Tiller
-            </button>
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">Hosted Tiller</p>
-              <p className="mt-2 text-sm font-semibold text-[#1a7f37]">
-                <span className="mr-2 inline-block h-2 w-2 rounded-full bg-[#1a7f37]" />
-                Hosted Tiller is active
-              </p>
-              <p className="mt-1 text-xs text-[#57606a]">
-                Tiller runs from the protected Cloudflare-hosted hub. Set up Self Host when you are ready to move to an always-on host machine.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setSetupOpen(true)}
-              className="rounded-lg border border-[#0969da]/30 bg-[#0969da] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#0a5bc4]"
-            >
-              {setupInProgress ? "Continue Self Host Setup" : "Set up Self Host"}
-            </button>
-          </div>
-        )}
-      </div>
-      {setupOpen && (
-        <div role="dialog" aria-modal="false" aria-label="Set up Self Host" className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
+    <div className="grid gap-4">
+      <div className="grid gap-3 md:grid-cols-2">
+        <div className={`rounded-xl border px-4 py-3 ${
+          execution?.selected.target === "cf"
+            ? "border-kumo-success/40 bg-kumo-success-tint"
+            : "border-kumo-line bg-kumo-base"
+        }`}>
           <div className="flex items-start justify-between gap-3">
             <div>
-              <p className="text-sm font-semibold text-[#24292f]">Set up Self Host</p>
-              <p className="mt-1 text-xs text-[#57606a]">Run this command on the machine that will host Tiller.</p>
+              <p className="text-sm font-semibold text-kumo-default">Cloudflare Containers</p>
+              <p className="mt-1 text-xs leading-5 text-kumo-subtle">
+                Managed, with no machine to set up or keep online.
+              </p>
             </div>
-            <button
-              type="button"
-              onClick={() => setSetupOpen(false)}
-              className="rounded-lg border border-[#d0d7de] bg-white px-2 py-1 text-xs text-[#57606a] hover:bg-[#f6f8fa]"
+            {execution?.selected.target === "cf" && (
+              <Badge variant="success" appearance="dot">Selected</Badge>
+            )}
+          </div>
+          {execution?.selected.target !== "cf" && (
+            <Button
+              className="mt-3"
+              variant="secondary"
+              size="sm"
+              loading={saving === "cf"}
+              disabled={loading || saving !== null}
+              onClick={() => void select("cf")}
             >
-              Close
-            </button>
-          </div>
-          <div className="mt-3 rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2">
-            <code className="break-words text-xs text-[#24292f]">{command}</code>
-          </div>
-        </div>
-      )}
-      {showTechnicalDetails && (
-        <details className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3">
-          <summary className="cursor-pointer text-sm font-semibold text-[#24292f]">Technical details</summary>
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
-            {[
-              { label: "Host runtime", status: hostRuntime },
-              { label: "Subscription Gateway", status: gatewayStatus },
-            ].map(({ label, status: readiness }) => {
-              const classes = statusToneClasses(readiness.tone);
-              return (
-                <div key={label} className="rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2">
-                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">{label}</p>
-                  <p className={`mt-2 text-sm font-semibold ${classes.title}`}>
-                    <span className={`mr-2 inline-block h-2 w-2 rounded-full ${classes.dot}`} />
-                    {readiness.title}
-                  </p>
-                  <p className="mt-1 text-xs text-[#57606a]">{readiness.detail}</p>
-                </div>
-              );
-            })}
-          </div>
-          {setupInProgress && (
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={() => setSetupOpen(true)}
-                className="rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
-              >
-                Show setup command
-              </button>
-              <button
-                type="button"
-                aria-label='Return to Hosted Tiller. Type "return to hosted" to confirm.'
-                onClick={() => void handleReturnToHosted()}
-                className="rounded-lg border border-[#cf222e]/40 bg-white px-3 py-1.5 text-xs font-medium text-[#cf222e] transition-colors hover:bg-[#fff5f5]"
-              >
-                Return to Hosted Tiller
-              </button>
-            </div>
+              Use Cloudflare
+            </Button>
           )}
-        </details>
-      )}
+        </div>
+
+        <div className={`rounded-xl border px-4 py-3 ${
+          execution?.selected.target === "host"
+            ? "border-kumo-success/40 bg-kumo-success-tint"
+            : "border-kumo-line bg-kumo-base"
+        }`}>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-kumo-default">Your machine</p>
+              <p className="mt-1 text-xs leading-5 text-kumo-subtle">
+                Can reduce compute costs and may run faster.
+              </p>
+            </div>
+            {execution?.selected.target === "host" && (
+              <Badge
+                variant={execution.executionReady ? "success" : "warning"}
+                appearance="dot"
+              >
+                Selected
+              </Badge>
+            )}
+          </div>
+          <p className="mt-2 text-xs text-kumo-subtle">
+            {selectedHostCopy ?? candidateCopy}
+          </p>
+          {selectedHostCopy && execution?.candidate.state === "ready"
+            && execution.candidate.machineId !== selectedMachineId && (
+            <p className="mt-1 text-xs text-kumo-subtle">{candidateCopy}</p>
+          )}
+          {execution?.candidate.state === "ready" && !candidateSelected && (
+            <Button
+              className="mt-3"
+              variant="primary"
+              size="sm"
+              loading={saving === "host"}
+              disabled={loading || saving !== null}
+              onClick={() => void select("host")}
+            >
+              Use this machine
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
+        <p className="text-xs font-medium text-kumo-default">Connect a machine</p>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <code className="min-w-0 flex-1 break-all text-xs text-kumo-default">{setupCommand}</code>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              void navigator.clipboard.writeText(setupCommand).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1500);
+              });
+            }}
+          >
+            {copied ? "Copied" : "Copy"}
+          </Button>
+        </div>
+      </div>
+
+      <p className="text-xs text-kumo-subtle">
+        Changes apply only to new workloads. Delete and recreate a workload to use a different backend.
+      </p>
+      {loading && <p className="text-xs text-kumo-subtle">Checking execution readiness...</p>}
+      {error && <p className="text-xs text-kumo-danger">{error}</p>}
     </div>
   );
 }
@@ -1780,45 +1838,39 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
   const [codexImportOpen, setCodexImportOpen] = useState(false);
   const [codexStatusRefreshing, setCodexStatusRefreshing] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [billingSaving, setBillingSaving] = useState<"claude" | "openai" | null>(null);
   const addToast = useToast();
   const codexStatus = codexSubscriptionStatus(status);
   const codexImportDisabled = status.hasChatGPTAuth && status.chatgptAuthStatus !== "needs_reconnect";
-  const selfHostFeaturesVisible = status.isLocalDev || status.deploymentMode === "self-host";
-  const codexVisible =
-    status.enabledHarnesses.includes("codex") || status.hasOpenAIKey || (selfHostFeaturesVisible && status.hasChatGPTAuth);
   const opencodeVisible = status.enabledHarnesses.includes("opencode");
 
   const subscriptionCredentials: CredentialDef[] = [
-    ...(selfHostFeaturesVisible
-      ? [
-          {
-            label: "Claude subscription token",
-            description: "Use a Claude Code OAuth token from your subscription on Tiller Self Host.",
-            secretKey: "CLAUDE_CODE_OAUTH_TOKEN",
-            configured: status.hasClaudeSubscription,
-            testable: true,
-            help: <ClaudeSubscriptionSetupHint />,
-          },
-        ]
-      : []),
+    {
+      label: "Claude subscription token",
+      description: "Use a Claude Code OAuth token from your subscription.",
+      secretKey: "CLAUDE_CODE_OAUTH_TOKEN",
+      configured: status.hasClaudeSubscription,
+      active: status.claudeBillingMode === "subscription",
+      testable: false,
+      help: <ClaudeSubscriptionSetupHint />,
+    },
   ];
   const apiCredentials: CredentialDef[] = [
     {
       label: "Claude API key",
       secretKey: "ANTHROPIC_API_KEY",
       configured: status.hasAnthropicKey,
-      testable: true,
+      active: status.claudeBillingMode === "api",
+      testable: false,
     },
-    ...(codexVisible
-      ? [
-          {
-            label: "Codex API key",
-            secretKey: "OPENAI_API_KEY",
-            configured: status.hasOpenAIKey,
-            testable: true,
-          },
-        ]
-      : []),
+    {
+      label: "OpenAI API key",
+      description: "Use OpenAI-backed models with Codex or OpenCode.",
+      secretKey: "OPENAI_API_KEY",
+      configured: status.hasOpenAIKey,
+      active: status.openaiBillingMode === "api",
+      testable: false,
+    },
   ];
 
   async function handleSave(payload: Record<string, string>) {
@@ -1832,6 +1884,27 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
       return next;
     });
     addToast({ title: "Credential saved", variant: "success" });
+  }
+
+  async function handleBillingMode(provider: "claude" | "openai", mode: BillingMode) {
+    setBillingSaving(provider);
+    try {
+      await saveBillingMode(HUB_URL, provider, mode);
+      await onRefresh();
+      addToast({
+        title: `${provider === "claude" ? "Claude" : "OpenAI"} ${mode === "subscription" ? "Subscription" : "API"} mode active`,
+        body: "New launch profiles use this route. Running containers and retained Plan Writers stay pinned until recreated.",
+        variant: "success",
+      });
+    } catch (error) {
+      addToast({
+        title: `Could not change ${provider === "claude" ? "Claude" : "OpenAI"} billing mode`,
+        body: error instanceof Error ? error.message : String(error),
+        variant: "error",
+      });
+    } finally {
+      setBillingSaving(null);
+    }
   }
 
   async function handleTest() {
@@ -1859,13 +1932,13 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
       const latest = await fetchSetupStatus(HUB_URL);
       await onRefresh();
       if (latest.chatgptAuthStatus === "connected" || latest.chatgptAuthStatus === "refreshing") {
-        const active = latest.openaiPlannerAvailable && latest.openaiPlannerRoute === "subscription-gateway";
+        const active = latest.openaiPlannerAvailable && latest.openaiPlannerRoute === "subscription-app-server";
         addToast({
           title: active ? "Subscription active" : "Subscription imported",
           body: active
             ? "The OpenAI planner can use the imported Codex subscription."
             : latest.openaiPlannerReason ??
-              "The subscription is imported. Tiller Self Host may still need the Subscription Gateway.",
+              "The subscription is imported, but the selected runtime is not ready.",
           variant: active ? "success" : "warning",
         });
       } else if (latest.chatgptAuthStatus === "needs_reconnect") {
@@ -1895,51 +1968,76 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
   }
 
   return (
-    <div className="flex-1 overflow-y-auto bg-[#f6f8fa]">
+    <div className="flex-1 overflow-y-auto bg-kumo-recessed">
       {codexImportOpen && (
-        <CodexImportDialog onClose={() => setCodexImportOpen(false)} />
+        <CodexImportDialog
+          onClose={() => setCodexImportOpen(false)}
+          onImported={onRefresh}
+        />
       )}
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 px-6 py-8">
-        <div className="flex items-start justify-between gap-4">
+      <div className="border-b border-kumo-line bg-kumo-base px-6 py-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-              <h2 className="text-lg font-semibold text-[#24292f]">Settings</h2>
-              <p className="mt-1 text-sm text-[#57606a]">
-                {status.isLocalDev
-                  ? "Manage model access for host environments on this localhost hub. Keep `tiller host` running when you want environments to start."
-                  : "Manage model access and hosting status."}
-              </p>
-            </div>
-          <button
-            type="button"
-            onClick={onDone}
-            className="rounded-lg border border-[#d0d7de] bg-white px-4 py-2 text-sm text-[#57606a] transition-colors hover:bg-[#f6f8fa]"
-          >
-            Back
-          </button>
+            <h2 className="text-lg font-semibold text-kumo-strong">Global Settings</h2>
+            <p className="mt-1 text-sm text-kumo-subtle">
+              {status.isLocalDev
+                ? "Manage model access for workloads on Your machine in this localhost Hub. Keep `tiller host` running when you want workloads to start."
+                : "Manage model access and the execution backend for new workloads."}
+            </p>
+          </div>
+          <Button variant="secondary" size="sm" onClick={onDone}>
+            Done
+          </Button>
         </div>
+      </div>
+
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 px-6 py-8">
+        <Card
+          title="Appearance"
+          description="Choose how Tiller looks on this device. System follows your OS preference."
+        >
+          <AppearanceRow />
+        </Card>
+
+        <WorkersDevAccessLifecycleCard status={status} />
 
         <Card
-          title="Hosting"
-          description="Hosted Tiller stays on protected workers.dev. Tiller Self Host is a guided graduation to a protected custom domain."
-          tone={status.selfHostStatus === "ready" || status.hostedInfrastructureReady ? "success" : "warning"}
+          title="Execution backend"
+          description="Choose where new workloads run."
+          tone="default"
         >
-          <HostingStatusCards status={status} onRefresh={onRefresh} />
+          <ExecutionBackendCard canonicalHubUrl={status.workersDevHubUrl ?? HUB_URL} />
         </Card>
 
         <Card
           title="Model access"
           description={
             status.modelAuthConfigured
-              ? "Manage your Claude and Codex credentials. OpenCode uses the built-in Workers AI proxy."
-              : codexVisible || opencodeVisible
-                ? "Add Claude or Codex credentials when you want those harnesses. OpenCode uses the built-in Workers AI proxy."
-                : "Add a Claude API key or Claude subscription token. This is the only required setup item."
+              ? "Manage model credentials. OpenCode includes Kimi through Workers AI and can also use OpenAI-backed models."
+              : "Add credentials for Claude, Codex, or OpenAI-backed OpenCode models. Kimi uses the built-in Workers AI proxy."
           }
           tone={status.modelAuthConfigured ? "success" : "warning"}
         >
           <div className="grid gap-5">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <BillingModeSelector
+                provider="Claude"
+                current={status.claudeBillingMode}
+                saving={billingSaving === "claude"}
+                onChange={(mode) => handleBillingMode("claude", mode)}
+              />
+              <BillingModeSelector
+                provider="OpenAI"
+                current={status.openaiBillingMode}
+                saving={billingSaving === "openai"}
+                onChange={(mode) => handleBillingMode("openai", mode)}
+              />
+            </div>
+            <p className="text-xs text-kumo-subtle">
+              Saving a credential does not activate it. Mode changes apply to newly claimed launch profiles; running containers and retained Plan Writer runtimes remain pinned until recreated.
+            </p>
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">API Keys</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">API Keys</p>
               <div className="mt-3 grid gap-3">
                 {opencodeVisible && (
                   <OpenCodeInfoRow />
@@ -1956,9 +2054,8 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
               </div>
             </div>
 
-            {subscriptionCredentials.length > 0 || (codexVisible && selfHostFeaturesVisible) ? (
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">Subscriptions</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">Subscriptions</p>
               <div className="mt-3 grid gap-3">
                 {subscriptionCredentials.map((def) => (
                   <CredentialRow
@@ -1969,19 +2066,16 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
                     onTest={handleTest}
                   />
                 ))}
-                {codexVisible && selfHostFeaturesVisible && (
-                  <CodexSubscriptionRow
-                    status={status}
-                    codexStatus={codexStatus}
-                    onImport={() => setCodexImportOpen(true)}
-                    importDisabled={codexImportDisabled}
-                    onCheckStatus={() => void handleCodexStatusRefresh()}
-                    checkingStatus={codexStatusRefreshing}
-                  />
-                )}
+                <CodexSubscriptionRow
+                  status={status}
+                  codexStatus={codexStatus}
+                  onImport={() => setCodexImportOpen(true)}
+                  importDisabled={codexImportDisabled}
+                  onCheckStatus={() => void handleCodexStatusRefresh()}
+                  checkingStatus={codexStatusRefreshing}
+                />
               </div>
             </div>
-            ) : null}
           </div>
         </Card>
 
@@ -1993,25 +2087,25 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
           <GitHubAppSettings status={status} onRefresh={onRefresh} />
         </Card>
 
-        <section className="rounded-2xl border border-[#d0d7de] bg-white p-5">
+        <LayerCard render={<section />} className="p-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <h3 className="text-base font-semibold text-[#24292f]">Advanced</h3>
-              <p className="mt-1 text-sm text-[#57606a]">Less common environment lifecycle and repository bootstrap settings.</p>
+              <h3 className="text-base font-semibold text-kumo-strong">Advanced</h3>
+              <p className="mt-1 text-sm text-kumo-subtle">Less common environment lifecycle and repository bootstrap settings.</p>
             </div>
-            <button
-              type="button"
+            <Button
+              variant="secondary"
+              size="sm"
               aria-expanded={advancedOpen}
               onClick={() => setAdvancedOpen((value) => !value)}
-              className="rounded-lg border border-[#d0d7de] bg-white px-3 py-1.5 text-xs font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
             >
               {advancedOpen ? "Hide advanced" : "Show advanced"}
-            </button>
+            </Button>
           </div>
           {advancedOpen && (
             <div className="mt-4 grid gap-3">
               <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#57606a]">Environment auto-stop</p>
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">Environment auto-stop</p>
                 <div className="mt-3 grid gap-3">
                   <IdleTimeoutRow
                     currentMinutes={status.idleTimeoutMinutes}
@@ -2033,17 +2127,17 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
               </div>
             </div>
           )}
-        </section>
+        </LayerCard>
 
         {status.isLocalDev && (
           <Card
             title="Localhost hub"
-            description="This localhost hub is contributor-only and supports the Tiller Self Host backend for local development."
+            description="This localhost Hub is contributor-only and supports Your machine for local development."
             tone="default"
           >
-            <div className="rounded-xl border border-[#d0d7de] bg-white px-4 py-4">
-              <p className="text-sm font-semibold text-[#24292f]">Browser-first host flow</p>
-              <p className="mt-2 text-xs text-[#57606a]">
+            <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-4">
+              <p className="text-sm font-semibold text-kumo-default">Browser-first host flow</p>
+              <p className="mt-2 text-xs text-kumo-subtle">
                 Keep <code>npm run dev</code> running here, then start <code>tiller host</code> in a second terminal
                 when you want environments to boot. Host Docker containers call back to this hub through
                 <code>host.docker.internal</code>.

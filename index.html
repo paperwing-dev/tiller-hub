@@ -1,9 +1,22 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-mode="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tiller</title>
+    <script>
+      // Set the theme before the app bundle loads to avoid a first-paint flash.
+      (function () {
+        var pref = null;
+        try {
+          pref = localStorage.getItem("tiller-theme");
+        } catch (e) {}
+        if (pref !== "light" && pref !== "dark") {
+          pref = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        }
+        document.documentElement.dataset.mode = pref;
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

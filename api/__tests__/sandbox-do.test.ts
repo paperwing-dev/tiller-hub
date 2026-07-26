@@ -43,6 +43,8 @@ function createLifecycleStubForStop(overrides: Record<string, unknown> = {}) {
     noteRunnerStopped: vi.fn().mockResolvedValue(
       createLifecycleState(overrides),
     ),
+    noteFencedRunnerAbsentBeforeNightStart: vi.fn().mockResolvedValue(false),
+    noteFencedNightStartRejectedBeforeMutation: vi.fn().mockResolvedValue(false),
     getStopWorkspaceSyncedMeta: vi.fn().mockResolvedValue(null),
     clearStopWorkspaceSyncedMeta: vi.fn().mockResolvedValue(undefined),
   };
@@ -229,7 +231,6 @@ describe("SandboxDO", () => {
     mocks.projectAndPersistEnvSummary.mockResolvedValue({
       slug: "demo-env",
       repoUrl: "https://github.com/test/repo",
-      runnerMachineId: "demo-env",
       createdAt: "2026-04-10T00:00:00.000Z",
       status: "failed",
     });
@@ -284,7 +285,6 @@ describe("SandboxDO", () => {
     const projectedMeta = {
       slug: "demo-env",
       repoUrl: "https://github.com/test/repo",
-      runnerMachineId: "demo-env",
       createdAt: "2026-04-10T00:00:00.000Z",
       status: "stopped",
       workspaceDirty: true,
@@ -384,7 +384,6 @@ describe("SandboxDO", () => {
     mocks.projectAndPersistEnvSummary.mockResolvedValue({
       slug: "demo-env",
       repoUrl: "https://github.com/test/repo",
-      runnerMachineId: "demo-env",
       createdAt: "2026-04-10T00:00:00.000Z",
       status: "starting",
     });
@@ -441,14 +440,12 @@ describe("SandboxDO", () => {
       .mockResolvedValueOnce({
         slug: "demo-env",
         repoUrl: "https://github.com/test/repo",
-        runnerMachineId: "demo-env",
         createdAt: "2026-04-10T00:00:00.000Z",
         status: "running",
       })
       .mockResolvedValueOnce({
         slug: "demo-env",
         repoUrl: "https://github.com/test/repo",
-        runnerMachineId: "demo-env",
         createdAt: "2026-04-10T00:00:00.000Z",
         status: "saving",
       });

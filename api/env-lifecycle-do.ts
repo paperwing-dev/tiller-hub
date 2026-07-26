@@ -1,14 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import type {
   Env,
+  GitHubEnvPendingPublishProjection,
   EnvLifecycleDesiredState,
   EnvLifecycleOperation,
   EnvLifecyclePhase,
   EnvLifecycleState,
   EnvMeta,
   EnvMutableState,
+  EnvDefinition,
+  HarnessSettings,
   EnvStatus,
-  ScmOperationType,
   StartupDiagnosticEvent,
   StartupDiagnosticFailure,
   StartupDiagnosticLogTails,
@@ -16,6 +18,11 @@ import type {
   StartupDiagnosticStepId,
   StartupDiagnosticsSnapshot,
   StartupDiagnosticsState,
+  RunnerCommandClaim,
+  CodexExecutionProfile,
+  ResolvedClaudeAuthMode,
+  CodexAuthPreference,
+  ExecutionPlacement,
 } from "./types";
 import { projectEnvSummary } from "./sync/projectors";
 import {
@@ -29,7 +36,13 @@ import {
   ENV_LIFECYCLE_STOP_TIMEOUT_MS,
 } from "./env-lifecycle";
 import type { PendingStopWorkspaceSyncedMeta, StopWorkspaceSyncedMetaPatch } from "./env-lifecycle";
-import { persistEnvSummary, readEnvDefinition } from "./plan/store";
+import type { DraftPrContent } from "./github/pr-content";
+import {
+  getEnvDefinitionKey,
+  persistEnvDefinition,
+  persistEnvSummary,
+  readEnvDefinition,
+} from "./plan/store";
 import { loadRepoProjection } from "./repo/access";
 import {
   buildEnvMetaFromLayers,
@@ -37,12 +50,51 @@ import {
   createEmptyMutableState,
   normalizeMutableState,
 } from "./env/state";
+import {
+  SCHEDULED_RUN_CAPACITY_RETRY_MS,
+  SCHEDULED_RUN_EFFECT_RETRY_MS,
+  SCHEDULED_RUN_HARD_CAP_MS,
+  SCHEDULED_RUN_PREPARATION_ABANDON_MS,
+  SCHEDULED_RUN_PREPARATION_LEASE_MS,
+  SCHEDULED_RUN_RETRY_MS,
+  finishedScheduledRun,
+  nextScheduledRunWakeAt,
+  projectScheduledRun,
+  type ActiveScheduledRunReceipt,
+  type EnvironmentPlanSchedule,
+  type ImmutableEnvironmentPlan,
+  type ScheduledRunCredentialIds,
+  type ScheduledRunRecord,
+  type ScheduledRunRequestedOutcome,
+} from "./env/scheduled-run-state";
+import { cleanupLaunchCredentialsBestEffort, startEnvAction, stopEnvAction } from "./env/lifecycle-actions";
+import type { ScheduledRunCapacityDO } from "./scheduled-run-capacity-do";
+import { codexExecutionAuthMode } from "./codex-execution";
+import { EXISTING_EXECUTION_UNAVAILABLE_MESSAGE } from "./execution";
+import { cleanupGitHubPublishRuntime } from "./github/publish-runtime";
+import { revokeGitHubBridgesForEnvPublish } from "./github/bridge";
+import { resolveCanonicalHubOrigin } from "./canonical-origin";
+import { isLoopbackHostname } from "../shared/local-dev";
 
 const MUTABLE_STATE_KEY = "env-mutable-state";
 const ENV_SLUG_KEY = "env-slug";
+const SCHEDULED_RUN_RECORD_KEY = "env-scheduled-run-record-v1";
+const IMMUTABLE_PLAN_KEY = "env-immutable-plan-v1";
+const SCHEDULED_RUN_LEASE_RELEASE_KEY = "env-scheduled-run-lease-release";
+const SCHEDULED_RUN_ATTEMPT_SEQUENCE_KEY = "env-scheduled-run-attempt-sequence";
+const RUNNER_COMMAND_GENERATION_KEY = "runner-command-generation";
+const RUNNER_COMMAND_CLAIM_KEY = "runner-command-claim";
+const ENV_PUBLICATION_KEY = "env-publication";
+const PROJECTION_VERSION_KEY = "env-projection-version";
+const PROJECTION_DIRTY_KEY = "env-projection-dirty-version";
+const INITIAL_CREATE_CLAIM_KEY = "env-initial-create-claim";
+const INITIAL_CREATE_CLAIM_TTL_MS = 5 * 60_000;
 const STOP_WORKSPACE_SYNCED_META_KEY = "stop-workspace-synced-meta";
+const GITHUB_PUBLISH_OPERATION_KEY = "github-publish-operation";
+const GITHUB_PUBLISH_RESULT_CLAIM_TTL_MS = 10 * 60_000;
 const STARTUP_DIAGNOSTICS_ACTIVE_KEY = "startup-diagnostics-active";
 const STARTUP_DIAGNOSTICS_LAST_FAILED_KEY = "startup-diagnostics-last-failed";
+const CODEX_EXECUTION_PROFILE_KEY = "codex-execution-profile-v1";
 const STARTUP_DIAGNOSTICS_MAX_EVENTS = 50;
 const STARTUP_DIAGNOSTICS_MAX_LOG_TAIL_CHARS = 4000;
 
@@ -61,6 +113,16 @@ function buildStopOpId(): string {
 
 function buildStartOpId(): string {
   return `start-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function patchValue<K extends keyof StopWorkspaceSyncedMetaPatch>(
+  patch: StopWorkspaceSyncedMetaPatch,
+  current: EnvMutableState,
+  key: K,
+): StopWorkspaceSyncedMetaPatch[K] {
+  return Object.prototype.hasOwnProperty.call(patch, key)
+    ? patch[key]
+    : current[key] as StopWorkspaceSyncedMetaPatch[K];
 }
 
 function normalizeDiagnosticMessage(message?: string | null): string | null {
@@ -299,18 +361,131 @@ function buildFailureState(current: EnvMutableState, error: string): EnvLifecycl
   };
 }
 
-type ScmProjectionInput = {
-  type: ScmOperationType;
+export interface GitHubPublishOperationRecord {
   operationId: string;
-  phase: string;
-  startedAt?: string | null;
-};
+  envSlug: string;
+  repoId: string;
+  repoUrl: string;
+  jobSlug: string;
+  executionPlacement: ExecutionPlacement;
+  branch: string;
+  baseCommitSha: string;
+  workspaceHash: string;
+  expectedPriorHead: string | null;
+  hmacKey: string;
+  callbackToken: string;
+  pullRequestContent: DraftPrContent;
+  resultClaim: {
+    claimId: string;
+    expiresAtMs: number;
+  } | null;
+  cleanupPending: {
+    terminalError: string;
+  } | null;
+  startedAt: string;
+}
 
-type ClearedScmProjectionResult = {
-  completedAt?: string | null;
-  durationMs?: number | null;
-  timings?: string | null;
-};
+export interface EnvStartClaimResult {
+  lifecycle: EnvLifecycleState | null;
+  dispatchGranted: boolean;
+  harnessSettings: HarnessSettings | null;
+  claudeAuthMode?: ResolvedClaudeAuthMode;
+  codexAuthPreference?: CodexAuthPreference;
+}
+
+interface StoredCodexExecutionProfile {
+  startOpId: string;
+  profile: CodexExecutionProfile;
+  accountId: string | null;
+  projectionUpdatedAt?: string;
+}
+
+export interface ActiveImplementorCodexRuntimeSubject {
+  envSlug: string;
+  incarnationId: string;
+  startOpId: string;
+  profile: CodexExecutionProfile;
+}
+
+interface InitialCreateClaim {
+  incarnationId: string;
+  createdAtMs: number;
+}
+
+interface PendingScheduledRunLeaseRelease {
+  slug: string;
+  attemptId: string;
+  nextAttemptAtMs: number;
+}
+
+type StoredPendingScheduledRunLeaseReleases =
+  | PendingScheduledRunLeaseRelease
+  | PendingScheduledRunLeaseRelease[];
+
+function normalizePendingScheduledRunLeaseReleases(
+  stored: StoredPendingScheduledRunLeaseReleases | null | undefined,
+): PendingScheduledRunLeaseRelease[] {
+  if (!stored) return [];
+  const candidates = Array.isArray(stored) ? stored : [stored];
+  return candidates.filter((candidate) => Boolean(
+    candidate
+    && typeof candidate.slug === "string"
+    && candidate.slug.trim()
+    && typeof candidate.attemptId === "string"
+    && candidate.attemptId.trim()
+    && Number.isFinite(candidate.nextAttemptAtMs),
+  ));
+}
+
+function nextPendingScheduledRunLeaseReleaseAt(
+  pending: readonly PendingScheduledRunLeaseRelease[],
+): number | null {
+  if (pending.length === 0) return null;
+  return Math.min(...pending.map((release) => release.nextAttemptAtMs));
+}
+
+export type EnvStoppedInitializationResult =
+  | { created: true; claimId: string; mutableState: EnvMutableState }
+  | { created: false; claimId: null; mutableState: EnvMutableState | null };
+
+type ClaimedInitialEnvironmentResult = EnvStoppedInitializationResult;
+
+export interface EnvPublicationRecord {
+  incarnationId: string;
+  state: "pending" | "visible" | "deleted";
+  updatedAt: string;
+}
+
+export type ScheduledRunPublicStartGuard =
+  | { action: "ordinary" }
+  | { action: "blocked"; error: string };
+
+export type ScheduledRunOutcomeResult =
+  | {
+      status: "accepted" | "idempotent";
+      outcome: ScheduledRunRequestedOutcome;
+      stop?: RunnerCommandClaim;
+      lifecycle?: EnvLifecycleState;
+      preparationInFlight?: boolean;
+    }
+  | { status: "rejected"; error: string };
+
+export interface ScheduledRunAttemptSnapshot {
+  attemptId: string;
+  schedule: EnvironmentPlanSchedule;
+  plan: ImmutableEnvironmentPlan;
+}
+
+export interface ScheduledRunStopClaimResult {
+  scheduled: boolean;
+  preparationInFlight: boolean;
+  lifecycle: EnvLifecycleState;
+  runnerCommand: RunnerCommandClaim;
+}
+
+export type EnvDeleteClaimResult =
+  | { allowed: true; runnerCommand: RunnerCommandClaim; mutableState: EnvMutableState }
+  | { allowed: false; error: string; mutableState: EnvMutableState | null };
 
 export class EnvLifecycleDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -322,6 +497,33 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     return stored ? normalizeMutableState(stored) : null;
   }
 
+  private async markProjectionDirtyInTransaction(txn: DurableObjectTransaction): Promise<number> {
+    const version = ((await txn.get<number>(PROJECTION_VERSION_KEY)) ?? 0) + 1;
+    await txn.put(PROJECTION_VERSION_KEY, version);
+    await txn.put(PROJECTION_DIRTY_KEY, version);
+    return version;
+  }
+
+  private async readProjectionVersion(): Promise<number> {
+    return (await this.ctx.storage.get<number>(PROJECTION_VERSION_KEY)) ?? 0;
+  }
+
+  private async readScheduledRun(): Promise<ScheduledRunRecord | null> {
+    return (await this.ctx.storage.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY)) ?? null;
+  }
+
+  async getScheduledRun(): Promise<ScheduledRunRecord | null> {
+    return this.readScheduledRun();
+  }
+
+  async getImmutablePlan(): Promise<ImmutableEnvironmentPlan | null> {
+    return (await this.ctx.storage.get<ImmutableEnvironmentPlan>(IMMUTABLE_PLAN_KEY)) ?? null;
+  }
+
+  async getPublication(): Promise<EnvPublicationRecord | null> {
+    return (await this.ctx.storage.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY)) ?? null;
+  }
+
   private async rememberSlug(slug: string): Promise<void> {
     const normalized = slug.trim();
     if (!normalized) {
@@ -330,70 +532,409 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     await this.ctx.storage.put(ENV_SLUG_KEY, normalized);
   }
 
+  private async claimInitialCreation(incarnationId: string): Promise<string | null> {
+    const claim: InitialCreateClaim = {
+      incarnationId,
+      createdAtMs: Date.now(),
+    };
+    return this.ctx.storage.transaction(async (txn) => {
+      const [existingState, existingClaim, storedPendingLeaseReleases] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY),
+        txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+      ]);
+      const liveClaim = existingClaim
+        && Number.isFinite(existingClaim.createdAtMs)
+        && Date.now() - existingClaim.createdAtMs < INITIAL_CREATE_CLAIM_TTL_MS;
+      if (existingState || liveClaim) return null;
+      await txn.put(INITIAL_CREATE_CLAIM_KEY, claim);
+      const claimExpiresAt = claim.createdAtMs + INITIAL_CREATE_CLAIM_TTL_MS;
+      const pendingReleaseAt = nextPendingScheduledRunLeaseReleaseAt(
+        normalizePendingScheduledRunLeaseReleases(storedPendingLeaseReleases),
+      );
+      await txn.setAlarm(pendingReleaseAt != null
+        ? Math.min(claimExpiresAt, pendingReleaseAt)
+        : claimExpiresAt);
+      return claim.incarnationId;
+    });
+  }
+
+  private async hasInitialCreationClaim(): Promise<boolean> {
+    const claim = await this.ctx.storage.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY);
+    return Boolean(claim);
+  }
+
+  async isInitialCreationPending(): Promise<boolean> {
+    return this.hasInitialCreationClaim();
+  }
+
+  private async clearClaimedInitialState(claimId: string): Promise<boolean> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const [claim, publication, storedPendingLeaseReleases] = await Promise.all([
+        txn.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+      ]);
+      if (claim?.incarnationId !== claimId) return false;
+      await txn.delete([
+        INITIAL_CREATE_CLAIM_KEY,
+        MUTABLE_STATE_KEY,
+        SCHEDULED_RUN_RECORD_KEY,
+        IMMUTABLE_PLAN_KEY,
+        ENV_SLUG_KEY,
+        PROJECTION_DIRTY_KEY,
+        CODEX_EXECUTION_PROFILE_KEY,
+      ]);
+      if (publication?.incarnationId === claimId) {
+        await txn.put(ENV_PUBLICATION_KEY, {
+          ...publication,
+          state: "deleted",
+          updatedAt: nowIso(),
+        } satisfies EnvPublicationRecord);
+      }
+      const pendingReleaseAt = nextPendingScheduledRunLeaseReleaseAt(
+        normalizePendingScheduledRunLeaseReleases(storedPendingLeaseReleases),
+      );
+      if (pendingReleaseAt != null) {
+        await txn.setAlarm(Math.max(Date.now(), pendingReleaseAt));
+      } else {
+        await txn.deleteAlarm();
+      }
+      return true;
+    });
+  }
+
+  private async initializeClaimedEnvironment(options: {
+    definition: EnvDefinition;
+    initialMutableState: EnvMutableState;
+    buildMutableState: (initial: EnvMutableState) => EnvMutableState;
+    persistDefinition: boolean;
+    retainClaim: boolean;
+    scheduledRun?: {
+      runAtMs: number;
+      timeZone: string;
+      localDevOrigin: string | null;
+      plan: ImmutableEnvironmentPlan;
+    };
+    incarnationId?: string;
+  }): Promise<ClaimedInitialEnvironmentResult> {
+    const incarnationId = options.incarnationId
+      ?? options.definition.incarnationId
+      ?? crypto.randomUUID();
+    const claimId = await this.claimInitialCreation(incarnationId);
+    if (!claimId) {
+      return {
+        created: false,
+        claimId: null,
+        mutableState: await this.readStoredMutableState(),
+      };
+    }
+
+    let definitionWriteAttempted = false;
+    try {
+      const existingDefinition = await readEnvDefinition(this.env, options.definition.slug);
+      if (existingDefinition) {
+        const publication = await this.getPublication();
+        const staleUnpublishedDefinition = Boolean(
+          existingDefinition.incarnationId
+          && publication?.incarnationId !== existingDefinition.incarnationId,
+        ) || Boolean(
+          existingDefinition.incarnationId
+          && publication?.incarnationId === existingDefinition.incarnationId
+          && publication.state !== "visible",
+        );
+        if (!staleUnpublishedDefinition) {
+          await this.clearClaimedInitialState(claimId);
+          return { created: false, claimId: null, mutableState: null };
+        }
+      }
+      if (options.persistDefinition) {
+        definitionWriteAttempted = true;
+        await persistEnvDefinition(this.env, options.definition);
+      }
+      let mutableState = normalizeMutableState(
+        options.buildMutableState(normalizeMutableState(options.initialMutableState)),
+      );
+      const scheduledRun = options.scheduledRun
+        ? {
+            kind: "schedule",
+            incarnationId,
+            runAtMs: options.scheduledRun.runAtMs,
+            deadlineAtMs: options.scheduledRun.runAtMs + SCHEDULED_RUN_HARD_CAP_MS,
+            timeZone: options.scheduledRun.timeZone,
+            localDevOrigin: options.scheduledRun.localDevOrigin,
+            attemptId: null,
+            retryAtMs: null,
+            lastError: null,
+            capacityAcquired: false,
+            acquireUncertain: false,
+            cancelRequested: false,
+            terminalRequested: false,
+            createdAt: nowIso(),
+            updatedAt: nowIso(),
+          } satisfies EnvironmentPlanSchedule
+        : null;
+      if (options.scheduledRun && options.scheduledRun.plan.incarnationId !== incarnationId) {
+        throw new Error("The immutable plan belongs to a different environment incarnation.");
+      }
+      const projection = projectScheduledRun(scheduledRun);
+      if (projection) {
+        mutableState = normalizeMutableState({ ...mutableState, scheduledRun: projection });
+      }
+      await this.ctx.storage.transaction(async (txn) => {
+        const claim = await txn.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY);
+        if (
+          claim?.incarnationId !== claimId
+          || !Number.isFinite(claim.createdAtMs)
+          || Date.now() - claim.createdAtMs >= INITIAL_CREATE_CLAIM_TTL_MS
+        ) {
+          throw new Error("Initial environment creation ownership was lost before commit.");
+        }
+        await txn.put(ENV_SLUG_KEY, options.definition.slug);
+        await txn.put(MUTABLE_STATE_KEY, mutableState);
+        await this.markProjectionDirtyInTransaction(txn);
+        if (scheduledRun) {
+          await txn.put(SCHEDULED_RUN_RECORD_KEY, scheduledRun);
+          await txn.put(IMMUTABLE_PLAN_KEY, options.scheduledRun!.plan);
+        }
+        await txn.put(ENV_PUBLICATION_KEY, {
+          incarnationId,
+          state: options.retainClaim ? "pending" : "visible",
+          updatedAt: nowIso(),
+        } satisfies EnvPublicationRecord);
+        if (!options.retainClaim) await txn.delete(INITIAL_CREATE_CLAIM_KEY);
+        const startOpId = mutableState.lifecycleOperation === "start"
+          && mutableState.lifecycleDesiredState === "running"
+          && mutableState.lifecycleOpId
+          ? mutableState.lifecycleOpId
+          : null;
+        if (startOpId) {
+          await this.allocateRunnerCommandInTransaction(txn, startOpId, "running");
+        }
+      });
+      if (!options.retainClaim) await this.scheduleNextAlarm(mutableState, scheduledRun);
+      return { created: true, claimId, mutableState };
+    } catch (error) {
+      if (definitionWriteAttempted) {
+        await this.env.ENVS_KV.delete(getEnvDefinitionKey(options.definition.slug)).catch(() => {});
+      }
+      await this.clearClaimedInitialState(claimId).catch(() => {});
+      throw error;
+    }
+  }
+
   private async readStoredSlug(): Promise<string | null> {
     return (await this.ctx.storage.get<string>(ENV_SLUG_KEY)) ?? null;
   }
 
-  private async persistProjectedSummary(mutableState: EnvMutableState | null): Promise<void> {
-    if (!mutableState) {
-      return;
-    }
-
+  async getOwnedEnvView(): Promise<EnvMeta | null> {
     const slug = await this.readStoredSlug();
-    if (!slug) {
-      return;
-    }
-
+    if (!slug) return null;
     const definition = await readEnvDefinition(this.env, slug);
-    if (!definition) {
-      return;
-    }
-
+    if (!definition?.incarnationId) return null;
+    const snapshot = await this.ctx.storage.transaction(async (txn) => {
+      const [publication, storedMutable, storedProfile] = await Promise.all([
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StoredCodexExecutionProfile>(CODEX_EXECUTION_PROFILE_KEY),
+      ]);
+      if (!storedMutable) return null;
+      if (
+        publication?.incarnationId !== definition.incarnationId
+        || publication.state !== "visible"
+      ) return null;
+      return {
+        mutable: normalizeMutableState(storedMutable),
+        profile: storedProfile ?? null,
+      };
+    });
+    if (!snapshot) return null;
     const repo = await loadRepoProjection(this.env, definition.repoId);
-    if (!repo.ok) {
-      console.warn(`[env-lifecycle] Skipping projection for ${slug}; repo ${definition.repoId} is unavailable.`);
-      return;
-    }
+    if (!repo.ok) return null;
 
-    const meta = buildEnvMetaFromLayers(definition, mutableState, repo.repo.repoUrl);
+    const projectedDefinition = { ...definition };
+    let profileProjectionUpdatedAt: string | undefined;
+    if (definition.harness === "codex") {
+      delete projectedDefinition.codexAuthMode;
+      const awaitingCurrentProfile = snapshot.mutable.lifecyclePhase === "starting"
+        && snapshot.mutable.lifecycleOperation === "start"
+        && snapshot.mutable.lifecycleDesiredState === "running";
+      const matchingCurrentProfile = snapshot.profile?.startOpId === snapshot.mutable.lifecycleOpId;
+      const projectedProfile = awaitingCurrentProfile
+        ? matchingCurrentProfile ? snapshot.profile : null
+        : snapshot.profile;
+      if (projectedProfile) {
+        projectedDefinition.codexAuthMode = codexExecutionAuthMode(projectedProfile.profile);
+        profileProjectionUpdatedAt = projectedProfile.projectionUpdatedAt;
+      }
+    }
+    const projectedMutable = profileProjectionUpdatedAt
+      && parseTimestamp(profileProjectionUpdatedAt) > parseTimestamp(snapshot.mutable.updatedAt)
+      ? normalizeMutableState({ ...snapshot.mutable, updatedAt: profileProjectionUpdatedAt })
+      : snapshot.mutable;
+    return buildEnvMetaFromLayers(projectedDefinition, projectedMutable, repo.repo.repoUrl);
+  }
+
+  async persistOwnedProjection(
+    options: { broadcast?: boolean } = {},
+  ): Promise<EnvMeta | null> {
+    const shouldBroadcast = options.broadcast !== false;
+    const projectionVersion = shouldBroadcast
+      ? await this.readProjectionVersion()
+      : null;
+    const meta = await this.getOwnedEnvView();
+    if (!meta) return null;
     await persistEnvSummary(this.env, meta);
+    if (!shouldBroadcast) return meta;
+
     const hubId = this.env.HUB.idFromName("hub");
-    const hub = this.env.HUB.get(hubId) as unknown as {
+    const locationHint = this.env.DO_LOCATION_HINT as DurableObjectLocationHint | undefined;
+    const hub = this.env.HUB.get(
+      hubId,
+      locationHint ? { locationHint } : undefined,
+    ) as unknown as {
       broadcastEnvUpsert: (env: EnvMeta) => Promise<void> | void;
     };
     await hub.broadcastEnvUpsert(projectEnvSummary(meta));
+    await this.confirmProjectionDelivery(projectionVersion!);
+    return meta;
+  }
+
+  private async confirmProjectionDelivery(projectionVersion: number): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const dirtyVersion = await txn.get<number>(PROJECTION_DIRTY_KEY);
+      if (dirtyVersion === projectionVersion) {
+        await txn.delete(PROJECTION_DIRTY_KEY);
+      }
+    });
+    await this.scheduleNextAlarm(
+      await this.readStoredMutableState(),
+      await this.readScheduledRun(),
+    );
   }
 
   private async writeMutableState(state: EnvMutableState | null): Promise<EnvMutableState | null> {
     if (!state) {
       await this.ctx.storage.delete(MUTABLE_STATE_KEY);
-      const existingAlarm = await this.ctx.storage.getAlarm();
-      if (existingAlarm !== null) {
-        await this.ctx.storage.deleteAlarm();
-      }
+      await this.ctx.storage.delete(PROJECTION_DIRTY_KEY);
+      await this.scheduleNextAlarm(null, await this.readScheduledRun());
       return null;
     }
 
     const next = normalizeMutableState(state);
-    await this.ctx.storage.put(MUTABLE_STATE_KEY, next);
-
-    const alarmAt = this.getAlarmAt(next);
-    if (alarmAt === null) {
-      const existingAlarm = await this.ctx.storage.getAlarm();
-      if (existingAlarm !== null) {
-        await this.ctx.storage.deleteAlarm();
-      }
-      return next;
-    }
-
-    const existingAlarm = await this.ctx.storage.getAlarm();
-    if (existingAlarm === null || existingAlarm !== alarmAt) {
-      await this.ctx.storage.setAlarm(alarmAt);
-    }
+    await this.ctx.storage.transaction(async (txn) => {
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+    });
+    await this.scheduleNextAlarm(next, await this.readScheduledRun());
     return next;
   }
 
-  private getAlarmAt(state: EnvMutableState | EnvLifecycleState): number | null {
+  private async writeScheduledRunInTransaction(
+    txn: DurableObjectTransaction,
+    mutable: EnvMutableState,
+    record: ScheduledRunRecord | null,
+  ): Promise<EnvMutableState> {
+    if (record) await txn.put(SCHEDULED_RUN_RECORD_KEY, record);
+    else await txn.delete(SCHEDULED_RUN_RECORD_KEY);
+    const projection = projectScheduledRun(record);
+    const next = normalizeMutableState({
+      ...mutable,
+      ...(projection ? { scheduledRun: projection } : {}),
+      updatedAt: nowIso(),
+    });
+    if (!projection) delete next.scheduledRun;
+    await txn.put(MUTABLE_STATE_KEY, next);
+    await this.markProjectionDirtyInTransaction(txn);
+    return next;
+  }
+
+  private async queueScheduledRunLeaseReleaseInTransaction(
+    txn: DurableObjectTransaction,
+    slug: string,
+    attemptId: string,
+  ): Promise<void> {
+    const pending = normalizePendingScheduledRunLeaseReleases(
+      await txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+    );
+    if (pending.some((entry) => entry.slug === slug && entry.attemptId === attemptId)) return;
+    await txn.put(SCHEDULED_RUN_LEASE_RELEASE_KEY, [...pending, {
+      slug,
+      attemptId,
+      nextAttemptAtMs: Date.now(),
+    } satisfies PendingScheduledRunLeaseRelease]);
+  }
+
+  private async scheduleNextAlarm(
+    state: EnvMutableState | null,
+    scheduledRun: ScheduledRunRecord | null,
+  ): Promise<void> {
+    const scheduledAlarmAt = nextScheduledRunWakeAt(scheduledRun);
+    const activePreparation = scheduledRun?.kind === "active" ? scheduledRun.preparation : null;
+    const preparationDefersStopTimeout = Boolean(
+      activePreparation
+      && state
+      && state.lifecycleOperation === "stop"
+      && (state.lifecyclePhase === "saving" || state.lifecyclePhase === "stopping"),
+    );
+    const lifecycleAlarmAt = state && !preparationDefersStopTimeout
+      ? this.getLifecycleAlarmAt(state)
+      : null;
+    const projectionDirtyVersion = await this.ctx.storage.get<number>(PROJECTION_DIRTY_KEY);
+    const publishOperation = await this.ctx.storage.get<GitHubPublishOperationRecord>(
+      GITHUB_PUBLISH_OPERATION_KEY,
+    );
+    const pendingLeaseReleases = normalizePendingScheduledRunLeaseReleases(
+      await this.ctx.storage.get<StoredPendingScheduledRunLeaseReleases>(
+        SCHEDULED_RUN_LEASE_RELEASE_KEY,
+      ),
+    );
+    const stateAlarmAt = lifecycleAlarmAt == null
+      ? scheduledAlarmAt
+      : scheduledAlarmAt == null ? lifecycleAlarmAt : Math.min(lifecycleAlarmAt, scheduledAlarmAt);
+    const projectionAlarmAt = projectionDirtyVersion == null
+      ? null
+      : Date.now() + SCHEDULED_RUN_EFFECT_RETRY_MS;
+    const scheduledBaseAlarmAt = stateAlarmAt == null
+      ? projectionAlarmAt
+      : projectionAlarmAt == null ? stateAlarmAt : Math.min(stateAlarmAt, projectionAlarmAt);
+    const publishAlarmAt = publishOperation?.cleanupPending
+      ? Date.now()
+      : publishOperation?.resultClaim?.expiresAtMs ?? null;
+    const baseAlarmAt = publishAlarmAt == null
+      ? scheduledBaseAlarmAt
+      : scheduledBaseAlarmAt == null
+        ? publishAlarmAt
+        : Math.min(scheduledBaseAlarmAt, publishAlarmAt);
+    const pendingLeaseReleaseAt = nextPendingScheduledRunLeaseReleaseAt(pendingLeaseReleases);
+    const alarmAt = pendingLeaseReleaseAt == null
+      ? baseAlarmAt
+      : baseAlarmAt == null
+        ? pendingLeaseReleaseAt
+        : Math.min(baseAlarmAt, pendingLeaseReleaseAt);
+    const now = Date.now();
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (alarmAt === null) {
+      // A concurrent newer transition may have installed a future alarm after
+      // this caller computed no work. Keep future alarms; an already-due alarm
+      // is the delivery being finalized and can be cleared.
+      if (existingAlarm !== null && existingAlarm <= now) {
+        await this.ctx.storage.deleteAlarm();
+      }
+      return;
+    }
+
+    const nextAlarm = Math.max(now, alarmAt);
+    // Never let a stale post-transaction caller postpone an earlier alarm
+    // installed by a newer transition. Extra early wakes are harmless and
+    // recompute from canonical state; a missed hard cap or lifecycle deadline
+    // is not.
+    if (existingAlarm === null || existingAlarm <= now || nextAlarm < existingAlarm) {
+      await this.ctx.storage.setAlarm(nextAlarm);
+    }
+  }
+
+  private getLifecycleAlarmAt(state: EnvMutableState | EnvLifecycleState): number | null {
     const phase = "lifecyclePhase" in state ? state.lifecyclePhase : state.phase;
     const updatedAt = "lifecycleUpdatedAt" in state
       ? state.lifecycleUpdatedAt ?? state.updatedAt
@@ -420,41 +961,134 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       return null;
     }
 
-    const alarmAt = this.getAlarmAt(state);
+    const alarmAt = this.getLifecycleAlarmAt(state);
     if (alarmAt === null || now < alarmAt) {
       return state;
     }
 
-    if (state.lifecyclePhase === "starting") {
-      await this.recordStartupDiagnosticsFailure(state.lifecycleOpId, {
-        stepId: state.bootStepId ?? undefined,
-        message: ENV_LIFECYCLE_START_TIMEOUT_ERROR,
-      });
-    }
+    const candidate = {
+      opId: state.lifecycleOpId,
+      phase: state.lifecyclePhase,
+      updatedAt: state.lifecycleUpdatedAt ?? state.updatedAt,
+    };
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun, storedDiagnostics] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_ACTIVE_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        !current
+        || current.lifecycleOpId !== candidate.opId
+        || current.lifecyclePhase !== candidate.phase
+        || (current.lifecycleUpdatedAt ?? current.updatedAt) !== candidate.updatedAt
+      ) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
+      const currentAlarmAt = this.getLifecycleAlarmAt(current);
+      if (currentAlarmAt === null || now < currentAlarmAt) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
+      const preparationDefersStopTimeout = Boolean(
+        scheduledRun?.kind === "active"
+        && scheduledRun.preparation
+        && current.lifecycleOperation === "stop"
+        && current.lifecycleDesiredState === "stopped"
+        && (current.lifecyclePhase === "saving" || current.lifecyclePhase === "stopping"),
+      );
+      if (preparationDefersStopTimeout) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
 
-    const diagnostics =
-      state.lifecyclePhase === "starting"
-        ? await this.readStartupDiagnosticsSnapshot(STARTUP_DIAGNOSTICS_ACTIVE_KEY)
+      const timeoutError = current.lifecyclePhase === "starting"
+        ? ENV_LIFECYCLE_START_TIMEOUT_ERROR
+        : current.lifecyclePhase === "saving"
+          ? ENV_LIFECYCLE_SAVE_TIMEOUT_ERROR
+          : ENV_LIFECYCLE_STOP_TIMEOUT_ERROR;
+      const updatedAt = nowIso();
+      let diagnostics = storedDiagnostics
+        ? normalizeStartupDiagnosticsSnapshot(storedDiagnostics)
         : null;
-    const timedOut = applyLifecycleState(
-      diagnostics
-        ? {
-            ...state,
+      if (
+        current.lifecyclePhase === "starting"
+        && current.lifecycleOpId
+        && diagnostics?.opId === current.lifecycleOpId
+      ) {
+        const fallbackStepId = current.bootStepId ?? diagnostics.currentStepId ?? "startup-failed";
+        const failureEvent = buildStartupDiagnosticEvent({
+          at: updatedAt,
+          opId: current.lifecycleOpId,
+          stepId: fallbackStepId,
+          severity: "error",
+          message: timeoutError,
+        });
+        diagnostics = this.buildUpdatedStartupDiagnostics(diagnostics, {
+          event: failureEvent,
+          currentStepId: fallbackStepId,
+          currentStepMessage: timeoutError,
+          failure: {
+            message: timeoutError,
+            exitCode: null,
+            signal: null,
+            lastStepId: fallbackStepId,
+          },
+          updatedAt,
+        });
+        await txn.put(STARTUP_DIAGNOSTICS_ACTIVE_KEY, diagnostics);
+      }
+
+      const timedOutBase = diagnostics
+        && current.lifecyclePhase === "starting"
+        && diagnostics.opId === current.lifecycleOpId
+        ? normalizeMutableState({
+            ...current,
             bootMessage: diagnostics.currentStepMessage,
             bootStepId: diagnostics.currentStepId,
-          }
-        : state,
-      buildFailureState(
-        state,
-        state.lifecyclePhase === "starting"
-          ? ENV_LIFECYCLE_START_TIMEOUT_ERROR
-          : state.lifecyclePhase === "saving"
-            ? ENV_LIFECYCLE_SAVE_TIMEOUT_ERROR
-            : ENV_LIFECYCLE_STOP_TIMEOUT_ERROR,
-      ),
-    );
-    await this.writeMutableState(timedOut);
-    return timedOut;
+          })
+        : current;
+      const timedOut = applyLifecycleState(
+        timedOutBase,
+        {
+          ...buildFailureState(timedOutBase, timeoutError),
+          lastErrorAt: updatedAt,
+          updatedAt,
+        },
+      );
+
+      let nextScheduledRun = scheduledRun ?? null;
+      if (
+        nextScheduledRun?.kind === "active"
+        && (
+          nextScheduledRun.startOpId === current.lifecycleOpId
+          || nextScheduledRun.stopOpId === current.lifecycleOpId
+        )
+      ) {
+        const runnerStoppedConfirmed = current.lifecycleInfraState === "stopped"
+          && current.lifecycleLastRunnerState === "stopped";
+        const runnerCleanupRequired = nextScheduledRun.runnerDispatchStarted
+          && !runnerStoppedConfirmed;
+        nextScheduledRun = {
+          ...nextScheduledRun,
+          requestedOutcome: nextScheduledRun.requestedOutcome ?? "interrupted",
+          failure: timeoutError,
+          runnerStoppedConfirmed,
+          runnerCleanupRequired,
+          runnerUncertaintyError: runnerCleanupRequired ? timeoutError : null,
+          updatedAt,
+        };
+      }
+      const nextMutable = await this.writeScheduledRunInTransaction(
+        txn,
+        timedOut,
+        nextScheduledRun,
+      );
+      return { mutable: nextMutable, scheduledRun: nextScheduledRun, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    }
+    return result.mutable;
   }
 
   private resolveLifecycleOpId(
@@ -568,50 +1202,9 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     });
   }
 
-  private async recordStartupDiagnosticsEvent(
-    opId: string | null | undefined,
-    options: {
-      at?: string | null;
-      stepId: StartupDiagnosticStepId;
-      severity?: StartupDiagnosticSeverity | null;
-      message: string;
-      detail?: string | null;
-      logTails?: Partial<StartupDiagnosticLogTails> | null;
-    },
-  ): Promise<StartupDiagnosticsSnapshot | null> {
-    const resolvedOpId = this.resolveLifecycleOpId(opId);
-    if (!resolvedOpId) {
-      return null;
-    }
-
-    const active = await this.readStartupDiagnosticsSnapshot(STARTUP_DIAGNOSTICS_ACTIVE_KEY);
-    if (!active || active.opId !== resolvedOpId) {
-      return null;
-    }
-
-    const event = buildStartupDiagnosticEvent({
-      at: options.at,
-      opId: resolvedOpId,
-      stepId: options.stepId,
-      severity: options.severity,
-      message: options.message,
-      detail: options.detail,
-    });
-    if (!event) {
-      return active;
-    }
-
-    const next = this.buildUpdatedStartupDiagnostics(active, {
-      event,
-      logTails: options.logTails,
-      updatedAt: event.at,
-    });
-    await this.writeStartupDiagnosticsSnapshot(STARTUP_DIAGNOSTICS_ACTIVE_KEY, next);
-    return next;
-  }
-
-  private async recordStartupDiagnosticsFailure(
-    opId: string | null | undefined,
+  private buildStartupDiagnosticsFailure(
+    active: StartupDiagnosticsSnapshot | null,
+    opId: string,
     options: {
       at?: string | null;
       stepId?: StartupDiagnosticStepId | null;
@@ -621,14 +1214,8 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       signal?: string | null;
       logTails?: Partial<StartupDiagnosticLogTails> | null;
     },
-  ): Promise<StartupDiagnosticsSnapshot | null> {
-    const resolvedOpId = this.resolveLifecycleOpId(opId);
-    if (!resolvedOpId) {
-      return null;
-    }
-
-    const active = await this.readStartupDiagnosticsSnapshot(STARTUP_DIAGNOSTICS_ACTIVE_KEY);
-    if (!active || active.opId !== resolvedOpId) {
+  ): StartupDiagnosticsSnapshot | null {
+    if (!active || active.opId !== opId) {
       return null;
     }
 
@@ -640,7 +1227,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
 
     const failureEvent = buildStartupDiagnosticEvent({
       at: options.at,
-      opId: resolvedOpId,
+      opId,
       stepId: fallbackStepId,
       severity: "error",
       message: failureMessage,
@@ -659,7 +1246,6 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       logTails: options.logTails,
       updatedAt: normalizeDiagnosticMessage(options.at),
     });
-    await this.writeStartupDiagnosticsSnapshot(STARTUP_DIAGNOSTICS_ACTIVE_KEY, next);
     return next;
   }
 
@@ -669,6 +1255,268 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       lifecyclePhase: "stopped",
       lifecycleDesiredState: "stopped",
     });
+  }
+
+  private isExactActiveStart(current: EnvMutableState, opId: string | null): boolean {
+    return Boolean(
+      opId
+      && current.lifecycleOpId === opId
+      && current.lifecycleOperation === "start"
+      && current.lifecycleDesiredState === "running"
+      && (current.lifecyclePhase === "starting" || current.lifecyclePhase === "running"),
+    );
+  }
+
+  private async mutateExistingMutableState(
+    options: {
+      opId?: string | null;
+      startFenceRequested: boolean;
+    },
+    mutation: (current: EnvMutableState) => EnvMutableState,
+  ): Promise<EnvMutableState | null> {
+    const resolvedOpId = this.resolveLifecycleOpId(options.opId);
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const stored = await txn.get<EnvMutableState>(MUTABLE_STATE_KEY);
+      if (!stored) return { state: null, changed: false };
+      const current = normalizeMutableState(stored);
+      if (
+        options.startFenceRequested
+        && !this.isExactActiveStart(current, resolvedOpId)
+      ) {
+        return { state: current, changed: false };
+      }
+      const next = normalizeMutableState(mutation(current));
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { state: next, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.state, await this.readScheduledRun());
+    }
+    return result.state;
+  }
+
+  private buildStartingMutableState(
+    current: EnvMutableState,
+    harnessSettings: HarnessSettings,
+    opId = buildStartOpId(),
+    authClaim: {
+      claudeAuthMode?: ResolvedClaudeAuthMode | null;
+      codexAuthPreference?: CodexAuthPreference | null;
+    } = {},
+  ): EnvMutableState {
+    return normalizeMutableState({
+      ...applyLifecycleState({ ...current, harnessSettings }, {
+        phase: "starting",
+        activeOpId: opId,
+        activeOperation: "start",
+        desiredState: "running",
+        lastRunnerState: current.lifecycleLastRunnerState,
+        lastWorkspaceSyncedAckOpId: null,
+        infraState: "unknown",
+        runtimeReady: false,
+        lastError: null,
+        lastErrorAt: null,
+        updatedAt: nowIso(),
+      }),
+      startClaudeAuthMode: authClaim.claudeAuthMode ?? null,
+      startCodexAuthPreference: authClaim.codexAuthPreference ?? null,
+      bootMessage: null,
+      bootStepId: null,
+    });
+  }
+
+  private async resetStartupDiagnosticsForNewClaimInTransaction(
+    txn: DurableObjectTransaction,
+  ): Promise<void> {
+    const stored = await txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_ACTIVE_KEY);
+    if (stored) {
+      const active = normalizeStartupDiagnosticsSnapshot(stored);
+      if (active.failure) await txn.put(STARTUP_DIAGNOSTICS_LAST_FAILED_KEY, active);
+    }
+    await txn.delete(STARTUP_DIAGNOSTICS_ACTIVE_KEY);
+  }
+
+  async initializeAndBeginStart(
+    definition: EnvDefinition,
+    initialMutableState: EnvMutableState,
+    harnessSettings: HarnessSettings,
+    authClaim: {
+      claudeAuthMode?: ResolvedClaudeAuthMode | null;
+      codexAuthPreference?: CodexAuthPreference | null;
+    } = {},
+  ): Promise<EnvStartClaimResult> {
+    const initialization = await this.initializeClaimedEnvironment({
+      definition,
+      initialMutableState,
+      buildMutableState: (initial) => this.buildStartingMutableState(initial, harnessSettings, undefined, authClaim),
+      persistDefinition: true,
+      retainClaim: false,
+      incarnationId: definition.incarnationId,
+    });
+    if (!initialization.created) {
+      return {
+        lifecycle: buildLifecycleState(initialization.mutableState),
+        dispatchGranted: false,
+        harnessSettings: initialization.mutableState?.harnessSettings ?? null,
+      };
+    }
+    return {
+      lifecycle: buildLifecycleState(initialization.mutableState),
+      dispatchGranted: true,
+      harnessSettings: initialization.mutableState.harnessSettings,
+      ...(initialization.mutableState.startClaudeAuthMode
+        ? { claudeAuthMode: initialization.mutableState.startClaudeAuthMode }
+        : {}),
+      ...(initialization.mutableState.startCodexAuthPreference
+        ? { codexAuthPreference: initialization.mutableState.startCodexAuthPreference }
+        : {}),
+    };
+  }
+
+  async initializeStoppedEnvironment(
+    definition: EnvDefinition,
+    initialMutableState: EnvMutableState,
+    options?: {
+      schedule: { runAtMs: number; timeZone: string; localDevOrigin: string | null };
+      plan: Omit<ImmutableEnvironmentPlan, "incarnationId" | "createdAt">;
+      incarnationId: string;
+    },
+  ): Promise<EnvStoppedInitializationResult> {
+    return this.initializeClaimedEnvironment({
+      definition,
+      initialMutableState,
+      buildMutableState: (initial) => initial,
+      persistDefinition: false,
+      retainClaim: true,
+      scheduledRun: options ? {
+        ...options.schedule,
+        plan: {
+          ...options.plan,
+          incarnationId: options.incarnationId,
+          createdAt: nowIso(),
+        },
+      } : undefined,
+      incarnationId: options?.incarnationId,
+    });
+  }
+
+  async publishStoppedInitialization(claimId: string, definition: EnvDefinition): Promise<boolean> {
+    const claim = await this.ctx.storage.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY);
+    if (claim?.incarnationId !== claimId) return false;
+    if (definition.incarnationId && definition.incarnationId !== claimId) return false;
+    const publication = await this.getPublication();
+    if (
+      !publication
+      || publication.state !== "pending"
+      || publication.incarnationId !== claimId
+    ) return false;
+    const existing = await readEnvDefinition(this.env, definition.slug);
+    if (existing && (!definition.incarnationId || existing.incarnationId !== definition.incarnationId)) {
+      const existingPublication = await this.getPublication();
+      if (!existing.incarnationId || existingPublication?.state === "visible") return false;
+    }
+    await persistEnvDefinition(this.env, definition);
+    return true;
+  }
+
+  async commitStoppedInitialization(claimId: string): Promise<boolean> {
+    const committed = await this.ctx.storage.transaction(async (txn) => {
+      const [claim, publication, scheduledRun, projectionDirtyVersion] = await Promise.all([
+        txn.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<number>(PROJECTION_DIRTY_KEY),
+      ]);
+      const matchingPublication = publication?.incarnationId === claimId;
+      if (matchingPublication && publication.state === "visible") {
+        const wakeAt = nextScheduledRunWakeAt(scheduledRun ?? null);
+        const projectionAt = projectionDirtyVersion == null ? null : Date.now() + SCHEDULED_RUN_EFFECT_RETRY_MS;
+        const alarmAt = wakeAt == null
+          ? projectionAt
+          : projectionAt == null ? wakeAt : Math.min(wakeAt, projectionAt);
+        if (alarmAt != null) await txn.setAlarm(Math.max(Date.now(), alarmAt));
+        return true;
+      }
+      if (
+        claim?.incarnationId !== claimId
+        || !matchingPublication
+        || publication.state !== "pending"
+      ) return false;
+      await txn.put(ENV_PUBLICATION_KEY, {
+        ...publication,
+        state: "visible",
+        updatedAt: nowIso(),
+      } satisfies EnvPublicationRecord);
+      await txn.delete(INITIAL_CREATE_CLAIM_KEY);
+      const wakeAt = nextScheduledRunWakeAt(scheduledRun ?? null);
+      const projectionAt = projectionDirtyVersion == null ? null : Date.now() + SCHEDULED_RUN_EFFECT_RETRY_MS;
+      const alarmAt = wakeAt == null
+        ? projectionAt
+        : projectionAt == null ? wakeAt : Math.min(wakeAt, projectionAt);
+      if (alarmAt != null) await txn.setAlarm(Math.max(Date.now(), alarmAt));
+      return true;
+    });
+    if (committed) {
+      await this.scheduleNextAlarm(
+        await this.readStoredMutableState(),
+        await this.readScheduledRun(),
+      );
+    }
+    return committed;
+  }
+
+  async rollbackStoppedInitialization(claimId: string): Promise<boolean> {
+    const rollback = await this.ctx.storage.transaction(async (txn) => {
+      const [claim, slug, publication] = await Promise.all([
+        txn.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+      ]);
+      if (claim?.incarnationId !== claimId) return null;
+      if (publication?.incarnationId === claimId) {
+        await txn.put(ENV_PUBLICATION_KEY, {
+          ...publication,
+          state: "deleted",
+          updatedAt: nowIso(),
+        } satisfies EnvPublicationRecord);
+      }
+      return { slug: slug ?? null };
+    });
+    if (!rollback) return false;
+
+    const failures: unknown[] = [];
+    try {
+      const kvCleanup = rollback.slug
+        ? await Promise.allSettled([
+            this.env.ENVS_KV.delete(rollback.slug),
+            this.env.ENVS_KV.delete(getEnvDefinitionKey(rollback.slug)),
+          ])
+        : [];
+      for (const result of kvCleanup) {
+        if (result.status === "rejected") failures.push(result.reason);
+      }
+      if (!rollback.slug) {
+        failures.push(new Error("Initial environment rollback is missing its lifecycle-owned slug"));
+      }
+    } catch (error) {
+      failures.push(error);
+    } finally {
+      try {
+        if (!(await this.clearClaimedInitialState(claimId))) {
+          failures.push(new Error("Initial environment rollback lost its lifecycle creation claim"));
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "Initial environment KV rollback was incomplete",
+      );
+    }
+    return true;
   }
 
   async initializeMutableStateFromMeta(meta: EnvMeta): Promise<EnvMutableState> {
@@ -696,6 +1544,1062 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     return buildLifecycleState(current);
   }
 
+  async claimCodexExecutionProfile(
+    startOpId: string,
+    profile: CodexExecutionProfile,
+  ): Promise<CodexExecutionProfile | null> {
+    const resolvedOpId = this.resolveLifecycleOpId(startOpId);
+    if (!resolvedOpId) return null;
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, existing] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StoredCodexExecutionProfile>(CODEX_EXECUTION_PROFILE_KEY),
+      ]);
+      if (!storedMutable || !this.isExactActiveStart(normalizeMutableState(storedMutable), resolvedOpId)) {
+        return { profile: null, mutable: null, claimed: false };
+      }
+      const current = normalizeMutableState(storedMutable);
+      if (existing?.startOpId === resolvedOpId) {
+        return { profile: existing.profile, mutable: current, claimed: false };
+      }
+      const currentUpdatedAtMs = parseTimestamp(current.updatedAt);
+      const updatedAt = new Date(Math.max(Date.now(), currentUpdatedAtMs + 1)).toISOString();
+      const next = normalizeMutableState({ ...current, updatedAt });
+      await txn.put(CODEX_EXECUTION_PROFILE_KEY, {
+        startOpId: resolvedOpId,
+        profile,
+        accountId: null,
+        projectionUpdatedAt: updatedAt,
+      } satisfies StoredCodexExecutionProfile);
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { profile, mutable: next, claimed: true };
+    });
+    if (result.profile && result.mutable) {
+      await this.scheduleNextAlarm(result.mutable, await this.readScheduledRun());
+    }
+    return result.profile;
+  }
+
+  async acceptImplementorCodexRuntimeAuth(
+    startOpId: string,
+    accountId: string,
+  ): Promise<"accepted" | "inactive" | "account_changed"> {
+    const resolvedOpId = this.resolveLifecycleOpId(startOpId);
+    const normalizedAccountId = accountId.trim();
+    if (!resolvedOpId || !normalizedAccountId) return "inactive";
+    return await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, storedProfile] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StoredCodexExecutionProfile>(CODEX_EXECUTION_PROFILE_KEY),
+      ]);
+      if (
+        !storedMutable
+        || !storedProfile
+        || storedProfile.startOpId !== resolvedOpId
+        || storedProfile.profile.kind !== "subscription-app-server"
+        || storedProfile.profile.surface !== "implementor"
+        || !this.isExactActiveStart(normalizeMutableState(storedMutable), resolvedOpId)
+      ) {
+        return "inactive";
+      }
+      if (storedProfile.accountId && storedProfile.accountId !== normalizedAccountId) {
+        return "account_changed";
+      }
+      if (!storedProfile.accountId) {
+        await txn.put(CODEX_EXECUTION_PROFILE_KEY, {
+          ...storedProfile,
+          accountId: normalizedAccountId,
+        } satisfies StoredCodexExecutionProfile);
+      }
+      return "accepted";
+    });
+  }
+
+  async getCodexExecutionProfile(startOpId: string): Promise<CodexExecutionProfile | null> {
+    const stored = await this.ctx.storage.get<StoredCodexExecutionProfile>(CODEX_EXECUTION_PROFILE_KEY);
+    return stored?.startOpId === startOpId ? stored.profile : null;
+  }
+
+  async getActiveImplementorCodexRuntimeSubject(): Promise<ActiveImplementorCodexRuntimeSubject | null> {
+    const snapshot = await this.ctx.storage.transaction(async (txn) => {
+      const [mutable, slug, publication, storedProfile] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<StoredCodexExecutionProfile>(CODEX_EXECUTION_PROFILE_KEY),
+      ]);
+      if (!mutable || !slug || !publication || publication.state !== "visible" || !storedProfile) return null;
+      const normalized = normalizeMutableState(mutable);
+      if (!this.isExactActiveStart(normalized, storedProfile.startOpId)) return null;
+      return {
+        envSlug: slug,
+        incarnationId: publication.incarnationId,
+        startOpId: storedProfile.startOpId,
+        profile: storedProfile.profile,
+      };
+    });
+    return snapshot;
+  }
+
+  private async allocateRunnerCommandInTransaction(
+    txn: DurableObjectTransaction,
+    operationId: string,
+    desiredState: RunnerCommandClaim["desiredState"],
+  ): Promise<RunnerCommandClaim> {
+    const existing = await txn.get<RunnerCommandClaim>(RUNNER_COMMAND_CLAIM_KEY);
+    if (existing?.operationId === operationId) {
+      if (existing.desiredState !== desiredState) {
+        throw new Error("A runner command operation cannot change its desired state.");
+      }
+      return existing;
+    }
+    const highWater = (await txn.get<number>(RUNNER_COMMAND_GENERATION_KEY)) ?? 0;
+    const claim: RunnerCommandClaim = {
+      commandGeneration: highWater + 1,
+      operationId,
+      desiredState,
+    };
+    await txn.put(RUNNER_COMMAND_GENERATION_KEY, claim.commandGeneration);
+    await txn.put(RUNNER_COMMAND_CLAIM_KEY, claim);
+    return claim;
+  }
+
+  async claimRunnerCommand(
+    operationId: string,
+    desiredState: RunnerCommandClaim["desiredState"],
+  ): Promise<RunnerCommandClaim> {
+    const normalizedOperationId = operationId.trim();
+    if (!normalizedOperationId) throw new TypeError("Runner command operationId is required.");
+    return this.ctx.storage.transaction(async (txn) => {
+      const [existing, storedMutable] = await Promise.all([
+        txn.get<RunnerCommandClaim>(RUNNER_COMMAND_CLAIM_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      if (existing?.operationId === normalizedOperationId && existing.desiredState !== desiredState) {
+        throw new Error("A runner command operation cannot change its desired state.");
+      }
+      if (
+        !existing
+        || existing.operationId !== normalizedOperationId
+        || existing.desiredState !== desiredState
+      ) {
+        throw new Error(existing
+          ? "The runner command lifecycle operation has been superseded."
+          : "The runner command was not allocated by the active lifecycle transition.");
+      }
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const lifecycleOwnsCommand = desiredState === "running"
+        ? Boolean(
+            current
+            && current.lifecycleOpId === normalizedOperationId
+            && current.lifecycleOperation === "start"
+            && current.lifecycleDesiredState === "running"
+            && current.lifecyclePhase === "starting",
+          )
+        : desiredState === "stopped"
+          ? Boolean(
+              current
+              && current.lifecycleOpId === normalizedOperationId
+              && current.lifecycleOperation === "stop"
+              && current.lifecycleDesiredState === "stopped"
+              && (current.lifecyclePhase === "saving"
+                || current.lifecyclePhase === "stopping"
+                || current.lifecyclePhase === "failed"
+                || current.lifecyclePhase === "stopped"),
+            )
+          : Boolean(current?.status === "deleting");
+      if (!lifecycleOwnsCommand) {
+        throw new Error("The runner command lifecycle operation has been superseded.");
+      }
+      return existing;
+    });
+  }
+
+  async peekVisibleMutableState(incarnationId: string): Promise<EnvMutableState | null> {
+    const expected = incarnationId.trim();
+    if (!expected) return null;
+    return this.ctx.storage.transaction(async (txn) => {
+      const [publication, storedMutable] = await Promise.all([
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      if (
+        publication?.incarnationId !== expected
+        || publication.state !== "visible"
+        || !storedMutable
+      ) return null;
+      return normalizeMutableState(storedMutable);
+    });
+  }
+
+  private settleActiveScheduledRun(
+    record: ActiveScheduledRunReceipt,
+    at = nowIso(),
+  ): ScheduledRunRecord {
+    if (
+      record.preparation
+      || record.credentialsMayExist
+      || !record.capacityReleased
+      || !record.runnerStoppedConfirmed
+      || !record.persistenceConfirmed
+      || !record.requestedOutcome
+      || record.runnerCleanupRequired
+    ) return record;
+    return finishedScheduledRun(record, {
+      outcome: record.failure ? "failed" : record.requestedOutcome,
+      error: record.failure,
+      at,
+    });
+  }
+
+  async cancelScheduledRun(): Promise<{ cancelled: boolean; finalizing?: boolean; error?: string }> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable, slug] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!record || record.kind === "finished") {
+        return { cancelled: true as const, record: record ?? null, mutable };
+      }
+      if (record.kind === "active") {
+        return {
+          cancelled: false as const,
+          error: "The Scheduled Run has already started.",
+          record,
+          mutable,
+        };
+      }
+      if (!mutable) {
+        return { cancelled: false as const, error: "Environment state not found.", record, mutable };
+      }
+      const possibleLease = Boolean(record.attemptId && (record.capacityAcquired || record.acquireUncertain));
+      if (possibleLease) {
+        if (!slug) throw new Error("Scheduled Run capacity release is missing its environment slug.");
+        await this.queueScheduledRunLeaseReleaseInTransaction(txn, slug, record.attemptId!);
+        const next: EnvironmentPlanSchedule = {
+          ...record,
+          cancelRequested: true,
+          retryAtMs: null,
+          updatedAt: nowIso(),
+        };
+        const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+        await txn.setAlarm(Date.now());
+        return { cancelled: true as const, finalizing: true as const, record: next, mutable: nextMutable };
+      }
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, null);
+      return { cancelled: true as const, record: null, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.cancelled
+      ? { cancelled: true, ...(result.finalizing ? { finalizing: true } : {}) }
+      : { cancelled: false, error: result.error };
+  }
+
+  async preparePublicStart(): Promise<ScheduledRunPublicStartGuard> {
+    const current = await this.readScheduledRun();
+    if (!current || (current.kind === "finished" && !current.cleanupRequired)) {
+      return { action: "ordinary" };
+    }
+    return {
+      action: "blocked",
+      error: current.kind === "schedule"
+        ? "Cancel the Scheduled Run before starting this environment."
+        : current.kind === "active" && current.runnerCleanupRequired
+          ? EXISTING_EXECUTION_UNAVAILABLE_MESSAGE
+          : "The Scheduled Run is active or finalizing. Stop it before starting this environment.",
+    };
+  }
+
+  async beginScheduledRunAttempt(
+    expectedIncarnationId?: string,
+  ): Promise<ScheduledRunAttemptSnapshot> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedRecord, plan, publication, storedMutable] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<ImmutableEnvironmentPlan>(IMMUTABLE_PLAN_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      if (!storedRecord || storedRecord.kind !== "schedule" || !plan || !storedMutable) {
+        throw new Error("No Scheduled Run is ready to start.");
+      }
+      if (
+        (expectedIncarnationId && storedRecord.incarnationId !== expectedIncarnationId)
+        || plan.incarnationId !== storedRecord.incarnationId
+        || publication?.incarnationId !== storedRecord.incarnationId
+        || publication.state !== "visible"
+      ) throw new Error("The Scheduled Run belongs to a replaced environment incarnation.");
+      if (storedRecord.cancelRequested || storedRecord.terminalRequested) {
+        throw new Error("The Scheduled Run is finalizing and cannot start.");
+      }
+      if (storedRecord.acquireUncertain || storedRecord.capacityAcquired) {
+        return { attemptId: storedRecord.attemptId!, schedule: storedRecord, plan, mutable: normalizeMutableState(storedMutable) };
+      }
+      const now = Date.now();
+      if (now < (storedRecord.retryAtMs ?? storedRecord.runAtMs)) {
+        throw new Error("The Scheduled Run is not due yet.");
+      }
+      if (now >= storedRecord.deadlineAtMs) {
+        throw new Error("The Scheduled Run deadline passed before a runner could start.");
+      }
+      let attemptId = storedRecord.attemptId;
+      if (!attemptId) {
+        const stored = await txn.get<number>(SCHEDULED_RUN_ATTEMPT_SEQUENCE_KEY);
+        const sequence = typeof stored === "number" && Number.isSafeInteger(stored) && stored >= 0 ? stored + 1 : 1;
+        await txn.put(SCHEDULED_RUN_ATTEMPT_SEQUENCE_KEY, sequence);
+        attemptId = `attempt-${sequence}-${crypto.randomUUID()}`;
+      }
+      const next: EnvironmentPlanSchedule = {
+        ...storedRecord,
+        attemptId,
+        retryAtMs: null,
+        lastError: null,
+        updatedAt: nowIso(),
+      };
+      const mutable = await this.writeScheduledRunInTransaction(
+        txn,
+        normalizeMutableState(storedMutable),
+        next,
+      );
+      return { attemptId, schedule: next, plan, mutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.schedule);
+    return { attemptId: result.attemptId, schedule: result.schedule, plan: result.plan };
+  }
+
+  async recordScheduledPreStartFailure(options: {
+    attemptId: string;
+    error: string;
+    retryable: boolean;
+    capacityDenied?: boolean;
+  }): Promise<ScheduledRunRecord | null> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedRecord, storedMutable, slug] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!storedRecord || storedRecord.kind !== "schedule" || storedRecord.attemptId !== options.attemptId || !mutable) {
+        return { record: storedRecord ?? null, mutable };
+      }
+      const delay = options.capacityDenied ? SCHEDULED_RUN_CAPACITY_RETRY_MS : SCHEDULED_RUN_RETRY_MS;
+      const retryAtMs = Date.now() + delay;
+      const retryable = options.retryable
+        && !storedRecord.cancelRequested
+        && retryAtMs < storedRecord.deadlineAtMs;
+      const possibleLease = storedRecord.capacityAcquired || storedRecord.acquireUncertain;
+      let next: ScheduledRunRecord;
+      if (possibleLease) {
+        if (!slug) throw new Error("Scheduled Run capacity release is missing its environment slug.");
+        await this.queueScheduledRunLeaseReleaseInTransaction(txn, slug, options.attemptId);
+        next = {
+          ...storedRecord,
+          terminalRequested: !retryable,
+          retryAtMs: retryable ? retryAtMs : null,
+          lastError: options.error,
+          updatedAt: nowIso(),
+        };
+        await txn.setAlarm(Date.now());
+      } else if (retryable) {
+        next = {
+          ...storedRecord,
+          retryAtMs,
+          lastError: options.error,
+          updatedAt: nowIso(),
+        };
+      } else {
+        next = finishedScheduledRun(storedRecord, { outcome: "failed", error: options.error });
+      }
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.record;
+  }
+
+  async markScheduledCapacityAcquireUncertain(attemptId: string, error: string): Promise<boolean> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable, slug] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!record || record.kind !== "schedule" || record.attemptId !== attemptId || !mutable || !slug) {
+        return { changed: false, record: record ?? null, mutable };
+      }
+      const next: EnvironmentPlanSchedule = {
+        ...record,
+        acquireUncertain: true,
+        lastError: error,
+        updatedAt: nowIso(),
+      };
+      await this.queueScheduledRunLeaseReleaseInTransaction(txn, slug, attemptId);
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      await txn.setAlarm(Date.now());
+      return { changed: true, record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.changed;
+  }
+
+  async recordScheduledCapacityAcquired(attemptId: string): Promise<boolean> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable, storedPending] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!record || record.kind !== "schedule" || record.attemptId !== attemptId || !mutable) {
+        return { acquired: false, record: record ?? null, mutable };
+      }
+      if (record.cancelRequested || record.terminalRequested) {
+        return { acquired: false, record, mutable };
+      }
+      const next: EnvironmentPlanSchedule = {
+        ...record,
+        capacityAcquired: true,
+        acquireUncertain: false,
+        updatedAt: nowIso(),
+      };
+      const retained = normalizePendingScheduledRunLeaseReleases(storedPending)
+        .filter((entry) => entry.attemptId !== attemptId);
+      if (retained.length > 0) await txn.put(SCHEDULED_RUN_LEASE_RELEASE_KEY, retained);
+      else await txn.delete(SCHEDULED_RUN_LEASE_RELEASE_KEY);
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { acquired: true, record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.acquired;
+  }
+
+  async claimScheduledRunStart(options: {
+    attemptId: string;
+    harnessSettings: HarnessSettings;
+    hostMachineId: string | null;
+    authClaim?: {
+      claudeAuthMode?: ResolvedClaudeAuthMode | null;
+      codexAuthPreference?: CodexAuthPreference | null;
+    };
+  }): Promise<EnvStartClaimResult> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable, slug, pendingReleases] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+        txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!record || !mutable || !slug) {
+        return { lifecycle: buildLifecycleState(mutable), dispatchGranted: false, harnessSettings: mutable?.harnessSettings ?? null, record: record ?? null };
+      }
+      if (record.kind === "active" && record.attemptId === options.attemptId) {
+        const granted = this.isExactActiveStart(mutable, record.startOpId)
+          && mutable.lifecyclePhase === "starting";
+        return {
+          lifecycle: buildLifecycleState(mutable),
+          dispatchGranted: granted,
+          harnessSettings: mutable.harnessSettings,
+          claudeAuthMode: mutable.startClaudeAuthMode,
+          codexAuthPreference: mutable.startCodexAuthPreference,
+          record,
+        };
+      }
+      const startable = mutable.lifecyclePhase === "stopped"
+        || mutable.lifecyclePhase === "failed"
+        || mutable.status === "stopped"
+        || mutable.status === "failed"
+        || mutable.status === "unknown";
+      if (
+        record.kind !== "schedule"
+        || record.attemptId !== options.attemptId
+        || !record.capacityAcquired
+        || record.acquireUncertain
+        || record.cancelRequested
+        || record.terminalRequested
+        || Date.now() >= record.deadlineAtMs
+        || !startable
+      ) {
+        return { lifecycle: buildLifecycleState(mutable), dispatchGranted: false, harnessSettings: mutable.harnessSettings, record };
+      }
+      const opId = buildStartOpId();
+      const nextMutable = this.buildStartingMutableState(
+        mutable,
+        options.harnessSettings,
+        opId,
+        options.authClaim,
+      );
+      const runnerCommand = await this.allocateRunnerCommandInTransaction(txn, opId, "running");
+      const at = nowIso();
+      const active: ActiveScheduledRunReceipt = {
+        kind: "active",
+        incarnationId: record.incarnationId,
+        slug,
+        runAtMs: record.runAtMs,
+        deadlineAtMs: record.deadlineAtMs,
+        timeZone: record.timeZone,
+        localDevOrigin: record.localDevOrigin,
+        createdAt: record.createdAt,
+        updatedAt: at,
+        attemptId: options.attemptId,
+        startOpId: opId,
+        startCause: "scheduled",
+        runnerGeneration: runnerCommand.commandGeneration,
+        harnessSettings: options.harnessSettings,
+        hostMachineId: options.hostMachineId,
+        preparation: { claimedAtMs: Date.now(), heartbeatAtMs: Date.now(), effectMayBeLive: false },
+        credentialsMayExist: false,
+        credentialIds: {},
+        runnerDispatchStarted: false,
+        runnerStoppedConfirmed: false,
+        persistenceConfirmed: false,
+        capacityReleased: false,
+        requestedOutcome: null,
+        stopOpId: null,
+        stopRunnerGeneration: null,
+        runnerCleanupRequired: false,
+        runnerUncertaintyError: null,
+        failure: null,
+        startedAt: at,
+      };
+      const retainedReleases = normalizePendingScheduledRunLeaseReleases(pendingReleases)
+        .filter((pending) => pending.slug !== slug || pending.attemptId !== options.attemptId);
+      if (retainedReleases.length > 0) await txn.put(SCHEDULED_RUN_LEASE_RELEASE_KEY, retainedReleases);
+      else await txn.delete(SCHEDULED_RUN_LEASE_RELEASE_KEY);
+      await this.resetStartupDiagnosticsForNewClaimInTransaction(txn);
+      const projected = await this.writeScheduledRunInTransaction(txn, nextMutable, active);
+      return {
+        lifecycle: buildLifecycleState(projected),
+        dispatchGranted: true,
+        harnessSettings: projected.harnessSettings,
+        claudeAuthMode: projected.startClaudeAuthMode,
+        codexAuthPreference: projected.startCodexAuthPreference,
+        record: active,
+      };
+    });
+    await this.scheduleNextAlarm(await this.readStoredMutableState(), result.record);
+    return {
+      lifecycle: result.lifecycle,
+      dispatchGranted: result.dispatchGranted,
+      harnessSettings: result.harnessSettings,
+      ...(result.claudeAuthMode ? { claudeAuthMode: result.claudeAuthMode } : {}),
+      ...(result.codexAuthPreference
+        ? { codexAuthPreference: result.codexAuthPreference }
+        : {}),
+    };
+  }
+
+  async beginScheduledRunPreparation(opIdInput: string): Promise<number | null> {
+    const opId = this.resolveLifecycleOpId(opIdInput);
+    if (!opId) return null;
+    const current = await this.readScheduledRun();
+    return current?.kind === "active" && current.startOpId === opId
+      ? current.preparation?.claimedAtMs ?? null
+      : null;
+  }
+
+  async renewScheduledRunPreparation(options: { opId: string; claimedAtMs: number }): Promise<boolean> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const record = await txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY);
+      if (
+        record?.kind !== "active"
+        || record.startOpId !== options.opId
+        || record.preparation?.claimedAtMs !== options.claimedAtMs
+      ) return false;
+      await txn.put(SCHEDULED_RUN_RECORD_KEY, {
+        ...record,
+        preparation: { ...record.preparation, heartbeatAtMs: Date.now() },
+        updatedAt: nowIso(),
+      } satisfies ActiveScheduledRunReceipt);
+      return true;
+    });
+  }
+
+  async beginScheduledRunPreparationEffect(options: { opId: string; claimedAtMs: number }): Promise<boolean> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const record = await txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY);
+      if (
+        record?.kind !== "active"
+        || record.startOpId !== options.opId
+        || record.preparation?.claimedAtMs !== options.claimedAtMs
+      ) return false;
+      if (record.preparation.effectMayBeLive) return true;
+      await txn.put(SCHEDULED_RUN_RECORD_KEY, {
+        ...record,
+        preparation: { ...record.preparation, effectMayBeLive: true, heartbeatAtMs: Date.now() },
+        updatedAt: nowIso(),
+      } satisfies ActiveScheduledRunReceipt);
+      return true;
+    });
+  }
+
+  async finishScheduledRunPreparationEffect(options: { opId: string; claimedAtMs: number }): Promise<boolean> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const record = await txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY);
+      if (
+        record?.kind !== "active"
+        || record.startOpId !== options.opId
+        || record.preparation?.claimedAtMs !== options.claimedAtMs
+      ) return false;
+      if (!record.preparation.effectMayBeLive) return true;
+      await txn.put(SCHEDULED_RUN_RECORD_KEY, {
+        ...record,
+        preparation: { ...record.preparation, effectMayBeLive: false, heartbeatAtMs: Date.now() },
+        updatedAt: nowIso(),
+      } satisfies ActiveScheduledRunReceipt);
+      return true;
+    });
+  }
+
+  async finishScheduledRunPreparation(options: { opId: string; claimedAtMs: number }): Promise<boolean> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        record?.kind !== "active"
+        || record.startOpId !== options.opId
+        || record.preparation?.claimedAtMs !== options.claimedAtMs
+        || record.preparation.effectMayBeLive
+        || !mutable
+      ) return { released: false, record: record ?? null, mutable };
+      const next = this.settleActiveScheduledRun({ ...record, preparation: null, updatedAt: nowIso() });
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { released: true, record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.released;
+  }
+
+  async expireScheduledRunPreparation(options: {
+    opId: string;
+    claimedAtMs: number;
+    heartbeatAtMs: number;
+    now: number;
+  }): Promise<boolean> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        record?.kind !== "active"
+        || record.startOpId !== options.opId
+        || record.preparation?.claimedAtMs !== options.claimedAtMs
+        || record.preparation.heartbeatAtMs !== options.heartbeatAtMs
+        || options.now < options.heartbeatAtMs + (
+          record.preparation.effectMayBeLive
+            ? SCHEDULED_RUN_PREPARATION_ABANDON_MS
+            : SCHEDULED_RUN_PREPARATION_LEASE_MS
+        )
+        || !mutable
+      ) return { expired: false, record: record ?? null, mutable };
+      const next: ActiveScheduledRunReceipt = {
+        ...record,
+        preparation: null,
+        failure: record.failure ?? "Scheduled Run preparation was interrupted before it completed.",
+        updatedAt: nowIso(),
+      };
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { expired: true, record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.expired;
+  }
+
+  async markScheduledRunCredentialsMayExist(opId: string, claimedAtMs: number): Promise<boolean> {
+    return this.updateActiveScheduledRun(opId, (record) => {
+      if (record.preparation?.claimedAtMs !== claimedAtMs) return null;
+      return { ...record, credentialsMayExist: true, updatedAt: nowIso() };
+    });
+  }
+
+  async recordScheduledRunCredentialIds(opId: string, ids: ScheduledRunCredentialIds): Promise<boolean> {
+    return this.updateActiveScheduledRun(opId, (record) => ({
+      ...record,
+      credentialsMayExist: true,
+      credentialIds: { ...record.credentialIds, ...ids },
+      updatedAt: nowIso(),
+    }));
+  }
+
+  async markScheduledRunRunnerDispatch(opId: string, claimedAtMs: number): Promise<boolean> {
+    return this.updateActiveScheduledRun(opId, (record) => {
+      if (record.preparation?.claimedAtMs !== claimedAtMs) return null;
+      return { ...record, runnerDispatchStarted: true, updatedAt: nowIso() };
+    });
+  }
+
+  private async updateActiveScheduledRun(
+    opId: string,
+    update: (record: ActiveScheduledRunReceipt) => ActiveScheduledRunReceipt | null,
+  ): Promise<boolean> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (record?.kind !== "active" || record.startOpId !== opId || !mutable) {
+        return { changed: false, record: record ?? null, mutable };
+      }
+      const updated = update(record);
+      if (!updated) return { changed: false, record, mutable };
+      const next = this.settleActiveScheduledRun(updated);
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { changed: true, record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.changed;
+  }
+
+  async recordScheduledRunPostClaimFailure(options: {
+    opId: string;
+    error: string;
+    runnerStoppedConfirmed: boolean;
+    expectedIncarnationId?: string;
+  }): Promise<boolean> {
+    return this.updateActiveScheduledRun(options.opId, (record) => {
+      if (options.expectedIncarnationId && record.incarnationId !== options.expectedIncarnationId) return null;
+      return {
+        ...record,
+        failure: options.error,
+        runnerStoppedConfirmed: record.runnerStoppedConfirmed || options.runnerStoppedConfirmed,
+        updatedAt: nowIso(),
+      };
+    });
+  }
+
+  async recordScheduledRunCredentialsCleaned(
+    opId: string,
+    expectedIncarnationId?: string,
+  ): Promise<boolean> {
+    return this.updateActiveScheduledRun(opId, (record) => {
+      if (expectedIncarnationId && record.incarnationId !== expectedIncarnationId) return null;
+      return { ...record, credentialsMayExist: false, credentialIds: {}, updatedAt: nowIso() };
+    });
+  }
+
+  async recordScheduledRunCredentialCleanupPending(
+    opId: string,
+    expectedIncarnationId?: string,
+  ): Promise<boolean> {
+    return this.updateActiveScheduledRun(opId, (record) => {
+      if (expectedIncarnationId && record.incarnationId !== expectedIncarnationId) return null;
+      return { ...record, credentialsMayExist: true, updatedAt: nowIso() };
+    });
+  }
+
+  async requestScheduledRunOutcome(options: {
+    opId?: string;
+    outcome: ScheduledRunRequestedOutcome;
+  }): Promise<ScheduledRunOutcomeResult> {
+    const expectedStartOpId = this.resolveLifecycleOpId(options.opId);
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (record?.kind === "finished") {
+        if (expectedStartOpId && record.startOpId !== expectedStartOpId) {
+          return { result: { status: "rejected", error: "The lifecycle operation does not match the finished Scheduled Run." } as ScheduledRunOutcomeResult, record, mutable };
+        }
+        if (record.requestedOutcome === options.outcome || record.outcome === options.outcome) {
+          return { result: { status: "idempotent", outcome: options.outcome } as ScheduledRunOutcomeResult, record, mutable };
+        }
+        return { result: { status: "rejected", error: `The Scheduled Run outcome is already ${record.requestedOutcome ?? record.outcome}.` } as ScheduledRunOutcomeResult, record, mutable };
+      }
+      if (record?.kind !== "active" || !mutable) {
+        return { result: { status: "rejected", error: "No active Scheduled Run was found." } as ScheduledRunOutcomeResult, record: record ?? null, mutable };
+      }
+      if (expectedStartOpId && record.startOpId !== expectedStartOpId) {
+        return { result: { status: "rejected", error: "The lifecycle operation does not match the active Scheduled Run." } as ScheduledRunOutcomeResult, record, mutable };
+      }
+      if (record.requestedOutcome && record.requestedOutcome !== options.outcome) {
+        return { result: { status: "rejected", error: `The Scheduled Run outcome is already ${record.requestedOutcome}.` } as ScheduledRunOutcomeResult, record, mutable };
+      }
+      let nextMutable = mutable;
+      let stopOpId = record.stopOpId;
+      let stopCommand: RunnerCommandClaim;
+      const alreadyStopping = mutable.lifecycleOperation === "stop"
+        && mutable.lifecycleDesiredState === "stopped"
+        && mutable.lifecycleOpId;
+      if (alreadyStopping) {
+        stopOpId = mutable.lifecycleOpId!;
+        stopCommand = await this.allocateRunnerCommandInTransaction(txn, stopOpId, "stopped");
+      } else {
+        stopOpId = buildStopOpId();
+        nextMutable = applyLifecycleState(mutable, {
+          phase: "saving",
+          activeOpId: stopOpId,
+          activeOperation: "stop",
+          desiredState: "stopped",
+          lastRunnerState: mutable.lifecycleLastRunnerState,
+          lastWorkspaceSyncedAckOpId: null,
+          infraState: mutable.lifecycleInfraState,
+          runtimeReady: false,
+          lastError: null,
+          lastErrorAt: null,
+          updatedAt: nowIso(),
+        });
+        stopCommand = await this.allocateRunnerCommandInTransaction(txn, stopOpId, "stopped");
+      }
+      const next: ActiveScheduledRunReceipt = {
+        ...record,
+        requestedOutcome: record.requestedOutcome ?? options.outcome,
+        stopOpId,
+        stopRunnerGeneration: stopCommand.commandGeneration,
+        updatedAt: nowIso(),
+      };
+      const projected = await this.writeScheduledRunInTransaction(txn, nextMutable, next);
+      await txn.setAlarm(Date.now());
+      return {
+        result: {
+          status: record.requestedOutcome ? "idempotent" : "accepted",
+          outcome: next.requestedOutcome!,
+          stop: stopCommand,
+          lifecycle: buildLifecycleState(projected)!,
+          preparationInFlight: next.preparation != null,
+        } as ScheduledRunOutcomeResult,
+        record: next,
+        mutable: projected,
+      };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.result;
+  }
+
+  async recordScheduledRunnerUncertainty(options: {
+    stopOpId: string;
+    error: string;
+  }): Promise<boolean> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [record, storedMutable] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (record?.kind !== "active" || record.stopOpId !== options.stopOpId || !mutable) {
+        return { changed: false, record: record ?? null, mutable };
+      }
+      const next: ActiveScheduledRunReceipt = {
+        ...record,
+        runnerCleanupRequired: true,
+        runnerUncertaintyError: options.error,
+        updatedAt: nowIso(),
+      };
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { changed: true, record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.changed;
+  }
+
+  async prepareScheduledRunLeaseRelease(): Promise<{ slug: string; attemptId: string } | null> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const pending = normalizePendingScheduledRunLeaseReleases(
+        await txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+      );
+      const now = Date.now();
+      const index = pending.findIndex((entry) => entry.nextAttemptAtMs <= now);
+      if (index < 0) return null;
+      const selected = pending[index];
+      pending[index] = { ...selected, nextAttemptAtMs: now + SCHEDULED_RUN_EFFECT_RETRY_MS };
+      await txn.put(SCHEDULED_RUN_LEASE_RELEASE_KEY, pending);
+      return { slug: selected.slug, attemptId: selected.attemptId };
+    });
+  }
+
+  async confirmScheduledRunLeaseReleased(attemptId: string): Promise<ScheduledRunRecord | null> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedPending, record, storedMutable] = await Promise.all([
+        txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const pending = normalizePendingScheduledRunLeaseReleases(storedPending);
+      const retained = pending.filter((entry) => entry.attemptId !== attemptId);
+      if (retained.length > 0) await txn.put(SCHEDULED_RUN_LEASE_RELEASE_KEY, retained);
+      else await txn.delete(SCHEDULED_RUN_LEASE_RELEASE_KEY);
+      if (!record || record.attemptId !== attemptId || !mutable) {
+        return { record: record ?? null, mutable };
+      }
+      let next: ScheduledRunRecord | null = record;
+      if (record.kind === "schedule") {
+        if (record.cancelRequested) {
+          next = null;
+        } else if (record.terminalRequested || Date.now() >= record.deadlineAtMs) {
+          next = finishedScheduledRun(record, {
+            outcome: "failed",
+            error: record.lastError ?? "The Scheduled Run deadline passed before a runner could start.",
+          });
+        } else {
+          next = {
+            ...record,
+            attemptId: null,
+            capacityAcquired: false,
+            acquireUncertain: false,
+            retryAtMs: record.retryAtMs ?? Date.now() + SCHEDULED_RUN_RETRY_MS,
+            updatedAt: nowIso(),
+          };
+        }
+      } else if (record.kind === "active") {
+        next = this.settleActiveScheduledRun({ ...record, capacityReleased: true, updatedAt: nowIso() });
+      }
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+    return result.record;
+  }
+
+  async beginDelete(): Promise<EnvDeleteClaimResult> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun, publication, highWater, existingCommand, slug] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<number>(RUNNER_COMMAND_GENERATION_KEY),
+        txn.get<RunnerCommandClaim>(RUNNER_COMMAND_CLAIM_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!current) return { allowed: false as const, error: "Environment state not found.", mutableState: null };
+      if (current.status === "deleting" && existingCommand?.desiredState === "absent") {
+        return { allowed: true as const, runnerCommand: existingCommand, mutableState: current };
+      }
+      if (scheduledRun?.kind === "active" || (scheduledRun?.kind === "finished" && scheduledRun.cleanupRequired)) {
+        return {
+          allowed: false as const,
+          error: scheduledRun.kind === "active" && scheduledRun.runnerCleanupRequired
+            ? EXISTING_EXECUTION_UNAVAILABLE_MESSAGE
+            : "Stop and finish the active Scheduled Run before deleting this environment.",
+          mutableState: current,
+        };
+      }
+      if (scheduledRun?.kind === "schedule" && scheduledRun.attemptId
+        && (scheduledRun.capacityAcquired || scheduledRun.acquireUncertain)) {
+        if (!slug) throw new Error("Scheduled Run capacity release is missing its environment slug.");
+        await this.queueScheduledRunLeaseReleaseInTransaction(txn, slug, scheduledRun.attemptId);
+        const finalizing: EnvironmentPlanSchedule = {
+          ...scheduledRun,
+          cancelRequested: true,
+          retryAtMs: null,
+          updatedAt: nowIso(),
+        };
+        await this.writeScheduledRunInTransaction(txn, current, finalizing);
+        await txn.setAlarm(Date.now());
+        return {
+          allowed: false as const,
+          error: "The Scheduled Run cancellation is still finalizing.",
+          mutableState: current,
+        };
+      }
+      const operationId = `destroy-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+      const runnerCommand: RunnerCommandClaim = {
+        commandGeneration: (highWater ?? 0) + 1,
+        operationId,
+        desiredState: "absent",
+      };
+      const updatedAt = nowIso();
+      const next = normalizeMutableState({
+        ...current,
+        status: "deleting",
+        lifecyclePhase: null,
+        lifecycleOpId: null,
+        lifecycleOperation: null,
+        lifecycleDesiredState: null,
+        lifecycleLastRunnerState: null,
+        lifecycleLastWorkspaceSyncedAckOpId: null,
+        lifecycleInfraState: "unknown",
+        lifecycleRuntimeReady: false,
+        lifecycleUpdatedAt: null,
+        error: null,
+        errorAt: null,
+        updatedAt,
+      });
+      delete next.scheduledRun;
+      await txn.delete(SCHEDULED_RUN_RECORD_KEY);
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await txn.put(RUNNER_COMMAND_GENERATION_KEY, runnerCommand.commandGeneration);
+      await txn.put(RUNNER_COMMAND_CLAIM_KEY, runnerCommand);
+      await this.markProjectionDirtyInTransaction(txn);
+      if (publication) {
+        await txn.put(ENV_PUBLICATION_KEY, { ...publication, state: "deleted", updatedAt });
+      }
+      return { allowed: true as const, runnerCommand, mutableState: next };
+    });
+    await this.scheduleNextAlarm(result.mutableState, await this.readScheduledRun());
+    return result;
+  }
+
+  async abortDelete(error: string): Promise<EnvMutableState | null> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, publication] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+      ]);
+      if (!storedMutable) return null;
+      const updatedAt = nowIso();
+      const next = normalizeMutableState({
+        ...storedMutable,
+        status: "failed",
+        error,
+        errorAt: updatedAt,
+        updatedAt,
+      });
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      if (publication?.state === "deleted") {
+        await txn.put(ENV_PUBLICATION_KEY, { ...publication, state: "visible", updatedAt });
+      }
+      return next;
+    });
+    await this.scheduleNextAlarm(result, await this.readScheduledRun());
+    return result;
+  }
+
+  async finalizeDeletion(): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const pendingLeaseReleases = normalizePendingScheduledRunLeaseReleases(
+        await txn.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+      );
+      await txn.delete([
+        MUTABLE_STATE_KEY,
+        SCHEDULED_RUN_RECORD_KEY,
+        IMMUTABLE_PLAN_KEY,
+        ENV_SLUG_KEY,
+        INITIAL_CREATE_CLAIM_KEY,
+        STOP_WORKSPACE_SYNCED_META_KEY,
+        GITHUB_PUBLISH_OPERATION_KEY,
+        STARTUP_DIAGNOSTICS_ACTIVE_KEY,
+        STARTUP_DIAGNOSTICS_LAST_FAILED_KEY,
+        PROJECTION_DIRTY_KEY,
+        CODEX_EXECUTION_PROFILE_KEY,
+      ]);
+      const publication = await txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY);
+      if (publication) {
+        await txn.put(ENV_PUBLICATION_KEY, { ...publication, state: "deleted", updatedAt: nowIso() });
+      }
+      const pendingReleaseAt = nextPendingScheduledRunLeaseReleaseAt(pendingLeaseReleases);
+      if (pendingReleaseAt != null) {
+        await txn.setAlarm(Math.max(Date.now(), pendingReleaseAt));
+      } else {
+        await txn.deleteAlarm();
+      }
+    });
+  }
+
   async getStartupDiagnostics(): Promise<StartupDiagnosticsState> {
     return this.readStartupDiagnosticsState();
   }
@@ -708,41 +2612,57 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     detail?: string | null;
   }): Promise<StartupDiagnosticsState> {
     const resolvedOpId = this.resolveLifecycleOpId(options.opId);
-    const current = this.getOrCreateMutableState(await this.getMutableState());
-    const existing = await this.readStartupDiagnosticsState();
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, storedActive, storedLastFailed] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_ACTIVE_KEY),
+        txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_LAST_FAILED_KEY),
+      ]);
+      const existing: StartupDiagnosticsState = {
+        active: storedActive ? normalizeStartupDiagnosticsSnapshot(storedActive) : null,
+        lastFailed: storedLastFailed ? normalizeStartupDiagnosticsSnapshot(storedLastFailed) : null,
+      };
+      if (!storedMutable || !this.isExactActiveStart(normalizeMutableState(storedMutable), resolvedOpId)) {
+        return { diagnostics: existing, mutableState: null, changed: false };
+      }
 
-    if (!resolvedOpId) {
-      return existing;
-    }
+      let active = createEmptyStartupDiagnostics(resolvedOpId!, options.backend);
+      const initialEvent =
+        options.stepId && options.message
+          ? buildStartupDiagnosticEvent({
+              opId: resolvedOpId!,
+              stepId: options.stepId,
+              severity: "info",
+              message: options.message,
+              detail: options.detail,
+            })
+          : null;
+      if (initialEvent) {
+        active = this.buildUpdatedStartupDiagnostics(active, { event: initialEvent });
+      }
 
-    let active = createEmptyStartupDiagnostics(resolvedOpId, options.backend);
-    const initialEvent =
-      options.stepId && options.message
-        ? buildStartupDiagnosticEvent({
-            opId: resolvedOpId,
-            stepId: options.stepId,
-            severity: "info",
-            message: options.message,
-            detail: options.detail,
-          })
-        : null;
-    if (initialEvent) {
-      active = this.buildUpdatedStartupDiagnostics(active, { event: initialEvent });
-    }
-
-    const nextDiagnostics = await this.setStartupDiagnosticsState({
-      active,
-      lastFailed: existing.active?.failure ? existing.active : existing.lastFailed,
+      const lastFailed = existing.active?.failure ? existing.active : existing.lastFailed;
+      await txn.put(STARTUP_DIAGNOSTICS_ACTIVE_KEY, active);
+      if (lastFailed) await txn.put(STARTUP_DIAGNOSTICS_LAST_FAILED_KEY, lastFailed);
+      else await txn.delete(STARTUP_DIAGNOSTICS_LAST_FAILED_KEY);
+      const nextMutable = normalizeMutableState({
+        ...storedMutable,
+        bootMessage: active.currentStepMessage,
+        bootStepId: active.currentStepId,
+        updatedAt: active.updatedAt,
+      });
+      await txn.put(MUTABLE_STATE_KEY, nextMutable);
+      await this.markProjectionDirtyInTransaction(txn);
+      return {
+        diagnostics: { active, lastFailed },
+        mutableState: nextMutable,
+        changed: true,
+      };
     });
-    await this.updateBootSummary(
-      current,
-      {
-        message: nextDiagnostics.active?.currentStepMessage,
-        stepId: nextDiagnostics.active?.currentStepId,
-      },
-      nextDiagnostics.active?.updatedAt,
-    );
-    return nextDiagnostics;
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.mutableState, await this.readScheduledRun());
+    }
+    return result.diagnostics;
   }
 
   async reportStartupEvent(options: {
@@ -754,91 +2674,182 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     at?: string | null;
     logTails?: Partial<StartupDiagnosticLogTails> | null;
   }): Promise<StartupDiagnosticsSnapshot | null> {
-    const current = await this.getMutableState();
-    const next = await this.recordStartupDiagnosticsEvent(options.opId, options);
-    if (!next) {
-      return null;
-    }
-    await this.updateBootSummary(
-      current,
-      {
-        message: next.currentStepMessage,
-        stepId: next.currentStepId,
-      },
-      next.updatedAt,
-    );
-    return next;
+    const resolvedOpId = this.resolveLifecycleOpId(options.opId);
+    if (!resolvedOpId) return null;
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, storedDiagnostics, scheduledRun] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_ACTIVE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const active = storedDiagnostics
+        ? normalizeStartupDiagnosticsSnapshot(storedDiagnostics)
+        : null;
+      if (
+        !current
+        || !this.isExactActiveStart(current, resolvedOpId)
+        || !active
+        || active.opId !== resolvedOpId
+      ) {
+        return {
+          diagnostics: null,
+          mutable: current,
+          scheduledRun: scheduledRun ?? null,
+          changed: false,
+        };
+      }
+
+      const event = buildStartupDiagnosticEvent({
+        at: options.at,
+        opId: resolvedOpId,
+        stepId: options.stepId,
+        severity: options.severity,
+        message: options.message,
+        detail: options.detail,
+      });
+      if (!event) {
+        return {
+          diagnostics: active,
+          mutable: current,
+          scheduledRun: scheduledRun ?? null,
+          changed: false,
+        };
+      }
+      const nextDiagnostics = this.buildUpdatedStartupDiagnostics(active, {
+        event,
+        logTails: options.logTails,
+        updatedAt: event.at,
+      });
+      const nextMutable = normalizeMutableState({
+        ...current,
+        bootMessage: nextDiagnostics.currentStepMessage,
+        bootStepId: nextDiagnostics.currentStepId,
+        updatedAt: nextDiagnostics.updatedAt,
+      });
+      await txn.put(STARTUP_DIAGNOSTICS_ACTIVE_KEY, nextDiagnostics);
+      await txn.put(MUTABLE_STATE_KEY, nextMutable);
+      await this.markProjectionDirtyInTransaction(txn);
+      return {
+        diagnostics: nextDiagnostics,
+        mutable: nextMutable,
+        scheduledRun: scheduledRun ?? null,
+        changed: true,
+      };
+    });
+    if (result.changed) await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    return result.diagnostics;
   }
 
   async reportStartupFailure(options: {
     opId: string | null | undefined;
     stepId?: StartupDiagnosticStepId | null;
     message: string;
+    runnerMayExist?: boolean;
     detail?: string | null;
     exitCode?: number | null;
     signal?: string | null;
     at?: string | null;
     logTails?: Partial<StartupDiagnosticLogTails> | null;
+    /** Record a lead-harness crash under the same exact Start operation. */
+    leadHarnessFailure?: boolean;
   }): Promise<EnvLifecycleState | null> {
-    const current = await this.getMutableState();
     const resolvedOpId = this.resolveLifecycleOpId(options.opId);
-    if (!current || !resolvedOpId) {
-      return buildLifecycleState(current);
-    }
-
-    const diagnostics = await this.recordStartupDiagnosticsFailure(resolvedOpId, options);
-    const failureMessage = diagnostics?.failure?.message ?? normalizeDiagnosticMessage(options.message) ?? "Startup failed";
-
-    let nextCurrent = current;
-    if (diagnostics) {
-      nextCurrent = normalizeMutableState({
-        ...nextCurrent,
-        bootMessage: diagnostics.currentStepMessage,
-        bootStepId: diagnostics.currentStepId,
-        updatedAt: diagnostics.updatedAt,
-      });
-    }
-
-    if (current.lifecycleOpId !== resolvedOpId) {
-      await this.writeMutableState(nextCurrent);
-      return buildLifecycleState(nextCurrent);
-    }
-
-    if (current.lifecyclePhase === "starting") {
-      const failed = applyLifecycleState(
-        {
-          ...nextCurrent,
-          lifecycleLastRunnerState: "stopped",
-          lifecycleInfraState: "stopped",
-          lifecycleRuntimeReady: false,
-        },
-        buildFailureState(
-          {
-            ...nextCurrent,
-            lifecycleLastRunnerState: "stopped",
-            lifecycleInfraState: "stopped",
-            lifecycleRuntimeReady: false,
-          },
-          failureMessage,
-        ),
+    if (!resolvedOpId) return buildLifecycleState(await this.getMutableState());
+    const normalizedFailureMessage = normalizeDiagnosticMessage(options.message) ?? "Startup failed";
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun, storedDiagnostics] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_ACTIVE_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!current || current.lifecycleOpId !== resolvedOpId) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
+      const activeDiagnostics = storedDiagnostics
+        ? normalizeStartupDiagnosticsSnapshot(storedDiagnostics)
+        : null;
+      const diagnostics = this.buildStartupDiagnosticsFailure(
+        activeDiagnostics,
+        resolvedOpId,
+        options,
       );
-      await this.writeMutableState(failed);
-      return buildLifecycleState(failed);
-    }
+      const failureMessage = diagnostics?.failure?.message ?? normalizedFailureMessage;
+      const updatedAt = diagnostics?.updatedAt ?? nowIso();
+      const withHarnessFailure = (state: EnvMutableState): EnvMutableState => options.leadHarnessFailure
+        ? normalizeMutableState({
+            ...state,
+            leadHarnessStatus: "failed",
+            leadHarnessError: failureMessage,
+            leadHarnessUpdatedAt: updatedAt,
+          })
+        : state;
+      const matchingScheduledRun = scheduledRun?.kind === "active"
+        && scheduledRun.startOpId === resolvedOpId;
+      if (scheduledRun?.kind === "active" && !matchingScheduledRun) {
+        return { mutable: current, scheduledRun, changed: false };
+      }
 
-    if (current.lifecyclePhase === "failed" && current.lifecycleDesiredState === "running") {
-      const failed = normalizeMutableState({
-        ...nextCurrent,
-        error: failureMessage,
-        errorAt: diagnostics?.updatedAt ?? nowIso(),
-        updatedAt: diagnostics?.updatedAt ?? nowIso(),
-      });
-      await this.writeMutableState(failed);
-      return buildLifecycleState(failed);
-    }
+      let next = current;
+      if (
+        options.leadHarnessFailure
+        && current.lifecyclePhase === "running"
+        && current.lifecycleOperation === "start"
+        && current.lifecycleDesiredState === "running"
+      ) {
+        next = withHarnessFailure(normalizeMutableState({ ...current, updatedAt }));
+      } else if (current.lifecyclePhase === "starting") {
+        const withDiagnostics = diagnostics
+          ? normalizeMutableState({
+              ...current,
+              bootMessage: diagnostics.currentStepMessage,
+              bootStepId: diagnostics.currentStepId,
+              updatedAt: diagnostics.updatedAt,
+            })
+          : current;
+        const failedBase = options.runnerMayExist
+          ? { ...withDiagnostics, lifecycleRuntimeReady: false }
+          : {
+              ...withDiagnostics,
+              lifecycleLastRunnerState: "stopped" as const,
+              lifecycleInfraState: "stopped" as const,
+              lifecycleRuntimeReady: false,
+            };
+        next = withHarnessFailure(applyLifecycleState(failedBase, {
+          ...buildFailureState(failedBase, failureMessage),
+          lastErrorAt: updatedAt,
+          updatedAt,
+        }));
+      } else if (current.lifecyclePhase === "failed" && current.lifecycleDesiredState === "running") {
+        next = withHarnessFailure(normalizeMutableState({
+          ...current,
+          ...(diagnostics
+            ? { bootMessage: diagnostics.currentStepMessage, bootStepId: diagnostics.currentStepId }
+            : {}),
+          error: failureMessage,
+          errorAt: updatedAt,
+          updatedAt,
+        }));
+      } else {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
 
-    await this.writeMutableState(nextCurrent);
-    return buildLifecycleState(nextCurrent);
+      let nextScheduledRun = scheduledRun ?? null;
+      if (matchingScheduledRun) {
+        nextScheduledRun = {
+          ...scheduledRun,
+          failure: failureMessage,
+          runnerStoppedConfirmed: scheduledRun.runnerStoppedConfirmed || !options.runnerMayExist,
+          updatedAt,
+        };
+      }
+      if (diagnostics) await txn.put(STARTUP_DIAGNOSTICS_ACTIVE_KEY, diagnostics);
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      return { mutable: projected, scheduledRun: nextScheduledRun, changed: true };
+    });
+    if (result.changed) await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    return buildLifecycleState(result.mutable);
   }
 
   async clearMutableState(): Promise<null> {
@@ -880,215 +2891,277 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     return next;
   }
 
-  async requestStop(): Promise<EnvLifecycleState> {
-    const current = this.getOrCreateMutableState(await this.getMutableState());
-    if (
-      current.lifecycleOperation === "stop" &&
-      (current.lifecyclePhase === "saving" || current.lifecyclePhase === "stopping")
-    ) {
-      return buildLifecycleState(current)!;
+  async requestStop(expectedIncarnationId?: string): Promise<EnvLifecycleState> {
+    await this.getMutableState();
+    const scheduled = await this.readScheduledRun();
+    if (scheduled?.kind === "active") {
+      if (expectedIncarnationId && scheduled.incarnationId !== expectedIncarnationId) {
+        throw new Error("The Scheduled Run belongs to a replaced environment incarnation.");
+      }
+      const claimed = await this.requestScheduledRunOutcome({
+        outcome: scheduled.requestedOutcome ?? "interrupted",
+      });
+      if (claimed.status === "rejected" || !claimed.lifecycle) throw new Error(claimed.status === "rejected" ? claimed.error : "Failed to claim Scheduled Run Stop.");
+      return claimed.lifecycle;
     }
-
-    const next = applyLifecycleState(current, {
-      phase: "saving",
-      activeOpId: buildStopOpId(),
-      activeOperation: "stop",
-      desiredState: "stopped",
-      lastRunnerState: "running",
-      lastWorkspaceSyncedAckOpId: null,
-      infraState: current.lifecycleInfraState,
-      runtimeReady: false,
-      lastError: null,
-      lastErrorAt: null,
-      updatedAt: nowIso(),
-    });
-    await this.writeMutableState(next);
-    return buildLifecycleState(next)!;
-  }
-
-  async requestStart(): Promise<EnvLifecycleState> {
-    const current = this.getOrCreateMutableState(await this.getMutableState());
-    if (
-      current.lifecycleOperation === "start" &&
-      (current.lifecyclePhase === "starting" || current.lifecyclePhase === "running")
-    ) {
-      return buildLifecycleState(current)!;
+    if (scheduled?.kind === "finished" && scheduled.cleanupRequired) {
+      throw new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE);
     }
-
-    const next = applyLifecycleState(current, {
-      phase: "starting",
-      activeOpId: buildStartOpId(),
-      activeOperation: "start",
-      desiredState: "running",
-      lastRunnerState: current.lifecycleLastRunnerState,
-      lastWorkspaceSyncedAckOpId: null,
-      infraState: "unknown",
-      runtimeReady: false,
-      lastError: null,
-      lastErrorAt: null,
-      updatedAt: nowIso(),
-    });
-    await this.writeMutableState(next);
-    return buildLifecycleState(next)!;
-  }
-
-  async noteInfraReady(opId?: string | null): Promise<EnvLifecycleState | null> {
-    const current = await this.getMutableState();
-    const resolvedOpId = this.resolveLifecycleOpId(opId);
-    if (!current || !resolvedOpId || current.lifecycleOpId !== resolvedOpId) {
-      return buildLifecycleState(current);
-    }
-    if (current.lifecycleDesiredState !== "running") {
-      return buildLifecycleState(current);
-    }
-
-    const updatedAt = nowIso();
-    const next = normalizeMutableState({
-      ...current,
-      lifecycleInfraState: "ready",
-      lifecycleLastRunnerState: "running",
-      lifecycleUpdatedAt: updatedAt,
-      updatedAt,
-    });
-    await this.writeMutableState(next);
-    return buildLifecycleState(next);
-  }
-
-  async noteRunnerStarted(opId?: string | null): Promise<EnvLifecycleState | null> {
-    const current = await this.getMutableState();
-    const resolvedOpId = this.resolveLifecycleOpId(opId);
-    if (!current || !resolvedOpId || current.lifecycleOpId !== resolvedOpId) {
-      return buildLifecycleState(current);
-    }
-    if (
-      current.lifecyclePhase !== "starting" &&
-      !(current.lifecyclePhase === "failed" && current.lifecycleDesiredState === "running")
-    ) {
-      return buildLifecycleState(current);
-    }
-
-    const next = normalizeMutableState({
-      ...applyLifecycleState(current, {
-        phase: "running",
-        activeOpId: current.lifecycleOpId,
-        activeOperation: current.lifecycleOperation ?? "start",
-        desiredState: "running",
+    const next = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, creationClaim] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY),
+      ]);
+      const current = this.getOrCreateMutableState(
+        storedMutable ? normalizeMutableState(storedMutable) : null,
+      );
+      if (creationClaim) return current;
+      if (
+        current.lifecycleOperation === "stop"
+        && (current.lifecyclePhase === "saving" || current.lifecyclePhase === "stopping")
+        && current.lifecycleOpId
+      ) {
+        await this.allocateRunnerCommandInTransaction(txn, current.lifecycleOpId, "stopped");
+        return current;
+      }
+      const claimed = applyLifecycleState(current, {
+        phase: "saving",
+        activeOpId: buildStopOpId(),
+        activeOperation: "stop",
+        desiredState: "stopped",
         lastRunnerState: "running",
-        lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
-        infraState: "ready",
-        runtimeReady: true,
+        lastWorkspaceSyncedAckOpId: null,
+        infraState: current.lifecycleInfraState,
+        runtimeReady: false,
         lastError: null,
         lastErrorAt: null,
         updatedAt: nowIso(),
-      }),
-      bootMessage: null,
-      bootStepId: null,
+      });
+      await txn.put(MUTABLE_STATE_KEY, claimed);
+      await this.allocateRunnerCommandInTransaction(txn, claimed.lifecycleOpId!, "stopped");
+      await this.markProjectionDirtyInTransaction(txn);
+      return claimed;
     });
-    await this.writeMutableState(next);
-    await this.clearStartupDiagnosticsState();
-    return buildLifecycleState(next);
+    await this.scheduleNextAlarm(next, await this.readScheduledRun());
+    return buildLifecycleState(next)!;
+  }
+
+  async beginStart(
+    harnessSettings: HarnessSettings,
+    authClaim: {
+      claudeAuthMode?: ResolvedClaudeAuthMode | null;
+      codexAuthPreference?: CodexAuthPreference | null;
+    } = {},
+  ): Promise<EnvStartClaimResult> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun, creationClaim] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!current) {
+        return { lifecycle: null, dispatchGranted: false, harnessSettings: null, scheduledRun: scheduledRun ?? null };
+      }
+      const terminalCanArchive = scheduledRun?.kind === "finished" && !scheduledRun.cleanupRequired;
+      const scheduledRunBlocksStart = Boolean(scheduledRun && !terminalCanArchive);
+      const startable = !creationClaim
+        && !scheduledRunBlocksStart
+        && (
+          current.lifecyclePhase === "stopped"
+          || current.lifecyclePhase === "failed"
+          || current.status === "stopped"
+          || current.status === "failed"
+          || current.status === "unknown"
+        );
+      if (!startable) {
+        return {
+          lifecycle: buildLifecycleState(current),
+          dispatchGranted: false,
+          harnessSettings: current.harnessSettings,
+          scheduledRun: scheduledRun ?? null,
+        };
+      }
+      let nextScheduledRun = scheduledRun ?? null;
+      if (terminalCanArchive) {
+        nextScheduledRun = { ...scheduledRun, archivedAt: nowIso(), updatedAt: nowIso() };
+      }
+      const next = this.buildStartingMutableState(current, harnessSettings, undefined, authClaim);
+      await this.resetStartupDiagnosticsForNewClaimInTransaction(txn);
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      await this.allocateRunnerCommandInTransaction(txn, projected.lifecycleOpId!, "running");
+      return {
+        lifecycle: buildLifecycleState(projected),
+        dispatchGranted: true,
+        harnessSettings: projected.harnessSettings,
+        ...(projected.startClaudeAuthMode ? { claudeAuthMode: projected.startClaudeAuthMode } : {}),
+        ...(projected.startCodexAuthPreference ? { codexAuthPreference: projected.startCodexAuthPreference } : {}),
+        scheduledRun: nextScheduledRun,
+      };
+    });
+    await this.scheduleNextAlarm(await this.readStoredMutableState(), result.scheduledRun);
+    return {
+      lifecycle: result.lifecycle,
+      dispatchGranted: result.dispatchGranted,
+      harnessSettings: result.harnessSettings,
+      ...(result.claudeAuthMode ? { claudeAuthMode: result.claudeAuthMode } : {}),
+      ...(result.codexAuthPreference ? { codexAuthPreference: result.codexAuthPreference } : {}),
+    };
+  }
+
+  async noteInfraReady(opId?: string | null): Promise<EnvLifecycleState | null> {
+    const resolvedOpId = this.resolveLifecycleOpId(opId);
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const stored = await txn.get<EnvMutableState>(MUTABLE_STATE_KEY);
+      const current = stored ? normalizeMutableState(stored) : null;
+      if (
+        !current
+        || !resolvedOpId
+        || !this.isExactActiveStart(current, resolvedOpId)
+      ) return { state: current, changed: false };
+
+      const updatedAt = nowIso();
+      const next = normalizeMutableState({
+        ...current,
+        lifecycleInfraState: "ready",
+        lifecycleLastRunnerState: "running",
+        lifecycleUpdatedAt: updatedAt,
+        updatedAt,
+      });
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { state: next, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.state, await this.readScheduledRun());
+    }
+    return buildLifecycleState(result.state);
+  }
+
+  async noteRunnerStarted(opId?: string | null): Promise<EnvLifecycleState | null> {
+    const resolvedOpId = this.resolveLifecycleOpId(opId);
+    if (!resolvedOpId) return buildLifecycleState(await this.getMutableState());
+    await this.getMutableState();
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun, activeDiagnostics] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_ACTIVE_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!current || current.lifecycleOpId !== resolvedOpId) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
+      const matchingScheduledRun = scheduledRun?.kind === "active"
+        && scheduledRun.startOpId === resolvedOpId;
+      const scheduledRunBlocksOrdinaryStart = scheduledRun?.kind === "schedule"
+        || (scheduledRun?.kind === "active" && !matchingScheduledRun)
+        || (scheduledRun?.kind === "finished" && scheduledRun.cleanupRequired);
+      if (scheduledRunBlocksOrdinaryStart) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
+      const startable = current.lifecyclePhase === "starting"
+        || (current.lifecyclePhase === "failed" && current.lifecycleDesiredState === "running");
+      if (!startable) return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      const updatedAt = nowIso();
+      const next = normalizeMutableState({
+        ...applyLifecycleState(current, {
+          phase: "running",
+          activeOpId: current.lifecycleOpId,
+          activeOperation: current.lifecycleOperation ?? "start",
+          desiredState: "running",
+          lastRunnerState: "running",
+          lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
+          infraState: "ready",
+          runtimeReady: true,
+          lastError: null,
+          lastErrorAt: null,
+          updatedAt,
+        }),
+        bootMessage: null,
+        bootStepId: null,
+      });
+      const nextScheduledRun = matchingScheduledRun
+        ? { ...scheduledRun, runnerDispatchStarted: true, updatedAt } satisfies ActiveScheduledRunReceipt
+        : scheduledRun ?? null;
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      if (activeDiagnostics?.opId === resolvedOpId) {
+        await txn.delete(STARTUP_DIAGNOSTICS_ACTIVE_KEY);
+        await txn.delete(STARTUP_DIAGNOSTICS_LAST_FAILED_KEY);
+      }
+      return { mutable: projected, scheduledRun: nextScheduledRun, changed: true };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    return buildLifecycleState(result.mutable);
   }
 
   async noteRunnerStartFailed(
     opId: string | null | undefined,
     error: string,
   ): Promise<EnvLifecycleState | null> {
-    const current = await this.getMutableState();
-    const resolvedOpId = this.resolveLifecycleOpId(opId);
-    if (!current || !resolvedOpId || current.lifecycleOpId !== resolvedOpId) {
-      return buildLifecycleState(current);
-    }
-    if (current.lifecyclePhase !== "starting") {
-      return buildLifecycleState(current);
-    }
-
-    await this.recordStartupDiagnosticsFailure(resolvedOpId, {
-      stepId: current.bootStepId ?? undefined,
+    return this.reportStartupFailure({
+      opId,
       message: error,
+      runnerMayExist: false,
     });
-    const diagnostics = await this.readStartupDiagnosticsSnapshot(STARTUP_DIAGNOSTICS_ACTIVE_KEY);
-    const next = applyLifecycleState(
-      {
-        ...current,
-        bootMessage: diagnostics?.currentStepMessage ?? normalizeDiagnosticMessage(error),
-        bootStepId: diagnostics?.currentStepId ?? current.bootStepId,
-      },
-      buildFailureState(
-        {
-          ...current,
-          lifecycleLastRunnerState: "stopped",
-          lifecycleInfraState: "stopped",
-          lifecycleRuntimeReady: false,
-        },
-        error,
-      ),
-    );
-    await this.writeMutableState(next);
-    return buildLifecycleState(next);
   }
 
   async setRunnerBinding(options: {
     runnerId?: string | null;
-    runnerMachineId?: string | null;
-  }): Promise<EnvMutableState> {
-    const current = this.getOrCreateMutableState(await this.getMutableState());
-    const updatedAt = nowIso();
-    const next = normalizeMutableState({
-      ...current,
-      runnerId:
-        options.runnerId !== undefined
-          ? (options.runnerId?.trim() || null)
-          : current.runnerId,
-      runnerMachineId:
-        options.runnerMachineId !== undefined
-          ? (options.runnerMachineId?.trim() || null)
-          : current.runnerMachineId,
-      updatedAt,
-    });
-    await this.writeMutableState(next);
-    return next;
+    opId?: string | null;
+  }): Promise<EnvMutableState | null> {
+    return this.mutateExistingMutableState(
+      {
+        opId: options.opId,
+        startFenceRequested: Object.prototype.hasOwnProperty.call(options, "opId"),
+      },
+      (current) => ({
+        ...current,
+        runnerId:
+          options.runnerId !== undefined
+            ? (options.runnerId?.trim() || null)
+            : current.runnerId,
+        updatedAt: nowIso(),
+      }),
+    );
   }
 
   async setBootProgress(
     message: string | null,
     stepId?: StartupDiagnosticStepId | null,
-  ): Promise<EnvMutableState> {
-    const current = this.getOrCreateMutableState(await this.getMutableState());
-    const next = normalizeMutableState({
-      ...current,
-      bootMessage: message?.trim() || null,
-      bootStepId:
-        stepId !== undefined
-          ? (stepId ?? null)
-          : current.bootStepId,
-      updatedAt: nowIso(),
-    });
-    await this.writeMutableState(next);
-    return next;
+  ): Promise<EnvMutableState | null> {
+    return this.mutateExistingMutableState(
+      { startFenceRequested: false },
+      (current) => normalizeMutableState({
+        ...current,
+        bootMessage: message?.trim() || null,
+        bootStepId:
+          stepId !== undefined
+            ? (stepId ?? null)
+            : current.bootStepId,
+        updatedAt: nowIso(),
+      }),
+    );
   }
 
-  async setAuthWarning(warning: string | null): Promise<EnvMutableState> {
-    const current = this.getOrCreateMutableState(await this.getMutableState());
-    const next = normalizeMutableState({
-      ...current,
-      authWarning: warning?.trim() || null,
-      updatedAt: nowIso(),
-    });
-    await this.writeMutableState(next);
-    return next;
-  }
-
-  async clearLeadHarnessState(): Promise<EnvMutableState> {
-    const current = this.getOrCreateMutableState(await this.getMutableState());
-    const next = normalizeMutableState({
-      ...current,
-      leadHarnessStatus: null,
-      leadHarnessError: null,
-      leadHarnessUpdatedAt: null,
-      updatedAt: nowIso(),
-    });
-    await this.writeMutableState(next);
-    return next;
+  async clearLeadHarnessState(
+    options?: { opId?: string | null },
+  ): Promise<EnvMutableState | null> {
+    return this.mutateExistingMutableState(
+      {
+        opId: options?.opId,
+        startFenceRequested: Boolean(
+          options && Object.prototype.hasOwnProperty.call(options, "opId"),
+        ),
+      },
+      (current) => ({
+        ...current,
+        leadHarnessStatus: null,
+        leadHarnessError: null,
+        leadHarnessUpdatedAt: null,
+        updatedAt: nowIso(),
+      }),
+    );
   }
 
   async recordStopWorkspaceSynced(
@@ -1099,127 +3172,216 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       clearError?: boolean;
     },
   ): Promise<EnvMutableState | null> {
-    const current = await this.getMutableState();
-    if (!current) {
-      return null;
-    }
+    const resolvedStopFinalizeOpId = options?.stopFinalize
+      ? this.resolveLifecycleOpId(options.opId)
+      : null;
+    const startFenceRequested = !options?.stopFinalize
+      && Boolean(options && Object.prototype.hasOwnProperty.call(options, "opId"));
+    const resolvedStartOpId = startFenceRequested
+      ? this.resolveLifecycleOpId(options?.opId)
+      : null;
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [stored, scheduledRun] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      if (!stored) return { state: null, scheduledRun: scheduledRun ?? null, changed: false };
+      const current = normalizeMutableState(stored);
 
-    const updatedAt = nowIso();
-    let next = normalizeMutableState({
-      ...current,
-      workspaceDirty: patch.workspaceDirty ?? current.workspaceDirty,
-      workspaceNeedsAttention: patch.workspaceNeedsAttention ?? current.workspaceNeedsAttention,
-      workspaceLastSyncedAt: patch.workspaceLastSyncedAt ?? current.workspaceLastSyncedAt,
-      baseMainCommit: patch.baseMainCommit ?? current.baseMainCommit,
-      lastKnownMainCommit: patch.lastKnownMainCommit ?? current.lastKnownMainCommit,
-      branchStatus: patch.branchStatus ?? current.branchStatus,
-      error: options?.clearError ? null : current.error,
-      errorAt: options?.clearError ? null : current.errorAt,
-      updatedAt,
-    });
-
-    if (options?.stopFinalize) {
-      const resolvedOpId = this.resolveLifecycleOpId(options.opId);
-      if (resolvedOpId) {
-        await this.ctx.storage.put(STOP_WORKSPACE_SYNCED_META_KEY, {
-          opId: resolvedOpId,
-          patch,
-        } satisfies PendingStopWorkspaceSyncedMeta);
+      if (startFenceRequested && !this.isExactActiveStart(current, resolvedStartOpId)) {
+        return { state: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
+      if (options?.stopFinalize) {
+        const matchingStop = Boolean(
+          resolvedStopFinalizeOpId
+          && current.lifecycleOpId === resolvedStopFinalizeOpId
+          && current.lifecycleOperation === "stop"
+          && current.lifecycleDesiredState === "stopped"
+          && (
+            current.lifecyclePhase === "saving"
+            || current.lifecyclePhase === "stopping"
+            || current.lifecyclePhase === "failed"
+            || (
+              current.lifecyclePhase === "stopped"
+              && current.lifecycleLastWorkspaceSyncedAckOpId === resolvedStopFinalizeOpId
+            )
+          ),
+        );
+        const matchingSelfStop = this.isExactActiveStart(current, resolvedStopFinalizeOpId);
+        if (!matchingStop && !matchingSelfStop) {
+          console.warn(
+            `[env-lifecycle] stale workspace-synced ack ignored: ${JSON.stringify({
+              opId: resolvedStopFinalizeOpId,
+              currentPhase: current.lifecyclePhase,
+              currentOpId: current.lifecycleOpId,
+              currentOperation: current.lifecycleOperation,
+              desiredState: current.lifecycleDesiredState,
+            })}`,
+          );
+          return { state: current, scheduledRun: scheduledRun ?? null, changed: false };
+        }
       }
 
-      if (resolvedOpId && current.lifecycleOpId === resolvedOpId && current.lifecyclePhase === "saving") {
-        next = applyLifecycleState(
-          next,
-          {
-            phase: "stopping",
-            activeOpId: current.lifecycleOpId,
-            activeOperation: current.lifecycleOperation,
-            desiredState: "stopped",
-            lastRunnerState: current.lifecycleLastRunnerState,
-            lastWorkspaceSyncedAckOpId: resolvedOpId,
-            infraState: current.lifecycleInfraState,
-            runtimeReady: false,
-            lastError: null,
-            lastErrorAt: null,
-            updatedAt,
-          },
-          { status: "stopping" },
-        );
-        console.info(
-          `[env-lifecycle] workspace-synced ack advanced lifecycle: ${JSON.stringify({
+      const updatedAt = nowIso();
+      let next = normalizeMutableState({
+        ...current,
+        workspaceDirty: patchValue(patch, current, "workspaceDirty"),
+        workspaceNeedsAttention: patchValue(patch, current, "workspaceNeedsAttention"),
+        workspaceLastSyncedAt: patchValue(patch, current, "workspaceLastSyncedAt"),
+        baseMainCommit: patchValue(patch, current, "baseMainCommit"),
+        lastKnownMainCommit: patchValue(patch, current, "lastKnownMainCommit"),
+        branchStatus: patchValue(patch, current, "branchStatus"),
+        githubBaseBranch: patchValue(patch, current, "githubBaseBranch"),
+        githubBaseCommitSha: patchValue(patch, current, "githubBaseCommitSha"),
+        githubHeadCommitSha: patchValue(patch, current, "githubHeadCommitSha"),
+        githubPrNumber: patchValue(patch, current, "githubPrNumber"),
+        githubPrUrl: patchValue(patch, current, "githubPrUrl"),
+        githubPrState: patchValue(patch, current, "githubPrState"),
+        githubMergedAt: patchValue(patch, current, "githubMergedAt"),
+        githubPublishStatus: patchValue(patch, current, "githubPublishStatus"),
+        githubPublishOperationId: patchValue(patch, current, "githubPublishOperationId"),
+        githubPublishError: patchValue(patch, current, "githubPublishError"),
+        githubLastPublishedAt: patchValue(patch, current, "githubLastPublishedAt"),
+        githubLastPublishedWorkspaceHash: patchValue(patch, current, "githubLastPublishedWorkspaceHash"),
+        githubPendingPublish: patchValue(patch, current, "githubPendingPublish"),
+        error: options?.clearError ? null : current.error,
+        errorAt: options?.clearError ? null : current.errorAt,
+        updatedAt,
+      });
+
+      let nextScheduledRun = scheduledRun ?? null;
+      if (options?.stopFinalize) {
+        const resolvedOpId = resolvedStopFinalizeOpId!;
+        const runnerAlreadyStopped = current.lifecycleLastRunnerState === "stopped"
+          && current.lifecycleInfraState === "stopped";
+
+        if (current.lifecycleOperation === "stop" && runnerAlreadyStopped) {
+          next = normalizeMutableState({
+            ...applyLifecycleState(next, {
+              phase: "stopped",
+              activeOpId: current.lifecycleOpId,
+              activeOperation: "stop",
+              desiredState: "stopped",
+              lastRunnerState: "stopped",
+              lastWorkspaceSyncedAckOpId: resolvedOpId,
+              infraState: "stopped",
+              runtimeReady: false,
+              lastError: null,
+              lastErrorAt: null,
+              updatedAt,
+            }),
+            bootMessage: null,
+            bootStepId: null,
+          });
+          await txn.delete(STOP_WORKSPACE_SYNCED_META_KEY);
+        } else if (current.lifecycleOperation === "stop") {
+          await txn.put(STOP_WORKSPACE_SYNCED_META_KEY, {
             opId: resolvedOpId,
-            fromPhase: current.lifecyclePhase,
-            toPhase: "stopping",
-            currentOpId: current.lifecycleOpId,
-          })}`,
-        );
-      } else if (
-        (current.lifecyclePhase === "running" || current.lifecyclePhase === "starting") &&
-        current.lifecycleDesiredState === "running"
+            patch,
+          } satisfies PendingStopWorkspaceSyncedMeta);
+          next = applyLifecycleState(
+            next,
+            {
+              phase: "stopping",
+              activeOpId: current.lifecycleOpId,
+              activeOperation: current.lifecycleOperation,
+              desiredState: "stopped",
+              lastRunnerState: current.lifecycleLastRunnerState,
+              lastWorkspaceSyncedAckOpId: resolvedOpId,
+              infraState: current.lifecycleInfraState,
+              runtimeReady: false,
+              lastError: null,
+              lastErrorAt: null,
+              updatedAt,
+            },
+            { status: "stopping" },
+          );
+          console.info(
+            `[env-lifecycle] workspace-synced ack advanced lifecycle: ${JSON.stringify({
+              opId: resolvedOpId,
+              fromPhase: current.lifecyclePhase,
+              toPhase: "stopping",
+              currentOpId: current.lifecycleOpId,
+            })}`,
+          );
+        } else {
+          await txn.put(STOP_WORKSPACE_SYNCED_META_KEY, {
+            opId: resolvedOpId,
+            patch,
+          } satisfies PendingStopWorkspaceSyncedMeta);
+          next = applyLifecycleState(
+            next,
+            {
+              phase: "stopping",
+              activeOpId: current.lifecycleOpId,
+              activeOperation: "stop",
+              desiredState: "stopped",
+              lastRunnerState: current.lifecycleLastRunnerState,
+              lastWorkspaceSyncedAckOpId: current.lifecycleOpId,
+              infraState: current.lifecycleInfraState,
+              runtimeReady: false,
+              lastError: null,
+              lastErrorAt: null,
+              updatedAt,
+            },
+            { status: "stopping" },
+          );
+          console.info(
+            `[env-lifecycle] workspace-synced ack treated as self-stop: ${JSON.stringify({
+              opId: resolvedOpId,
+              fromPhase: current.lifecyclePhase,
+              toPhase: "stopping",
+              currentOpId: current.lifecycleOpId,
+              desiredState: current.lifecycleDesiredState,
+            })}`,
+          );
+        }
+      }
+
+      if (
+        options?.stopFinalize
+        && nextScheduledRun?.kind === "active"
+        && nextScheduledRun.stopOpId === resolvedStopFinalizeOpId
       ) {
-        next = applyLifecycleState(
-          next,
-          {
-            phase: "stopping",
-            activeOpId: current.lifecycleOpId,
-            activeOperation: "stop",
-            desiredState: "stopped",
-            lastRunnerState: current.lifecycleLastRunnerState,
-            lastWorkspaceSyncedAckOpId: current.lifecycleOpId,
-            infraState: current.lifecycleInfraState,
-            runtimeReady: false,
-            lastError: null,
-            lastErrorAt: null,
-            updatedAt,
-          },
-          { status: "stopping" },
-        );
-        console.info(
-          `[env-lifecycle] workspace-synced ack treated as self-stop: ${JSON.stringify({
-            opId: resolvedOpId,
-            fromPhase: current.lifecyclePhase,
-            toPhase: "stopping",
-            currentOpId: current.lifecycleOpId,
-            desiredState: current.lifecycleDesiredState,
-          })}`,
-        );
-      } else {
-        console.warn(
-          `[env-lifecycle] workspace-synced ack did not advance lifecycle: ${JSON.stringify({
-            opId: resolvedOpId,
-            currentPhase: current.lifecyclePhase,
-            currentOpId: current.lifecycleOpId,
-            desiredState: current.lifecycleDesiredState,
-            lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
-          })}`,
-        );
+        const runnerStoppedConfirmed = nextScheduledRun.runnerStoppedConfirmed
+          || (current.lifecycleLastRunnerState === "stopped" && current.lifecycleInfraState === "stopped");
+        nextScheduledRun = this.settleActiveScheduledRun({
+          ...nextScheduledRun,
+          persistenceConfirmed: true,
+          runnerStoppedConfirmed,
+          runnerCleanupRequired: runnerStoppedConfirmed
+            ? false
+            : nextScheduledRun.runnerCleanupRequired,
+          runnerUncertaintyError: runnerStoppedConfirmed
+            ? null
+            : nextScheduledRun.runnerUncertaintyError,
+          updatedAt,
+        });
       }
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      return { state: projected, scheduledRun: nextScheduledRun, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.state, result.scheduledRun);
     }
-
-    await this.writeMutableState(next);
-    return next;
+    return result.state;
   }
 
   async noteStopWorkspaceSynced(
     opId?: string | null,
     workspacePatch?: Partial<StopWorkspaceSyncedMetaPatch> | null,
   ): Promise<EnvLifecycleState | null> {
-    const current = await this.getMutableState();
-    const patch: StopWorkspaceSyncedMetaPatch = {
-      workspaceDirty: workspacePatch?.workspaceDirty ?? current?.workspaceDirty ?? null,
-      workspaceNeedsAttention:
-        workspacePatch?.workspaceNeedsAttention ?? current?.workspaceNeedsAttention ?? null,
-      workspaceLastSyncedAt:
-        workspacePatch?.workspaceLastSyncedAt ?? current?.workspaceLastSyncedAt ?? null,
-      baseMainCommit: workspacePatch?.baseMainCommit ?? current?.baseMainCommit ?? null,
-      lastKnownMainCommit: workspacePatch?.lastKnownMainCommit ?? current?.lastKnownMainCommit ?? null,
-      branchStatus: workspacePatch?.branchStatus ?? current?.branchStatus ?? null,
-    };
-    const next = await this.recordStopWorkspaceSynced(patch, {
+    // Keep omitted fields omitted so recordStopWorkspaceSynced resolves them
+    // from the exact current operation inside its transaction. Expanding this
+    // partial patch from an earlier read would reintroduce a stale overwrite.
+    const next = await this.recordStopWorkspaceSynced(
+      { ...(workspacePatch ?? {}) } as StopWorkspaceSyncedMetaPatch,
+      {
       opId,
       stopFinalize: true,
       clearError: true,
-    });
+      },
+    );
     return buildLifecycleState(next);
   }
 
@@ -1231,19 +3393,395 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     await this.ctx.storage.delete(STOP_WORKSPACE_SYNCED_META_KEY);
   }
 
+  async getGitHubPublishOperation(): Promise<GitHubPublishOperationRecord | null> {
+    return (await this.ctx.storage.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY)) ?? null;
+  }
+
+  async claimGitHubPublishResult(input: {
+    operationId: string;
+    callbackToken: string;
+    workspaceHash: string;
+    claimId: string;
+  }): Promise<
+    | { status: "claimed"; operation: GitHubPublishOperationRecord }
+    | { status: "inactive" | "invalid" | "cleanup_pending" | "in_progress" }
+  > {
+    const claimId = input.claimId.trim();
+    if (!claimId) throw new Error("GitHub publish result claims require a claim ID.");
+    const now = Date.now();
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, storedOperation] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        !current
+        || current.githubPublishOperationId !== input.operationId
+        || storedOperation?.operationId !== input.operationId
+      ) {
+        return { response: { status: "inactive" as const }, state: current };
+      }
+      if (
+        storedOperation.callbackToken !== input.callbackToken
+        || storedOperation.workspaceHash !== input.workspaceHash
+      ) {
+        return { response: { status: "invalid" as const }, state: current };
+      }
+      if (storedOperation.cleanupPending) {
+        return { response: { status: "cleanup_pending" as const }, state: current };
+      }
+      if (storedOperation.resultClaim) {
+        if (storedOperation.resultClaim.expiresAtMs > now) {
+          return { response: { status: "in_progress" as const }, state: current };
+        }
+        await txn.put(GITHUB_PUBLISH_OPERATION_KEY, {
+          ...storedOperation,
+          resultClaim: null,
+          cleanupPending: {
+            terminalError: "GitHub publish result processing was interrupted. Retry publishing.",
+          },
+        } satisfies GitHubPublishOperationRecord);
+        await txn.setAlarm(now);
+        return { response: { status: "cleanup_pending" as const }, state: current };
+      }
+      const operation: GitHubPublishOperationRecord = {
+        ...storedOperation,
+        resultClaim: {
+          claimId,
+          expiresAtMs: now + GITHUB_PUBLISH_RESULT_CLAIM_TTL_MS,
+        },
+      };
+      await txn.put(GITHUB_PUBLISH_OPERATION_KEY, operation);
+      const existingAlarm = await txn.getAlarm();
+      if (
+        existingAlarm === null
+        || existingAlarm > operation.resultClaim!.expiresAtMs
+      ) {
+        await txn.setAlarm(operation.resultClaim!.expiresAtMs);
+      }
+      return {
+        response: { status: "claimed" as const, operation },
+        state: current,
+      };
+    });
+    return result.response;
+  }
+
+  async beginGitHubPublishOperation(input: Omit<
+    GitHubPublishOperationRecord,
+    "resultClaim" | "cleanupPending"
+  > & {
+    projection: GitHubEnvPendingPublishProjection;
+  }): Promise<
+    | { claimed: true; state: EnvMutableState }
+    | { claimed: false; state: EnvMutableState | null }
+  > {
+    const updatedAt = nowIso();
+    const record: GitHubPublishOperationRecord = {
+      operationId: input.operationId,
+      envSlug: input.envSlug,
+      repoId: input.repoId,
+      repoUrl: input.repoUrl,
+      jobSlug: input.jobSlug,
+      executionPlacement: input.executionPlacement,
+      branch: input.branch,
+      baseCommitSha: input.baseCommitSha,
+      workspaceHash: input.workspaceHash,
+      expectedPriorHead: input.expectedPriorHead,
+      hmacKey: input.hmacKey,
+      callbackToken: input.callbackToken,
+      pullRequestContent: input.pullRequestContent,
+      resultClaim: null,
+      cleanupPending: null,
+      startedAt: input.startedAt,
+    };
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, storedOperation] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        current?.githubPublishOperationId === input.operationId
+        && storedOperation?.operationId === input.operationId
+      ) {
+        return { claimed: true as const, state: current, changed: false };
+      }
+      if (
+        !current
+        || current.githubPublishOperationId
+        || current.githubPublishStatus === "publishing"
+        || storedOperation
+      ) {
+        return { claimed: false as const, state: current, changed: false };
+      }
+      const next = normalizeMutableState({
+        ...current,
+        githubBranch: input.branch,
+        githubPublishStatus: "publishing",
+        githubPublishOperationId: input.operationId,
+        githubPublishError: null,
+        githubPendingPublish: {
+          ...input.projection,
+          updatedAt,
+        },
+        workspaceNeedsAttention: false,
+        branchStatus: current.branchStatus === "needs-attention" ? "ready-to-merge" : current.branchStatus,
+        updatedAt,
+      });
+      await txn.put(GITHUB_PUBLISH_OPERATION_KEY, record);
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { claimed: true as const, state: next, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.state, await this.readScheduledRun());
+    }
+    return { claimed: result.claimed, state: result.state };
+  }
+
+  async updateGitHubPublishOperation(input: {
+    operationId: string;
+    resultClaimId: string;
+    projection?: GitHubEnvPendingPublishProjection | null;
+    patch?: Partial<Pick<
+      EnvMutableState,
+      | "githubHeadCommitSha"
+      | "githubPublishStatus"
+      | "githubPublishError"
+      | "githubPendingPublish"
+      | "workspaceNeedsAttention"
+      | "branchStatus"
+    >>;
+  }): Promise<{ applied: boolean }> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, storedOperation] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        !current
+        || current.githubPublishOperationId !== input.operationId
+        || storedOperation?.operationId !== input.operationId
+        || storedOperation.cleanupPending
+        || storedOperation.resultClaim?.claimId !== input.resultClaimId
+      ) {
+        return { applied: false, state: current, changed: false };
+      }
+      const updatedAt = nowIso();
+      const renewedClaim = {
+        claimId: input.resultClaimId,
+        expiresAtMs: Date.now() + GITHUB_PUBLISH_RESULT_CLAIM_TTL_MS,
+      };
+      await txn.put(GITHUB_PUBLISH_OPERATION_KEY, {
+        ...storedOperation,
+        resultClaim: renewedClaim,
+      } satisfies GitHubPublishOperationRecord);
+      const existingAlarm = await txn.getAlarm();
+      if (existingAlarm === null || existingAlarm > renewedClaim.expiresAtMs) {
+        await txn.setAlarm(renewedClaim.expiresAtMs);
+      }
+      const next = normalizeMutableState({
+        ...current,
+        ...input.patch,
+        ...(input.projection !== undefined
+          ? {
+              githubPendingPublish: input.projection
+                ? { ...input.projection, updatedAt }
+                : null,
+            }
+          : {}),
+        updatedAt,
+      });
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { applied: true, state: next, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.state, await this.readScheduledRun());
+    }
+    return { applied: result.applied };
+  }
+
+  async markGitHubPublishCleanupPending(input: {
+    operationId: string;
+    terminalError: string;
+    resultClaimId?: string;
+  }): Promise<boolean> {
+    const terminalError = input.terminalError.trim() || "GitHub publish cleanup was interrupted.";
+    const resultClaimId = input.resultClaimId?.trim() || null;
+    return await this.ctx.storage.transaction(async (txn) => {
+      const [stored, current] = await Promise.all([
+        txn.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      if (
+        !stored
+        || stored.operationId !== input.operationId
+        || !current
+        || current.githubPublishOperationId !== input.operationId
+        || (stored.resultClaim?.claimId ?? null) !== resultClaimId
+      ) return false;
+      await txn.put(GITHUB_PUBLISH_OPERATION_KEY, {
+        ...stored,
+        resultClaim: null,
+        cleanupPending: {
+          terminalError: stored.cleanupPending?.terminalError ?? terminalError,
+        },
+      } satisfies GitHubPublishOperationRecord);
+      await txn.setAlarm(Date.now());
+      return true;
+    });
+  }
+
+  async finishGitHubPublishOperation(input: {
+    operationId: string;
+    resultClaimId?: string;
+    patch: Partial<Pick<
+      EnvMutableState,
+      | "githubHeadCommitSha"
+      | "githubPrNumber"
+      | "githubPrUrl"
+      | "githubPrState"
+      | "githubMergedAt"
+      | "githubPublishStatus"
+      | "githubPublishError"
+      | "githubLastPublishedAt"
+      | "githubLastPublishedWorkspaceHash"
+      | "workspaceDirty"
+      | "workspaceNeedsAttention"
+      | "branchStatus"
+    >>;
+  }): Promise<{ applied: boolean }> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, storedOperation] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const resultClaimId = input.resultClaimId?.trim() || null;
+      if (
+        !current
+        || current.githubPublishOperationId !== input.operationId
+        || storedOperation?.operationId !== input.operationId
+        || (storedOperation.resultClaim?.claimId ?? null) !== resultClaimId
+        || (storedOperation.cleanupPending !== null && resultClaimId !== null)
+      ) {
+        return { applied: false, state: current, changed: false };
+      }
+      await txn.delete(GITHUB_PUBLISH_OPERATION_KEY);
+      const updatedAt = nowIso();
+      const next = normalizeMutableState({
+        ...current,
+        ...input.patch,
+        githubPublishOperationId: null,
+        githubPendingPublish: null,
+        updatedAt,
+      });
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { applied: true, state: next, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.state, await this.readScheduledRun());
+    }
+    return { applied: result.applied };
+  }
+
+  private async expireGitHubPublishResultClaim(): Promise<void> {
+    const now = Date.now();
+    await this.ctx.storage.transaction(async (txn) => {
+      const [operation, current] = await Promise.all([
+        txn.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      if (
+        !operation?.resultClaim
+        || operation.resultClaim.expiresAtMs > now
+        || !current
+        || current.githubPublishOperationId !== operation.operationId
+      ) return;
+      await txn.put(GITHUB_PUBLISH_OPERATION_KEY, {
+        ...operation,
+        resultClaim: null,
+        cleanupPending: {
+          terminalError: "GitHub publish result processing was interrupted. Retry publishing.",
+        },
+      } satisfies GitHubPublishOperationRecord);
+      await txn.setAlarm(now);
+    });
+  }
+
+  private async runGitHubPublishCleanupEffect(): Promise<void> {
+    const operation = await this.getGitHubPublishOperation();
+    if (!operation?.cleanupPending) return;
+    await cleanupGitHubPublishRuntime(this.env, operation);
+    await revokeGitHubBridgesForEnvPublish(this.env, {
+      repoId: operation.repoId,
+      operationId: operation.operationId,
+    });
+
+    const current = await this.getMutableState();
+    await this.finishGitHubPublishOperation({
+      operationId: operation.operationId,
+      patch: {
+        githubPublishStatus: "failed",
+        githubPublishError: operation.cleanupPending.terminalError,
+        workspaceNeedsAttention: false,
+        branchStatus: current?.branchStatus === "needs-attention"
+          ? "ready-to-merge"
+          : current?.branchStatus ?? null,
+      },
+    });
+  }
+
   async recordWorkspaceSyncFailed(
     opId: string | null | undefined,
     error: string,
   ): Promise<EnvMutableState | null> {
-    const current = await this.getMutableState();
     const resolvedOpId = this.resolveLifecycleOpId(opId);
-    if (!current || !resolvedOpId || current.lifecycleOpId !== resolvedOpId) {
-      return current;
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const matchingStop = Boolean(
+        current
+        && resolvedOpId
+        && current.lifecycleOpId === resolvedOpId
+        && current.lifecycleOperation === "stop"
+        && current.lifecycleDesiredState === "stopped"
+        && (
+          current.lifecyclePhase === "saving"
+          || current.lifecyclePhase === "stopping"
+          || current.lifecyclePhase === "failed"
+        ),
+      );
+      if (!current || !matchingStop) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
+      }
+      const runnerStoppedConfirmed = current.lifecycleInfraState === "stopped"
+        && current.lifecycleLastRunnerState === "stopped";
+      const next = applyLifecycleState(current, buildFailureState(current, error));
+      const nextScheduledRun = scheduledRun?.kind === "active" && scheduledRun.stopOpId === resolvedOpId
+        ? this.settleActiveScheduledRun({
+            ...scheduledRun,
+            failure: error,
+            persistenceConfirmed: true,
+            runnerStoppedConfirmed: scheduledRun.runnerStoppedConfirmed || runnerStoppedConfirmed,
+            updatedAt: nowIso(),
+          })
+        : scheduledRun ?? null;
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      return { mutable: projected, scheduledRun: nextScheduledRun, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
     }
-
-    const next = applyLifecycleState(current, buildFailureState(current, error));
-    await this.writeMutableState(next);
-    return next;
+    return result.mutable;
   }
 
   async noteWorkspaceSyncFailed(
@@ -1272,47 +3810,6 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       leadHarnessStatus: "failed",
       leadHarnessError: message.trim() || "Lead harness exited unexpectedly",
       leadHarnessUpdatedAt: updatedAt,
-      updatedAt,
-    });
-    await this.writeMutableState(next);
-    return next;
-  }
-
-  async setScmProjection(state: ScmProjectionInput): Promise<EnvMutableState | null> {
-    const current = await this.getMutableState();
-    if (!current) {
-      return null;
-    }
-    const updatedAt = nowIso();
-    const next = normalizeMutableState({
-      ...current,
-      scmOperationType: state.type,
-      scmOperationId: state.operationId,
-      scmOperationPhase: state.phase,
-      scmOperationStartedAt: state.startedAt ?? current.scmOperationStartedAt ?? updatedAt,
-      scmOperationUpdatedAt: updatedAt,
-      updatedAt,
-    });
-    await this.writeMutableState(next);
-    return next;
-  }
-
-  async clearScmProjection(result?: ClearedScmProjectionResult): Promise<EnvMutableState | null> {
-    const current = await this.getMutableState();
-    if (!current) {
-      return null;
-    }
-    const updatedAt = nowIso();
-    const next = normalizeMutableState({
-      ...current,
-      scmOperationType: null,
-      scmOperationId: null,
-      scmOperationPhase: null,
-      scmOperationStartedAt: null,
-      scmOperationUpdatedAt: null,
-      scmLastCompletedAt: result?.completedAt ?? current.scmLastCompletedAt,
-      scmLastDurationMs: result?.durationMs ?? current.scmLastDurationMs,
-      scmLastTimings: result?.timings ?? current.scmLastTimings,
       updatedAt,
     });
     await this.writeMutableState(next);
@@ -1350,18 +3847,96 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     return next;
   }
 
+  async noteFencedRunnerAbsentBeforeScheduledStart(
+    stopOpId: string,
+    startRejectedBeforeWorkspace = false,
+  ): Promise<boolean> {
+    const resolvedStopOpId = this.resolveLifecycleOpId(stopOpId);
+    if (!resolvedStopOpId) return false;
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        !current
+        || current.lifecycleOpId !== resolvedStopOpId
+        || current.lifecycleOperation !== "stop"
+        || current.lifecycleDesiredState !== "stopped"
+        || !scheduledRun
+        || scheduledRun.kind !== "active"
+        || scheduledRun.stopOpId !== resolvedStopOpId
+        || scheduledRun.preparation
+        || (scheduledRun.runnerDispatchStarted && !startRejectedBeforeWorkspace)
+      ) return { finalized: false, mutable: current, scheduledRun: scheduledRun ?? null };
+      const updatedAt = nowIso();
+      const nextMutable = normalizeMutableState({
+        ...applyLifecycleState(current, {
+          phase: "stopped",
+          activeOpId: resolvedStopOpId,
+          activeOperation: "stop",
+          desiredState: "stopped",
+          lastRunnerState: "stopped",
+          lastWorkspaceSyncedAckOpId: resolvedStopOpId,
+          infraState: "stopped",
+          runtimeReady: false,
+          lastError: null,
+          lastErrorAt: null,
+          updatedAt,
+        }),
+        bootMessage: null,
+        bootStepId: null,
+      });
+      const nextScheduledRun = this.settleActiveScheduledRun({
+        ...scheduledRun,
+        runnerStoppedConfirmed: true,
+        persistenceConfirmed: true,
+        runnerCleanupRequired: false,
+        runnerUncertaintyError: null,
+        updatedAt,
+      });
+      const projected = await this.writeScheduledRunInTransaction(txn, nextMutable, nextScheduledRun);
+      return { finalized: true, mutable: projected, scheduledRun: nextScheduledRun };
+    });
+    if (result.finalized) {
+      await this.ctx.storage.delete(STOP_WORKSPACE_SYNCED_META_KEY);
+      await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    }
+    return result.finalized;
+  }
+
+  async noteFencedScheduledStartRejectedBeforeMutation(startOpId: string): Promise<boolean> {
+    const resolvedStartOpId = this.resolveLifecycleOpId(startOpId);
+    if (!resolvedStartOpId) return false;
+    const record = await this.readScheduledRun();
+    return record?.kind === "active"
+      && record.startOpId === resolvedStartOpId
+      && Boolean(record.stopOpId)
+      ? this.noteFencedRunnerAbsentBeforeScheduledStart(record.stopOpId!, true)
+      : false;
+  }
+
   async noteRunnerStopped(
     opId: string | null | undefined,
     reason?: string | null,
   ): Promise<EnvLifecycleState | null> {
-    const current = await this.getMutableState();
     const resolvedOpId = this.resolveLifecycleOpId(opId);
-    if (!current || !resolvedOpId || current.lifecycleOpId !== resolvedOpId) {
-      return buildLifecycleState(current);
-    }
-
-    if (current.lifecyclePhase === "stopping") {
-      const next = normalizeMutableState({
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun, storedDiagnostics] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<StartupDiagnosticsSnapshot>(STARTUP_DIAGNOSTICS_ACTIVE_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (!current || !resolvedOpId || current.lifecycleOpId !== resolvedOpId) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false, runnerStoppedBeforeWorkspace: false };
+      }
+      const updatedAt = nowIso();
+      let next = current;
+      let failure: string | null = null;
+      let runnerStoppedBeforeWorkspace = false;
+      const finalizeStopped = () => normalizeMutableState({
         ...applyLifecycleState(current, {
           phase: "stopped",
           activeOpId: current.lifecycleOpId,
@@ -1373,143 +3948,421 @@ export class EnvLifecycleDO extends DurableObject<Env> {
           runtimeReady: false,
           lastError: null,
           lastErrorAt: null,
-          updatedAt: nowIso(),
+          updatedAt,
         }),
         bootMessage: null,
         bootStepId: null,
       });
-      await this.writeMutableState(next);
-      return buildLifecycleState(next);
-    }
+      if (
+        current.lifecyclePhase === "stopping"
+        || (
+          current.lifecyclePhase === "failed"
+          && current.lifecycleDesiredState === "stopped"
+          && current.lifecycleLastWorkspaceSyncedAckOpId === resolvedOpId
+        )
+      ) {
+        next = finalizeStopped();
+        await txn.delete(STOP_WORKSPACE_SYNCED_META_KEY);
+      } else if (current.lifecyclePhase === "failed" && current.lifecycleDesiredState === "stopped") {
+        failure = current.error?.trim() || ENV_LIFECYCLE_RUNNER_EXIT_BEFORE_PERSIST_ERROR;
+        next = normalizeMutableState({
+          ...current,
+          lifecycleLastRunnerState: "stopped",
+          lifecycleInfraState: "stopped",
+          lifecycleRuntimeReady: false,
+          lifecycleUpdatedAt: updatedAt,
+          updatedAt,
+        });
+      } else if (current.lifecyclePhase === "saving") {
+        next = normalizeMutableState({
+          ...current,
+          lifecycleLastRunnerState: "stopped",
+          lifecycleInfraState: "stopped",
+          lifecycleRuntimeReady: false,
+          updatedAt,
+        });
+        runnerStoppedBeforeWorkspace = true;
+      } else if (current.lifecyclePhase === "starting" || current.lifecyclePhase === "running") {
+        failure = current.lifecyclePhase === "starting"
+          ? reason?.trim()
+            ? `Container exited before the environment finished starting (${reason.trim()}).`
+            : "Container exited before the environment finished starting."
+          : reason?.trim()
+            ? `Container exited unexpectedly while the environment was running (${reason.trim()}).`
+            : ENV_LIFECYCLE_RUNNER_EXIT_WHILE_RUNNING_ERROR;
+        let diagnostics = storedDiagnostics
+          ? normalizeStartupDiagnosticsSnapshot(storedDiagnostics)
+          : null;
+        if (current.lifecyclePhase === "starting" && diagnostics?.opId === resolvedOpId) {
+          const fallbackStepId = current.bootStepId ?? diagnostics.currentStepId ?? "startup-failed";
+          const failureEvent = buildStartupDiagnosticEvent({
+            opId: resolvedOpId,
+            stepId: fallbackStepId,
+            severity: "error",
+            message: failure,
+          });
+          diagnostics = this.buildUpdatedStartupDiagnostics(diagnostics, {
+            event: failureEvent,
+            currentStepId: fallbackStepId,
+            currentStepMessage: failure,
+            failure: { message: failure, exitCode: null, signal: null, lastStepId: fallbackStepId },
+            updatedAt,
+          });
+          await txn.put(STARTUP_DIAGNOSTICS_ACTIVE_KEY, diagnostics);
+        }
+        const stoppedCurrent = {
+          ...current,
+          ...(current.lifecyclePhase === "starting"
+            ? { bootMessage: diagnostics?.currentStepMessage ?? failure, bootStepId: diagnostics?.currentStepId ?? current.bootStepId }
+            : {}),
+          lifecycleLastRunnerState: "stopped" as const,
+          lifecycleInfraState: "stopped" as const,
+          lifecycleRuntimeReady: false,
+        };
+        next = applyLifecycleState(stoppedCurrent, buildFailureState(stoppedCurrent, failure));
+      } else {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false, runnerStoppedBeforeWorkspace: false };
+      }
 
+      let nextScheduledRun = scheduledRun ?? null;
+      if (
+        scheduledRun?.kind === "active"
+        && (scheduledRun.stopOpId === resolvedOpId || scheduledRun.startOpId === resolvedOpId)
+      ) {
+        nextScheduledRun = this.settleActiveScheduledRun({
+          ...scheduledRun,
+          runnerStoppedConfirmed: true,
+          runnerCleanupRequired: false,
+          runnerUncertaintyError: null,
+          ...(failure ? { failure } : {}),
+          updatedAt,
+        });
+      }
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      return { mutable: projected, scheduledRun: nextScheduledRun, changed: true, runnerStoppedBeforeWorkspace };
+    });
+    if (result.runnerStoppedBeforeWorkspace) {
+      console.warn(`[env-lifecycle] runner stopped before workspace-synced ack: ${JSON.stringify({ opId: resolvedOpId, reason: reason?.trim() ?? null })}`);
+    }
+    if (result.changed) await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    return buildLifecycleState(result.mutable);
+  }
+
+  private getScheduledRunCapacityStub(): ScheduledRunCapacityDO {
+    const id = this.env.SCHEDULED_RUN_CAPACITY.idFromName("scheduled-runs");
+    return this.env.SCHEDULED_RUN_CAPACITY.get(id) as unknown as ScheduledRunCapacityDO;
+  }
+
+  private alarmExecutionContext(): ExecutionContext {
+    return {
+      waitUntil: (promise: Promise<unknown>) => this.ctx.waitUntil(promise),
+      passThroughOnException: () => {},
+      props: {},
+    } as unknown as ExecutionContext;
+  }
+
+  private async ownsScheduledRunIncarnation(record: ScheduledRunRecord): Promise<boolean> {
+    const publication = await this.getPublication();
+    return publication?.incarnationId === record.incarnationId && publication.state === "visible";
+  }
+
+  private async resolveScheduledRunOrigin(
+    schedule: EnvironmentPlanSchedule,
+  ): Promise<string> {
+    if (schedule.localDevOrigin === null) {
+      return resolveCanonicalHubOrigin(this.env);
+    }
+    if (typeof schedule.localDevOrigin !== "string") {
+      throw new Error("Scheduled workload was created by an unsupported version.");
+    }
+    const local = new URL(schedule.localDevOrigin);
     if (
-      current.lifecyclePhase === "failed"
-      && current.lifecycleDesiredState === "stopped"
-      && current.lifecycleLastWorkspaceSyncedAckOpId === resolvedOpId
+      local.origin !== schedule.localDevOrigin
+      || !isLoopbackHostname(local.hostname)
     ) {
-      const next = normalizeMutableState({
-        ...applyLifecycleState(current, {
-          phase: "stopped",
-          activeOpId: current.lifecycleOpId,
-          activeOperation: current.lifecycleOperation,
-          desiredState: "stopped",
-          lastRunnerState: "stopped",
-          lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
-          infraState: "stopped",
-          runtimeReady: false,
-          lastError: null,
-          lastErrorAt: null,
-          updatedAt: nowIso(),
-        }),
-        bootMessage: null,
-        bootStepId: null,
-      });
-      await this.writeMutableState(next);
-      return buildLifecycleState(next);
+      throw new Error("Scheduled workload has an invalid contributor origin.");
     }
-
-    if (current.lifecyclePhase === "saving") {
-      console.warn(
-        `[env-lifecycle] runner stopped before workspace-synced ack: ${JSON.stringify({
-          opId: resolvedOpId,
-          currentPhase: current.lifecyclePhase,
-          currentOpId: current.lifecycleOpId,
-          lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
-          reason: reason?.trim() ?? null,
-        })}`,
-      );
-      const detail = reason?.trim()
-        ? `Container exited before workspace persistence completed (${reason.trim()}). Recent workspace changes may not be saved.`
-        : ENV_LIFECYCLE_RUNNER_EXIT_BEFORE_PERSIST_ERROR;
-      const next = applyLifecycleState(
-        {
-          ...current,
-          lifecycleLastRunnerState: "stopped",
-          lifecycleInfraState: "stopped",
-          lifecycleRuntimeReady: false,
-        },
-        buildFailureState(
-          {
-            ...current,
-            lifecycleLastRunnerState: "stopped",
-            lifecycleInfraState: "stopped",
-            lifecycleRuntimeReady: false,
-          },
-          detail,
-        ),
-      );
-      await this.writeMutableState(next);
-      return buildLifecycleState(next);
-    }
-
-    if (current.lifecyclePhase === "starting") {
-      const detail = reason?.trim()
-        ? `Container exited before the environment finished starting (${reason.trim()}).`
-        : "Container exited before the environment finished starting.";
-      await this.recordStartupDiagnosticsFailure(resolvedOpId, {
-        stepId: current.bootStepId ?? undefined,
-        message: detail,
-      });
-      const diagnostics = await this.readStartupDiagnosticsSnapshot(STARTUP_DIAGNOSTICS_ACTIVE_KEY);
-      const next = applyLifecycleState(
-        {
-          ...current,
-          bootMessage: diagnostics?.currentStepMessage ?? detail,
-          bootStepId: diagnostics?.currentStepId ?? current.bootStepId,
-          lifecycleLastRunnerState: "stopped",
-          lifecycleInfraState: "stopped",
-          lifecycleRuntimeReady: false,
-        },
-        buildFailureState(
-          {
-            ...current,
-            lifecycleLastRunnerState: "stopped",
-            lifecycleInfraState: "stopped",
-            lifecycleRuntimeReady: false,
-          },
-          detail,
-        ),
-      );
-      await this.writeMutableState(next);
-      return buildLifecycleState(next);
-    }
-
-    if (current.lifecyclePhase === "running") {
-      const detail = reason?.trim()
-        ? `Container exited unexpectedly while the environment was running (${reason.trim()}).`
-        : ENV_LIFECYCLE_RUNNER_EXIT_WHILE_RUNNING_ERROR;
-      const next = applyLifecycleState(
-        {
-          ...current,
-          lifecycleLastRunnerState: "stopped",
-          lifecycleInfraState: "stopped",
-          lifecycleRuntimeReady: false,
-        },
-        buildFailureState(
-          {
-            ...current,
-            lifecycleLastRunnerState: "stopped",
-            lifecycleInfraState: "stopped",
-            lifecycleRuntimeReady: false,
-          },
-          detail,
-        ),
-      );
-      await this.writeMutableState(next);
-      return buildLifecycleState(next);
-    }
-
-    return buildLifecycleState(current);
+    return local.origin;
   }
+
+  private async runScheduledRunStartEffect(schedule: EnvironmentPlanSchedule): Promise<void> {
+    if (!(await this.ownsScheduledRunIncarnation(schedule))) return;
+    const meta = await this.getOwnedEnvView();
+    if (!(await this.ownsScheduledRunIncarnation(schedule))) return;
+    if (!meta) {
+      const attempt = schedule.attemptId
+        ? schedule
+        : (await this.beginScheduledRunAttempt(schedule.incarnationId)).schedule;
+      await this.recordScheduledPreStartFailure({
+        attemptId: attempt.attemptId!,
+        error: "The scheduled environment or its repository is missing.",
+        retryable: false,
+      });
+      return;
+    }
+    try {
+      const requestOrigin = await this.resolveScheduledRunOrigin(schedule);
+      const result = await startEnvAction({
+        env: this.env,
+        executionCtx: this.alarmExecutionContext(),
+        request: new Request(requestOrigin),
+        requestUrl: requestOrigin,
+        slug: meta.slug,
+        intent: "scheduled",
+        schedulerDeadlineAtMs: schedule.deadlineAtMs,
+        expectedIncarnationId: schedule.incarnationId,
+        lifecycleStub: this,
+        cachedMeta: meta,
+      });
+      if (result.status < 400 || result.scheduledRunTransitionApplied) return;
+      const current = await this.readScheduledRun();
+      const error = typeof (result.body as { error?: unknown } | null)?.error === "string"
+        ? (result.body as { error: string }).error
+        : "Scheduled Run preparation failed.";
+      if (current?.kind === "schedule" && current.attemptId) {
+        await this.recordScheduledPreStartFailure({
+          attemptId: current.attemptId,
+          error,
+          retryable: result.retryDisposition === "retry-pre-start",
+        });
+      } else if (current?.kind === "active") {
+        await this.recordScheduledRunPostClaimFailure({
+          opId: current.startOpId,
+          error,
+          runnerStoppedConfirmed: !current.runnerDispatchStarted,
+          expectedIncarnationId: current.incarnationId,
+        });
+      }
+    } catch (error) {
+      const current = await this.readScheduledRun();
+      const message = error instanceof Error ? error.message : String(error);
+      if (current?.kind === "schedule" && current.attemptId) {
+        await this.recordScheduledPreStartFailure({
+          attemptId: current.attemptId,
+          error: message,
+          retryable: true,
+        });
+      } else if (current?.kind === "active") {
+        await this.recordScheduledRunPostClaimFailure({
+          opId: current.startOpId,
+          error: message,
+          runnerStoppedConfirmed: !current.runnerDispatchStarted,
+          expectedIncarnationId: current.incarnationId,
+        });
+      }
+    }
+  }
+
+  private async runScheduledRunStopEffect(record: ActiveScheduledRunReceipt): Promise<void> {
+    if (record.preparation || !(await this.ownsScheduledRunIncarnation(record))) return;
+    const meta = await this.getOwnedEnvView();
+    if (!meta || !(await this.ownsScheduledRunIncarnation(record))) return;
+    try {
+      const result = await stopEnvAction({
+        env: this.env,
+        executionCtx: this.alarmExecutionContext(),
+        slug: meta.slug,
+        intent: "scheduled",
+        requestedOutcome: record.requestedOutcome ?? "interrupted",
+        expectedStartOpId: record.startOpId,
+        lifecycleStub: this,
+        cachedMeta: meta,
+        expectedIncarnationId: record.incarnationId,
+      });
+      if (result.status >= 400 && result.runnerUncertain) {
+        const message = typeof (result.body as { error?: unknown } | null)?.error === "string"
+          ? (result.body as { error: string }).error
+          : "Scheduled Run runner shutdown could not be confirmed.";
+        const current = await this.readScheduledRun();
+        if (current?.kind === "active" && current.stopOpId) {
+          await this.recordScheduledRunnerUncertainty({ stopOpId: current.stopOpId, error: message });
+        }
+      }
+    } catch (error) {
+      const current = await this.readScheduledRun();
+      if (current?.kind === "active" && current.stopOpId) {
+        await this.recordScheduledRunnerUncertainty({
+          stopOpId: current.stopOpId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  private async ensureScheduledRunLeaseReleaseQueued(record: ActiveScheduledRunReceipt): Promise<void> {
+    if (record.capacityReleased) return;
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY);
+      if (current?.kind !== "active" || current.attemptId !== record.attemptId || current.capacityReleased) return;
+      await this.queueScheduledRunLeaseReleaseInTransaction(txn, current.slug, current.attemptId);
+      await txn.setAlarm(Date.now());
+    });
+  }
+
+  private async runScheduledRunLeaseReleaseEffect(): Promise<void> {
+    const release = await this.prepareScheduledRunLeaseRelease();
+    if (!release) return;
+    try {
+      const result = await this.getScheduledRunCapacityStub().release(release);
+      if (result.released) await this.confirmScheduledRunLeaseReleased(release.attemptId);
+    } catch (error) {
+      console.error("[env-lifecycle] Failed to release Scheduled Run capacity:", error);
+    }
+  }
+
+  private async runScheduledRunCleanupEffect(record: ActiveScheduledRunReceipt): Promise<void> {
+    if (record.preparation || !(await this.ownsScheduledRunIncarnation(record))) return;
+    if (!record.stopOpId || !record.requestedOutcome) {
+      await this.requestScheduledRunOutcome({
+        opId: record.startOpId,
+        outcome: record.requestedOutcome ?? "interrupted",
+      });
+      return;
+    }
+    if (!record.runnerStoppedConfirmed || !record.persistenceConfirmed) {
+      await this.runScheduledRunStopEffect(record);
+      return;
+    }
+    if (record.credentialsMayExist) {
+      const cleanup = await cleanupLaunchCredentialsBestEffort(
+        this.env,
+        record.slug,
+        undefined,
+        {
+          scope: { incarnationId: record.incarnationId, startOpId: record.startOpId },
+          ids: record.credentialIds,
+        },
+      );
+      if (cleanup.complete) {
+        await this.recordScheduledRunCredentialsCleaned(record.startOpId, record.incarnationId);
+      } else {
+        await this.recordScheduledRunCredentialCleanupPending(record.startOpId, record.incarnationId);
+      }
+      return;
+    }
+    await this.ensureScheduledRunLeaseReleaseQueued(record);
+  }
+
+  private async expireScheduledRunBeforeStart(record: EnvironmentPlanSchedule): Promise<void> {
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [current, storedMutable, slug] = await Promise.all([
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+      ]);
+      const mutable = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (current?.kind !== "schedule" || current.updatedAt !== record.updatedAt || !mutable) {
+        return { record: current ?? null, mutable };
+      }
+      const error = "The Scheduled Run deadline passed before a runner could start.";
+      let next: ScheduledRunRecord;
+      if (current.attemptId && (current.capacityAcquired || current.acquireUncertain)) {
+        if (!slug) throw new Error("Scheduled Run capacity release is missing its environment slug.");
+        await this.queueScheduledRunLeaseReleaseInTransaction(txn, slug, current.attemptId);
+        next = { ...current, terminalRequested: true, lastError: error, retryAtMs: null, updatedAt: nowIso() };
+        await txn.setAlarm(Date.now());
+      } else {
+        next = finishedScheduledRun(current, { outcome: "failed", error });
+      }
+      const nextMutable = await this.writeScheduledRunInTransaction(txn, mutable, next);
+      return { record: next, mutable: nextMutable };
+    });
+    await this.scheduleNextAlarm(result.mutable, result.record);
+  }
+
+  private async runAlarmPass(): Promise<void> {
+    await this.runScheduledRunLeaseReleaseEffect();
+    const creationClaim = await this.ctx.storage.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY);
+    if (creationClaim) {
+      const expiresAt = creationClaim.createdAtMs + INITIAL_CREATE_CLAIM_TTL_MS;
+      if (Date.now() < expiresAt) {
+        const pending = normalizePendingScheduledRunLeaseReleases(
+          await this.ctx.storage.get<StoredPendingScheduledRunLeaseReleases>(SCHEDULED_RUN_LEASE_RELEASE_KEY),
+        );
+        const releaseAt = nextPendingScheduledRunLeaseReleaseAt(pending);
+        await this.ctx.storage.setAlarm(releaseAt == null ? expiresAt : Math.min(expiresAt, releaseAt));
+        return;
+      }
+      try {
+        await this.rollbackStoppedInitialization(creationClaim.incarnationId);
+      } catch (error) {
+        console.error("[env-lifecycle] Failed to clean expired environment creation KV:", error);
+        if (await this.ctx.storage.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY)) {
+          await this.ctx.storage.setAlarm(Date.now() + SCHEDULED_RUN_EFFECT_RETRY_MS);
+        }
+      }
+      return;
+    }
+
+    await this.getMutableState();
+    await this.expireGitHubPublishResultClaim();
+    await this.runGitHubPublishCleanupEffect();
+    let record = await this.readScheduledRun();
+    const now = Date.now();
+    if (
+      record?.kind === "active"
+      && record.preparation
+      && now >= record.preparation.heartbeatAtMs + (
+        record.preparation.effectMayBeLive
+          ? SCHEDULED_RUN_PREPARATION_ABANDON_MS
+          : SCHEDULED_RUN_PREPARATION_LEASE_MS
+      )
+    ) {
+      await this.expireScheduledRunPreparation({
+        opId: record.startOpId,
+        claimedAtMs: record.preparation.claimedAtMs,
+        heartbeatAtMs: record.preparation.heartbeatAtMs,
+        now,
+      });
+      record = await this.readScheduledRun();
+    }
+
+    if (record?.kind === "schedule" && now >= record.deadlineAtMs) {
+      await this.expireScheduledRunBeforeStart(record);
+      record = await this.readScheduledRun();
+    } else if (record?.kind === "active" && now >= record.deadlineAtMs && !record.requestedOutcome) {
+      await this.requestScheduledRunOutcome({ opId: record.startOpId, outcome: "interrupted" });
+      record = await this.readScheduledRun();
+    }
+
+    if (record?.kind === "schedule") {
+      const dueAt = record.retryAtMs ?? record.runAtMs;
+      if (
+        !record.cancelRequested
+        && !record.terminalRequested
+        && !record.acquireUncertain
+        && !record.capacityAcquired
+        && now >= dueAt
+        && now < record.deadlineAtMs
+      ) await this.runScheduledRunStartEffect(record);
+    } else if (record?.kind === "active") {
+      if (!record.preparation && (record.requestedOutcome || record.failure)) {
+        await this.runScheduledRunCleanupEffect(record);
+      }
+    }
+
+    await this.runScheduledRunLeaseReleaseEffect();
+    try {
+      await this.persistOwnedProjection();
+    } catch (error) {
+      console.error("[env-lifecycle] Failed to publish environment projection:", error);
+    }
+    await this.scheduleNextAlarm(
+      await this.readStoredMutableState(),
+      await this.readScheduledRun(),
+    );
+  }
+
   async alarm(): Promise<void> {
-    const before = await this.readStoredMutableState();
-    const next = await this.getMutableState();
-    if (!before || !next) {
-      return;
+    try {
+      await this.runAlarmPass();
+    } catch (error) {
+      console.error("[env-lifecycle] Alarm pass failed; scheduling recovery:", error);
+      // Cloudflare's automatic alarm retries are finite. Persist our own next
+      // wake so a transient dependency or a bad deployment cannot strand the
+      // lifecycle after those retries are exhausted.
+      await this.ctx.storage.setAlarm(Date.now() + SCHEDULED_RUN_EFFECT_RETRY_MS);
     }
-    if (JSON.stringify(before) === JSON.stringify(next)) {
-      return;
-    }
-    await this.persistProjectedSummary(next);
   }
+
 }

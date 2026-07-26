@@ -1,9 +1,10 @@
 {
-	"name": "tiller-hub",
+	"name": "tiller",
 	"main": "api/index.ts",
 	"compatibility_date": "2025-01-29",
 	"compatibility_flags": [
-		"nodejs_compat"
+		"nodejs_compat",
+		"global_fetch_strictly_public"
 	],
 	"assets": {
 		"binding": "ASSETS",
@@ -19,9 +20,9 @@
 		}
 	],
 	"vars": {
-		// Deploy-button region code. Accepted values:
+		// Required deploy-button choice. Enter one of:
 		// wnam, enam, weur, eeur, apac, oc
-		"TILLER_REGION": "wnam"
+		"TILLER_REGION": ""
 	},
 	"containers": [
 		{
@@ -31,23 +32,33 @@
 			"instance_type": "standard-1"
 		},
 		{
-			"class_name": "ScmBootstrapDO",
-			"image": "docker.io/jamieatlason/tiller-scm:stable",
-			"max_instances": 2,
-			"instance_type": "basic"
-		},
-		{
-			"class_name": "ScmOperationDO",
+			"class_name": "GitHubJobDO",
 			"image": "docker.io/jamieatlason/tiller-scm:stable",
 			"max_instances": 4,
 			"instance_type": "basic"
+		},
+		{
+			// Planner runs need the coding CLIs + tiller-planner from the
+			// sandbox image — never the CLI-less tiller-scm image.
+			"class_name": "PlannerRunDO",
+			"image": "docker.io/jamieatlason/tiller-sandbox:stable",
+			"max_instances": 10,
+			"instance_type": "standard-1"
 		}
 	],
 	"durable_objects": {
 		"bindings": [
 			{
+				"name": "SCHEDULED_RUN_CAPACITY",
+				"class_name": "ScheduledRunCapacityDO"
+			},
+			{
 				"name": "ENV_LIFECYCLE",
 				"class_name": "EnvLifecycleDO"
+			},
+			{
+				"name": "ENV_REVIEW",
+				"class_name": "EnvReviewDO"
 			},
 			{
 				"name": "ARTIFACT_STORE",
@@ -62,20 +73,16 @@
 				"class_name": "SandboxDO"
 			},
 			{
-				"name": "REPO_MERGE_LOCK",
-				"class_name": "RepoMergeLockDO"
-			},
-			{
 				"name": "TILLER_VOICE",
 				"class_name": "TillerVoice"
 			},
 			{
-				"name": "SCM_BOOTSTRAP",
-				"class_name": "ScmBootstrapDO"
+				"name": "GITHUB_JOB",
+				"class_name": "GitHubJobDO"
 			},
 			{
-				"name": "SCM_OPERATION",
-				"class_name": "ScmOperationDO"
+				"name": "PLANNER_RUN",
+				"class_name": "PlannerRunDO"
 			},
 			{
 				"name": "THREAD",
@@ -84,10 +91,6 @@
 			{
 				"name": "WORKSPACE",
 				"class_name": "WorkspaceDO"
-			},
-			{
-				"name": "PLAN_CHAT",
-				"class_name": "PlanChatAgent"
 			},
 			{
 				"name": "REVIEWER_CHAT",
@@ -224,6 +227,41 @@
 			"deleted_classes": [
 				"ResearchChatAgent",
 				"CartographerChatAgent"
+			]
+		},
+		{
+			"tag": "v21",
+			"deleted_classes": [
+				"PlanChatAgent"
+			]
+		},
+		{
+			"tag": "v22",
+			"new_sqlite_classes": [
+				"PlannerRunDO"
+			]
+		},
+		{
+			"tag": "v23",
+			"new_sqlite_classes": [
+				"GitHubJobDO"
+			],
+			"deleted_classes": [
+				"RepoMergeLockDO",
+				"ScmOperationDO",
+				"ScmBootstrapDO"
+			]
+		},
+		{
+			"tag": "v24",
+			"new_sqlite_classes": [
+				"EnvReviewDO"
+			]
+		},
+		{
+			"tag": "v25",
+			"new_sqlite_classes": [
+				"ScheduledRunCapacityDO"
 			]
 		}
 	],

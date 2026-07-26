@@ -1,4 +1,5 @@
 import type { EnvHarness, EnvMeta, LeadHarnessStatus } from "../api/types";
+import { getHarnessModel } from "../shared/harness-catalog";
 
 export function getHarnessBadgeLabel(harness: EnvHarness): string {
   return harness === "codex"
@@ -10,23 +11,24 @@ export function getHarnessBadgeLabel(harness: EnvHarness): string {
 
 export function getHarnessBadgeClass(harness: EnvHarness): string {
   return harness === "codex"
-    ? "border-sky-200 bg-sky-50 text-sky-700"
+    ? "border-kumo-info/30 bg-kumo-info-tint text-kumo-info"
     : harness === "opencode"
-      ? "border-teal-200 bg-teal-50 text-teal-700"
-      : "border-orange-200 bg-orange-50 text-orange-700";
+      ? "border-kumo-badge-teal/30 bg-kumo-badge-teal/10 text-kumo-badge-teal"
+      : "border-kumo-badge-orange/40 bg-kumo-badge-orange/10 text-kumo-badge-orange";
 }
 
 export function getEnvAuthBadge(
-  env: Pick<EnvMeta, "harness" | "resolvedAuthMode" | "authMode" | "codexAuthMode" | "opencodeProvider">,
+  env: Pick<EnvMeta, "harness" | "resolvedAuthMode" | "codexAuthMode">,
 ): { label: string; className: string } | null {
   const { harness } = env;
 
   if (harness === "codex") {
+    if (!env.codexAuthMode) return null;
     return {
       label: env.codexAuthMode === "subscription" ? "Subscription" : "API key",
       className: env.codexAuthMode === "subscription"
-        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-        : "border-sky-200 bg-sky-50 text-sky-700",
+        ? "border-kumo-success/30 bg-kumo-success-tint text-kumo-success"
+        : "border-kumo-info/30 bg-kumo-info-tint text-kumo-info",
     };
   }
 
@@ -39,15 +41,25 @@ export function getEnvAuthBadge(
   return {
     label: env.resolvedAuthMode === "api" ? "API key" : "Subscription",
     className: env.resolvedAuthMode === "api"
-      ? "border-amber-200 bg-amber-50 text-amber-700"
-      : "border-emerald-200 bg-emerald-50 text-emerald-700",
+      ? "border-kumo-warning/40 bg-kumo-warning-tint text-kumo-warning"
+      : "border-kumo-success/30 bg-kumo-success-tint text-kumo-success",
   };
 }
 
 export function getEnvModelBadge(
-  _env: Pick<EnvMeta, "harness" | "opencodeModel">,
+  env: Pick<EnvMeta, "harness" | "harnessSettings">,
 ): { label: string; className: string } | null {
-  return null;
+  const label = getEnvModelLabel(env);
+  return label
+    ? { label, className: "border-kumo-line bg-kumo-base text-kumo-subtle" }
+    : null;
+}
+
+export function getEnvModelLabel(
+  env: Pick<EnvMeta, "harness" | "harnessSettings">,
+): string | null {
+  if (!env.harnessSettings) return null;
+  return getHarnessModel(env.harness, env.harnessSettings.model)?.label ?? null;
 }
 
 export function getLeadHarnessBadge(

@@ -113,17 +113,26 @@ export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
     const hubRepo = await resolveHubUpdateRepoState(env, { autoDetect: true });
     const cached = await env.ENVS_KV.get(UPDATE_CHECK_CACHE_KEY, "json");
     if (isCacheableUpdateResult(cached, currentUpdate)) {
-      const currentIssue = issueForState(cached.updateAvailable, hubRepo);
+      const updateAvailable = currentUpdate.sourceId !== cached.latestUpdate.sourceId;
+      const currentIssue = issueForState(updateAvailable, hubRepo);
       const { issue: _cachedIssue, hubRepo: _cachedHubRepo, updateMethod: _cachedUpdateMethod, ...cachedResult } = cached;
       return {
         ...cachedResult,
+        updateAvailable,
+        currentUpdate,
+        buildDiagnostics: getBuildDiagnostics(),
         hubRepo,
         updateMethod: updateMethodForState(hubRepo),
         ...(currentIssue ? { issue: currentIssue } : {}),
       };
     }
 
-    const latestRelease = await fetchLatestReleaseUpdateMetadata();
+    const buildDiagnostics = getBuildDiagnostics();
+    const latestRelease = await fetchLatestReleaseUpdateMetadata({
+      currentVersion: buildDiagnostics.version || currentUpdate.version,
+      channel: buildDiagnostics.channel,
+      updateServiceDisabled: env.TILLER_UPDATE_SERVICE_DISABLED,
+    });
     const result = buildUpdateCheckResult(
       currentUpdate,
       latestRelease.update,

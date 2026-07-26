@@ -3,11 +3,11 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const packageRoot = path.resolve(import.meta.dirname, "..");
-const wranglerOutputPath = path.join(packageRoot, "dist", "tiller_hub", "wrangler.json");
+const wranglerOutputPath = path.join(packageRoot, "dist", "tiller", "wrangler.json");
 const packageJsonPath = path.join(packageRoot, "package.json");
 const manifestPath = path.join(packageRoot, "manifest.json");
 const CONTAINER_IMAGE_TAG_ENV = "CONTAINER_IMAGE_TAG";
-const SCM_BOOTSTRAP_IMAGE_TAG_ENV = "SCM_BOOTSTRAP_IMAGE_TAG";
+const GITHUB_JOB_IMAGE_TAG_ENV = "GITHUB_JOB_IMAGE_TAG";
 const REQUIRE_PINNED_IMAGES_ENV = "TILLER_MANIFEST_REQUIRE_PINNED_IMAGES";
 
 const SUPPORTED_UPDATE_TYPES = new Set([
@@ -36,15 +36,17 @@ function toTitleSuffix(bindingName) {
 }
 
 function getContainerImageOverride(className) {
-  if (className === "SandboxDO") return process.env[CONTAINER_IMAGE_TAG_ENV]?.trim() || "";
-  if (className === "ScmBootstrapDO" || className === "ScmOperationDO") {
-    return process.env[SCM_BOOTSTRAP_IMAGE_TAG_ENV]?.trim() || "";
+  if (className === "SandboxDO" || className === "PlannerRunDO") {
+    return process.env[CONTAINER_IMAGE_TAG_ENV]?.trim() || "";
+  }
+  if (className === "GitHubJobDO") {
+    return process.env[GITHUB_JOB_IMAGE_TAG_ENV]?.trim() || "";
   }
   return "";
 }
 
 function isManagedContainerClass(className) {
-  return className === "SandboxDO" || className === "ScmBootstrapDO" || className === "ScmOperationDO";
+  return className === "SandboxDO" || className === "GitHubJobDO" || className === "PlannerRunDO";
 }
 
 function requirePinnedManagedImage(container) {

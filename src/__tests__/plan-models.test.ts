@@ -9,7 +9,7 @@ import {
 describe("plan-models", () => {
   it("identifies the ChatGPT plan model", () => {
     expect(isChatGPTPlanModel("gpt-5.5")).toBe(true);
-    expect(isChatGPTPlanModel("@cf/moonshotai/kimi-k2.5")).toBe(false);
+    expect(isChatGPTPlanModel("@cf/moonshotai/kimi-k2.7-code")).toBe(false);
   });
 
   it("returns a non-ChatGPT fallback model", () => {
@@ -27,9 +27,9 @@ describe("plan-models", () => {
 
   it("preserves non-ChatGPT selections when ChatGPT is unavailable", () => {
     expect(
-      coercePlanModelSelection("@cf/moonshotai/kimi-k2.5", {
+      coercePlanModelSelection("@cf/moonshotai/kimi-k2.7-code", {
         chatgptAvailable: false,
       }),
-    ).toBe("@cf/moonshotai/kimi-k2.5");
+    ).toBe("@cf/moonshotai/kimi-k2.7-code");
   });
 });

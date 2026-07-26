@@ -2,7 +2,7 @@ import { Container } from "@cloudflare/containers";
 import type { Env } from "./types";
 import { getEnvLifecycleStub } from "./helpers";
 import { getHub, projectAndPersistEnvSummary } from "./env/service";
-import { revokeCodexGatewaySessionsForEnv } from "./gateway-session";
+import { CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES } from "../shared/cloudflare-timeout";
 
 const STOP_CONTROL_PORT = 8790;
 const STOP_CONTROL_PREPARE_PATH = "/prepare-stop";
@@ -18,6 +18,7 @@ const STOP_CONTROL_PREPARE_PATH = "/prepare-stop";
 // authority; all API read paths project its state onto KV metadata.
 
 export class SandboxDO extends Container<Env> {
+  sleepAfter = `${CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES}m`;
   stopControlPort = STOP_CONTROL_PORT;
   lifecycleOpStorageKey = "lifecycle-op-id";
 
@@ -88,7 +89,7 @@ export class SandboxDO extends Container<Env> {
     if (idleTimeoutMinutes !== undefined && idleTimeoutMinutes > 0) {
       this.sleepAfter = `${idleTimeoutMinutes}m`;
     }
-    // When idleTimeoutMinutes is 0 or undefined, keep Container base default ("10m").
+    // When idleTimeoutMinutes is 0 or undefined, keep Tiller's shared default.
     // There is no way to truly disable sleepAfter; the settings UI caps at 1440 (24h).
 
     await this.startAndWaitForPorts({
@@ -111,10 +112,7 @@ export class SandboxDO extends Container<Env> {
         return;
       }
 
-      const projected = await projectAndPersistEnvSummary(this.env, getHub(this.env), slug);
-      if (projected?.status === "stopped") {
-        await revokeCodexGatewaySessionsForEnv(this.env, slug);
-      }
+      await projectAndPersistEnvSummary(this.env, getHub(this.env), slug);
     } catch (err) {
       console.error(`[sandbox] Failed to mark env infra-ready on start:`, err);
       throw err;

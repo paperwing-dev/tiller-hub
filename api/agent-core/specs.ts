@@ -1,4 +1,5 @@
 import type { Env } from "../types";
+import { KIMI_K2_7_CODE } from "../../shared/harness-catalog";
 import { resolveAgentModel } from "./models";
 import type { AgentSpec, HostedAgentId, HostedAgentMetadata } from "./types";
 
@@ -6,7 +7,7 @@ export const PLAN_AGENT_NAME = "plan";
 export const REVIEWER_AGENT_NAME = "reviewer";
 
 const PLAN_METADATA_INSTRUCTIONS =
-  "PlanChat V2 configures its cached policy and runtime tools in plan-chat-support.ts.";
+  "Provider-neutral planner runs own plan-writing policy and durable save behavior.";
 
 export const PLAN_AGENT_SPEC: AgentSpec = {
   name: PLAN_AGENT_NAME,
@@ -34,7 +35,7 @@ export const REVIEWER_AGENT_SPEC: AgentSpec = {
   runtime: "direct-tools",
   modelTarget: {
     provider: "workers-ai",
-    defaultModel: "@cf/moonshotai/kimi-k2.5",
+    defaultModel: KIMI_K2_7_CODE.providerModel,
   },
   toolNames: ["read_file", "list_files", "glob", "recall_memory"],
   baseInstructions: REVIEWER_BASE_INSTRUCTIONS,
@@ -53,11 +54,6 @@ const HOSTED_AGENT_CONFIGS: Array<{
   label: string;
   spec: AgentSpec;
 }> = [
-  {
-    id: "plan-chat",
-    label: "Plan",
-    spec: PLAN_AGENT_SPEC,
-  },
   {
     id: "reviewer-chat",
     label: "Reviewer",

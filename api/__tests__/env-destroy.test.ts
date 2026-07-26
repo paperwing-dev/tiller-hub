@@ -24,15 +24,19 @@ function createEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
 }
 
 describe("destroyEnv", () => {
-  it("deletes KV entry even when runner backend destroy fails", async () => {
+  it("preserves all durable environment data when host runner destruction fails", async () => {
     const kvDelete = vi.fn().mockResolvedValue(undefined);
     const broadcast = vi.fn().mockResolvedValue(undefined);
     const getAllSessions = vi.fn().mockResolvedValue([]);
     const destroyWorkspace = vi.fn().mockResolvedValue(undefined);
-    const clearMutableState = vi.fn().mockResolvedValue(null);
+    const finalizeDeletion = vi.fn().mockResolvedValue(undefined);
 
     const env = {
-      ENVS_KV: { delete: kvDelete },
+      ENVS_KV: {
+        delete: kvDelete,
+        get: vi.fn().mockResolvedValue(null),
+        list: vi.fn().mockResolvedValue({ keys: [], list_complete: true }),
+      },
       BUCKET: {
         list: vi.fn().mockResolvedValue({ objects: [], truncated: false }),
         delete: vi.fn().mockResolvedValue(undefined),
@@ -44,7 +48,13 @@ describe("destroyEnv", () => {
       },
       ENV_LIFECYCLE: {
         idFromName: vi.fn().mockReturnValue("lifecycle-id"),
-        get: vi.fn().mockReturnValue({ clearMutableState }),
+        get: vi.fn().mockReturnValue({ finalizeDeletion }),
+      },
+      ENV_REVIEW: {
+        idFromName: vi.fn().mockReturnValue("review-id"),
+        get: vi.fn().mockReturnValue({
+          finalizeEnvironmentDeletion: vi.fn().mockResolvedValue(undefined),
+        }),
       },
       // No active host registration — getRunnerBackend will throw for the host backend
     } as any;
@@ -52,22 +62,24 @@ describe("destroyEnv", () => {
     const meta = createEnvMeta({
       slug: "test-env",
       repoUrl: "https://github.com/test/repo",
-      runnerMachineId: "m-123",
       backend: "host" as const,
+      executionPlacement: { backend: "host", machineId: "m-123" },
       createdAt: "2024-01-01",
     });
 
-    const hub = { broadcastEnvRemove: broadcast, getAllSessions, deleteSession: vi.fn() };
+    const hub = {
+      broadcastEnvRemove: broadcast,
+      getAllSessions,
+      deleteSession: vi.fn(),
+      revokeCloudflareMcpProxyTokensForEnv: vi.fn(),
+    };
 
-    // Should NOT throw even though no runner is registered
-    await destroyEnv(env, meta, hub);
+    await expect(destroyEnv(env, meta, hub)).rejects.toThrow();
 
-    expect(destroyWorkspace).toHaveBeenCalled();
-    expect(kvDelete).toHaveBeenCalledWith("test-env");
-    expect(kvDelete).toHaveBeenCalledWith("envdef:test-env");
-    expect(kvDelete).toHaveBeenCalledTimes(2);
-    expect(clearMutableState).toHaveBeenCalled();
-    expect(broadcast).toHaveBeenCalledWith("test-env");
+    expect(destroyWorkspace).not.toHaveBeenCalled();
+    expect(kvDelete).not.toHaveBeenCalled();
+    expect(finalizeDeletion).not.toHaveBeenCalled();
+    expect(broadcast).not.toHaveBeenCalled();
   });
 
   it("deletes KV entry when runner backend is available and destroy succeeds", async () => {
@@ -76,7 +88,7 @@ describe("destroyEnv", () => {
     const getAllSessions = vi.fn().mockResolvedValue([]);
     const destroyWorkspace = vi.fn().mockResolvedValue(undefined);
     const backendDestroy = vi.fn().mockResolvedValue(undefined);
-    const clearMutableState = vi.fn().mockResolvedValue(null);
+    const finalizeDeletion = vi.fn().mockResolvedValue(undefined);
 
     const env = {
       ENVS_KV: { delete: kvDelete },
@@ -90,7 +102,13 @@ describe("destroyEnv", () => {
       },
       ENV_LIFECYCLE: {
         idFromName: vi.fn().mockReturnValue("lifecycle-id"),
-        get: vi.fn().mockReturnValue({ clearMutableState }),
+        get: vi.fn().mockReturnValue({ finalizeDeletion }),
+      },
+      ENV_REVIEW: {
+        idFromName: vi.fn().mockReturnValue("review-id"),
+        get: vi.fn().mockReturnValue({
+          finalizeEnvironmentDeletion: vi.fn().mockResolvedValue(undefined),
+        }),
       },
       SANDBOX: {
         idFromName: vi.fn().mockReturnValue("sb-id"),
@@ -101,12 +119,17 @@ describe("destroyEnv", () => {
     const meta = createEnvMeta({
       slug: "test-env",
       repoUrl: "https://github.com/test/repo",
-      runnerMachineId: "m-123",
       backend: "cf" as const,
+      executionPlacement: { backend: "cf", machineId: null },
       createdAt: "2024-01-01",
     });
 
-    const hub = { broadcastEnvRemove: broadcast, getAllSessions, deleteSession: vi.fn() };
+    const hub = {
+      broadcastEnvRemove: broadcast,
+      getAllSessions,
+      deleteSession: vi.fn(),
+      revokeCloudflareMcpProxyTokensForEnv: vi.fn(),
+    };
 
     await destroyEnv(env, meta, hub);
 
@@ -114,7 +137,50 @@ describe("destroyEnv", () => {
     expect(kvDelete).toHaveBeenCalledWith("test-env");
     expect(kvDelete).toHaveBeenCalledWith("envdef:test-env");
     expect(kvDelete).toHaveBeenCalledTimes(2);
-    expect(clearMutableState).toHaveBeenCalled();
+    expect(finalizeDeletion).toHaveBeenCalled();
     expect(broadcast).toHaveBeenCalledWith("test-env");
+  });
+
+  it("keeps the discoverable definition and reports failure when lifecycle finalization fails", async () => {
+    const kvDelete = vi.fn().mockResolvedValue(undefined);
+    const broadcast = vi.fn().mockResolvedValue(undefined);
+    const finalizeDeletion = vi.fn().mockRejectedValue(new Error("durable finalization unavailable"));
+    const env = {
+      ENVS_KV: { delete: kvDelete },
+      BUCKET: {
+        list: vi.fn().mockResolvedValue({ objects: [], truncated: false }),
+        delete: vi.fn().mockResolvedValue(undefined),
+      },
+      WORKSPACE: {
+        idFromName: vi.fn().mockReturnValue("ws-id"),
+        get: vi.fn().mockReturnValue({ destroyWorkspace: vi.fn().mockResolvedValue(undefined) }),
+      },
+      ENV_LIFECYCLE: {
+        idFromName: vi.fn().mockReturnValue("lifecycle-id"),
+        get: vi.fn().mockReturnValue({ finalizeDeletion }),
+      },
+      ENV_REVIEW: {
+        idFromName: vi.fn().mockReturnValue("review-id"),
+        get: vi.fn().mockReturnValue({
+          finalizeEnvironmentDeletion: vi.fn().mockResolvedValue(undefined),
+        }),
+      },
+      SANDBOX: {
+        idFromName: vi.fn().mockReturnValue("sb-id"),
+        get: vi.fn().mockReturnValue({ destroySandbox: vi.fn().mockResolvedValue(undefined) }),
+      },
+    } as any;
+    const hub = {
+      broadcastEnvRemove: broadcast,
+      getAllSessions: vi.fn().mockResolvedValue([]),
+      deleteSession: vi.fn(),
+      revokeCloudflareMcpProxyTokensForEnv: vi.fn(),
+    };
+
+    await expect(destroyEnv(env, createEnvMeta(), hub)).rejects.toThrow("durable finalization unavailable");
+
+    expect(kvDelete).toHaveBeenCalledWith("test-env");
+    expect(kvDelete).not.toHaveBeenCalledWith("envdef:test-env");
+    expect(broadcast).not.toHaveBeenCalled();
   });
 });

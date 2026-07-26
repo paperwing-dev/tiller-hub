@@ -1,5 +1,4 @@
 import type { Env } from "../types";
-import { getRepoGitNotReadyError } from "../env/scm-operations";
 import { GitHubAppError, isGitHubAppAllowedForRequest } from "../github/app";
 import {
   createRepoWorkspaceFromGitHubAppSelection,
@@ -9,7 +8,6 @@ import {
 } from "../plan/store";
 import type { RepoMeta } from "../types";
 
-export type RepoAccess = "selected-write" | "selected-write-with-git";
 export type RepoWorkspace = SelectedRepoWorkspace;
 export type RepoProjection = RepoMeta;
 
@@ -82,17 +80,6 @@ function githubAppFailure(error: GitHubAppError): RepoAccessFailure {
   };
 }
 
-function gitNotReadyFailure(error: string): RepoAccessFailure {
-  return {
-    ok: false,
-    status: 409,
-    body: {
-      error,
-      code: "repo_git_not_ready",
-    },
-  };
-}
-
 function trimRepoId(repoId: string | null | undefined): string {
   return repoId?.trim() ?? "";
 }
@@ -124,10 +111,27 @@ export async function loadRepoProjection(
   return { ok: true, repo: repo.meta };
 }
 
+export async function loadTrackedRepo(
+  env: Env,
+  repoId: string | null | undefined,
+): Promise<RepoAccessResult<RepoWorkspace>> {
+  const selectedRepoId = trimRepoId(repoId);
+  if (!selectedRepoId) return repoIdRequiredFailure();
+
+  let repo: RepoWorkspace | null;
+  try {
+    repo = await getRepoWorkspaceForRepoId(env, selectedRepoId);
+  } catch (error) {
+    return repoMetadataUnavailableFailure(error);
+  }
+
+  if (!repo) return repoNotFoundFailure();
+  return { ok: true, repo };
+}
+
 export async function loadRepo(
   env: Env,
   repoId: string | null | undefined,
-  access: RepoAccess,
 ): Promise<RepoAccessResult<RepoWorkspace>> {
   const selectedRepoId = trimRepoId(repoId);
   if (!selectedRepoId) return repoIdRequiredFailure();
@@ -143,10 +147,6 @@ export async function loadRepo(
   }
 
   if (!repo) return repoNotFoundFailure();
-  if (access === "selected-write-with-git") {
-    const repoNotReady = getRepoGitNotReadyError(repo.meta);
-    if (repoNotReady) return gitNotReadyFailure(repoNotReady);
-  }
   return { ok: true, repo };
 }
 
@@ -154,15 +154,14 @@ export async function loadRepoForRequest(
   env: Env,
   request: Request,
   repoId: string | null | undefined,
-  access: RepoAccess,
 ): Promise<RepoAccessResult<RepoWorkspace>> {
   if (!(await isGitHubAppAllowedForRequest(env, request))) {
     return { ok: false, status: 403, body: githubAppPublicHubDisabledBody() };
   }
-  return await loadRepo(env, repoId, access);
+  return await loadRepo(env, repoId);
 }
 
-export async function loadStoredRepoForDeletion(
+export async function loadTrackedRepoForRequest(
   env: Env,
   request: Request,
   repoId: string | null | undefined,
@@ -170,19 +169,7 @@ export async function loadStoredRepoForDeletion(
   if (!(await isGitHubAppAllowedForRequest(env, request))) {
     return { ok: false, status: 403, body: githubAppPublicHubDisabledBody() };
   }
-
-  const selectedRepoId = trimRepoId(repoId);
-  if (!selectedRepoId) return repoIdRequiredFailure();
-
-  let repo: RepoWorkspace | null;
-  try {
-    repo = await getRepoWorkspaceForRepoId(env, selectedRepoId);
-  } catch (error) {
-    return repoMetadataUnavailableFailure(error);
-  }
-
-  if (!repo) return repoNotFoundFailure();
-  return { ok: true, repo };
+  return await loadTrackedRepo(env, repoId);
 }
 
 export async function createOrRefreshRepoFromSelectionClaimForRequest(

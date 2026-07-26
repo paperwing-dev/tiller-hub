@@ -1,5 +1,8 @@
 @import "@xterm/xterm/css/xterm.css";
 @import "tailwindcss";
+@import "@cloudflare/kumo/styles/tailwind";
+@source "../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
+@source "../../../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
 
 @theme {
   --font-sans:
@@ -15,13 +18,37 @@
 }
 
 body {
-  @apply bg-white text-[#24292f] font-sans min-h-screen;
+  @apply bg-kumo-base text-kumo-default font-sans min-h-screen;
 }
 
-@keyframes slide-in {
+a[href],
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+.tiller-rail-logo {
+  filter: brightness(0);
+}
+
+:root[data-mode="dark"] .tiller-rail-logo {
+  filter: brightness(0) invert(1);
+}
+
+.tiller-sidebar-wrap {
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.tiller-sidebar-open-text {
+  animation: tiller-sidebar-text-in 140ms ease-out 170ms both;
+}
+
+@keyframes tiller-sidebar-text-in {
   from {
     opacity: 0;
-    transform: translateX(100%);
+    transform: translateX(-4px);
   }
   to {
     opacity: 1;
@@ -29,8 +56,10 @@ body {
   }
 }
 
-.animate-slide-in {
-  animation: slide-in 0.2s ease-out;
+@media (prefers-reduced-motion: reduce) {
+  .tiller-sidebar-open-text {
+    animation: none;
+  }
 }
 
 @keyframes waveform {

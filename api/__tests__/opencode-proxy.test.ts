@@ -46,7 +46,7 @@ describe("OpenCode proxy routes", () => {
       object: "list",
       data: [
         {
-          id: "@cf/moonshotai/kimi-k2.5",
+          id: "@cf/moonshotai/kimi-k2.7-code",
           object: "model",
           created: 0,
           owned_by: "cloudflare-workers-ai",
@@ -60,7 +60,7 @@ describe("OpenCode proxy routes", () => {
       id: "upstream-1",
       object: "chat.completion",
       created: 123,
-      model: "@cf/moonshotai/kimi-k2.5",
+      model: "@cf/moonshotai/kimi-k2.7-code",
       choices: [
         {
           index: 0,
@@ -106,7 +106,7 @@ describe("OpenCode proxy routes", () => {
     await expect(res.json()).resolves.toMatchObject({
       id: "upstream-1",
       object: "chat.completion",
-      model: "@cf/moonshotai/kimi-k2.5",
+      model: "@cf/moonshotai/kimi-k2.7-code",
       choices: [
         {
           index: 0,
@@ -124,9 +124,9 @@ describe("OpenCode proxy routes", () => {
       },
     });
     expect(run).toHaveBeenCalledWith(
-      "@cf/moonshotai/kimi-k2.5",
+      "@cf/moonshotai/kimi-k2.7-code",
       expect.objectContaining({
-        model: "@cf/moonshotai/kimi-k2.5",
+        model: "@cf/moonshotai/kimi-k2.7-code",
         messages: [{ role: "user", content: "hi" }],
       }),
     );
@@ -222,7 +222,7 @@ describe("OpenCode proxy routes", () => {
 
     expect(res.status).toBe(200);
     expect(run).toHaveBeenCalledWith(
-      "@cf/moonshotai/kimi-k2.5",
+      "@cf/moonshotai/kimi-k2.7-code",
       expect.objectContaining({
         messages: [
           { role: "user", content: "use a tool" },

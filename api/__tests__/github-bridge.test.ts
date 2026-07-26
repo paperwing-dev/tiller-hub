@@ -1,29 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createGitHubBridgeRecord,
+  githubBridgeTokenAccess,
   revokeGitHubBridgesForInteractiveEnv,
   validateGitHubBridgeRequest,
 } from "../github/bridge";
 import type { Env } from "../types";
 
 const mocks = vi.hoisted(() => ({
-  getOperation: vi.fn(),
   getRepoWorkspaceForRepoId: vi.fn(),
   loadEnvView: vi.fn(),
 }));
 
 vi.mock("../plan/store", () => ({
-  getSelectedRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
+  getRepoWorkspaceForRepoId: mocks.getRepoWorkspaceForRepoId,
 }));
 
 vi.mock("../env/view", () => ({
   loadEnvView: mocks.loadEnvView,
-}));
-
-vi.mock("../scm/operation-store", () => ({
-  getScmOperationStore: () => ({
-    getOperation: mocks.getOperation,
-  }),
 }));
 
 class MemoryKV {
@@ -69,7 +63,6 @@ function bridgeRequest(creds: { id: string; secret: string }) {
 
 describe("GitHub bridge validation", () => {
   beforeEach(() => {
-    mocks.getOperation.mockReset();
     mocks.getRepoWorkspaceForRepoId.mockReset();
     mocks.loadEnvView.mockReset();
   });
@@ -77,7 +70,9 @@ describe("GitHub bridge validation", () => {
   it("accepts an active interactive bridge for the exact repo", async () => {
     const env = makeEnv();
     mocks.loadEnvView.mockResolvedValue({ status: "running", repoId: "repo-id" });
-    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({ meta: { repoId: "repo-id" } });
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
+      meta: { repoId: "repo-id", githubFullName: "example/repo" },
+    });
     const creds = await createGitHubBridgeRecord(env, {
       subject: { type: "interactive-env", envSlug: "dev" },
       githubFullName: "Example/Repo",
@@ -165,24 +160,46 @@ describe("GitHub bridge validation", () => {
     if (!expired.ok) expect(expired.body.code).toBe("github_bridge_expired");
   });
 
-  it("validates bootstrap and SCM subjects against active repo state", async () => {
+  it("rejects a bridge whose stored repository identity no longer matches", async () => {
     const env = makeEnv();
-    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({ meta: { gitStatus: "pending" } });
-    const bootstrapCreds = await createGitHubBridgeRecord(env, {
-      subject: { type: "repo-bootstrap", bootstrapSlug: "repo-git-bootstrap-abc", repoId: "repo-id" },
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
+      meta: { repoId: "repo-id", githubFullName: "example/renamed" },
+    });
+    const creds = await createGitHubBridgeRecord(env, {
+      subject: { type: "github-planner", jobSlug: "planner-job", repoId: "repo-id" },
       githubFullName: "example/repo",
     });
 
-    const bootstrap = await validateGitHubBridgeRequest(env, bridgeRequest(bootstrapCreds), "example/repo");
-    expect(bootstrap.ok).toBe(true);
+    const result = await validateGitHubBridgeRequest(env, bridgeRequest(creds), "example/repo");
 
-    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({ meta: { repoId: "repo-id" } });
-    mocks.getOperation.mockResolvedValue({ status: "pending", envSlug: "dev" });
-    mocks.loadEnvView.mockResolvedValue({ status: "running", scmOperationId: "op-1" });
-    const scmCreds = await createGitHubBridgeRecord(env, {
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.body.code).toBe("github_bridge_repo_mismatch");
+  });
+
+  it("validates planner and env publish subjects against active repo state", async () => {
+    const env = makeEnv();
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
+      meta: { repoId: "repo-id", githubFullName: "example/repo" },
+    });
+    const plannerCreds = await createGitHubBridgeRecord(env, {
+      subject: { type: "github-planner", jobSlug: "planner-job", repoId: "repo-id" },
+      githubFullName: "example/repo",
+    });
+
+    const planner = await validateGitHubBridgeRequest(env, bridgeRequest(plannerCreds), "example/repo");
+    expect(planner.ok).toBe(true);
+    if (planner.ok) expect(githubBridgeTokenAccess(planner.record)).toBe("read");
+
+    mocks.loadEnvView.mockResolvedValue({
+      status: "stopped",
+      repoId: "repo-id",
+      githubPublishOperationId: "op-1",
+      githubPublishStatus: "publishing",
+    });
+    const publishCreds = await createGitHubBridgeRecord(env, {
       subject: {
-        type: "scm-operation",
-        jobSlug: "scm-op-dev-00000001",
+        type: "github-env-publish",
+        jobSlug: "github-env-publish-dev-00000001",
         envSlug: "dev",
         repoId: "repo-id",
         operationId: "op-1",
@@ -190,7 +207,8 @@ describe("GitHub bridge validation", () => {
       githubFullName: "example/repo",
     });
 
-    const scm = await validateGitHubBridgeRequest(env, bridgeRequest(scmCreds), "example/repo");
-    expect(scm.ok).toBe(true);
+    const publish = await validateGitHubBridgeRequest(env, bridgeRequest(publishCreds), "example/repo");
+    expect(publish.ok).toBe(true);
+    if (publish.ok) expect(githubBridgeTokenAccess(publish.record)).toBe("write");
   });
 });
