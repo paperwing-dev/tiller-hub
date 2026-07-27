@@ -3,9 +3,9 @@
   "channel": "deploy-button",
   "updateMode": "full-source",
   "sourceRepo": "paperwing-dev/tiller-hub",
-  "sourceId": "73f557175e3be818b4b28219dbe7394017ed27c5",
-  "version": "0.2.37",
-  "label": "Tiller Hub v0.2.37",
+  "sourceId": "f809d3d89d892e6cecb9bc0522c7f4e1f245c1b1",
+  "version": "0.2.38",
+  "label": "Tiller Hub v0.2.38",
   "managedFiles": [
     ".gitignore",
     "api/access/credentials.ts",
@@ -271,7 +271,7 @@
     "wrangler.jsonc"
   ],
   "selfHostRuntime": {
-    "imageSourceId": "73f557175e3be818b4b28219dbe7394017ed27c5",
-    "sandboxImage": "docker.io/jamieatlason/tiller-sandbox:73f557175e3be818b4b28219dbe7394017ed27c5"
+    "imageSourceId": "f809d3d89d892e6cecb9bc0522c7f4e1f245c1b1",
+    "sandboxImage": "docker.io/jamieatlason/tiller-sandbox:f809d3d89d892e6cecb9bc0522c7f4e1f245c1b1"
   }
 }
