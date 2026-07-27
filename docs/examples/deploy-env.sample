@@ -1,0 +1,18 @@
+# Optional maintainer inputs for `npm run deploy`
+#
+# The deploy script targets the one canonical workers.dev origin. Custom
+# domains and aliases are unsupported.
+#
+# Localhost development uses `.dev.vars` plus `wrangler.dev.jsonc`, not this
+# file. Put local model credentials in `.dev.vars`.
+
+CLOUDFLARE_API_TOKEN=
+CLOUDFLARE_ACCOUNT_ID=
+
+# Optional explicit Worker-name override for local deploys.
+TILLER_WORKER_NAME=
+
+# Optional image overrides. Leave empty to preserve the images already deployed
+# for existing container applications.
+CONTAINER_IMAGE_TAG=
+GITHUB_JOB_IMAGE_TAG=

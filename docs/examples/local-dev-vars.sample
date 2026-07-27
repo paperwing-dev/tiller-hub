@@ -1,0 +1,13 @@
+# Local `npm run dev` example
+#
+# Copy this file to `.dev.vars` for localhost development.
+# `.env` is for deploy-time inputs and will not satisfy the local "Required setup"
+# page.
+#
+# Required: set at least one model credential before running `npm run dev`.
+CLAUDE_CODE_OAUTH_TOKEN=
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+#
+# Localhost development already uses `LOCAL_DEV_ONLY_BACKEND=true` from
+# `wrangler.dev.jsonc`; start `tiller host` separately for local containers.

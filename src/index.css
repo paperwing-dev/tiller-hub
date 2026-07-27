@@ -1,0 +1,73 @@
+@import "@xterm/xterm/css/xterm.css";
+@import "tailwindcss";
+@import "@cloudflare/kumo/styles/tailwind";
+@source "../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
+@source "../../../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
+
+@theme {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "SF Mono", SFMono-Regular, ui-monospace, monospace;
+}
+
+:root {
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  @apply bg-kumo-base text-kumo-default font-sans min-h-screen;
+}
+
+a[href],
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+.tiller-rail-logo {
+  filter: brightness(0);
+}
+
+:root[data-mode="dark"] .tiller-rail-logo {
+  filter: brightness(0) invert(1);
+}
+
+.tiller-sidebar-wrap {
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.tiller-sidebar-open-text {
+  animation: tiller-sidebar-text-in 140ms ease-out 170ms both;
+}
+
+@keyframes tiller-sidebar-text-in {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiller-sidebar-open-text {
+    animation: none;
+  }
+}
+
+@keyframes waveform {
+  0%, 100% { transform: scaleY(0.4); }
+  50%       { transform: scaleY(1); }
+}
+
+.animate-waveform {
+  animation: waveform 0.9s ease-in-out infinite;
+  transform-origin: bottom;
+}
