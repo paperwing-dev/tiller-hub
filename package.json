@@ -52,8 +52,8 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.40.2",
-    "@cloudflare/vitest-pool-workers": "^0.16.15",
+    "@cloudflare/vite-plugin": "^1.47.0",
+    "@cloudflare/vitest-pool-workers": "^0.16.20",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -64,6 +64,6 @@
     "postcss": "^8.5.15",
     "vite": "^8.0.16",
     "vitest": "^4.1.7",
-    "wrangler": "^4.100.0"
+    "wrangler": "^4.105.0"
   }
 }
