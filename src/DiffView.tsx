@@ -20,13 +20,13 @@ export default function DiffView({ oldString, newString, filePath }: DiffViewPro
   }, [oldString, newString]);
 
   return (
-    <div className="overflow-hidden rounded-md border border-[#d0d7de] bg-white">
+    <div className="overflow-hidden rounded-md border border-kumo-line bg-kumo-base">
       {filePath && (
-        <div className="border-b border-[#d0d7de] bg-[#f6f8fa] px-2 py-1 text-xs text-[#57606a] font-mono truncate">
+        <div className="border-b border-kumo-line bg-kumo-recessed px-2 py-1 text-xs text-kumo-subtle font-mono truncate">
           {filePath}
         </div>
       )}
-      <div className="px-2 py-1 text-xs text-[#57606a] border-b border-[#d0d7de] bg-[#f6f8fa]">
+      <div className="px-2 py-1 text-xs text-kumo-subtle border-b border-kumo-line bg-kumo-recessed">
         {stats}
       </div>
       <div className="font-mono text-xs max-h-64 overflow-auto">
@@ -38,8 +38,8 @@ export default function DiffView({ oldString, newString, filePath }: DiffViewPro
 
           const prefix = part.added ? "+" : part.removed ? "-" : " ";
           let className = "";
-          if (part.added) className = "bg-[#dafbe1] text-[#1a7f37]";
-          else if (part.removed) className = "bg-[#ffebe9] text-[#cf222e]";
+          if (part.added) className = "bg-kumo-success-tint text-kumo-success";
+          else if (part.removed) className = "bg-kumo-danger-tint text-kumo-danger";
 
           return (
             <div key={i} className={className}>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { StoredSession } from "../types";
 import {
+  filterRoutableActiveManagedSessions,
   isManagedSessionMetadataUpdateValid,
   listManagedSessionIdsForEnv,
   partitionManagedSessions,
@@ -9,6 +10,7 @@ import {
   readManagedRoleFromStoredSession,
   readManagedRoleFromMetadata,
   readManagedEnvSlugFromStoredSession,
+  readTerminalScopeFromStoredSession,
 } from "../session-attachment";
 
 function makeSession(overrides: Partial<StoredSession> = {}): StoredSession {
@@ -96,6 +98,24 @@ describe("partitionManagedSessions", () => {
     expect(result.managedSessions.map((session) => session.id)).toEqual(["session-1"]);
     expect(result.orphanSessionIds).toEqual(["session-2", "session-3", "session-4"]);
   });
+
+  it("excludes plan-writer terminals from environment listings without pruning them as orphans", () => {
+    const planWriter = makeSession({
+      id: "plan-writer-1",
+      metadata: JSON.stringify({
+        terminalScope: {
+          kind: "plan-writer",
+          repoId: "repo-1",
+          planArtifactId: "plan-1",
+          generation: 1,
+        },
+      }),
+    });
+    const result = partitionManagedSessions([makeSession(), planWriter], new Set(["test-env"]));
+    expect(result.managedSessions.map((session) => session.id)).toEqual(["session-1"]);
+    expect(result.orphanSessionIds).toEqual([]);
+    expect(readTerminalScopeFromStoredSession(planWriter)).toMatchObject({ kind: "plan-writer", generation: 1 });
+  });
 });
 
 describe("partitionManagedSessionsByLookup", () => {
@@ -120,6 +140,24 @@ describe("partitionManagedSessionsByLookup", () => {
   });
 });
 
+describe("filterRoutableActiveManagedSessions", () => {
+  it("keeps only active sessions with live terminal owners", () => {
+    const sessions = [
+      makeSession({ id: "routable" }),
+      makeSession({ id: "stale" }),
+      makeSession({ id: "inactive", active: 0 }),
+      makeSession({ id: "ended", ended_at: "2024-01-01T00:10:00.000Z" }),
+    ];
+
+    expect(
+      filterRoutableActiveManagedSessions(
+        sessions,
+        ["routable", "inactive", "ended"],
+      ).map((session) => session.id),
+    ).toEqual(["routable"]);
+  });
+});
+
 describe("listManagedSessionIdsForEnv", () => {
   it("returns all session ids attached to the env slug", () => {
     expect(
@@ -140,7 +178,7 @@ describe("isManagedSessionMetadataUpdateValid", () => {
     expect(
       isManagedSessionMetadataUpdateValid(
         makeSession(),
-        { envSlug: "test-env", role: "lead", slashCommands: [] },
+        { envSlug: "test-env", role: "lead" },
       ),
     ).toBe(true);
   });
@@ -159,5 +197,25 @@ describe("isManagedSessionMetadataUpdateValid", () => {
         { envSlug: "other-env", role: "lead" },
       ),
     ).toBe(false);
+  });
+
+  it("keeps a plan-writer generation immutable and never removes revocation", () => {
+    const metadata = {
+      terminalScope: {
+        kind: "plan-writer",
+        repoId: "repo-1",
+        planArtifactId: "plan-1",
+        generation: 2,
+        revokedAt: "2026-07-13T00:00:00.000Z",
+      },
+    };
+    const session = makeSession({ metadata: JSON.stringify(metadata) });
+    expect(isManagedSessionMetadataUpdateValid(session, metadata)).toBe(true);
+    expect(isManagedSessionMetadataUpdateValid(session, {
+      terminalScope: { ...metadata.terminalScope, generation: 3 },
+    })).toBe(false);
+    expect(isManagedSessionMetadataUpdateValid(session, {
+      terminalScope: { ...metadata.terminalScope, revokedAt: undefined },
+    })).toBe(false);
   });
 });

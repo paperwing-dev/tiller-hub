@@ -1,21 +1,54 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  TILLER_REGION_PLACEHOLDER,
   VALID_TILLER_REGIONS,
   buildDeployConfig,
   deriveContainerApplicationName,
   deriveBucketName,
-  ensureWranglerAccountId,
   extractBucketLocation,
   needsLiveContainerImageLookup,
   normalizeWorkerName,
   normalizeTillerRegion,
-  normalizeEmailList,
   parseDotEnv,
+  parseJsonc,
   parseWranglerJsonOutput,
+  resolveTillerRegion,
   resolveContainerImages,
   resolveWorkerName,
   rewriteContainerApplicationNames,
 } from "./deploy-with-region.mjs";
+
+describe("deploy-button region contract", () => {
+  it("ships a blank required choice instead of a silent geographic default", () => {
+    const wrangler = parseJsonc(
+      readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"),
+      "wrangler.jsonc",
+    );
+    expect(wrangler.vars?.TILLER_REGION).toBe("");
+
+    const packageJson = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    );
+    expect(packageJson.cloudflare?.bindings?.TILLER_REGION?.description)
+      .toMatch(/Required:.*does not choose the nearest region automatically/s);
+  });
+
+  it("keeps every maintainer deploy path on the tracked Worker name", () => {
+    const wrangler = parseJsonc(
+      readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"),
+      "wrangler.jsonc",
+    );
+    expect(wrangler.name).toBe("tiller");
+
+    for (const script of [
+      new URL("../../../scripts/deploy.sh", import.meta.url),
+      new URL("../../../scripts/release.sh", import.meta.url),
+    ]) {
+      expect(readFileSync(script, "utf8")).not.toContain("TILLER_WORKER_NAME=");
+    }
+  });
+});
 
 describe("normalizeTillerRegion", () => {
   it("accepts all supported region codes", () => {
@@ -30,6 +63,40 @@ describe("normalizeTillerRegion", () => {
 
   it("rejects unsupported values", () => {
     expect(() => normalizeTillerRegion("sam")).toThrow(/Invalid TILLER_REGION/);
+  });
+
+  it("rejects the checked-in deploy-button placeholder", () => {
+    expect(() => normalizeTillerRegion(TILLER_REGION_PLACEHOLDER))
+      .toThrow(/Choose one before deployment/);
+  });
+});
+
+describe("resolveTillerRegion", () => {
+  it("uses an explicit local or CI override before the Wrangler value", () => {
+    expect(
+      resolveTillerRegion(
+        { vars: { TILLER_REGION: TILLER_REGION_PLACEHOLDER } },
+        { TILLER_REGION: "weur" },
+      ),
+    ).toBe("weur");
+  });
+
+  it("uses the region selected in the deploy-button-generated config", () => {
+    expect(
+      resolveTillerRegion(
+        { vars: { TILLER_REGION: "apac" } },
+        {},
+      ),
+    ).toBe("apac");
+  });
+
+  it("does not silently turn a blank template value into a region", () => {
+    expect(
+      () => resolveTillerRegion(
+        { vars: { TILLER_REGION: "" } },
+        {},
+      ),
+    ).toThrow(/Missing TILLER_REGION/);
   });
 });
 
@@ -80,6 +147,27 @@ describe("resolveWorkerName", () => {
 });
 
 describe("buildDeployConfig", () => {
+  it.each(["tiller", "tiller-hub"])(
+    "preserves public-fetch routing when deploying as %s",
+    (workerName) => {
+      const compatibilityFlags = ["nodejs_compat", "global_fetch_strictly_public"];
+      const config = buildDeployConfig(
+        {
+          name: "tiller",
+          compatibility_flags: compatibilityFlags,
+          vars: { TILLER_REGION: "wnam" },
+        },
+        {
+          bucketName: `${workerName}-r2-12345678`,
+          region: "wnam",
+          workerName,
+        },
+      );
+
+      expect(config.compatibility_flags).toEqual(compatibilityFlags);
+    },
+  );
+
   it("injects DO_LOCATION_HINT and BUCKET while removing TILLER_REGION", () => {
     const config = buildDeployConfig(
       {
@@ -107,6 +195,31 @@ describe("buildDeployConfig", () => {
     ]);
     expect(config.workers_dev).toBe(true);
     expect(config.preview_urls).toBe(false);
+  });
+
+  it("always emits a workers.dev deployment without direct custom-domain routing", () => {
+    const config = buildDeployConfig(
+      {
+        name: "tiller-hub",
+        vars: {
+          TILLER_REGION: "wnam",
+          HUB_PUBLIC_URL: "https://tiller.example.com",
+          WORKER_SERVICE_NAME: "tiller-hub",
+          WORKERS_DEV_ALIAS_DISABLED: "false",
+        },
+        routes: [{ pattern: "tiller.example.com", custom_domain: true }],
+      },
+      {
+        bucketName: "tiller-hub-r2-12345678",
+        region: "wnam",
+        workerName: "tiller-hub",
+      },
+    );
+
+    expect(config.vars).toEqual({ DO_LOCATION_HINT: "wnam" });
+    expect(config.workers_dev).toBe(true);
+    expect(config.preview_urls).toBe(false);
+    expect(config.routes).toBeUndefined();
   });
 
   it("can rewrite the generated config to the selected Worker name", () => {
@@ -160,38 +273,6 @@ describe("buildDeployConfig", () => {
     ]);
   });
 
-  it("builds a protected custom-domain deploy config", () => {
-    const config = buildDeployConfig(
-      {
-        name: "tiller-hub",
-        vars: {
-          TILLER_REGION: "wnam",
-        },
-      },
-      {
-        bucketName: "tiller-hub-r2-12345678",
-        region: "wnam",
-        customDomain: "tiller.example.com",
-        workerName: "tiller-hub",
-      },
-    );
-
-    expect(config.vars).toEqual({
-      DO_LOCATION_HINT: "wnam",
-      HUB_PUBLIC_URL: "https://tiller.example.com",
-      WORKER_SERVICE_NAME: "tiller-hub",
-      WORKERS_DEV_ALIAS_DISABLED: "true",
-    });
-    expect(config.workers_dev).toBe(false);
-    expect(config.preview_urls).toBe(false);
-    expect(config.routes).toEqual([
-      {
-        pattern: "tiller.example.com",
-        custom_domain: true,
-      },
-    ]);
-  });
-
   it("overrides the SandboxDO container image when CONTAINER_IMAGE_TAG is set", () => {
     const prev = process.env.CONTAINER_IMAGE_TAG;
     process.env.CONTAINER_IMAGE_TAG = "docker.io/jamieatlason/tiller-sandbox:abc123";
@@ -202,8 +283,8 @@ describe("buildDeployConfig", () => {
           vars: { TILLER_REGION: "wnam" },
           containers: [
             { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:stable", max_instances: 2 },
-            { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 2 },
-            { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
+            { class_name: "PlannerRunDO", image: "docker.io/jamieatlason/tiller-sandbox:stable", max_instances: 10 },
+            { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
             { class_name: "OtherDO", image: "docker.io/other/image:v1", max_instances: 1 },
           ],
         },
@@ -211,8 +292,8 @@ describe("buildDeployConfig", () => {
       );
       expect(config.containers).toEqual([
         { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123", max_instances: 2 },
-        { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 2 },
-        { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
+        { class_name: "PlannerRunDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123", max_instances: 10 },
+        { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
         { class_name: "OtherDO", image: "docker.io/other/image:v1", max_instances: 1 },
       ]);
     } finally {
@@ -221,9 +302,9 @@ describe("buildDeployConfig", () => {
     }
   });
 
-  it("overrides the ScmBootstrapDO image when SCM_BOOTSTRAP_IMAGE_TAG is set", () => {
-    const prev = process.env.SCM_BOOTSTRAP_IMAGE_TAG;
-    process.env.SCM_BOOTSTRAP_IMAGE_TAG = "docker.io/jamieatlason/tiller-scm:def456";
+  it("overrides the GitHubJobDO image when GITHUB_JOB_IMAGE_TAG is set", () => {
+    const prev = process.env.GITHUB_JOB_IMAGE_TAG;
+    process.env.GITHUB_JOB_IMAGE_TAG = "docker.io/jamieatlason/tiller-scm:def456";
     try {
       const config = buildDeployConfig(
         {
@@ -231,28 +312,26 @@ describe("buildDeployConfig", () => {
           vars: { TILLER_REGION: "wnam" },
           containers: [
             { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:stable", max_instances: 2 },
-            { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 2 },
-            { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
+            { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
           ],
         },
         { bucketName: "tiller-hub-r2-12345678", region: "wnam" },
       );
       expect(config.containers).toEqual([
         { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:stable", max_instances: 2 },
-        { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:def456", max_instances: 2 },
-        { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:def456", max_instances: 4 },
+        { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:def456", max_instances: 4 },
       ]);
     } finally {
-      if (prev == null) delete process.env.SCM_BOOTSTRAP_IMAGE_TAG;
-      else process.env.SCM_BOOTSTRAP_IMAGE_TAG = prev;
+      if (prev == null) delete process.env.GITHUB_JOB_IMAGE_TAG;
+      else process.env.GITHUB_JOB_IMAGE_TAG = prev;
     }
   });
 
   it("leaves containers unchanged when image override env vars are not set", () => {
     const prev = process.env.CONTAINER_IMAGE_TAG;
-    const prevBootstrap = process.env.SCM_BOOTSTRAP_IMAGE_TAG;
+    const prevGitHubJob = process.env.GITHUB_JOB_IMAGE_TAG;
     delete process.env.CONTAINER_IMAGE_TAG;
-    delete process.env.SCM_BOOTSTRAP_IMAGE_TAG;
+    delete process.env.GITHUB_JOB_IMAGE_TAG;
     try {
       const config = buildDeployConfig(
         {
@@ -260,22 +339,20 @@ describe("buildDeployConfig", () => {
           vars: { TILLER_REGION: "wnam" },
           containers: [
             { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:stable", max_instances: 2 },
-            { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 2 },
-            { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
+            { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
           ],
         },
         { bucketName: "tiller-hub-r2-12345678", region: "wnam" },
       );
       expect(config.containers).toEqual([
         { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:stable", max_instances: 2 },
-        { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 2 },
-        { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
+        { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:stable", max_instances: 4 },
       ]);
     } finally {
       if (prev == null) delete process.env.CONTAINER_IMAGE_TAG;
       else process.env.CONTAINER_IMAGE_TAG = prev;
-      if (prevBootstrap == null) delete process.env.SCM_BOOTSTRAP_IMAGE_TAG;
-      else process.env.SCM_BOOTSTRAP_IMAGE_TAG = prevBootstrap;
+      if (prevGitHubJob == null) delete process.env.GITHUB_JOB_IMAGE_TAG;
+      else process.env.GITHUB_JOB_IMAGE_TAG = prevGitHubJob;
     }
   });
 
@@ -292,14 +369,8 @@ describe("buildDeployConfig", () => {
             max_instances: 2,
           },
           {
-            class_name: "ScmBootstrapDO",
-            name: "tiller-hub-scmbootstrapdo",
-            image: "docker.io/jamieatlason/tiller-scm:stable",
-            max_instances: 2,
-          },
-          {
-            class_name: "ScmOperationDO",
-            name: "tiller-hub-scmoperationdo",
+            class_name: "GitHubJobDO",
+            name: "tiller-hub-githubjobdo",
             image: "docker.io/jamieatlason/tiller-scm:stable",
             max_instances: 4,
           },
@@ -310,8 +381,7 @@ describe("buildDeployConfig", () => {
         region: "wnam",
         liveContainerImages: new Map([
           ["tiller-hub-sandboxdo", "docker.io/jamieatlason/tiller-sandbox:abc123"],
-          ["tiller-hub-scmbootstrapdo", "docker.io/jamieatlason/tiller-scm:def456"],
-          ["tiller-hub-scmoperationdo", "docker.io/jamieatlason/tiller-scm:def456"],
+          ["tiller-hub-githubjobdo", "docker.io/jamieatlason/tiller-scm:def456"],
         ]),
       },
     );
@@ -324,14 +394,8 @@ describe("buildDeployConfig", () => {
         max_instances: 2,
       },
       {
-        class_name: "ScmBootstrapDO",
-        name: "tiller-hub-scmbootstrapdo",
-        image: "docker.io/jamieatlason/tiller-scm:def456",
-        max_instances: 2,
-      },
-      {
-        class_name: "ScmOperationDO",
-        name: "tiller-hub-scmoperationdo",
+        class_name: "GitHubJobDO",
+        name: "tiller-hub-githubjobdo",
         image: "docker.io/jamieatlason/tiller-scm:def456",
         max_instances: 4,
       },
@@ -378,14 +442,14 @@ describe("resolveContainerImages", () => {
       max_instances: 2,
     },
     {
-      class_name: "ScmBootstrapDO",
-      name: "tiller-hub-scmbootstrapdo",
-      image: "docker.io/jamieatlason/tiller-scm:stable",
-      max_instances: 2,
+      class_name: "PlannerRunDO",
+      name: "tiller-hub-plannerrundo",
+      image: "docker.io/jamieatlason/tiller-sandbox:stable",
+      max_instances: 10,
     },
     {
-      class_name: "ScmOperationDO",
-      name: "tiller-hub-scmoperationdo",
+      class_name: "GitHubJobDO",
+      name: "tiller-hub-githubjobdo",
       image: "docker.io/jamieatlason/tiller-scm:stable",
       max_instances: 4,
     },
@@ -394,11 +458,11 @@ describe("resolveContainerImages", () => {
   it("uses explicit overrides ahead of live images", () => {
     const resolutions = resolveContainerImages(containers, {
       sandboxImageTag: "docker.io/jamieatlason/tiller-sandbox:override",
-      scmBootstrapImageTag: "docker.io/jamieatlason/tiller-scm:override",
+      githubJobImageTag: "docker.io/jamieatlason/tiller-scm:override",
       liveContainerImages: new Map([
         ["tiller-hub-sandboxdo", "docker.io/jamieatlason/tiller-sandbox:live"],
-        ["tiller-hub-scmbootstrapdo", "docker.io/jamieatlason/tiller-scm:live"],
-        ["tiller-hub-scmoperationdo", "docker.io/jamieatlason/tiller-scm:live"],
+        ["tiller-hub-plannerrundo", "docker.io/jamieatlason/tiller-sandbox:live"],
+        ["tiller-hub-githubjobdo", "docker.io/jamieatlason/tiller-scm:live"],
       ]),
     });
 
@@ -414,17 +478,17 @@ describe("resolveContainerImages", () => {
       },
       {
         container: {
-          class_name: "ScmBootstrapDO",
-          name: "tiller-hub-scmbootstrapdo",
-          image: "docker.io/jamieatlason/tiller-scm:override",
-          max_instances: 2,
+          class_name: "PlannerRunDO",
+          name: "tiller-hub-plannerrundo",
+          image: "docker.io/jamieatlason/tiller-sandbox:override",
+          max_instances: 10,
         },
         source: "override",
       },
       {
         container: {
-          class_name: "ScmOperationDO",
-          name: "tiller-hub-scmoperationdo",
+          class_name: "GitHubJobDO",
+          name: "tiller-hub-githubjobdo",
           image: "docker.io/jamieatlason/tiller-scm:override",
           max_instances: 4,
         },
@@ -450,17 +514,17 @@ describe("resolveContainerImages", () => {
       },
       {
         container: {
-          class_name: "ScmBootstrapDO",
-          name: "tiller-hub-scmbootstrapdo",
-          image: "docker.io/jamieatlason/tiller-scm:stable",
-          max_instances: 2,
+          class_name: "PlannerRunDO",
+          name: "tiller-hub-plannerrundo",
+          image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          max_instances: 10,
         },
         source: "default",
       },
       {
         container: {
-          class_name: "ScmOperationDO",
-          name: "tiller-hub-scmoperationdo",
+          class_name: "GitHubJobDO",
+          name: "tiller-hub-githubjobdo",
           image: "docker.io/jamieatlason/tiller-scm:stable",
           max_instances: 4,
         },
@@ -476,12 +540,12 @@ describe("needsLiveContainerImageLookup", () => {
       needsLiveContainerImageLookup(
         [
           { class_name: "SandboxDO", name: "tiller-hub-sandboxdo", image: "docker.io/jamieatlason/tiller-sandbox:stable" },
-          { class_name: "ScmBootstrapDO", name: "tiller-hub-scmbootstrapdo", image: "docker.io/jamieatlason/tiller-scm:stable" },
-          { class_name: "ScmOperationDO", name: "tiller-hub-scmoperationdo", image: "docker.io/jamieatlason/tiller-scm:stable" },
+          { class_name: "PlannerRunDO", name: "tiller-hub-plannerrundo", image: "docker.io/jamieatlason/tiller-sandbox:stable" },
+          { class_name: "GitHubJobDO", name: "tiller-hub-githubjobdo", image: "docker.io/jamieatlason/tiller-scm:stable" },
         ],
         {
           sandboxImageTag: "docker.io/jamieatlason/tiller-sandbox:abc123",
-          scmBootstrapImageTag: "",
+          githubJobImageTag: "",
         },
       ),
     ).toBe(true);
@@ -490,12 +554,12 @@ describe("needsLiveContainerImageLookup", () => {
       needsLiveContainerImageLookup(
         [
           { class_name: "SandboxDO", name: "tiller-hub-sandboxdo", image: "docker.io/jamieatlason/tiller-sandbox:stable" },
-          { class_name: "ScmBootstrapDO", name: "tiller-hub-scmbootstrapdo", image: "docker.io/jamieatlason/tiller-scm:stable" },
-          { class_name: "ScmOperationDO", name: "tiller-hub-scmoperationdo", image: "docker.io/jamieatlason/tiller-scm:stable" },
+          { class_name: "PlannerRunDO", name: "tiller-hub-plannerrundo", image: "docker.io/jamieatlason/tiller-sandbox:stable" },
+          { class_name: "GitHubJobDO", name: "tiller-hub-githubjobdo", image: "docker.io/jamieatlason/tiller-scm:stable" },
         ],
         {
           sandboxImageTag: "docker.io/jamieatlason/tiller-sandbox:abc123",
-          scmBootstrapImageTag: "docker.io/jamieatlason/tiller-scm:def456",
+          githubJobImageTag: "docker.io/jamieatlason/tiller-scm:def456",
         },
       ),
     ).toBe(false);
@@ -512,9 +576,9 @@ describe("extractBucketLocation", () => {
 
 describe("parseDotEnv", () => {
   it("parses basic .env content", () => {
-    expect(parseDotEnv("TILLER_CUSTOM_DOMAIN=tiller.example.com\nTILLER_ACCESS_EMAILS=one@example.com,two@example.com\n")).toEqual({
-      TILLER_CUSTOM_DOMAIN: "tiller.example.com",
-      TILLER_ACCESS_EMAILS: "one@example.com,two@example.com",
+    expect(parseDotEnv("CLOUDFLARE_ACCOUNT_ID=account-123\nCONTAINER_IMAGE_TAG=image:sha\n")).toEqual({
+      CLOUDFLARE_ACCOUNT_ID: "account-123",
+      CONTAINER_IMAGE_TAG: "image:sha",
     });
   });
 });
@@ -527,76 +591,5 @@ describe("parseWranglerJsonOutput", () => {
         "wrangler output",
       ),
     ).toEqual({ location: "WNAM" });
-  });
-});
-
-describe("normalizeEmailList", () => {
-  it("splits comma and newline separated emails", () => {
-    expect(normalizeEmailList("one@example.com,\ntwo@example.com")).toEqual([
-      "one@example.com",
-      "two@example.com",
-    ]);
-  });
-});
-
-describe("ensureWranglerAccountId", () => {
-  it("prefers an explicit CLOUDFLARE_ACCOUNT_ID", async () => {
-    const previous = process.env.CLOUDFLARE_ACCOUNT_ID;
-    delete process.env.CLOUDFLARE_ACCOUNT_ID;
-
-    try {
-      const result = await ensureWranglerAccountId({
-        customDomain: "tiller.example.com",
-        apiToken: "cfat_test",
-        accountId: "acc-explicit",
-      });
-      expect(result).toBe("acc-explicit");
-      expect(process.env.CLOUDFLARE_ACCOUNT_ID).toBe("acc-explicit");
-    } finally {
-      if (previous == null) delete process.env.CLOUDFLARE_ACCOUNT_ID;
-      else process.env.CLOUDFLARE_ACCOUNT_ID = previous;
-    }
-  });
-
-  it("falls back to the legacy default account id env", async () => {
-    const previous = process.env.CLOUDFLARE_ACCOUNT_ID;
-    delete process.env.CLOUDFLARE_ACCOUNT_ID;
-
-    try {
-      const result = await ensureWranglerAccountId({
-        customDomain: "tiller.example.com",
-        apiToken: "cfat_test",
-        legacyAccountId: "acc-legacy",
-      });
-      expect(result).toBe("acc-legacy");
-      expect(process.env.CLOUDFLARE_ACCOUNT_ID).toBe("acc-legacy");
-    } finally {
-      if (previous == null) delete process.env.CLOUDFLARE_ACCOUNT_ID;
-      else process.env.CLOUDFLARE_ACCOUNT_ID = previous;
-    }
-  });
-
-  it("derives the account id from the custom domain when needed", async () => {
-    const previous = process.env.CLOUDFLARE_ACCOUNT_ID;
-    delete process.env.CLOUDFLARE_ACCOUNT_ID;
-
-    try {
-      const result = await ensureWranglerAccountId(
-        {
-          customDomain: "tiller.paperwing.dev",
-          apiToken: "cfat_test",
-        },
-        {
-          resolveAccountForHostnameImpl: async () => ({
-            accountId: "acc-derived",
-          }),
-        },
-      );
-      expect(result).toBe("acc-derived");
-      expect(process.env.CLOUDFLARE_ACCOUNT_ID).toBe("acc-derived");
-    } finally {
-      if (previous == null) delete process.env.CLOUDFLARE_ACCOUNT_ID;
-      else process.env.CLOUDFLARE_ACCOUNT_ID = previous;
-    }
   });
 });

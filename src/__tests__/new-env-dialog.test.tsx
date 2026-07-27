@@ -1,9 +1,18 @@
-import React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+/**
+ * @vitest-environment jsdom
+ */
+import React, { act } from "react";
+import userEvent from "@testing-library/user-event";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubRepositorySelection } from "../api";
+import type { Artifact } from "../../api/coordination/types";
 
 const useGitHubRepositoriesMock = vi.hoisted(() => vi.fn());
+const apiMocks = vi.hoisted(() => ({
+  fetchExecutionStatus: vi.fn(),
+  fetchRepoArtifacts: vi.fn(),
+}));
 
 vi.mock("../useGitHubRepositories", () => ({
   githubRepositoryKey: (selection: { installationId: number; repositoryId: number }) =>
@@ -11,11 +20,16 @@ vi.mock("../useGitHubRepositories", () => ({
   useGitHubRepositories: useGitHubRepositoriesMock,
 }));
 
+vi.mock("../api", () => ({
+  fetchExecutionStatus: apiMocks.fetchExecutionStatus,
+  fetchRepoArtifacts: apiMocks.fetchRepoArtifacts,
+}));
+
 import {
-  getEffectiveCodexAuthPreference,
-  getHarnessCredentialError,
-  getInitialEnvBackendSelection,
+  getInitialEnvHarnessSelection,
+  getNewEnvHarnessDefault,
   getRepositoryPagination,
+  getScheduledRunRequirementError,
   NewEnvDialog,
   NewRepoDialog,
   REPOSITORY_PAGE_SIZE,
@@ -24,13 +38,33 @@ import {
 const repo = {
   repoId: "repo-1",
   repoUrl: "https://github.com/example/repo",
+  scmModel: "github" as const,
+  githubFullName: "example/repo",
+  githubDefaultBranch: "main",
+  githubDefaultBranchHeadSha: "main-sha",
   mainCommit: "main-sha",
-  gitArtifactId: "git-artifact-1",
+  gitArtifactId: null,
   gitStatus: "ready" as const,
   createdAt: "2026-04-13T00:00:00.000Z",
   updatedAt: "2026-04-13T00:00:00.000Z",
   bootstrappedFromRef: "HEAD",
 };
+
+function makePlan(overrides: Partial<Artifact> = {}): Artifact {
+  return {
+    id: "plan-1",
+    repoId: "repo-1",
+    type: "plan",
+    basis: { repoId: "repo-1", mainCommit: "main-sha" },
+    title: "Checkout polish plan",
+    body: { markdown: "Make checkout better." },
+    status: "todo",
+    createdAt: "2026-04-13T00:00:00.000Z",
+    updatedAt: "2026-04-14T00:00:00.000Z",
+    version: 1,
+    ...overrides,
+  };
+}
 
 function makeGitHubRepository(index: number): GitHubRepositorySelection {
   const name = `repo-${String(index).padStart(2, "0")}`;
@@ -44,91 +78,35 @@ function makeGitHubRepository(index: number): GitHubRepositorySelection {
   };
 }
 
-function stripReactMarkers(markup: string): string {
-  return markup.replaceAll("<!-- -->", "");
-}
-
-describe("getInitialEnvBackendSelection", () => {
-  it("defaults to host when local development is pinned to the host backend", () => {
-    expect(getInitialEnvBackendSelection({ isLocalDev: true, deploymentMode: "hosted", hostConnected: false })).toBe("host");
-  });
-
-  it("defaults to host when Tiller Self Host mode has a connected machine", () => {
-    expect(getInitialEnvBackendSelection({ isLocalDev: false, deploymentMode: "self-host", hostConnected: true })).toBe("host");
-  });
-
-  it("defaults to cloudflare in Hosted Tiller even if a stale host is connected", () => {
-    expect(getInitialEnvBackendSelection({ isLocalDev: false, deploymentMode: "hosted", hostConnected: true })).toBe("cf");
+describe("getInitialEnvHarnessSelection", () => {
+  it("prefers Open Code when it is enabled", () => {
+    expect(getInitialEnvHarnessSelection(["claude-code", "codex", "opencode"])).toBe("opencode");
+    expect(getInitialEnvHarnessSelection(["claude-code", "codex"])).toBe("claude-code");
+    expect(getNewEnvHarnessDefault("opencode")).toEqual({ model: "gpt-5.6-sol", effort: "xhigh" });
   });
 });
 
-describe("getEffectiveCodexAuthPreference", () => {
-  it("keeps auto auth for host-backed Codex envs", () => {
-    expect(
-      getEffectiveCodexAuthPreference({
-        backend: "host",
-        deploymentMode: "self-host",
-      }),
-    ).toBe("auto");
-  });
+describe("getScheduledRunRequirementError", () => {
+  const ready = {
+    harness: "codex" as const,
+    executionReady: true,
+    openaiBillingMode: "subscription" as const,
+    hasOpenAIKey: false,
+    chatgptAuthStatus: "connected" as const,
+  };
 
-  it("forces API key auth for Hosted Tiller Cloudflare Codex envs", () => {
-    expect(
-      getEffectiveCodexAuthPreference({
-        backend: "cf",
-        deploymentMode: "hosted",
-      }),
-    ).toBe("api-key");
-  });
-
-  it("uses auto auth for self-host Cloudflare Codex envs", () => {
-    expect(
-      getEffectiveCodexAuthPreference({
-        backend: "cf",
-        deploymentMode: "self-host",
-      }),
-    ).toBe("auto");
-  });
-});
-
-describe("getHarnessCredentialError", () => {
-  it("blocks Claude Cloudflare envs without an Anthropic API key", () => {
-    expect(
-      getHarnessCredentialError({
-        harness: "claude-code",
-        backend: "cf",
-        deploymentMode: "hosted",
-      }),
-    ).toContain("ANTHROPIC_API_KEY");
-  });
-
-  it("allows host Claude envs with either subscription or API key auth", () => {
-    expect(
-      getHarnessCredentialError({
-        harness: "claude-code",
-        backend: "host",
-        deploymentMode: "self-host",
-        hasClaudeSubscription: true,
-      }),
-    ).toBeNull();
-    expect(
-      getHarnessCredentialError({
-        harness: "claude-code",
-        backend: "host",
-        deploymentMode: "self-host",
-        hasAnthropicKey: true,
-      }),
-    ).toBeNull();
-  });
-
-  it("blocks Codex envs without subscription login or API key auth", () => {
-    expect(
-      getHarnessCredentialError({
-        harness: "codex",
-        backend: "host",
-        deploymentMode: "self-host",
-      }),
-    ).toContain("OPENAI_API_KEY");
+  it("keeps scheduler eligibility aligned with the selected backend and billing mode", () => {
+    expect(getScheduledRunRequirementError({ ...ready, executionReady: false }))
+      .toContain("selected execution backend is unavailable");
+    expect(getScheduledRunRequirementError({ ...ready, harness: "claude-code" })).toContain("Codex harness");
+    expect(getScheduledRunRequirementError({ ...ready, chatgptAuthStatus: "needs_reconnect" })).toContain("subscription authentication");
+    expect(getScheduledRunRequirementError({
+      ...ready,
+      openaiBillingMode: "api",
+      chatgptAuthStatus: "missing",
+      hasOpenAIKey: true,
+    })).toBeNull();
+    expect(getScheduledRunRequirementError(ready)).toBeNull();
   });
 });
 
@@ -153,7 +131,83 @@ describe("getRepositoryPagination", () => {
   });
 });
 
+// Kumo dialogs render through a portal into document.body, so the rendering
+// tests below mount with createRoot and assert against the live document.
+const originalReact = (globalThis as typeof globalThis & { React?: typeof React }).React;
+let container: HTMLDivElement;
+let root: Root | null = null;
+
+function setupDom() {
+  beforeEach(() => {
+    (
+      globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    ).IS_REACT_ACT_ENVIRONMENT = true;
+    Object.defineProperty(globalThis, "React", {
+      configurable: true,
+      value: React,
+    });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    if (root) {
+      act(() => {
+        root?.unmount();
+      });
+    }
+    container.remove();
+    root = null;
+    document.body.innerHTML = "";
+    Object.defineProperty(globalThis, "React", {
+      configurable: true,
+      value: originalReact,
+    });
+  });
+}
+
+function bodyText(): string {
+  return document.body.textContent ?? "";
+}
+
+function findButtonByText(text: string): HTMLButtonElement | undefined {
+  return Array.from(document.body.querySelectorAll("button"))
+    .find((button) => button.textContent === text);
+}
+
+async function chooseSelectOption(label: string, optionText: string): Promise<void> {
+  const user = userEvent.setup({ pointerEventsCheck: 0 });
+  const trigger = document.body.querySelector<HTMLElement>(`[aria-label="${label}"]`);
+  expect(trigger).not.toBeNull();
+  await act(async () => {
+    await user.click(trigger!);
+  });
+  const option = Array.from(document.body.querySelectorAll<HTMLElement>('[role="option"]'))
+    .find((candidate) => candidate.textContent?.startsWith(optionText));
+  expect(option).not.toBeUndefined();
+  await act(async () => {
+    await user.click(option!);
+  });
+}
+
+async function openSelectOptions(label: string): Promise<HTMLElement[]> {
+  const user = userEvent.setup({ pointerEventsCheck: 0 });
+  const trigger = document.body.querySelector<HTMLElement>(`[aria-label="${label}"]`);
+  expect(trigger).not.toBeNull();
+  await act(async () => {
+    await user.click(trigger!);
+  });
+  return Array.from(document.body.querySelectorAll<HTMLElement>('[role="option"]'));
+}
+
+function isDisabledOption(option: HTMLElement): boolean {
+  return option.getAttribute("aria-disabled") === "true" || option.hasAttribute("data-disabled");
+}
+
 describe("NewRepoDialog", () => {
+  setupDom();
+
   beforeEach(() => {
     useGitHubRepositoriesMock.mockReturnValue({
       repositories: [],
@@ -173,24 +227,25 @@ describe("NewRepoDialog", () => {
       error: null,
     });
 
-    const markup = stripReactMarkers(
-      renderToStaticMarkup(
+    act(() => {
+      root?.render(
         <NewRepoDialog
           onClose={vi.fn()}
           hubUrl="https://hub.example.com"
           repos={[]}
           onCreate={vi.fn(async () => undefined)}
         />,
-      ),
-    );
+      );
+    });
 
-    expect(markup).toContain("owner/repo-01");
-    expect(markup).toContain("owner/repo-05");
-    expect(markup).not.toContain("owner/repo-06");
-    expect(markup).toContain("1-5 of 6");
-    expect(markup).toContain("Page 1 of 2");
-    expect(markup).toContain("Previous");
-    expect(markup).toContain("Next");
+    const text = bodyText();
+    expect(text).toContain("owner/repo-01");
+    expect(text).toContain("owner/repo-05");
+    expect(text).not.toContain("owner/repo-06");
+    expect(text).toContain("1-5 of 6");
+    expect(text).toContain("Page 1 of 2");
+    expect(findButtonByText("Previous")).toBeInstanceOf(HTMLButtonElement);
+    expect(findButtonByText("Next")).toBeInstanceOf(HTMLButtonElement);
   });
 
   it("hides pagination controls when the filtered repository list fits on one page", () => {
@@ -202,93 +257,401 @@ describe("NewRepoDialog", () => {
       error: null,
     });
 
-    const markup = stripReactMarkers(
-      renderToStaticMarkup(
+    act(() => {
+      root?.render(
         <NewRepoDialog
           onClose={vi.fn()}
           hubUrl="https://hub.example.com"
           repos={[]}
           onCreate={vi.fn(async () => undefined)}
         />,
-      ),
-    );
+      );
+    });
 
-    expect(markup).not.toContain("Page 1 of 1");
-    expect(markup).not.toContain("1-5 of 5");
+    const text = bodyText();
+    expect(text).not.toContain("Page 1 of 1");
+    expect(text).not.toContain("1-5 of 5");
   });
 });
 
 describe("NewEnvDialog", () => {
-  it("does not let a default Codex harness silently flip backend selection to host", () => {
-    const markup = renderToStaticMarkup(
-      <NewEnvDialog
-        onClose={vi.fn()}
-        isLocalDev={false}
-        deploymentMode="self-host"
-        hostConnected={false}
-        hasOpenAIKey={true}
-        enabledHarnesses={["codex", "claude-code", "opencode"]}
-        repo={repo}
-        onCreate={vi.fn(async () => undefined)}
-      />,
-    );
+  setupDom();
 
-    expect(markup).toContain('<option value="cf" selected="">Cloudflare Containers</option>');
-    expect(markup).toContain('<option value="host" disabled="">Tiller Self Host</option>');
-    expect(markup).toContain("Start `tiller host` to use Tiller Self Host.");
+  beforeEach(() => {
+    apiMocks.fetchExecutionStatus.mockReset();
+    apiMocks.fetchExecutionStatus.mockResolvedValue({
+      selected: { target: "cf" },
+      selectedHost: null,
+      candidate: { state: "not_connected" },
+      executionReady: true,
+    });
+    apiMocks.fetchRepoArtifacts.mockReset();
+    apiMocks.fetchRepoArtifacts.mockResolvedValue({
+      artifacts: [makePlan()],
+      refs: [],
+    });
   });
 
-  it("hides the Codex auth selector for host-backed Codex envs when auth is configured", () => {
-    const markup = renderToStaticMarkup(
-      <NewEnvDialog
-        onClose={vi.fn()}
-        isLocalDev={false}
-        deploymentMode="self-host"
-        hostConnected={true}
-        hasOpenAIKey={true}
-        enabledHarnesses={["codex", "claude-code", "opencode"]}
-        repo={repo}
-        onCreate={vi.fn(async () => undefined)}
-      />,
-    );
+  function renderNewEnvDialog(props: Partial<React.ComponentProps<typeof NewEnvDialog>> = {}) {
+    act(() => {
+      root?.render(
+        <NewEnvDialog
+          onClose={vi.fn()}
+          hubUrl="https://hub.example.com"
+          enabledHarnesses={["codex", "claude-code", "opencode"]}
+          claudeBillingMode="api"
+          openaiBillingMode="api"
+          repo={repo}
+          onCreate={vi.fn(async () => undefined)}
+          {...props}
+        />,
+      );
+    });
+  }
 
-    expect(markup).not.toContain("Codex Auth");
-    expect(markup).not.toContain("choose auth automatically");
+  it("does not expose a per-workload execution backend control", () => {
+    renderNewEnvDialog({ hasOpenAIKey: true });
+
+    const backendTrigger = document.body.querySelector('[aria-label="Execution Backend"]');
+    expect(backendTrigger).toBeNull();
+    expect(bodyText()).not.toContain("Cloudflare Containers");
+    expect(bodyText()).not.toContain("Your machine");
   });
 
-  it("hides the Codex auth selector in Hosted Tiller when API key auth is configured", () => {
-    const markup = renderToStaticMarkup(
-      <NewEnvDialog
-        onClose={vi.fn()}
-        isLocalDev={false}
-        deploymentMode="hosted"
-        hostConnected={false}
-        hasOpenAIKey={true}
-        enabledHarnesses={["codex", "claude-code", "opencode"]}
-        repo={repo}
-        onCreate={vi.fn(async () => undefined)}
-      />,
-    );
+  it("hides the Codex auth selector when auth is configured", () => {
+    renderNewEnvDialog({ hasOpenAIKey: true, enabledHarnesses: ["codex"] });
 
-    expect(markup).not.toContain("Codex Auth");
-    expect(markup).not.toContain("Hosted Tiller uses OPENAI_API_KEY");
+    const text = bodyText();
+    expect(text).not.toContain("Codex Auth");
+    expect(text).not.toContain("choose auth automatically");
+  });
+
+  it("hides the Codex auth selector when API key auth is configured", () => {
+    renderNewEnvDialog({ hasOpenAIKey: true, enabledHarnesses: ["codex"] });
+
+    const text = bodyText();
+    expect(text).not.toContain("Codex Auth");
+    expect(text).not.toContain("uses OPENAI_API_KEY");
   });
 
   it("shows a blocking credential error without disabling harness selection", () => {
-    const markup = renderToStaticMarkup(
-      <NewEnvDialog
-        onClose={vi.fn()}
-        isLocalDev={false}
-        deploymentMode="hosted"
-        hostConnected={false}
-        enabledHarnesses={["codex", "claude-code", "opencode"]}
-        repo={repo}
-        onCreate={vi.fn(async () => undefined)}
-      />,
-    );
+    renderNewEnvDialog();
 
-    expect(markup).toContain("Codex requires OPENAI_API_KEY");
-    expect(markup).toContain('<select class="w-full bg-white border border-[#d0d7de]');
-    expect(markup).toContain('type="submit" disabled=""');
+    expect(bodyText()).toContain("Configure the active OpenAI API key");
+    expect(document.body.querySelectorAll('[data-testid="harness-model-requirement"]')).toHaveLength(1);
+
+    const harnessTrigger = document.body.querySelector<HTMLElement>('[aria-label="Harness"]');
+    expect(harnessTrigger).not.toBeNull();
+    expect(harnessTrigger?.getAttribute("disabled")).toBeNull();
+    expect(harnessTrigger?.getAttribute("aria-disabled")).not.toBe("true");
+
+    const submitButton = findButtonByText("Create");
+    expect(submitButton).toBeInstanceOf(HTMLButtonElement);
+    expect(submitButton?.disabled).toBe(true);
+  });
+
+  it("keeps unavailable non-selected models visible and disabled", async () => {
+    renderNewEnvDialog({
+      enabledHarnesses: ["opencode"],
+      workersAiConfigured: true,
+      hasOpenAIKey: false,
+    });
+
+    const options = await openSelectOptions("Model");
+    const sol = options.find((option) => option.textContent?.startsWith("GPT-5.6 Sol"));
+    const gpt55 = options.find((option) => option.textContent?.startsWith("GPT-5.5"));
+    const kimi = options.find((option) => option.textContent?.startsWith("Kimi K2.7 Code"));
+
+    expect(sol?.textContent).toContain("Configure the active OpenAI API key");
+    expect(gpt55?.textContent).toContain("Configure the active OpenAI API key");
+    expect(isDisabledOption(sol!)).toBe(true);
+    expect(isDisabledOption(gpt55!)).toBe(true);
+    expect(isDisabledOption(kimi!)).toBe(false);
+  });
+
+  it("clears a failed Create error when either model or effort changes", async () => {
+    const onCreate = vi.fn(async () => {
+      throw new Error("Create provider rejected the request");
+    });
+    renderNewEnvDialog({ hasOpenAIKey: true, onCreate });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(bodyText()).toContain("Create provider rejected the request");
+
+    await chooseSelectOption("Model", "GPT-5.5");
+    expect(bodyText()).not.toContain("Create provider rejected the request");
+
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(bodyText()).toContain("Create provider rejected the request");
+
+    await chooseSelectOption("Effort", "high");
+    expect(bodyText()).not.toContain("Create provider rejected the request");
+  });
+
+  it("defaults to Open Code with GPT-5.6 and renders compact Model and Effort selectors", () => {
+    renderNewEnvDialog({ hasOpenAIKey: true });
+
+    const harness = document.body.querySelector('[aria-label="Harness"]');
+    const model = document.body.querySelector('[aria-label="Model"]');
+    const effort = document.body.querySelector('[aria-label="Effort"]');
+    expect(harness?.textContent).toContain("Open Code");
+    expect(model?.textContent).toContain("GPT-5.6 Sol");
+    expect(effort?.textContent).toContain("xhigh");
+    expect(harness?.compareDocumentPosition(model as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(model?.compareDocumentPosition(effort as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(bodyText()).not.toContain("Tiller will not downgrade or retry automatically");
+    expect(document.body.querySelector('[role="dialog"]')).toHaveClass("h-[calc(100vh-2rem)]", "max-h-[52rem]");
+  });
+
+  it("retains a supported effort when the rendered model selection changes", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({ hasOpenAIKey: true, onCreate });
+
+    await chooseSelectOption("Model", "GPT-5.5");
+    expect(document.body.querySelector('[aria-label="Effort"]')?.textContent).toContain("xhigh");
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "opencode",
+      planSelection: { mode: "none" },
+      harnessSettings: { model: "gpt-5.5", effort: "xhigh" },
+      schedule: undefined,
+    });
+  });
+
+  it("updates the harness and its catalog default together", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({ hasOpenAIKey: true, hasAnthropicKey: true, onCreate });
+
+    await chooseSelectOption("Harness", "Claude Code");
+    expect(document.body.querySelector('[aria-label="Model"]')?.textContent).toContain("Opus 4.8");
+    expect(document.body.querySelector('[aria-label="Effort"]')?.textContent).toContain("xhigh");
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "claude-code",
+      planSelection: { mode: "none" },
+      harnessSettings: { model: "claude-opus-4.8", effort: "xhigh" },
+      schedule: undefined,
+    });
+  });
+
+  it("offers Fast mode for Codex implementors and submits the persisted setting", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({
+      enabledHarnesses: ["codex"],
+      hasOpenAIKey: true,
+      onCreate,
+    });
+
+    const fastMode = document.body.querySelector<HTMLInputElement>('input[aria-label="Fast mode"]');
+    expect(fastMode).toBeInstanceOf(HTMLInputElement);
+    expect(fastMode?.checked).toBe(false);
+    expect(bodyText()).toContain("Runs supported Codex models faster at a higher usage rate.");
+
+    await act(async () => {
+      fastMode?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "codex",
+      planSelection: { mode: "none" },
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh", fastMode: true },
+      schedule: undefined,
+    });
+  });
+
+  it("does not offer Fast mode for non-Codex implementors", () => {
+    renderNewEnvDialog({ enabledHarnesses: ["opencode"], hasOpenAIKey: true });
+    expect(document.body.querySelector('input[aria-label="Fast mode"]')).toBeNull();
+  });
+
+  it("closes without persisting settings when Create is cancelled", async () => {
+    const onClose = vi.fn();
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({ hasOpenAIKey: true, onClose, onCreate });
+
+    await act(async () => {
+      findButtonByText("Cancel")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+
+  it("defaults startup plan selection to no plan", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({ hasOpenAIKey: true, onCreate });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const noPlanRadio = document.body.querySelector<HTMLInputElement>('input[name="new-env-plan-choice-repo-1"][value="none"]');
+    expect(noPlanRadio?.checked).toBe(true);
+
+    const submitButton = findButtonByText("Create");
+    await act(async () => {
+      submitButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "opencode",
+      planSelection: { mode: "none" },
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
+      schedule: undefined,
+    });
+  });
+
+  it("submits a selected saved startup plan", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({ hasOpenAIKey: true, onCreate });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const specificRadio = document.body.querySelector<HTMLInputElement>('input[name="new-env-plan-choice-repo-1"][value="specific"]');
+    expect(specificRadio).toBeInstanceOf(HTMLInputElement);
+
+    await act(async () => {
+      specificRadio?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(bodyText()).toContain("Checkout polish plan");
+
+    const submitButton = findButtonByText("Create");
+    await act(async () => {
+      submitButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "opencode",
+      planSelection: { mode: "specific", artifactId: "plan-1" },
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
+      schedule: undefined,
+    });
+  });
+
+  it("schedules a selected plan on the Settings-selected backend", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    apiMocks.fetchExecutionStatus.mockResolvedValue({
+      selected: { target: "host", machineId: "machine-1" },
+      selectedHost: { state: "ready", machineId: "machine-1", displayName: "studio-mac" },
+      candidate: { state: "ready", machineId: "machine-1", displayName: "studio-mac" },
+      executionReady: true,
+    });
+    renderNewEnvDialog({
+      hasChatGPTAuth: true,
+      chatgptAuthStatus: "connected",
+      enabledHarnesses: ["codex"],
+      openaiBillingMode: "subscription",
+      onCreate,
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const specificRadio = document.body.querySelector<HTMLInputElement>(
+      'input[name="new-env-plan-choice-repo-1"][value="specific"]',
+    );
+    await act(async () => {
+      specificRadio?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    const nonFastCheckboxes = Array.from(document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'))
+      .filter((checkbox) => checkbox.getAttribute("aria-label") !== "Fast mode");
+    expect(nonFastCheckboxes).toHaveLength(1);
+    expect(document.body.querySelector('input[aria-label="Fast mode"]')).toBeInstanceOf(HTMLInputElement);
+    expect(bodyText()).toContain("Schedule: run tonight at 3:00 AM");
+
+    await act(async () => {
+      nonFastCheckboxes[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      findButtonByText("Schedule")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "codex",
+      planSelection: { mode: "specific", artifactId: "plan-1" },
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
+      schedule: {
+        runAtMs: expect.any(Number),
+        timeZone: expect.any(String),
+      },
+    });
+  });
+
+  it("only offers To do plans for startup selection", async () => {
+    apiMocks.fetchRepoArtifacts.mockResolvedValue({
+      artifacts: [
+        makePlan({
+          id: "draft-plan",
+          title: "Draft plan",
+          status: "draft",
+          updatedAt: "2026-04-16T00:00:00.000Z",
+        }),
+        makePlan({
+          id: "completed-plan",
+          title: "Completed plan",
+          status: "completed",
+          updatedAt: "2026-04-15T00:00:00.000Z",
+        }),
+        makePlan({
+          id: "todo-plan",
+          title: "Todo plan",
+          status: "todo",
+          body: { markdown: "# Todo plan\n\n- Step one" },
+          updatedAt: "2026-04-14T00:00:00.000Z",
+        }),
+      ],
+      refs: [],
+    });
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({ hasOpenAIKey: true, onCreate });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const specificRadio = document.body.querySelector<HTMLInputElement>('input[name="new-env-plan-choice-repo-1"][value="specific"]');
+    await act(async () => {
+      specificRadio?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const text = bodyText();
+    expect(text).toContain("Todo plan");
+    expect(text).toContain("Step one");
+    expect(text).not.toContain("Draft plan");
+    expect(text).not.toContain("Completed plan");
+    expect(text).toContain("Select from Plans to Do");
+    expect(text).not.toContain("Choose specific plan");
+    expect(document.body.querySelector("h1")?.textContent).toBe("Todo plan");
+    expect(document.body.querySelector("li")?.textContent).toBe("Step one");
+
+    const submitButton = findButtonByText("Create");
+    await act(async () => {
+      submitButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "opencode",
+      planSelection: { mode: "specific", artifactId: "todo-plan" },
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
+      schedule: undefined,
+    });
   });
 });

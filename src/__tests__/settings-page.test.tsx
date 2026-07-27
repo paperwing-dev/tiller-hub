@@ -12,22 +12,10 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     needsSetup: false,
     setupPhase: "complete",
     isLocalDev: false,
-    currentOrigin: "https://hub.example.com",
-    hubUrl: "https://hub.example.com",
-    deploymentMode: "self-host",
-    selfHostStatus: "ready",
-    selfHostSetupAttemptId: null,
     workersDevHubUrl: "https://demo.preview.workers.dev",
-    routeKind: "custom-domain",
-    workerServiceName: null,
     modelAuthConfigured: true,
-    modelAuthMode: "subscription",
-    hostedInfrastructureReady: true,
-    hostedBlockingReasons: [],
-    hostedModelReady: true,
-    hostedModelBlockingReasons: [],
-    selfHostReady: true,
-    selfHostBlockingReasons: [],
+    claudeBillingMode: "subscription",
+    openaiBillingMode: "subscription",
     workersAiConfigured: false,
     hasClaudeSubscription: true,
     hasAnthropicKey: false,
@@ -39,30 +27,13 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     openaiPlannerAvailable: false,
     openaiPlannerRoute: null,
     openaiPlannerReason: null,
+    codexBackendReadiness: { cf: "authentication_unavailable", host: "backend_offline" },
     hostRegistered: false,
-    hostRegisteredMode: "none",
-    hostGatewayAvailable: false,
-    hostGatewayConfigured: false,
-    hostGatewayMode: "none",
     enabledHarnesses: ["claude-code", "codex", "opencode"],
     protectionMode: "cf-access",
-    protectionCanAutomate: true,
-    serviceTokenConfigured: true,
-    gatewayHostname: null,
-    browserProtected: true,
-    gatewayProvisioned: true,
-    gatewayTunnelConfigured: false,
-    gatewaySupportAvailable: false,
-    gatewaySupportReason: null,
-    workersDevCutoverPending: false,
-    unsupportedProtectionConfig: false,
-    workersDevAliasDisabled: false,
-    protectionAppDomain: null,
-    accessConfigured: true,
-    accessIssuer: "https://team.cloudflareaccess.com",
-    accessJwksUrl: null,
+    tokenExpiresAt: null,
+    renewalRecommended: false,
     hostConnected: false,
-    hostConnectionMode: "none",
     idleTimeoutMinutes: 10,
     canonicalMainBootstrapDepth: 0,
     githubAppAvailable: false,
@@ -165,6 +136,7 @@ describe("SettingsPage GitHub App wizard", () => {
 
     expect(html).toContain("Advanced");
     expect(html).toContain("Show advanced");
+    expect(html).not.toContain("Session Env");
     expect(html).not.toContain("Environment auto-stop");
     expect(html).not.toContain("Idle timeout");
     expect(html).not.toContain("Canonical main history depth");
@@ -182,6 +154,81 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).not.toContain("Import or replace");
   });
 
+  it("builds a Codex import command that targets the exact current Hub", async () => {
+    const { buildCodexImportCommand } = await import("../SettingsPage");
+
+    expect(buildCodexImportCommand("https://fresh.preview.workers.dev")).toBe(
+      "npx --yes @paperwing-dev/tiller@latest auth import codex --hub-url https://fresh.preview.workers.dev",
+    );
+  });
+
+  it("shows independent unselected modes and configured inactive credentials", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          claudeBillingMode: null,
+          openaiBillingMode: null,
+          hasClaudeSubscription: true,
+          hasAnthropicKey: true,
+          hasChatGPTAuth: true,
+          chatgptAuthStatus: "connected",
+          hasOpenAIKey: true,
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain("Claude billing mode");
+    expect(html).toContain("OpenAI billing mode");
+    expect(html.match(/No mode selected yet\./g)).toHaveLength(2);
+    expect(html).toContain("Claude subscription token");
+    expect(html).toContain("Configured · inactive");
+    expect(html).toContain("Saving a credential does not activate it");
+    expect(html).toContain("retained Plan Writer runtimes remain pinned until recreated");
+  });
+
+  it("marks a configured OpenAI subscription as inactive when API mode is selected", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          openaiBillingMode: "api",
+          hasChatGPTAuth: true,
+          chatgptAuthStatus: "connected",
+          hasOpenAIKey: true,
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain("Codex Subscription Login");
+    expect(html).toContain("Configured · inactive");
+    expect(html).toContain("Configured · active");
+  });
+
+  it("shows both OpenAI credential routes even when OpenAI harnesses are disabled", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          enabledHarnesses: [],
+          modelAuthConfigured: false,
+          hasClaudeSubscription: false,
+          workersAiConfigured: true,
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain("OpenAI API key");
+    expect(html).toContain("Use OpenAI-backed models with Codex or OpenCode.");
+    expect(html).toContain("Codex Subscription Login");
+  });
+
   it("disables Codex import when a subscription login is already present", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
     const html = renderToString(
@@ -190,11 +237,11 @@ describe("SettingsPage GitHub App wizard", () => {
           hasChatGPTAuth: true,
           chatgptAuthStatus: "connected",
           openaiPlannerAvailable: true,
-          openaiPlannerRoute: "subscription-gateway",
+          openaiPlannerRoute: "subscription-app-server",
           hostRegistered: true,
           hostConnected: true,
-          hostGatewayConfigured: true,
-          hostGatewayAvailable: true,
+          codexRouteStatus: "available",
+          codexBackendReadiness: { cf: "available", host: "available" },
         })}
         onDone={() => undefined}
         onRefresh={async () => undefined}
@@ -202,7 +249,63 @@ describe("SettingsPage GitHub App wizard", () => {
     );
 
     expect(html).toContain("Subscription active");
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Import Codex Login<\/button>/);
+    // Kumo Button wraps its children in a span, so match the disabled button
+    // by its attributes and accessible text rather than exact inner markup.
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>(?:<[^>]+>)*Import Codex Login/);
+  });
+
+  it("distinguishes a disconnected execution machine from unavailable authentication", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const disconnected = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          hasChatGPTAuth: true,
+          chatgptAuthStatus: "connected",
+          codexRouteStatus: "environment_not_connected",
+          openaiPlannerReason: "The selected execution machine is registered but not connected.",
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+    expect(disconnected).toContain("The selected execution machine is registered but not connected.");
+
+    const unavailable = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          hasChatGPTAuth: true,
+          chatgptAuthStatus: "connected",
+          codexRouteStatus: "authentication_unavailable",
+          openaiPlannerReason: "The selected OpenAI authentication route is unavailable.",
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+    expect(unavailable).toContain("Authentication unavailable");
+    expect(unavailable).toContain("The selected OpenAI authentication route is unavailable.");
+  });
+
+  it("shows backend readiness independently when Cloudflare is ready but the machine is disconnected", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          hasChatGPTAuth: true,
+          chatgptAuthStatus: "connected",
+          openaiPlannerAvailable: true,
+          openaiPlannerRoute: "subscription-app-server",
+          codexRouteStatus: "available",
+          codexBackendReadiness: { cf: "available", host: "environment_not_connected" },
+        })}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+    expect(html).toContain("Cloudflare Containers");
+    expect(html).toContain("Ready");
+    expect(html).toContain("Your machine");
+    expect(html).toContain("Environment not connected");
   });
 
   it("warns when the self-update repo is not visible to the GitHub App", async () => {
@@ -261,62 +364,40 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).not.toContain("Check the GitHub account");
   });
 
-  it("hides Self Host internals in Hosted mode and shows the setup action", async () => {
-    const { default: SettingsPage } = await import("../SettingsPage");
-    const html = renderToString(
-      <SettingsPage
-        status={baseStatus({
-          deploymentMode: "hosted",
-          selfHostStatus: "not-enabled",
-          selfHostReady: false,
-          hostConnected: false,
-          hostGatewayAvailable: false,
-        })}
-        onDone={() => undefined}
-        onRefresh={async () => undefined}
-      />,
-    );
-
-    expect(html).toContain("Hosted Tiller is active");
-    expect(html).toContain("Set up Self Host");
-    expect(html).not.toContain("Host runtime");
-    expect(html).not.toContain("Subscription Gateway");
-    expect(html).not.toContain("tiller host setup --hub-url");
-    expect(html).not.toContain("Active rollback hub");
-  });
-
-  it("uses Return to Hosted Tiller destructive confirmation language", async () => {
+  it("makes Settings the only execution-backend control and shows the canonical setup command", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
     const html = renderToString(
       <SettingsPage status={baseStatus()} onDone={() => undefined} onRefresh={async () => undefined} />,
     );
 
-    expect(html).toContain("Tiller Self Host is active");
-    expect(html).toContain("Healthy");
-    expect(html).toContain("Return to Hosted Tiller");
-    expect(html).toContain("return to hosted");
-    expect(html).not.toContain("Technical details");
-    expect(html).not.toContain("Host runtime");
+    expect(html).toContain("Execution backend");
+    expect(html).toContain("Choose where new workloads run.");
+    expect(html).toContain("Cloudflare Containers");
+    expect(html).toContain("Managed, with no machine to set up or keep online.");
+    expect(html).toContain("Your machine");
+    expect(html).toContain("Can reduce compute costs and may run faster.");
+    expect(html).toContain("tiller host setup --hub-url https://demo.preview.workers.dev");
+    expect(html).toContain("Changes apply only to new workloads.");
+    expect(html).not.toContain("Return to Hosted");
+    expect(html).not.toContain("deployment mode");
   });
 
-  it("shows Self Host technical details when the active host needs attention", async () => {
+  it("shows the Access expiration, 30-day warning, and single renewal action", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
     const html = renderToString(
       <SettingsPage
         status={baseStatus({
-          selfHostStatus: "offline",
-          selfHostReady: false,
-          hostRegistered: true,
-          hostConnected: false,
+          tokenExpiresAt: "2026-08-01T00:00:00.000Z",
+          renewalRecommended: true,
         })}
         onDone={() => undefined}
         onRefresh={async () => undefined}
       />,
     );
 
-    expect(html).toContain("Tiller Self Host is active");
-    expect(html).toContain("Needs attention");
-    expect(html).toContain("Technical details");
-    expect(html).toContain("Host runtime");
+    expect(html).toContain("CLI and agent access valid until");
+    expect(html).toContain("Renew within 30 days");
+    expect(html.match(/Renew with Cloudflare/g)).toHaveLength(1);
+    expect(html).toContain("existing CLI, machine, and workload connections");
   });
 });

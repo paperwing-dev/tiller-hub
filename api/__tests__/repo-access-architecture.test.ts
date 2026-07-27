@@ -34,6 +34,7 @@ describe("repo access architecture", () => {
         "loadSelectedRepo",
         "loadSelectedRepoForRequest",
         "loadStoredRepoForRequest",
+        "loadStoredRepoForDeletion",
         "getRepoWorkspaceForEnvSlug",
         "getRepoPlanWorkspaceStub",
       ];
@@ -81,6 +82,37 @@ describe("repo access architecture", () => {
     expect(repoCreateRoute).toContain("fullName");
   });
 
+  it("keeps planner-owned state on tracked access while Settings retain live access", async () => {
+    const plannerRoutes = await readFile(new URL("../planner/routes.ts", import.meta.url), "utf8");
+    const repoRoutes = await readFile(new URL("../repo/routes.ts", import.meta.url), "utf8");
+
+    expect(plannerRoutes).toContain("loadTrackedRepoForRequest");
+    expect(plannerRoutes).not.toContain("loadRepoForRequest");
+
+    for (const route of [
+      'repoRoutes.get("/api/repos/:repoId/artifacts"',
+      'repoRoutes.get("/api/repos/:repoId/artifacts/:id"',
+      'repoRoutes.post("/api/repos/:repoId/plans"',
+      'repoRoutes.patch("/api/repos/:repoId/artifacts/:id/status"',
+      'repoRoutes.delete("/api/repos/:repoId/plans/:artifactId"',
+      'repoRoutes.post("/api/repos/:repoId/artifacts"',
+    ]) {
+      const routeStart = repoRoutes.indexOf(route);
+      expect(routeStart, route).toBeGreaterThanOrEqual(0);
+      expect(repoRoutes.slice(routeStart, routeStart + 240), route).toContain("readTrackedRepoRouteContext");
+    }
+
+    for (const route of [
+      'repoRoutes.get("/api/repos/:repoId/session-env"',
+      'repoRoutes.get("/api/repos/:repoId/mcp-servers"',
+      'repoRoutes.get("/api/repos/:repoId/cloudflare-mcp"',
+    ]) {
+      const routeStart = repoRoutes.indexOf(route);
+      expect(routeStart, route).toBeGreaterThanOrEqual(0);
+      expect(repoRoutes.slice(routeStart, routeStart + 240), route).toContain("readValidatedRepoRouteContext");
+    }
+  });
+
   it("keeps env summary cache readers out of production code", async () => {
     const files = await listProductionApiFiles();
     const violations: string[] = [];
@@ -108,8 +140,13 @@ describe("repo access architecture", () => {
 
   it("keeps stored env definitions and summary cache rows free of repoUrl", async () => {
     const store = await readFile(new URL("../plan/store.ts", import.meta.url), "utf8");
+    const definitionKeys = store.match(
+      /const ENV_DEFINITION_KEYS = new Set<keyof EnvDefinition>\\(\\[[\\s\\S]*?\\]\\);/,
+    )?.[0] ?? "";
 
     expect(store).toContain("const { repoUrl: _repoUrl, ...storedMeta } = meta;");
-    expect(store).toContain("const { repoUrl: _repoUrl, ...storedDefinition } = definition");
+    expect(definitionKeys).not.toContain("repoUrl");
+    expect(store).toContain("Object.keys(value).every");
+    expect(store).toContain("JSON.stringify(definition)");
   });
 });

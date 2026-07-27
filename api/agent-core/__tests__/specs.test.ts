@@ -14,7 +14,7 @@ describe("getAgentSpec", () => {
       "list_artifacts",
       "save_plan",
     ]);
-    expect(spec.baseInstructions).toContain("PlanChat V2");
+    expect(spec.baseInstructions).toContain("Provider-neutral planner runs");
     expect(spec.includeProjectContext).toBeUndefined();
     expect(spec.includeMemories).toBeUndefined();
     expect(spec.injectWorkspaceSummary).toBeUndefined();
@@ -28,7 +28,7 @@ describe("getAgentSpec", () => {
     expect(spec.name).toBe("reviewer");
     expect(spec.runtime).toBe("direct-tools");
     expect(spec.modelTarget.provider).toBe("workers-ai");
-    expect(spec.modelTarget.defaultModel).toBe("@cf/moonshotai/kimi-k2.5");
+    expect(spec.modelTarget.defaultModel).toBe("@cf/moonshotai/kimi-k2.7-code");
     expect(spec.toolNames).toEqual(["read_file", "list_files", "glob", "recall_memory"]);
   });
 
@@ -46,20 +46,12 @@ describe("listHostedAgentMetadata", () => {
 
     expect(metadata).toEqual([
       {
-        id: "plan-chat",
-        name: "plan",
-        label: "Plan",
-        runtime: "think",
-        provider: "external-codex",
-        model: "gpt-5.5",
-      },
-      {
         id: "reviewer-chat",
         name: "reviewer",
         label: "Reviewer",
         runtime: "direct-tools",
         provider: "workers-ai",
-        model: "@cf/moonshotai/kimi-k2.5",
+        model: "@cf/moonshotai/kimi-k2.7-code",
       },
     ]);
   });

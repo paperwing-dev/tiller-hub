@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { UpdateCheckResult } from './api';
 import { formatUpdateName } from './update-display';
 
@@ -21,18 +22,29 @@ export function describeUpdateButtonState({
   isChecking: boolean;
 }): {
   title: string;
+  tooltip: string;
   enabled: boolean;
 } {
   if (isChecking) {
     return {
       title: 'Checking for updates',
+      tooltip: 'Checking for updates',
       enabled: false,
     };
   }
 
-  if (issue || !status) {
+  if (issue) {
     return {
-      title: issue ? `Update unavailable: ${issue}` : 'Update unavailable',
+      title: `Update unavailable: ${issue}`,
+      tooltip: `Update unavailable: ${issue}`,
+      enabled: false,
+    };
+  }
+
+  if (!status) {
+    return {
+      title: 'No update available',
+      tooltip: 'No update available',
       enabled: false,
     };
   }
@@ -40,6 +52,7 @@ export function describeUpdateButtonState({
   if (status.buildDiagnostics.channel === 'development') {
     return {
       title: 'Development build',
+      tooltip: 'Development build',
       enabled: false,
     };
   }
@@ -47,6 +60,7 @@ export function describeUpdateButtonState({
   if (dismissed) {
     return {
       title: 'Update dismissed',
+      tooltip: 'Update dismissed',
       enabled: false,
     };
   }
@@ -54,33 +68,50 @@ export function describeUpdateButtonState({
   if (!status.updateAvailable) {
     return {
       title: 'No update available',
+      tooltip: 'No update available',
       enabled: false,
     };
   }
 
   return {
     title: `Update available: ${formatUpdateName(status.currentUpdate)} -> ${formatUpdateName(status.latestUpdate)}`,
+    tooltip: 'Update available',
     enabled: true,
   };
 }
 
 export default function UpdateButton({ status, issue, dismissed, isChecking, onOpen }: UpdateBadgeProps) {
   const state = describeUpdateButtonState({ status, issue, dismissed, isChecking });
-  const className = state.enabled
-    ? 'border-[#0969da] bg-[#0969da] text-white shadow-sm hover:bg-[#0858c3]'
-    : 'cursor-not-allowed border-[#d0d7de] bg-[#f6f8fa] text-[#8c959f]';
+  const [open, setOpen] = useState(false);
 
   return (
-    <button
-      type="button"
-      onClick={state.enabled ? onOpen : undefined}
-      disabled={!state.enabled}
-      className={`inline-flex h-8 items-center rounded-md border px-3 text-xs font-semibold transition-colors ${className}`}
-      title={state.title}
-      aria-label={state.title}
+    <span
+      className="relative z-[1000] inline-flex"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
     >
-      Update
-    </button>
+      <button
+        type="button"
+        onClick={state.enabled ? onOpen : undefined}
+        disabled={!state.enabled}
+        title={state.title}
+        aria-label={state.title}
+        className={`h-6 rounded border px-2 text-[10px] font-medium uppercase tracking-wide transition-colors ${
+          state.enabled
+            ? 'border-kumo-focus bg-kumo-info-tint text-kumo-link hover:bg-kumo-tint'
+            : 'border-kumo-line bg-kumo-base text-kumo-subtle disabled:cursor-default disabled:opacity-60'
+        }`}
+      >
+        Update
+      </button>
+      {open && (
+        <span className="pointer-events-none absolute right-0 top-full z-[1001] mt-1 w-max max-w-72 rounded-md border border-kumo-line bg-kumo-elevated px-2 py-1 text-xs font-medium normal-case tracking-normal text-kumo-default shadow-lg">
+          {state.tooltip}
+        </span>
+      )}
+    </span>
   );
 }
 

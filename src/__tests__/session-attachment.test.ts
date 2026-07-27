@@ -46,9 +46,9 @@ describe("pickPrimaryEnvSession", () => {
     expect(session?.id).toBe("lead");
   });
 
-  it("returns null when no lead session exists for the env", () => {
+  it("rejects a session without an explicit lead role", () => {
     const session = pickPrimaryEnvSession(
-      [makeSession({ id: "worker", tag: "worker-1", metadata: JSON.stringify({ envSlug: "test-env", role: "worker" }) })],
+      [makeSession({ id: "unscoped", metadata: JSON.stringify({ envSlug: "test-env" }) })],
       "test-env",
     );
 

@@ -69,24 +69,24 @@ export default function VoiceAgent({
   const displayStatus = tillerStatus === "reading" ? "reading" : status;
 
   return (
-    <div className="border-t border-[#d0d7de] bg-[#f6f8fa] p-3">
-      <div className="bg-white border border-[#d0d7de] rounded-lg p-3 flex flex-col gap-2">
+    <div className="border-t border-kumo-line bg-kumo-recessed p-3">
+      <div className="bg-kumo-elevated border border-kumo-line rounded-lg p-3 flex flex-col gap-2">
         {/* Header row */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span
               className={`w-2 h-2 rounded-full ${
                 !connected
-                  ? "bg-red-500"
+                  ? "bg-kumo-danger"
                   : status === "idle"
-                    ? "bg-[#d0d7de]"
-                    : "bg-green-500"
+                    ? "bg-kumo-fill"
+                    : "bg-kumo-success"
               }`}
             />
-            <span className="text-sm font-medium text-[#24292f]">
+            <span className="text-sm font-medium text-kumo-default">
               Voice Agent
               {!connected && (
-                <span className="ml-1.5 text-xs font-normal text-red-600">
+                <span className="ml-1.5 text-xs font-normal text-kumo-danger">
                   (disconnected)
                 </span>
               )}
@@ -97,8 +97,8 @@ export default function VoiceAgent({
               onClick={onToggleDebug}
               className={`text-xs px-2.5 py-1 rounded border transition-colors ${
                 debugEnabled
-                  ? "border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100"
-                  : "border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a]"
+                  ? "border-kumo-info/40 bg-kumo-info-tint text-kumo-info hover:bg-kumo-info-tint/70"
+                  : "border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle"
               }`}
             >
               Debug {debugEnabled ? "On" : "Off"}
@@ -106,7 +106,7 @@ export default function VoiceAgent({
             {debugEnabled && (
               <button
                 onClick={onCopyDebug}
-                className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
+                className="text-xs px-2.5 py-1 rounded border border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle transition-colors"
               >
                 {debugCopyState === "copied"
                   ? "Copied"
@@ -119,15 +119,15 @@ export default function VoiceAgent({
               onClick={onToggleMute}
               className={`text-xs px-2.5 py-1 rounded border transition-colors ${
                 isMuted
-                  ? "border-red-300 bg-red-50 text-red-600 hover:bg-red-100"
-                  : "border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a]"
+                  ? "border-kumo-danger/40 bg-kumo-danger-tint text-kumo-danger hover:bg-kumo-danger-tint/70"
+                  : "border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle"
               }`}
             >
               {isMuted ? "Unmute" : "Mute"}
             </button>
             <button
               onClick={onEnd}
-              className="text-xs px-2.5 py-1 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors"
+              className="text-xs px-2.5 py-1 rounded border border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle transition-colors"
             >
               End Call
             </button>
@@ -136,7 +136,7 @@ export default function VoiceAgent({
 
         {/* Error banner */}
         {error && (
-          <div className="bg-red-50 border border-red-200 rounded px-2.5 py-1.5 text-xs text-red-700">
+          <div className="bg-kumo-danger-tint border border-kumo-danger/30 rounded px-2.5 py-1.5 text-xs text-kumo-danger">
             {error}
           </div>
         )}
@@ -144,7 +144,7 @@ export default function VoiceAgent({
         {/* Status visualizer */}
         <div className="flex items-center justify-center py-2 min-h-[48px]">
           {(displayStatus === "thinking" || displayStatus === "reading") && (
-            <div className="flex items-center gap-2 text-[#57606a]">
+            <div className="flex items-center gap-2 text-kumo-subtle">
               <SpinnerIcon className="w-4 h-4 animate-spin" />
               <span className="text-sm">
                 {displayStatus === "reading"
@@ -160,15 +160,15 @@ export default function VoiceAgent({
                 {WAVEFORM_BARS.map(({ heightClass, delay }, i) => (
                   <span
                     key={i}
-                    className={`w-1.5 ${heightClass} bg-blue-500 rounded-full animate-waveform`}
+                    className={`w-1.5 ${heightClass} bg-kumo-info rounded-full animate-waveform`}
                     style={{ animationDelay: delay }}
                   />
                 ))}
               </div>
               {/* Audio level meter */}
-              <div className="w-32 h-1 bg-[#eaeef2] rounded-full overflow-hidden">
+              <div className="w-32 h-1 bg-kumo-tint rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-blue-500 rounded-full transition-all duration-75"
+                  className="h-full bg-kumo-info rounded-full transition-all duration-75"
                   style={{ width: `${Math.min(audioLevel * 500, 100)}%` }}
                 />
               </div>
@@ -180,7 +180,7 @@ export default function VoiceAgent({
               {WAVEFORM_BARS.map(({ heightClass, delay }, i) => (
                 <span
                   key={i}
-                  className={`w-1.5 ${heightClass} bg-green-500 rounded-full animate-waveform`}
+                  className={`w-1.5 ${heightClass} bg-kumo-success rounded-full animate-waveform`}
                   style={{ animationDelay: delay, animationDuration: "0.6s" }}
                 />
               ))}
@@ -188,7 +188,7 @@ export default function VoiceAgent({
           )}
 
           {displayStatus === "idle" && (
-            <span className="text-sm text-[#57606a]">
+            <span className="text-sm text-kumo-subtle">
               {connected ? "Ready" : "Connecting..."}
             </span>
           )}
@@ -196,37 +196,37 @@ export default function VoiceAgent({
 
         {/* Metrics */}
         {metrics && (
-          <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-[10px] text-[#57606a] font-mono border-t border-[#d0d7de] pt-1.5">
+          <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-[10px] text-kumo-subtle font-mono border-t border-kumo-line pt-1.5">
             <span>STT {metrics.stt_ms}ms</span>
-            <span className="text-[#d0d7de]">/</span>
+            <span className="text-kumo-inactive">/</span>
             <span>LLM {metrics.llm_ms}ms</span>
-            <span className="text-[#d0d7de]">/</span>
+            <span className="text-kumo-inactive">/</span>
             <span>TTS {metrics.tts_ms}ms</span>
-            <span className="text-[#d0d7de]">/</span>
+            <span className="text-kumo-inactive">/</span>
             <span>Audio {metrics.first_audio_ms}ms</span>
           </div>
         )}
 
         {debugEnabled && (
-          <div className="border-t border-[#d0d7de] pt-2">
+          <div className="border-t border-kumo-line pt-2">
             <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-medium uppercase tracking-wide text-[#57606a]">
+              <span className="text-[11px] font-medium uppercase tracking-wide text-kumo-subtle">
                 Debug
               </span>
-              <span className="text-[10px] text-[#8b949e]">
+              <span className="text-[10px] text-kumo-subtle">
                 {debugEvents.length} events
               </span>
             </div>
-            <div className="max-h-32 overflow-y-auto rounded border border-[#d0d7de] bg-[#f6f8fa] px-2 py-1.5 font-mono text-[10px] text-[#57606a] space-y-1">
+            <div className="max-h-32 overflow-y-auto rounded border border-kumo-line bg-kumo-recessed px-2 py-1.5 font-mono text-[10px] text-kumo-subtle space-y-1">
               {debugEvents.length === 0 ? (
                 <p>No debug events yet.</p>
               ) : (
                 debugEvents.map((event, i) => (
                   <p key={`${event.timestamp}-${i}`}>
-                    <span className="text-[#8b949e]">
+                    <span className="text-kumo-subtle">
                       {new Date(event.timestamp).toLocaleTimeString()}
                     </span>{" "}
-                    <span className="text-[#24292f]">{event.stage}</span>
+                    <span className="text-kumo-default">{event.stage}</span>
                     {event.details ? ` ${JSON.stringify(event.details)}` : ""}
                   </p>
                 ))
@@ -237,18 +237,18 @@ export default function VoiceAgent({
 
         {/* Transcript */}
         {(transcript.length > 0 || interimTranscript) && (
-          <div className="text-xs text-[#57606a] space-y-1 border-t border-[#d0d7de] pt-2 max-h-32 overflow-y-auto">
+          <div className="text-xs text-kumo-subtle space-y-1 border-t border-kumo-line pt-2 max-h-32 overflow-y-auto">
             {transcript.slice(-4).map((msg, i) => (
               <p key={i}>
-                <span className="font-medium text-[#24292f]">
+                <span className="font-medium text-kumo-default">
                   {msg.role === "user" ? "You:" : "Agent:"}
                 </span>{" "}
                 {msg.text || "..."}
               </p>
             ))}
             {interimTranscript && (
-              <p className="italic text-[#8b949e]">
-                <span className="font-medium text-[#24292f]">You:</span>{" "}
+              <p className="italic text-kumo-subtle">
+                <span className="font-medium text-kumo-default">You:</span>{" "}
                 {interimTranscript}
               </p>
             )}

@@ -7,6 +7,50 @@ import type {
   ReviewArtifactBody,
 } from "./types";
 
+export const MAX_PLAN_MARKDOWN_BYTES = 1024 * 1024;
+
+const ATX_HEADING_PATTERN = /^[ \t]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*$/u;
+const FENCE_PATTERN = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/u;
+
+function normalizeHeadingText(value: string): string {
+  return value.replace(/[ \t]+#+[ \t]*$/u, "").trim();
+}
+
+export function derivePlanTitleFromMarkdown(markdown: string): string {
+  let fence: { marker: string; length: number } | null = null;
+  let readingTitleSection = false;
+
+  for (const line of markdown.replace(/^\uFEFF/u, "").split(/\r?\n/u)) {
+    const fenceMatch = FENCE_PATTERN.exec(line);
+    if (fenceMatch) {
+      const marker = fenceMatch[1]!;
+      if (!fence) {
+        fence = { marker: marker[0]!, length: marker.length };
+      } else if (
+        marker[0] === fence.marker
+        && marker.length >= fence.length
+        && !fenceMatch[2]!.trim()
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+    if (fence) continue;
+
+    const heading = ATX_HEADING_PATTERN.exec(line);
+    if (heading) {
+      const headingText = normalizeHeadingText(heading[2]!);
+      if (heading[1]!.length === 1) return headingText;
+      readingTitleSection = /^title:?$/iu.test(headingText);
+      continue;
+    }
+
+    if (readingTitleSection && line.trim()) return line.trim();
+  }
+
+  return "";
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }

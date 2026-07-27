@@ -4,32 +4,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+export function isMachineUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    .test(value.trim());
+}
+
 function parseHostServiceState(value: Record<string, unknown>): MachineServiceState["host"] {
-  const gatewayPort = typeof value.gatewayPort === "number" && Number.isFinite(value.gatewayPort)
-    ? value.gatewayPort
+  const machineId = typeof value.machineId === "string" ? value.machineId.trim() : "";
+  const displayName = typeof value.displayName === "string" && value.displayName.trim()
+    ? value.displayName.trim()
+    : machineId;
+  const localRunnerImage = typeof value.localRunnerImage === "string" && value.localRunnerImage.trim()
+    ? value.localRunnerImage.trim()
     : undefined;
-  const gatewayUrl = typeof value.gatewayUrl === "string" && value.gatewayUrl.trim()
-    ? value.gatewayUrl
+  const localRunnerImageSourceId = typeof value.localRunnerImageSourceId === "string" && value.localRunnerImageSourceId.trim()
+    ? value.localRunnerImageSourceId.trim()
     : undefined;
-  const gatewayTunnelType = value.gatewayTunnelType === "quick" || value.gatewayTunnelType === "named"
-    ? value.gatewayTunnelType
-    : undefined;
-  const gatewayServiceTokenHash = typeof value.gatewayServiceTokenHash === "string" && value.gatewayServiceTokenHash.trim()
-    ? value.gatewayServiceTokenHash.trim()
-    : undefined;
-  const codexGatewayAuth = value.codexGatewayAuth === "session-token" ? value.codexGatewayAuth : undefined;
 
   return {
-    machineId: typeof value.machineId === "string" ? value.machineId : "",
+    machineId,
+    displayName,
     connectedAt: typeof value.connectedAt === "string" ? value.connectedAt : "",
+    ...(value.runnerCommandProtocol === 1 ? { runnerCommandProtocol: 1 as const } : {}),
+    ...(value.codexRuntimeAuthProtocol === 1 ? { codexRuntimeAuthProtocol: 1 as const } : {}),
     dockerAvailable: value.dockerAvailable === true,
-    codexSubscription: value.codexSubscription === true,
-    ...(codexGatewayAuth ? { codexGatewayAuth } : {}),
+    runnerAvailable: value.runnerAvailable === true,
     claudeSubscription: value.claudeSubscription === true,
-    ...(gatewayPort !== undefined ? { gatewayPort } : {}),
-    ...(gatewayUrl ? { gatewayUrl } : {}),
-    ...(gatewayServiceTokenHash ? { gatewayServiceTokenHash } : {}),
-    ...(gatewayTunnelType ? { gatewayTunnelType } : {}),
+    ...(localRunnerImage ? { localRunnerImage } : {}),
+    ...(localRunnerImageSourceId ? { localRunnerImageSourceId } : {}),
     transport: "session",
   };
 }
@@ -70,15 +72,4 @@ export function mergeMachineServiceState(
 export function getMachineServiceKeys(raw: unknown): MachineServiceKey[] {
   const state = parseMachineServiceState(raw);
   return (["host"] as const).filter((key) => Boolean(state[key]));
-}
-
-export function clearMachineServiceKeys(
-  current: MachineServiceState,
-  keys: Iterable<MachineServiceKey>,
-): MachineServiceState {
-  const next: MachineServiceState = { ...current };
-  for (const key of keys) {
-    delete next[key];
-  }
-  return next;
 }

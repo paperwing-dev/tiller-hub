@@ -4,8 +4,15 @@ import {
   type ArtifactStoreDO,
   type PlanArtifact,
 } from "../coordination";
-import { getWorkspaceStub } from "../helpers";
-import type { Env, EnvMeta, RepoMeta } from "../types";
+import { getLocationHintOptions, getWorkspaceStub } from "../helpers";
+import type { HubDO } from "../hub";
+import type {
+  CodexAuthPreference,
+  Env,
+  EnvMeta,
+  RepoMeta,
+  ResolvedClaudeAuthMode,
+} from "../types";
 import {
   resolveCodexContainerAuth,
   resolveContainerAuth,
@@ -13,9 +20,7 @@ import {
 } from "./container-auth";
 import { getSecret } from "../setup/config";
 import { resolveProtectionState } from "../protection";
-import { resolveScmRunnerBackendKind } from "./runner-backend";
-import { resolveCodexModelRoute } from "../model-route";
-import { mintCodexGatewaySessionToken } from "../gateway-session";
+import { readAccessServiceCredential } from "../access/credentials";
 import {
   buildScmContainerEnvVars,
   type StartupPlanSelection,
@@ -23,21 +28,45 @@ import {
 import {
   resolveContainerHubUrl,
   buildEnvWorkspaceApiBaseUrl,
-  buildRepoGitArtifactUrl,
-  buildEnvScmOperationResultUrl,
-  buildEnvScmOperationHeartbeatUrl,
-  buildEnvScmOperationFailedUrl,
-  buildEnvScmConflictResolutionUrl,
-  buildRepoGitArtifactStagingUrl,
 } from "./hub-url";
 import type { SelectedRepoWorkspace } from "../plan/store";
-import type { RepoScmOperationType } from "../scm/repo-merge-lock-do";
 import workspacePolicy from "./workspace-policy.json";
 import { isGitHubAppAllowedForRequest } from "../github/app";
 import {
   bridgeCredentialsToEnvVars,
   createGitHubBridgeRecord,
 } from "../github/bridge";
+import { SESSION_ENV_NAMES_VAR } from "../redaction";
+import { TILLER_MCP_SERVERS_ENV_VAR, type RepoMcpServer } from "../mcp-servers";
+import {
+  getHarnessModel,
+  validateHarnessSettings,
+} from "../../shared/harness-catalog";
+import {
+  CLOUDFLARE_API_MCP_SERVER_ID,
+  CLOUDFLARE_MCP_PROXY_TOKEN_ENV_VAR,
+  CLOUDFLARE_MCP_PROXY_TOKEN_HEADER,
+} from "../cloudflare-mcp";
+import { buildOpenCodeRuntimeEnv } from "../opencode/runtime-env";
+import type {
+  ScheduledRunCredentialIds,
+  ScheduledRunCredentialScope,
+} from "./scheduled-run-state";
+import {
+  codexExecutionAuthMode,
+  codexExecutionRuntimeMode,
+  codexUnavailableReasonMessage,
+  resolveCodexExecutionForEnv,
+} from "../codex-execution";
+import { getEnvLifecycleStub } from "../helpers";
+import { mintImplementorCodexRuntimeCapability } from "./codex-runtime-capability";
+import type { CodexExecutionProfile } from "../types";
+import { BillingResolutionError, createBillingResolutionError } from "../billing-resolution";
+import {
+  resolveBillingCompatibility,
+  type BillingMode,
+  type ProviderControlledCredentialClass,
+} from "../../shared/billing";
 
 export type RepoWorkspaceHandle = SelectedRepoWorkspace;
 
@@ -49,11 +78,141 @@ export const STARTUP_PLAN_IMPLEMENTATION_PREAMBLE = [
   "and verification.",
 ].join("\n");
 
+export type EnvStartCause = "ordinary" | "scheduled";
+
+export const SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE = [
+  "This is an unattended Tiller Scheduled Run. Implement and verify the approved startup plan autonomously.",
+  "Inspect the existing workspace before changing it; it may contain work from an earlier process.",
+  "Only after implementation and verification are complete, run `tiller-plan complete`.",
+].join("\n");
+
+export function withStartCausePreamble(document: string | null, cause: EnvStartCause): string | null {
+  if (cause === "ordinary") return document;
+  return document
+    ? `${SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE}\n\n${document}`
+    : SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE;
+}
+
 interface RepoPlanSource {
   meta: Pick<RepoMeta, "repoId" | "mainCommit">;
 }
 
-type StartupArtifactStore = Pick<ArtifactStoreDO, "getArtifact" | "listLatestTodoPlansForMain">;
+export type StartupArtifactStore = Pick<ArtifactStoreDO, "getArtifact" | "listLatestTodoPlansForMain">;
+type RepoLaunchSettingsHub = Pick<
+  HubDO,
+  | "resolveRepoSessionEnvVars"
+  | "listEnabledRepoMcpServers"
+  | "mintCloudflareMcpProxyToken"
+  | "mintCloudflareMcpProxyTokenForStart"
+>;
+
+interface LaunchMcpServer {
+  id: string;
+  url: string;
+  envHttpHeaders?: Record<string, string>;
+}
+
+function getHub(env: Env): RepoLaunchSettingsHub {
+  const hubId = env.HUB.idFromName("hub");
+  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as RepoLaunchSettingsHub;
+}
+
+async function resolveRepoSessionEnvVars(
+  env: Env,
+  repoId: string | null | undefined,
+): Promise<Record<string, string>> {
+  const normalizedRepoId = repoId?.trim();
+  if (!normalizedRepoId) return {};
+  const hub = getHub(env);
+  return await hub.resolveRepoSessionEnvVars(normalizedRepoId);
+}
+
+async function resolveEnabledRepoMcpServers(
+  env: Env,
+  repoId: string | null | undefined,
+): Promise<RepoMcpServer[]> {
+  const normalizedRepoId = repoId?.trim();
+  if (!normalizedRepoId) return [];
+  const hub = getHub(env);
+  if (typeof hub.listEnabledRepoMcpServers !== "function") return [];
+  return await hub.listEnabledRepoMcpServers(normalizedRepoId);
+}
+
+function serializeLaunchMcpServers(servers: LaunchMcpServer[]): string {
+  return JSON.stringify(servers.map((server) => ({
+    id: server.id,
+    url: server.url,
+    ...(server.envHttpHeaders ? { envHttpHeaders: server.envHttpHeaders } : {}),
+  })));
+}
+
+async function resolveCloudflareApiMcpLaunch(args: {
+  env: Env;
+  repoId: string | null | undefined;
+  envSlug: string;
+  hubPublicUrl: string;
+  includeCfAccessHeaders?: boolean;
+  credentialScope?: ScheduledRunCredentialScope;
+}): Promise<{
+  server: LaunchMcpServer | null;
+  envVars: Record<string, string>;
+  credentialId?: string;
+}> {
+  const normalizedRepoId = args.repoId?.trim();
+  if (!normalizedRepoId) return { server: null, envVars: {} };
+  const hub = getHub(args.env);
+  if (typeof hub.mintCloudflareMcpProxyToken !== "function") return { server: null, envVars: {} };
+  const scoped = args.credentialScope
+    ? await hub.mintCloudflareMcpProxyTokenForStart(
+        normalizedRepoId,
+        args.envSlug,
+        args.credentialScope,
+      )
+    : null;
+  const token = scoped?.token
+    ?? (args.credentialScope ? null : await hub.mintCloudflareMcpProxyToken(normalizedRepoId, args.envSlug));
+  if (!token) return { server: null, envVars: {} };
+  return {
+    server: {
+      id: CLOUDFLARE_API_MCP_SERVER_ID,
+      url: `${args.hubPublicUrl.replace(/\/+$/, "")}/api/mcp/cloudflare`,
+      envHttpHeaders: {
+        [CLOUDFLARE_MCP_PROXY_TOKEN_HEADER]: CLOUDFLARE_MCP_PROXY_TOKEN_ENV_VAR,
+        ...(args.includeCfAccessHeaders
+          ? {
+              "CF-Access-Client-Id": "CF_ACCESS_CLIENT_ID",
+              "CF-Access-Client-Secret": "CF_ACCESS_CLIENT_SECRET",
+            }
+          : {}),
+      },
+    },
+    envVars: {
+      [CLOUDFLARE_MCP_PROXY_TOKEN_ENV_VAR]: token,
+    },
+    ...(scoped ? { credentialId: scoped.credentialId } : {}),
+  };
+}
+
+function withLaunchEnvMetadata(
+  repoSessionEnvVars: Record<string, string>,
+  commonEnvVars: Record<string, string>,
+  harnessEnvVars: Record<string, string>,
+): Record<string, string> {
+  const envVars = {
+    ...repoSessionEnvVars,
+    ...commonEnvVars,
+    ...harnessEnvVars,
+  };
+  const sessionEnvNames = Object.keys(repoSessionEnvVars)
+    .filter((name) => envVars[name] === repoSessionEnvVars[name])
+    .sort();
+
+  return {
+    ...envVars,
+    [SESSION_ENV_NAMES_VAR]: sessionEnvNames.join(","),
+    TILLER_MANAGED_ENV_NAMES: Object.keys(envVars).sort().join(","),
+  };
+}
 
 export function buildStartupPlanDocument(planText: string): string {
   const trimmed = planText.trim();
@@ -78,6 +237,15 @@ async function resolveLatestTodoPlan(
   return (await artifactStore.listLatestTodoPlansForMain(repoId, mainCommit, 1))[0] as PlanArtifact | undefined ?? null;
 }
 
+export async function resolveSpecificStartupPlanArtifact(
+  artifactStore: StartupArtifactStore,
+  artifactId: string,
+): Promise<PlanArtifact> {
+  const selectedPlan = asPlanArtifact(await artifactStore.getArtifact(artifactId));
+  if (!selectedPlan) throw new Error(`Plan artifact not found: ${artifactId}`);
+  return selectedPlan;
+}
+
 async function resolveSelectedPlanArtifact(
   repo: RepoPlanSource,
   artifactStore: StartupArtifactStore,
@@ -90,7 +258,7 @@ async function resolveSelectedPlanArtifact(
   }
 
   const selectedPlan = selection.mode === "specific"
-    ? asPlanArtifact(await artifactStore.getArtifact(selection.artifactId))
+    ? await resolveSpecificStartupPlanArtifact(artifactStore, selection.artifactId)
     : await resolveLatestTodoPlan(
       artifactStore,
       repo.meta.repoId,
@@ -125,6 +293,36 @@ export async function resolveSelectedPlanId(
   return selectedPlan?.id ?? null;
 }
 
+export async function resolveStartupPlanDocument(
+  repo: RepoPlanSource,
+  artifactStore: StartupArtifactStore,
+  meta: EnvMeta,
+  currentMainCommit: string | null,
+  selection: StartupPlanSelection,
+): Promise<string | null> {
+  const selectedPlan = await resolveSelectedPlanArtifact(repo, artifactStore, meta, currentMainCommit, selection);
+  return renderResolvedStartupPlanDocument(selectedPlan);
+}
+
+export function renderResolvedStartupPlanDocument(selectedPlan: PlanArtifact | null): string | null {
+  return selectedPlan ? buildStartupPlanDocument(renderArtifactBodyMarkdown(selectedPlan.body)) : null;
+}
+
+export async function materializeResolvedStartupPlan(
+  envWorkspace: ReturnType<typeof getWorkspaceStub>,
+  selectedPlan: PlanArtifact | null,
+): Promise<string | null> {
+  if (selectedPlan) {
+    await envWorkspace.writeWorkspaceFile(
+      "/.tiller/plan.md",
+      renderResolvedStartupPlanDocument(selectedPlan)!,
+    );
+  } else {
+    await envWorkspace.clearWorkspacePlanFile();
+  }
+  return selectedPlan?.id ?? null;
+}
+
 export async function materializeStartupPlan(
   repo: RepoPlanSource,
   artifactStore: StartupArtifactStore,
@@ -134,15 +332,7 @@ export async function materializeStartupPlan(
   selection: StartupPlanSelection,
 ): Promise<string | null> {
   const selectedPlan = await resolveSelectedPlanArtifact(repo, artifactStore, meta, currentMainCommit, selection);
-  if (selectedPlan) {
-    await envWorkspace.writeWorkspaceFile(
-      "/.tiller/plan.md",
-      buildStartupPlanDocument(renderArtifactBodyMarkdown(selectedPlan.body)),
-    );
-  } else {
-    await envWorkspace.clearWorkspacePlanFile();
-  }
-  return selectedPlan?.id ?? null;
+  return materializeResolvedStartupPlan(envWorkspace, selectedPlan);
 }
 
 export async function buildContainerLaunchConfig(
@@ -150,35 +340,97 @@ export async function buildContainerLaunchConfig(
   requestUrl: string,
   slug: string,
   repoUrl: string,
-  repoMeta: Pick<RepoMeta, "repoId" | "gitArtifactId" | "githubFullName"> | null | undefined,
+  repoMeta: Pick<RepoMeta, "repoId" | "githubFullName" | "githubDefaultBranch"> | null | undefined,
   meta: EnvMeta,
   options?: {
-    hostMachineId?: string | null;
+    startCause?: EnvStartCause;
+    credentialScope?: ScheduledRunCredentialScope;
+    startOpId?: string;
+    startAuthClaim?: {
+      claudeAuthMode: ResolvedClaudeAuthMode | null;
+      codexAuthPreference: CodexAuthPreference | null;
+    };
   },
 ): Promise<{
   envVars: Record<string, string>;
-  meta: Pick<EnvMeta, "harness" | "authMode" | "resolvedAuthMode" | "codexAuthPreference" | "codexAuthMode" | "opencodeProvider" | "opencodeModel" | "modelRoute" | "authWarning">;
+  meta: Pick<EnvMeta, "harness" | "resolvedAuthMode" | "codexAuthMode">;
+  credentials: ScheduledRunCredentialIds;
 }> {
   const backend = meta.backend;
   const harness = meta.harness;
+  const harnessSettings = validateHarnessSettings(harness, meta.harnessSettings);
+  if (!harnessSettings) {
+    throw new Error(
+      `A complete committed model and effort pair is required to launch the ${harness} harness.`,
+    );
+  }
+  const catalogModel = getHarnessModel(harness, harnessSettings.model);
+  if (!catalogModel) throw new Error(`Model ${harnessSettings.model} is not supported by ${harness}.`);
+  let billingMode: BillingMode | null = null;
+  let pinnedCodexProfile: CodexExecutionProfile | null = null;
+  const lifecycle = options?.startOpId ? getEnvLifecycleStub(env, slug) : null;
+  pinnedCodexProfile = lifecycle && harness === "codex"
+    ? await lifecycle.getCodexExecutionProfile(options!.startOpId!)
+    : null;
+  if (catalogModel.credential !== "workers-ai") {
+    const claim = options?.startAuthClaim;
+    if (!claim) throw new Error("Environment start billing claim is missing.");
+    const claimedMode: BillingMode | null = harness === "claude-code"
+      ? claim.claudeAuthMode
+      : harness === "codex"
+        ? claim.codexAuthPreference === "subscription"
+          ? "subscription"
+          : claim.codexAuthPreference === "api-key" ? "api" : null
+        : catalogModel.credential === "openai-api-key" ? "api" : null;
+    const compatibility = resolveBillingCompatibility(
+      catalogModel.credential as ProviderControlledCredentialClass,
+      claimedMode,
+    );
+    if (compatibility.kind !== "compatible") {
+      throw createBillingResolutionError(catalogModel, compatibility.kind);
+    }
+    billingMode = compatibility.mode;
+  }
   const runnerId = meta.runnerId ?? slug;
   const hubPublicUrl = await resolveContainerHubUrl(env, requestUrl, backend);
   const protection = await resolveProtectionState(env, requestUrl);
+  const repoSessionEnvVars = await resolveRepoSessionEnvVars(env, repoMeta?.repoId);
+  const repoMcpServers = await resolveEnabledRepoMcpServers(env, repoMeta?.repoId);
+  const accessCredential = protection.protectionMode === "cf-access"
+    ? await readAccessServiceCredential(env, hubPublicUrl)
+    : null;
+  const cfClientId = accessCredential?.clientId ?? "";
+  const cfClientSecret = accessCredential?.clientSecret ?? "";
+  const cloudflareApiMcp = await resolveCloudflareApiMcpLaunch({
+    env,
+    repoId: repoMeta?.repoId,
+    envSlug: slug,
+    hubPublicUrl,
+    includeCfAccessHeaders: Boolean(cfClientId && cfClientSecret),
+    credentialScope: options?.credentialScope,
+  });
+  const launchMcpServers: LaunchMcpServer[] = [
+    ...repoMcpServers.map((server) => ({ id: server.id, url: server.url })),
+    ...(cloudflareApiMcp.server ? [cloudflareApiMcp.server] : []),
+  ];
   const githubBridge = repoMeta?.githubFullName && await isGitHubAppAllowedForRequest(env, new Request(requestUrl))
     ? await createGitHubBridgeRecord(env, {
-        subject: { type: "interactive-env", envSlug: slug },
+        subject: {
+          type: "interactive-env",
+          envSlug: slug,
+          ...(options?.credentialScope ?? {}),
+        },
         githubFullName: repoMeta.githubFullName,
       })
     : null;
-  const cfClientId =
-    protection.protectionMode === "cf-access"
-      ? (await getSecret(env, "CF_ACCESS_CLIENT_ID"))?.trim() ?? ""
-      : "";
-  const cfClientSecret =
-    protection.protectionMode === "cf-access"
-      ? (await getSecret(env, "CF_ACCESS_CLIENT_SECRET"))?.trim() ?? ""
-      : "";
-
+  const githubBaseCheckout = repoMeta?.githubFullName && meta.githubBaseCommitSha && githubBridge
+    ? {
+        fullName: repoMeta.githubFullName,
+        baseBranch: meta.githubBaseBranch ?? repoMeta.githubDefaultBranch ?? "",
+        baseCommitSha: meta.githubBaseCommitSha,
+        branch: meta.githubBranch ?? "",
+      }
+    : null;
   const commonEnvVars = {
     NAMESPACE: "hub",
     REPO_SLUG: slug,
@@ -186,180 +438,141 @@ export async function buildContainerLaunchConfig(
     RUNNER_BACKEND: backend,
     RUNNER_ID: runnerId,
     HUB_URL: hubPublicUrl,
-    ...(repoMeta?.repoId && repoMeta.gitArtifactId
+    ...(githubBaseCheckout
       ? {
-          TILLER_REPO_GIT_ARTIFACT_URL: buildRepoGitArtifactUrl(
-            hubPublicUrl,
-            repoMeta.repoId,
-            repoMeta.gitArtifactId,
-          ),
+          TILLER_GITHUB_FULL_NAME: githubBaseCheckout.fullName,
+          TILLER_GITHUB_BASE_BRANCH: githubBaseCheckout.baseBranch,
+          TILLER_GITHUB_BASE_COMMIT_SHA: githubBaseCheckout.baseCommitSha,
+          TILLER_GITHUB_BRANCH: githubBaseCheckout.branch,
+          TILLER_GITHUB_WORKSPACE_DRAFT_FULL: "0",
         }
       : {}),
     NODE_OPTIONS: "--dns-result-order=ipv4first",
     TILLER_HARNESS: harness,
+    ...(options?.startCause === "scheduled" ? { TILLER_START_CAUSE: "scheduled" } : {}),
+    [TILLER_MCP_SERVERS_ENV_VAR]: serializeLaunchMcpServers(launchMcpServers),
+    ...cloudflareApiMcp.envVars,
     ...buildScmContainerEnvVars(meta),
     ...(cfClientId ? { CF_ACCESS_CLIENT_ID: cfClientId } : {}),
     ...(cfClientSecret ? { CF_ACCESS_CLIENT_SECRET: cfClientSecret } : {}),
     ...(githubBridge ? bridgeCredentialsToEnvVars(githubBridge) : {}),
   };
+  const baseCredentials: ScheduledRunCredentialIds = {
+    ...(githubBridge ? { githubBridgeId: githubBridge.id } : {}),
+    ...(cloudflareApiMcp.credentialId
+      ? { cloudflareMcpProxyTokenId: cloudflareApiMcp.credentialId }
+      : {}),
+  };
 
   if (harness === "codex") {
-    const codexAuthPreference = backend === "host" ? "auto" : (meta.codexAuthPreference ?? "auto");
-    const gatewayRoute = codexAuthPreference === "api-key"
-      ? undefined
-      : await resolveCodexModelRoute(env, {
-        target: backend === "host" ? "host" : "hosted",
-        machineId: backend === "host" ? (options?.hostMachineId ?? meta.runnerMachineId ?? null) : null,
-        allowApiFallback: codexAuthPreference !== "subscription",
+    if (catalogModel.binding.kind !== "codex") throw new Error(`Invalid Codex model: ${catalogModel.id}`);
+    let profile: CodexExecutionProfile | null = pinnedCodexProfile;
+    if (!profile) {
+      const resolution = await resolveCodexExecutionForEnv(env, {
+        surface: "implementor",
+        backend,
+        authPreference: billingMode === "subscription" ? "subscription" : "api-key",
       });
-    const gatewaySession = codexAuthPreference !== "api-key"
-      && (gatewayRoute?.kind === "gateway-subscription" || gatewayRoute?.kind === "host-gateway")
-      ? await mintCodexGatewaySessionToken(env, {
-        envSlug: slug,
-        routeKind: gatewayRoute.kind,
-        machineId: gatewayRoute.machineId,
-        gatewayUrl: gatewayRoute.kind === "gateway-subscription" ? gatewayRoute.gatewayUrl : null,
-      })
-      : null;
-    const auth = await resolveCodexContainerAuth(env, {
-      backend,
-      gatewayRoute: gatewayRoute ?? undefined,
-      authPreference: codexAuthPreference,
-      gatewaySessionToken: gatewaySession?.token ?? null,
+      if (resolution.kind === "unavailable") {
+        const message = codexUnavailableReasonMessage(resolution);
+        if (
+          resolution.reason === "api_key_missing"
+          || resolution.reason === "subscription_missing"
+          || resolution.reason === "subscription_needs_reconnect"
+        ) {
+          throw new BillingResolutionError("credential-not-configured", message);
+        }
+        throw new Error(message);
+      }
+      profile = resolution.profile;
+      if (options?.startOpId) {
+        profile = await getEnvLifecycleStub(env, slug).claimCodexExecutionProfile(
+          options.startOpId,
+          profile,
+        );
+        if (!profile) throw new Error("Environment start authentication ownership changed; Restart required.");
+      }
+    }
+
+    const authMode = codexExecutionAuthMode(profile);
+    const runtimeMode = codexExecutionRuntimeMode(profile);
+    let authEnvVars: Record<string, string>;
+    if (profile.kind === "subscription-app-server") {
+      const incarnationId = meta.incarnationId?.trim() ?? "";
+      const startOpId = options?.startOpId?.trim() ?? "";
+      if (!incarnationId || !startOpId) {
+        throw new Error("Codex subscription launch requires an active environment start fence.");
+      }
+      authEnvVars = {
+        TILLER_CODEX_RUNTIME_AUTH_URL: `${hubPublicUrl}/api/envs/${encodeURIComponent(slug)}/codex/runtime-auth`,
+        TILLER_CODEX_RUNTIME_CAPABILITY: await mintImplementorCodexRuntimeCapability(env, {
+          envSlug: slug,
+          incarnationId,
+          startOpId,
+        }),
+      };
+    } else {
+      const auth = await resolveCodexContainerAuth(env, { authPreference: "api-key" });
+      authEnvVars = auth.envVars;
+    }
+
+    const envVars = withLaunchEnvMetadata(repoSessionEnvVars, commonEnvVars, {
+      TILLER_CODEX_AUTH_MODE: authMode,
+      TILLER_CODEX_RUNTIME_MODE: runtimeMode,
+      TILLER_CODEX_MODEL: catalogModel.binding.model,
+      TILLER_CODEX_REASONING_EFFORT: harnessSettings.effort,
+      ...(harnessSettings.fastMode ? { TILLER_CODEX_FAST_MODE: "1" } : {}),
+      ...authEnvVars,
     });
     return {
-      envVars: {
-        ...commonEnvVars,
-        TILLER_CODEX_AUTH_PREFERENCE: auth.authPreference,
-        TILLER_CODEX_AUTH_MODE: auth.resolvedAuthMode,
-        TILLER_CODEX_MODEL_ROUTE: auth.modelRoute,
-        ...(auth.authWarning ? { TILLER_CODEX_AUTH_WARNING: auth.authWarning } : {}),
-        ...auth.envVars,
-      },
+      envVars,
       meta: {
         harness,
-        codexAuthPreference: auth.authPreference,
-        codexAuthMode: auth.resolvedAuthMode,
-        modelRoute: auth.modelRoute,
-        ...(auth.authWarning ? { authWarning: auth.authWarning } : {}),
+        codexAuthMode: authMode,
       },
+      credentials: baseCredentials,
     };
   }
 
   if (harness === "opencode") {
-    const auth = await resolveOpenCodeContainerAuth(env);
+    if (catalogModel.binding.kind !== "opencode") throw new Error(`Invalid OpenCode model: ${catalogModel.id}`);
+    const auth = await resolveOpenCodeContainerAuth(env, catalogModel);
+    const envVars = withLaunchEnvMetadata(
+      repoSessionEnvVars,
+      commonEnvVars,
+      buildOpenCodeRuntimeEnv({
+        model: catalogModel,
+        auth,
+        proxyBaseUrl: `${hubPublicUrl}/api/opencode/v1`,
+        reasoningEffort: harnessSettings.effort,
+      }),
+    );
     return {
-      envVars: {
-        ...commonEnvVars,
-        TILLER_OPENCODE_BASE_URL: `${hubPublicUrl}/api/opencode/v1`,
-        TILLER_OPENCODE_AUTH_TOKEN: auth.proxyToken,
-        TILLER_OPENCODE_MODEL_ID: auth.model,
-      },
-      meta: {
-        harness,
-        opencodeProvider: auth.provider,
-        opencodeModel: auth.model,
-      },
+      envVars,
+      meta: { harness },
+      credentials: baseCredentials,
     };
   }
 
+  if (catalogModel.binding.kind !== "claude") throw new Error(`Invalid Claude Code model: ${catalogModel.id}`);
+  if (!billingMode) throw new Error("Claude launch is missing its claimed billing mode.");
   const auth = await resolveContainerAuth(env, {
-    stored: backend === "host" ? "auto" : (meta.authMode ?? null),
+    requested: billingMode,
     backend,
+  });
+  const envVars = withLaunchEnvMetadata(repoSessionEnvVars, commonEnvVars, {
+    TILLER_CLAUDE_AUTH_RESOLVED_MODE: auth.resolvedAuthMode,
+    TILLER_CLAUDE_MODEL: catalogModel.binding.model,
+    TILLER_CLAUDE_EFFORT: harnessSettings.effort,
+    ...auth.envVars,
   });
 
   return {
-    envVars: {
-      ...commonEnvVars,
-      TILLER_CLAUDE_AUTH_MODE: auth.authMode,
-      TILLER_CLAUDE_AUTH_RESOLVED_MODE: auth.resolvedAuthMode,
-      ...(auth.authWarning ? { TILLER_CLAUDE_AUTH_WARNING: auth.authWarning } : {}),
-      ...auth.envVars,
-    },
+    envVars,
     meta: {
       harness,
-      authMode: auth.authMode,
       resolvedAuthMode: auth.resolvedAuthMode,
-      ...(auth.authWarning ? { authWarning: auth.authWarning } : {}),
     },
-  };
-}
-
-export async function buildGitOperationEnvVars(
-  env: Env,
-  requestUrl: string,
-  repo: RepoWorkspaceHandle,
-  meta: EnvMeta,
-  options: {
-    operationId: string;
-    operationType: RepoScmOperationType;
-    sourceGitArtifactId?: string | null;
-    stagedGitArtifactId?: string | null;
-    mergeLockToken?: string | null;
-  },
-): Promise<Record<string, string>> {
-  const backend = resolveScmRunnerBackendKind(env);
-  const hubPublicUrl = await resolveContainerHubUrl(env, requestUrl, backend);
-  const protection = await resolveProtectionState(env, requestUrl);
-  const jobSlug = `scm-op-${meta.slug}-${options.operationId.slice(-8)}`;
-  const githubBridge = await isGitHubAppAllowedForRequest(env, new Request(requestUrl))
-    ? await createGitHubBridgeRecord(env, {
-        subject: {
-          type: "scm-operation",
-          jobSlug,
-          envSlug: meta.slug,
-          repoId: repo.meta.repoId,
-          operationId: options.operationId,
-        },
-        githubFullName: repo.meta.githubFullName,
-      })
-    : null;
-  const cfClientId =
-    protection.protectionMode === "cf-access"
-      ? (await getSecret(env, "CF_ACCESS_CLIENT_ID"))?.trim() ?? ""
-      : "";
-  const cfClientSecret =
-    protection.protectionMode === "cf-access"
-      ? (await getSecret(env, "CF_ACCESS_CLIENT_SECRET"))?.trim() ?? ""
-      : "";
-
-  return {
-    TILLER_BOOTSTRAP_MODE: "scm-operation",
-    TILLER_SCM_OPERATION: options.operationType,
-    TILLER_SCM_OPERATION_ID: options.operationId,
-    TILLER_REPO_ID: repo.meta.repoId,
-    HUB_URL: hubPublicUrl,
-    TILLER_BRANCH_NAME: meta.branchName ?? "",
-    TILLER_BASE_MAIN_COMMIT: meta.baseMainCommit ?? "",
-    TILLER_ENV_WORKSPACE_API_BASE: buildEnvWorkspaceApiBaseUrl(hubPublicUrl, meta.slug),
-    TILLER_REPO_GIT_ARTIFACT_URL: buildRepoGitArtifactUrl(
-      hubPublicUrl,
-      repo.meta.repoId,
-      options.sourceGitArtifactId ?? repo.meta.gitArtifactId ?? null,
-    ),
-    TILLER_SCM_RESULT_URL: buildEnvScmOperationResultUrl(hubPublicUrl, meta.slug, options.operationId),
-    TILLER_SCM_PROGRESS_URL: `${hubPublicUrl.replace(/\/+$/, "")}/api/envs/${encodeURIComponent(meta.slug)}/scm-operations/${encodeURIComponent(options.operationId)}/progress`,
-    TILLER_SCM_FAILURE_URL: buildEnvScmOperationFailedUrl(hubPublicUrl, meta.slug, options.operationId),
-    TILLER_ENV_ONLY_PATHS: ENV_ONLY_CANONICAL_EXCLUDES.join(","),
-    ...((options.operationType === "merge-into-main" || options.operationType === "update-from-main")
-      ? {
-          TILLER_SCM_HEARTBEAT_URL: buildEnvScmOperationHeartbeatUrl(hubPublicUrl, meta.slug, options.operationId),
-          TILLER_SCM_CONFLICT_RESOLUTION_URL: buildEnvScmConflictResolutionUrl(
-            hubPublicUrl,
-            meta.slug,
-            options.operationId,
-          ),
-          ...(options.mergeLockToken ? { TILLER_SCM_MERGE_LOCK_TOKEN: options.mergeLockToken } : {}),
-        }
-      : {}),
-    ...(options.operationType === "merge-into-main" && options.stagedGitArtifactId
-      ? {
-          TILLER_REPO_GIT_STAGING_URL: buildRepoGitArtifactStagingUrl(hubPublicUrl, repo.meta.repoId, options.operationId),
-          TILLER_REPO_GIT_ARTIFACT_ID: options.stagedGitArtifactId,
-        }
-      : {}),
-    ...(githubBridge ? bridgeCredentialsToEnvVars(githubBridge) : {}),
-    ...(cfClientId ? { CF_ACCESS_CLIENT_ID: cfClientId } : {}),
-    ...(cfClientSecret ? { CF_ACCESS_CLIENT_SECRET: cfClientSecret } : {}),
+    credentials: baseCredentials,
   };
 }

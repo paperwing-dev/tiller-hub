@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, type RefObject } from "react";
 import type { UIMessage } from "ai";
 import { listHostedChatMessages, type HostedChatMessage } from "./hosted-chat";
+import LoadingIndicator from "./LoadingIndicator";
 
 interface HostedChatTranscriptProps {
   messages: UIMessage[];
@@ -38,11 +39,11 @@ export default function HostedChatTranscript({
   return (
     <div ref={activeScrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
       {loading && (
-        <div className="py-8 text-center text-sm text-[#57606a]">Loading...</div>
+        <LoadingIndicator label="Loading messages" className="py-8" />
       )}
 
       {!loading && renderedMessages.length === 0 && !error && (
-        <div className="py-8 text-center text-sm text-[#57606a]">
+        <div className="py-8 text-center text-sm text-kumo-subtle">
           {emptyState}
         </div>
       )}
@@ -55,21 +56,21 @@ export default function HostedChatTranscript({
           <div
             className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
               message.role === "user"
-                ? "bg-[#0969da] text-white"
-                : "border border-[#d0d7de] bg-[#f6f8fa] text-[#24292f]"
+                ? "bg-kumo-brand text-white"
+                : "border border-kumo-line bg-kumo-recessed text-kumo-default"
             }`}
           >
             {message.toolCalls && message.toolCalls.length > 0 && (
               <div className="mb-2 space-y-1">
                 {message.toolCalls.map((toolCall) => (
                   <details key={toolCall.id} className="text-xs">
-                    <summary className="cursor-pointer font-medium text-[#7c3aed]">
+                    <summary className="cursor-pointer font-medium text-kumo-info">
                       {toolCall.name}
                       {toolCall.pending ? " (running...)" : ""}
                       {toolCall.error ? " (failed)" : ""}
                     </summary>
                     {(toolCall.result || toolCall.error) && (
-                      <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded border border-[#e1e4e8] bg-white p-1.5 text-[10px]">
+                      <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded border border-kumo-line bg-kumo-base p-1.5 text-[10px]">
                         {(toolCall.error ?? toolCall.result ?? "").slice(0, 2000)}
                         {(toolCall.error ?? toolCall.result ?? "").length > 2000 ? "..." : ""}
                       </pre>
@@ -86,7 +87,7 @@ export default function HostedChatTranscript({
 
       {error && (
         <div className="flex justify-start">
-          <div className="max-w-[80%] rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <div className="max-w-[80%] rounded-lg border border-kumo-danger/30 bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger">
             {error.message}
           </div>
         </div>
@@ -95,7 +96,7 @@ export default function HostedChatTranscript({
       {streaming &&
         renderedMessages[renderedMessages.length - 1]?.role !== "assistant" && (
           <div className="flex justify-start">
-            <div className="animate-pulse rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2 text-sm text-[#57606a]">
+            <div className="animate-pulse rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-subtle">
               {thinkingLabel}
             </div>
           </div>

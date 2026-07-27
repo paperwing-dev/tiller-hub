@@ -5,18 +5,19 @@ import type {
 } from "../agent-core";
 import type { PlanArtifact, ReviewArtifact } from "../coordination";
 import { renderArtifactBodyMarkdown } from "../coordination";
+import { KIMI_K2_7_CODE } from "../../shared/harness-catalog";
 
 export const PLAN_DEFAULT_MODEL = "gpt-5.5";
 
 export const PLAN_MODEL_OPTIONS = [
   { id: "gpt-5.5", label: "ChatGPT 5.5" },
   { id: "@cf/nvidia/nemotron-3-120b-a12b", label: "Nemotron 120B" },
-  { id: "@cf/moonshotai/kimi-k2.5", label: "Kimi K2.5" },
+  { id: KIMI_K2_7_CODE.providerModel, label: KIMI_K2_7_CODE.label },
 ] as const;
 
 export const PLAN_REVIEW_MODELS = [
   "@cf/nvidia/nemotron-3-120b-a12b",
-  "@cf/moonshotai/kimi-k2.5",
+  KIMI_K2_7_CODE.providerModel,
 ] as const;
 
 export type PlanModelId = (typeof PLAN_MODEL_OPTIONS)[number]["id"];

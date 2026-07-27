@@ -11,6 +11,7 @@ type MemoryStorage = {
   get: <T>(key: string) => Promise<T | null>;
   put: (key: string, value: unknown) => Promise<void>;
   delete: (key: string) => Promise<void>;
+  transaction: <T>(callback: (txn: MemoryStorage) => Promise<T>) => Promise<T>;
   getAlarm: () => Promise<number | null>;
   setAlarm: (time: number) => Promise<void>;
   deleteAlarm: () => Promise<void>;
@@ -20,7 +21,7 @@ function createMemoryStorage(): MemoryStorage {
   const data = new Map<string, unknown>();
   let alarmAt: number | null = null;
 
-  return {
+  const storage: MemoryStorage = {
     async get<T>(key: string) {
       return (data.get(key) as T | undefined) ?? null;
     },
@@ -29,6 +30,9 @@ function createMemoryStorage(): MemoryStorage {
     },
     async delete(key: string) {
       data.delete(key);
+    },
+    async transaction<T>(callback: (txn: MemoryStorage) => Promise<T>) {
+      return callback(storage);
     },
     async getAlarm() {
       return alarmAt;
@@ -40,6 +44,7 @@ function createMemoryStorage(): MemoryStorage {
       alarmAt = null;
     },
   };
+  return storage;
 }
 
 function createSubject() {
@@ -59,10 +64,14 @@ async function readMutableState(subject: EnvLifecycleDO): Promise<EnvMutableStat
 function baseEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
   return {
     slug: "env-test",
+    incarnationId: "incarnation-1",
     repoUrl: "https://github.com/example/repo",
     repoId: "repo-1",
+    scmModel: "github",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
+    harnessSettings: null,
     createdAt: "2026-04-01T00:00:00.000Z",
     updatedAt: "2026-04-01T00:00:00.000Z",
     status: "running",
@@ -135,52 +144,9 @@ describe("EnvLifecycleDO mutable state", () => {
     expect(state.branchStatus).toBe("up-to-date");
   });
 
-  it("SCM projection change preserves workspace fields", async () => {
+  it("recordStopWorkspaceSynced updates workspace fields", async () => {
     const subject = createSubject();
     await subject.initializeMutableStateFromMeta(baseEnvMeta());
-
-    await subject.setScmProjection({
-      type: "merge-into-main",
-      operationId: "op-1",
-      phase: "Starting sandbox",
-    });
-    const state = await readMutableState(subject);
-
-    expect(state.scmOperationType).toBe("merge-into-main");
-    expect(state.scmOperationId).toBe("op-1");
-    expect(state.workspaceLastSyncedAt).toBe("2026-04-01T00:00:10.000Z");
-  });
-
-  it("clearing SCM projection preserves workspace fields", async () => {
-    const subject = createSubject();
-    await subject.initializeMutableStateFromMeta(baseEnvMeta());
-    await subject.setScmProjection({
-      type: "merge-into-main",
-      operationId: "op-1",
-      phase: "Starting sandbox",
-    });
-
-    await subject.clearScmProjection({
-      completedAt: "2026-04-02T00:00:00.000Z",
-      durationMs: 1234,
-    });
-    const state = await readMutableState(subject);
-
-    expect(state.scmOperationType).toBeNull();
-    expect(state.scmOperationId).toBeNull();
-    expect(state.scmLastCompletedAt).toBe("2026-04-02T00:00:00.000Z");
-    expect(state.scmLastDurationMs).toBe(1234);
-    expect(state.workspaceLastSyncedAt).toBe("2026-04-01T00:00:10.000Z");
-  });
-
-  it("recordStopWorkspaceSynced updates workspace fields without touching SCM state", async () => {
-    const subject = createSubject();
-    await subject.initializeMutableStateFromMeta(baseEnvMeta());
-    await subject.setScmProjection({
-      type: "merge-into-main",
-      operationId: "op-1",
-      phase: "Starting sandbox",
-    });
 
     await subject.recordStopWorkspaceSynced({
       workspaceDirty: true,
@@ -195,8 +161,6 @@ describe("EnvLifecycleDO mutable state", () => {
     expect(state.workspaceDirty).toBe(true);
     expect(state.workspaceLastSyncedAt).toBe("2026-04-02T00:00:00.000Z");
     expect(state.branchStatus).toBe("ready-to-merge");
-    expect(state.scmOperationType).toBe("merge-into-main");
-    expect(state.scmOperationId).toBe("op-1");
   });
 
   it("interleaving boot-progress and workspace-sync updates preserves last write of each", async () => {
@@ -221,18 +185,16 @@ describe("EnvLifecycleDO mutable state", () => {
     expect(state.branchStatus).toBe("up-to-date");
   });
 
-  it("setRunnerBinding updates binding without touching other fields", async () => {
+  it("setRunnerBinding updates the runtime id without touching other fields", async () => {
     const subject = createSubject();
     await subject.initializeMutableStateFromMeta(baseEnvMeta());
 
     await subject.setRunnerBinding({
       runnerId: "runner-42",
-      runnerMachineId: "machine-42",
     });
     const state = await readMutableState(subject);
 
     expect(state.runnerId).toBe("runner-42");
-    expect(state.runnerMachineId).toBe("machine-42");
     expect(state.bootMessage).toBe("Workspace: 42 files");
     expect(state.workspaceLastSyncedAt).toBe("2026-04-01T00:00:10.000Z");
   });

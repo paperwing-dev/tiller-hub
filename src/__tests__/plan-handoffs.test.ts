@@ -111,6 +111,13 @@ describe("plan artifact selectors", () => {
         createdAt: "2026-03-29T00:01:00.000Z",
       }),
       createArtifact({
+        id: "evaluating",
+        type: "plan",
+        status: "evaluating",
+        updatedAt: "2026-03-29T00:04:00.000Z",
+        createdAt: "2026-03-29T00:04:00.000Z",
+      }),
+      createArtifact({
         id: "archived",
         type: "plan",
         status: "archived",
@@ -119,6 +126,7 @@ describe("plan artifact selectors", () => {
     ];
 
     const grouped = groupPlansByStatus(artifacts);
+    expect(grouped.evaluating.map((artifact) => artifact.id)).toEqual(["evaluating"]);
     expect(grouped.todo.map((artifact) => artifact.id)).toEqual(["todo-new", "todo-old"]);
     expect(grouped.archived.map((artifact) => artifact.id)).toEqual(["archived"]);
   });

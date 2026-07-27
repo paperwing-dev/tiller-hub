@@ -1,7 +1,33 @@
 import React, { useEffect, useMemo, useState } from "react";
-import type { CodexAuthPreference, EnvHarness, RepoMeta } from "../api/types";
-import type { GitHubRepositorySelection } from "./api";
+import { Button } from "@cloudflare/kumo/components/button";
+import { Dialog } from "@cloudflare/kumo/components/dialog";
+import { Input } from "@cloudflare/kumo/components/input";
+import { Select } from "@cloudflare/kumo/components/select";
+import type { Artifact } from "../api/coordination/types";
+import type {
+  EnvHarness,
+  HarnessSettings,
+  RepoMeta,
+} from "../api/types";
+import {
+  getHarnessDefault,
+  getHarnessModel,
+  resolveHarnessModelAvailability,
+} from "../shared/harness-catalog";
+import type { BillingMode } from "../shared/billing";
+import {
+  fetchExecutionStatus,
+  fetchRepoArtifacts,
+  type CreateEnvOptions,
+  type ExecutionStatus,
+  type GitHubRepositorySelection,
+  type StartupPlanSelection,
+} from "./api";
 import { getHarnessBadgeLabel } from "./env-harness";
+import { NEW_EXECUTION_UNAVAILABLE_MESSAGE } from "./env-display";
+import HarnessSettingsFields from "./HarnessSettingsFields";
+import MarkdownContent from "./MarkdownContent";
+import { isPlanOutdatedForMain, listPlanArtifacts, renderArtifactBodyMarkdown } from "./plan-artifacts";
 import { getRepoMainStatusDetail, getRepoMainStatusLabel, isRepoMainReady } from "./repo-status";
 import { githubRepositoryKey, useGitHubRepositories } from "./useGitHubRepositories";
 
@@ -110,27 +136,30 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
-        <div className="px-5 py-4 border-b border-[#d0d7de]">
-          <h3 className="text-sm font-semibold text-[#24292f]">Add Repository</h3>
+    <Dialog.Root
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <Dialog className="w-full max-w-md p-0">
+        <div className="border-b border-kumo-line px-5 py-4">
+          <Dialog.Title className="text-sm font-semibold text-kumo-strong">Add Repository</Dialog.Title>
         </div>
         <form onSubmit={handleSubmit} className="px-5 py-4">
-          <label className="block text-xs font-medium text-[#57606a] mb-1.5">
-            GitHub Repository
-          </label>
-          <input
+          <Input
+            label="GitHub Repository"
             type="text"
             value={query}
             onChange={handleQueryChange}
             placeholder="Search selected repositories"
             autoFocus
             disabled={loading || loadingRepositories}
-            className="w-full bg-white border border-[#d0d7de] rounded px-3 py-2 text-sm text-[#24292f] placeholder:text-[#6e7781] disabled:opacity-50 focus:outline-none focus:border-[#0969da] focus:ring-1 focus:ring-[#0969da]/30"
+            className="w-full"
           />
-          <div className="mt-3 max-h-64 overflow-auto rounded border border-[#d0d7de] bg-white">
+          <div className="mt-3 max-h-64 overflow-auto rounded border border-kumo-line bg-kumo-base">
             {loadingRepositories ? (
-              <div className="px-3 py-3 text-xs text-[#57606a]">Loading repositories...</div>
+              <div className="px-3 py-3 text-xs text-kumo-subtle">Loading repositories...</div>
             ) : visibleRepositories.length > 0 ? (
               pageRepositories.map((repo) => {
                 const key = repoKey(repo);
@@ -138,7 +167,7 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
                 return (
                   <label
                     key={key}
-                    className={`flex cursor-pointer items-center gap-3 border-b border-[#d0d7de] px-3 py-2 last:border-b-0 ${alreadyAdded ? "bg-[#f6f8fa] opacity-60" : "hover:bg-[#f6f8fa]"}`}
+                    className={`flex cursor-pointer items-center gap-3 border-b border-kumo-line px-3 py-2 last:border-b-0 ${alreadyAdded ? "bg-kumo-recessed opacity-60" : "hover:bg-kumo-tint"}`}
                   >
                     <input
                       type="radio"
@@ -148,8 +177,8 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
                       disabled={loading || alreadyAdded}
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium text-[#24292f]">{repo.fullName}</span>
-                      <span className="block truncate text-[11px] text-[#6e7781]">
+                      <span className="block truncate text-sm font-medium text-kumo-default">{repo.fullName}</span>
+                      <span className="block truncate text-[11px] text-kumo-subtle">
                         {alreadyAdded ? "Already added" : repo.private ? "Private" : "Public"}
                         {repo.defaultBranch ? ` · ${repo.defaultBranch}` : ""}
                       </span>
@@ -158,67 +187,72 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
                 );
               })
             ) : (
-              <div className="px-3 py-3 text-xs text-[#57606a]">
+              <div className="px-3 py-3 text-xs text-kumo-subtle">
                 {repositories.length === 0 ? "No repositories available" : "No repositories match your search"}
               </div>
             )}
           </div>
           {visibleRepositories.length > 0 && pagination.totalPages > 1 && (
-            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-[#57606a]">
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-kumo-subtle">
               <span>
                 {pagination.startIndex + 1}-{pagination.endIndex} of {visibleRepositories.length}
               </span>
               <div className="flex items-center gap-2">
-                <button
+                <Button
                   type="button"
+                  variant="secondary"
+                  size="xs"
                   onClick={goToPreviousPage}
                   disabled={!canPage || !pagination.hasPrevious}
-                  className="rounded border border-[#d0d7de] bg-white px-2 py-1 text-[#57606a] transition-colors hover:bg-[#f6f8fa] disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Previous
-                </button>
+                </Button>
                 <span className="whitespace-nowrap">
                   Page {pagination.page} of {pagination.totalPages}
                 </span>
-                <button
+                <Button
                   type="button"
+                  variant="secondary"
+                  size="xs"
                   onClick={goToNextPage}
                   disabled={!canPage || !pagination.hasNext}
-                  className="rounded border border-[#d0d7de] bg-white px-2 py-1 text-[#57606a] transition-colors hover:bg-[#f6f8fa] disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Next
-                </button>
+                </Button>
               </div>
             </div>
           )}
           {warnings.length > 0 && (
-            <p className="mt-2 text-xs text-amber-700">
+            <p className="mt-2 text-xs text-kumo-warning">
               {warnings[0]?.message}
             </p>
           )}
           {error && (
-            <p className="mt-2 text-xs text-red-600">{error}</p>
+            <p className="mt-2 text-xs text-kumo-danger">{error}</p>
           )}
           <div className="flex justify-end gap-2 mt-4">
-            <button
+            <Button
               type="button"
+              variant="secondary"
+              size="sm"
               onClick={onClose}
               disabled={loading}
-              className="text-xs px-3 py-1.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors disabled:opacity-50"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="submit"
+              variant="primary"
+              size="sm"
+              loading={loading}
               disabled={loading || loadingRepositories || !selected || existingRepoIds.has(String(selected.repositoryId))}
-              className="text-xs px-3 py-1.5 rounded bg-[#0969da] hover:bg-[#0a5bc4] text-white font-medium transition-colors disabled:opacity-40"
             >
               {loading ? "Adding..." : "Add"}
-            </button>
+            </Button>
           </div>
         </form>
-      </div>
-    </div>
+      </Dialog>
+    </Dialog.Root>
   );
 }
 
@@ -230,148 +264,225 @@ function repoKey(repo: GitHubRepositorySelection): string {
 
 interface NewEnvDialogProps {
   onClose: () => void;
-  isLocalDev: boolean;
-  deploymentMode: "hosted" | "self-host";
-  hostConnected: boolean;
-  hostGatewayAvailable?: boolean;
+  hubUrl: string;
   hasClaudeSubscription?: boolean;
   hasAnthropicKey?: boolean;
   hasChatGPTAuth?: boolean;
+  chatgptAuthStatus?: "missing" | "connected" | "refreshing" | "needs_reconnect" | "temporarily_unavailable";
   hasOpenAIKey?: boolean;
+  claudeBillingMode?: BillingMode | null;
+  openaiBillingMode?: BillingMode | null;
   workersAiConfigured?: boolean;
   enabledHarnesses: EnvHarness[];
   repo: RepoMeta;
-  onCreate: (
-    backend: "cf" | "host",
-    harness: EnvHarness,
-    codexAuthPreference?: CodexAuthPreference,
-  ) => Promise<void>;
+  onCreate: (options: CreateEnvOptions) => Promise<void>;
 }
 
 function repoLabel(repoUrl: string): string {
   return repoUrl.replace(/^https?:\/\/(www\.)?github\.com\//, "");
 }
 
-export function getInitialEnvBackendSelection(
-  options: { isLocalDev: boolean; deploymentMode?: "hosted" | "self-host"; hostConnected: boolean; hostGatewayAvailable?: boolean },
-): "cf" | "host" {
-  if (!options.isLocalDev && options.deploymentMode === "hosted") return "cf";
-  const gatewayAvailable = options.hostGatewayAvailable ?? options.hostConnected;
-  return options.isLocalDev || (options.hostConnected && gatewayAvailable) ? "host" : "cf";
+export function getNextLocalThreeAm(now = new Date()): { runAtMs: number; timeZone: string } {
+  const runAt = new Date(now);
+  runAt.setHours(3, 0, 0, 0);
+  if (runAt.getTime() <= now.getTime()) runAt.setDate(runAt.getDate() + 1);
+  return {
+    runAtMs: runAt.getTime(),
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  };
 }
 
-export function getEffectiveCodexAuthPreference(
-  options: {
-    backend: "cf" | "host";
-    deploymentMode: "hosted" | "self-host";
-  },
-): CodexAuthPreference {
-  if (options.backend === "host") return "auto";
-  if (options.deploymentMode === "hosted") return "api-key";
-  return "auto";
-}
-
-export function getHarnessCredentialError(options: {
+export function getScheduledRunRequirementError(options: {
   harness: EnvHarness;
-  backend: "cf" | "host";
-  deploymentMode: "hosted" | "self-host";
-  hasClaudeSubscription?: boolean;
-  hasAnthropicKey?: boolean;
-  hasChatGPTAuth?: boolean;
-  hasOpenAIKey?: boolean;
-  workersAiConfigured?: boolean;
+  executionReady: boolean;
+  openaiBillingMode: "subscription" | "api" | null;
+  hasOpenAIKey: boolean;
+  chatgptAuthStatus: "missing" | "connected" | "refreshing" | "needs_reconnect" | "temporarily_unavailable";
 }): string | null {
-  if (options.harness === "claude-code") {
-    if (options.backend === "cf") {
-      return options.hasAnthropicKey ? null : "Claude Code requires ANTHROPIC_API_KEY for Cloudflare Containers.";
-    }
-    return options.hasClaudeSubscription || options.hasAnthropicKey
+  if (!options.executionReady) return NEW_EXECUTION_UNAVAILABLE_MESSAGE;
+  if (options.harness !== "codex") return "Scheduled Runs require the Codex harness.";
+  if (options.openaiBillingMode === "api") {
+    return options.hasOpenAIKey
       ? null
-      : "Claude Code requires CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY.";
+      : "Configure an OpenAI API key before scheduling a run.";
   }
-
-  if (options.harness === "codex") {
-    if (options.deploymentMode === "hosted") {
-      return options.hasOpenAIKey ? null : "Codex requires OPENAI_API_KEY for Hosted Tiller.";
-    }
-    return options.hasChatGPTAuth || options.hasOpenAIKey
-      ? null
-      : "Codex requires a Codex subscription login or OPENAI_API_KEY.";
+  if (options.openaiBillingMode !== "subscription") {
+    return "Select an OpenAI billing mode in Global Settings before scheduling a run.";
   }
-
-  if (options.harness === "opencode") {
-    return options.workersAiConfigured ? null : "OpenCode requires the Workers AI binding.";
+  if (options.chatgptAuthStatus !== "connected" && !options.hasOpenAIKey) {
+    return options.chatgptAuthStatus === "refreshing"
+      ? "Wait for Codex subscription authentication to finish refreshing."
+      : options.chatgptAuthStatus === "temporarily_unavailable"
+        ? "Codex subscription authentication is temporarily unavailable."
+        : "Connect Codex subscription authentication before scheduling a run.";
   }
-
   return null;
+}
+
+export function getInitialEnvHarnessSelection(enabledHarnesses: EnvHarness[]): EnvHarness {
+  return enabledHarnesses.includes("opencode")
+    ? "opencode"
+    : enabledHarnesses[0] ?? "claude-code";
+}
+
+export function getNewEnvHarnessDefault(harness: EnvHarness): HarnessSettings {
+  return harness === "opencode"
+    ? { model: "gpt-5.6-sol", effort: "xhigh" }
+    : getHarnessDefault(harness);
 }
 
 export function NewEnvDialog({
   onClose,
-  isLocalDev,
-  deploymentMode,
-  hostConnected,
-  hostGatewayAvailable = hostConnected,
+  hubUrl,
   hasClaudeSubscription = false,
   hasAnthropicKey = false,
   hasChatGPTAuth = false,
+  chatgptAuthStatus = "missing",
   hasOpenAIKey = false,
+  claudeBillingMode = null,
+  openaiBillingMode = null,
   workersAiConfigured = false,
   enabledHarnesses,
   repo,
   onCreate,
 }: NewEnvDialogProps) {
-  const [harness, setHarness] = useState<EnvHarness>(enabledHarnesses[0] ?? "claude-code");
-  const [backend, setBackend] = useState<"cf" | "host">(
-    getInitialEnvBackendSelection({ isLocalDev, deploymentMode, hostConnected, hostGatewayAvailable }),
+  const initialHarness = getInitialEnvHarnessSelection(enabledHarnesses);
+  const [harness, setHarness] = useState<EnvHarness>(initialHarness);
+  const [harnessSettings, setHarnessSettings] = useState<HarnessSettings>(() =>
+    getNewEnvHarnessDefault(initialHarness),
   );
+  const [executionStatus, setExecutionStatus] = useState<ExecutionStatus | null>(null);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [plansLoading, setPlansLoading] = useState(true);
+  const [plansError, setPlansError] = useState<string | null>(null);
+  const [planChoice, setPlanChoice] = useState<"none" | "specific">("none");
+  const [selectedPlanId, setSelectedPlanId] = useState("");
+  const [scheduleTonight, setScheduleTonight] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const backend = executionStatus?.selected.target ?? "cf";
+  const executionReady = executionStatus?.executionReady ?? false;
   const repoMainReady = isRepoMainReady(repo);
   const repoMainDetail = getRepoMainStatusDetail(repo);
-  const credentialError = getHarnessCredentialError({
-    harness,
-    backend,
-    deploymentMode,
+  const selectedCatalogModel = getHarnessModel(harness, harnessSettings.model);
+  const credentialStatus = {
     hasClaudeSubscription,
     hasAnthropicKey,
     hasChatGPTAuth,
     hasOpenAIKey,
     workersAiConfigured,
+    claudeBillingMode,
+    openaiBillingMode,
+    chatgptAuthStatus,
+    openaiSubscriptionReady: executionReady,
+    openaiSubscriptionUnavailableReason: executionReady
+      ? null
+      : NEW_EXECUTION_UNAVAILABLE_MESSAGE,
+  };
+  const selectedAvailability = selectedCatalogModel
+    ? resolveHarnessModelAvailability(selectedCatalogModel, backend, credentialStatus)
+    : null;
+  const credentialError = selectedAvailability?.message ?? null;
+  const planArtifacts = useMemo(
+    () => listPlanArtifacts(artifacts).filter((plan) => plan.status === "todo"),
+    [artifacts],
+  );
+  const selectedPlan = useMemo(
+    () => planArtifacts.find((plan) => plan.id === selectedPlanId) ?? planArtifacts[0] ?? null,
+    [planArtifacts, selectedPlanId],
+  );
+  const visibleError = error;
+  const scheduledRunRequirementError = getScheduledRunRequirementError({
+    harness,
+    executionReady,
+    openaiBillingMode,
+    hasOpenAIKey,
+    chatgptAuthStatus,
   });
-  const visibleError = error ?? credentialError;
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadPlans = async () => {
+      setPlansLoading(true);
+      setPlansError(null);
+      try {
+        const nextState = await fetchRepoArtifacts(hubUrl, repo.repoId);
+        if (cancelled) return;
+        setArtifacts(nextState.artifacts);
+      } catch (loadError) {
+        if (cancelled) return;
+        setArtifacts([]);
+        setPlansError(loadError instanceof Error ? loadError.message : "Failed to load plans");
+      } finally {
+        if (!cancelled) setPlansLoading(false);
+      }
+    };
+
+    void loadPlans();
+    return () => {
+      cancelled = true;
+    };
+  }, [hubUrl, repo.repoId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchExecutionStatus(hubUrl)
+      .then((status) => {
+        if (!cancelled) setExecutionStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setExecutionStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hubUrl]);
+
+  useEffect(() => {
+    setSelectedPlanId((current) => {
+      if (current && planArtifacts.some((plan) => plan.id === current)) return current;
+      return planArtifacts[0]?.id ?? "";
+    });
+  }, [planArtifacts]);
 
   useEffect(() => {
     if (!enabledHarnesses.includes(harness)) {
-      setHarness(enabledHarnesses[0] ?? "claude-code");
+      const nextHarness = getInitialEnvHarnessSelection(enabledHarnesses);
+      setHarness(nextHarness);
+      setHarnessSettings(getNewEnvHarnessDefault(nextHarness));
     }
   }, [enabledHarnesses, harness]);
 
   useEffect(() => {
-    if (isLocalDev) {
-      setBackend("host");
-    } else if (deploymentMode === "hosted") {
-      setBackend("cf");
-    } else if (!hostConnected || !hostGatewayAvailable) {
-      setBackend("cf");
-    }
-  }, [deploymentMode, hostConnected, hostGatewayAvailable, isLocalDev]);
+    setError(null);
+  }, [harness, planChoice, selectedPlanId]);
 
   useEffect(() => {
-    setError(null);
-  }, [backend, harness]);
+    if (planChoice !== "specific" || !selectedPlan || scheduledRunRequirementError) setScheduleTonight(false);
+  }, [scheduledRunRequirementError, planChoice, selectedPlan]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (credentialError) return;
+    const planSelection: StartupPlanSelection = planChoice === "specific"
+      ? selectedPlan
+        ? { mode: "specific", artifactId: selectedPlan.id }
+        : { mode: "none" }
+      : { mode: "none" };
+    if (planChoice === "specific" && !selectedPlan) {
+      setError("Choose a plan before creating the environment.");
+      return;
+    }
 
     setLoading(true);
     setError(null);
     try {
-      const effectiveCodexAuthPreference = harness === "codex"
-        ? getEffectiveCodexAuthPreference({ backend, deploymentMode })
-        : undefined;
-      await onCreate(backend, harness, effectiveCodexAuthPreference);
+      await onCreate({
+        harness,
+        planSelection,
+        harnessSettings,
+        schedule: scheduleTonight ? getNextLocalThreeAm() : undefined,
+      });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -380,93 +491,203 @@ export function NewEnvDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
-        <div className="px-5 py-4 border-b border-[#d0d7de]">
-          <h3 className="text-sm font-semibold text-[#24292f]">New Environment</h3>
-          <p className="text-xs text-[#57606a] mt-0.5">{repoLabel(repo.repoUrl)}</p>
+    <Dialog.Root
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-2xl flex-col overflow-hidden p-0">
+        <div className="border-b border-kumo-line px-5 py-4">
+          <Dialog.Title className="text-sm font-semibold text-kumo-strong">New Environment</Dialog.Title>
+          <Dialog.Description className="text-xs text-kumo-subtle mt-0.5">{repoLabel(repo.repoUrl)}</Dialog.Description>
         </div>
-        <form onSubmit={handleSubmit} className="px-5 py-4">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {!repoMainReady && (
-            <div className="mb-3 rounded border border-amber-200 bg-amber-50 px-3 py-2">
-              <div className="text-xs font-semibold uppercase tracking-wide text-amber-800">
+            <div className="mb-3 rounded border border-kumo-warning/30 bg-kumo-warning-tint px-3 py-2">
+              <div className="text-xs font-semibold uppercase tracking-wide text-kumo-warning">
                 {getRepoMainStatusLabel(repo)}
               </div>
-              <p className="mt-1 text-xs text-amber-900">
+              <p className="mt-1 text-xs text-kumo-warning">
                 {repoMainDetail}
               </p>
             </div>
           )}
-          <label className="block text-xs font-medium text-[#57606a] mb-1.5">
-            Execution Backend
-          </label>
-          {isLocalDev ? (
-            <div className="rounded border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2">
-              <p className="text-sm font-medium text-[#24292f]">Tiller Self Host</p>
-              <p className="mt-1 text-[11px] text-[#6e7781]">
-                This localhost hub only supports Tiller Self Host. Keep <code>tiller host</code> running before starting
-                environments.
-              </p>
-            </div>
-          ) : deploymentMode === "hosted" ? (
-            <div className="rounded border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2">
-              <p className="text-sm font-medium text-[#24292f]">Cloudflare Containers</p>
-              <p className="mt-1 text-[11px] text-[#6e7781]">
-                Hosted Tiller runs environments on Cloudflare. Switch to Tiller Self Host before using a connected
-                machine.
-              </p>
-            </div>
-          ) : (
-            <select
-              value={backend}
-              onChange={(e) => setBackend(e.target.value as "cf" | "host")}
-              disabled={loading}
-              className="w-full bg-white border border-[#d0d7de] rounded px-3 py-2 text-sm text-[#24292f] disabled:opacity-50 focus:outline-none focus:border-[#0969da] focus:ring-1 focus:ring-[#0969da]/30"
-            >
-              <option value="cf">Cloudflare Containers</option>
-              <option value="host" disabled={!hostConnected || !hostGatewayAvailable}>Tiller Self Host</option>
-            </select>
-          )}
-          {!isLocalDev && deploymentMode === "self-host" && (!hostConnected || !hostGatewayAvailable) && (
-            <p className="mt-1 text-[11px] text-[#9a6700]">Start `tiller host` to use Tiller Self Host.</p>
-          )}
-          <label className="block text-xs font-medium text-[#57606a] mt-3 mb-1.5">
+          <label className="block text-xs font-medium text-kumo-subtle mb-1.5">
             Harness
           </label>
-          <select
+          <Select
+            aria-label="Harness"
+            className="w-full"
             value={harness}
-            onChange={(e) => setHarness(e.target.value as EnvHarness)}
+            onValueChange={(value) => {
+              const nextHarness = (value ?? getInitialEnvHarnessSelection(enabledHarnesses)) as EnvHarness;
+              setHarness(nextHarness);
+              setHarnessSettings(getNewEnvHarnessDefault(nextHarness));
+            }}
             disabled={loading}
-            className="w-full bg-white border border-[#d0d7de] rounded px-3 py-2 text-sm text-[#24292f] disabled:opacity-50 focus:outline-none focus:border-[#0969da] focus:ring-1 focus:ring-[#0969da]/30"
+            renderValue={(value) => getHarnessBadgeLabel(value as EnvHarness)}
           >
             {enabledHarnesses.map((enabledHarness) => (
-              <option key={enabledHarness} value={enabledHarness}>
+              <Select.Option key={enabledHarness} value={enabledHarness}>
                 {getHarnessBadgeLabel(enabledHarness)}
-              </option>
+              </Select.Option>
             ))}
-          </select>
-          {visibleError && (
-            <p className="mt-2 text-xs text-red-600">{visibleError}</p>
+          </Select>
+          <HarnessSettingsFields
+            className="mt-3"
+            harness={harness}
+            backend={backend}
+            value={harnessSettings}
+            credentialStatus={credentialStatus}
+            disabled={loading}
+            onChange={(nextSettings) => {
+              setHarnessSettings(nextSettings);
+              setError(null);
+            }}
+          />
+          <div className="mt-3">
+            <div className="mb-1.5 text-xs font-medium text-kumo-subtle">Startup Plan</div>
+            {plansLoading ? (
+              <div className="rounded border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-subtle">
+                Loading plans...
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <label className="flex cursor-pointer items-start gap-3 rounded border border-kumo-line px-3 py-2">
+                  <input
+                    type="radio"
+                    name={`new-env-plan-choice-${repo.repoId}`}
+                    value="none"
+                    checked={planChoice === "none"}
+                    onChange={() => setPlanChoice("none")}
+                    disabled={loading}
+                    className="mt-0.5"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-kumo-default">No plan</span>
+                    <span className="block text-xs text-kumo-subtle">
+                      Best for quick debugging, small changes, or exploratory work that does not need a saved plan.
+                    </span>
+                  </span>
+                </label>
+
+                <label className="flex cursor-pointer items-start gap-3 rounded border border-kumo-line px-3 py-2">
+                  <input
+                    type="radio"
+                    name={`new-env-plan-choice-${repo.repoId}`}
+                    value="specific"
+                    checked={planChoice === "specific"}
+                    onChange={() => setPlanChoice("specific")}
+                    disabled={planArtifacts.length === 0 || loading}
+                    className="mt-0.5"
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium text-kumo-default">Select from Plans to Do</span>
+                    <Select
+                      aria-label="Startup Plan"
+                      className="mt-2 w-full"
+                      size="sm"
+                      value={selectedPlanId}
+                      onValueChange={(value) => setSelectedPlanId(value ?? "")}
+                      disabled={planChoice !== "specific" || planArtifacts.length === 0 || loading}
+                      renderValue={(value) => {
+                        const plan = planArtifacts.find((candidate) => candidate.id === value);
+                        return plan ? planOptionLabel(plan, repo.mainCommit ?? null) : "";
+                      }}
+                    >
+                      {planArtifacts.map((plan) => (
+                        <Select.Option key={plan.id} value={plan.id}>
+                          {planOptionLabel(plan, repo.mainCommit ?? null)}
+                        </Select.Option>
+                      ))}
+                    </Select>
+                    {plansError && (
+                      <span className="mt-2 block text-xs text-kumo-warning">{plansError}</span>
+                    )}
+                    {!plansError && planArtifacts.length === 0 && (
+                      <span className="mt-2 block text-xs text-kumo-subtle">No plans marked To do</span>
+                    )}
+                  </span>
+                </label>
+              </div>
+            )}
+          </div>
+          {selectedPlan && planChoice === "specific" && !plansLoading && (
+            <div className="mt-3 rounded border border-kumo-line bg-kumo-recessed px-3 py-3">
+              <div className="text-xs font-medium text-kumo-subtle">Selected plan</div>
+              <div className="mt-1 text-sm font-medium text-kumo-default">{selectedPlan.title || "Untitled plan"}</div>
+              <div className="mt-1 text-xs text-kumo-subtle">
+                Updated {formatTimestamp(selectedPlan.updatedAt)}
+              </div>
+              {isPlanOutdatedForMain(selectedPlan, repo.mainCommit ?? null) && (
+                <div className="mt-2 rounded border border-kumo-warning/30 bg-kumo-warning-tint px-2 py-1.5 text-xs text-kumo-warning">
+                  This plan was saved against a different main commit. You can still create with it because it was explicitly selected.
+                </div>
+              )}
+              <div className="mt-3 max-h-[min(18rem,35vh)] overflow-y-auto rounded border border-kumo-line bg-kumo-base px-3 py-3">
+                <MarkdownContent>{renderArtifactBodyMarkdown(selectedPlan.body)}</MarkdownContent>
+              </div>
+            </div>
           )}
-          <div className="flex justify-end gap-2 mt-4">
-            <button
+          {selectedPlan && planChoice === "specific" && !plansLoading && (
+            <div className="mt-3 rounded border border-kumo-line bg-kumo-recessed px-3 py-2">
+              <label className={`flex items-start gap-3 ${scheduledRunRequirementError ? "cursor-not-allowed opacity-70" : "cursor-pointer"}`}>
+                <input
+                  type="checkbox"
+                  checked={scheduleTonight}
+                  onChange={(event) => setScheduleTonight(event.target.checked)}
+                  disabled={loading || Boolean(scheduledRunRequirementError)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="block text-sm font-medium text-kumo-default">Schedule: run tonight at 3:00 AM</span>
+                  <span className="block text-xs text-kumo-subtle">Create the stopped environment now and start it unattended at the next local 3:00 AM.</span>
+                </span>
+              </label>
+              {scheduledRunRequirementError && (
+                <p className="mt-2 text-xs text-kumo-warning">{scheduledRunRequirementError}</p>
+              )}
+            </div>
+          )}
+            {visibleError && (
+              <p className="mt-2 text-xs text-kumo-danger">{visibleError}</p>
+            )}
+          </div>
+          <div className="flex shrink-0 justify-end gap-2 border-t border-kumo-line px-5 py-4">
+            <Button
               type="button"
+              variant="secondary"
+              size="sm"
               onClick={onClose}
               disabled={loading}
-              className="text-xs px-3 py-1.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] transition-colors disabled:opacity-50"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="submit"
+              variant="primary"
+              size="sm"
+              loading={loading}
               disabled={loading || !repoMainReady || Boolean(credentialError)}
-              className="text-xs px-3 py-1.5 rounded bg-[#0969da] hover:bg-[#0a5bc4] text-white font-medium transition-colors disabled:opacity-40"
             >
-              {loading ? "Creating..." : !repoMainReady ? "Waiting for Main..." : "Create"}
-            </button>
+              {loading ? "Creating..." : !repoMainReady ? "Waiting for Main..." : scheduleTonight ? "Schedule" : "Create"}
+            </Button>
           </div>
         </form>
-      </div>
-    </div>
+      </Dialog>
+    </Dialog.Root>
   );
+}
+
+function planOptionLabel(plan: Artifact, repoMainCommit: string | null): string {
+  return `${plan.title || "Untitled plan"}${isPlanOutdatedForMain(plan, repoMainCommit) ? " (main mismatch)" : ""}`;
+}
+
+function formatTimestamp(value: string | undefined): string {
+  if (!value) return "Unknown time";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
 }

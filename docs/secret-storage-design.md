@@ -62,7 +62,7 @@ Store secrets in the existing HubDO's private SQLite database, in a `config` tab
 Generate an AES-256 key in the DO on first boot, encrypt secrets before storing in KV. Requires compromising both systems to extract secrets.
 
 - **Pros:** Strongest application-level security. KV alone gives useless ciphertext. DO alone gives just the raw key.
-- **Cons:** Significantly more complex. Two storage systems to manage. Key rotation becomes a multi-step operation. For a self-hosted personal tool, this is over-engineered.
+- **Cons:** Significantly more complex. Two storage systems to manage. Key rotation becomes a multi-step operation. For a single-user personal tool, this is over-engineered.
 
 ## Decision: Durable Object SQLite (#5)
 
@@ -72,7 +72,7 @@ We chose DO SQLite because it's the only option that satisfies all three constra
 2. **Meaningfully better security than KV** — not API-accessible, not CLI-accessible, admin-only dashboard visibility with audit logging
 3. **Simple implementation** — uses existing HubDO singleton, ~30 lines of new code for the config table and RPC methods
 
-The security posture is a pragmatic middle ground: better than KV (no programmatic exfiltration), worse than wrangler secrets (admin can view in Data Studio). For a self-hosted personal deployment, this is an acceptable trade-off. Users who want wrangler-secret-level security can still use `wrangler secret put` — those values always take precedence over DO-stored config.
+The security posture is a pragmatic middle ground: better than KV (no programmatic exfiltration), worse than wrangler secrets (admin can view in Data Studio). For a single-user personal deployment, this is an acceptable trade-off. Users who want wrangler-secret-level security can still use `wrangler secret put` — those values always take precedence over DO-stored config.
 
 ## Implementation
 

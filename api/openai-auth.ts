@@ -1,230 +1,142 @@
-import { rpcError } from "./errors";
-import type { ChatGPTAuthStatus, Env } from "./types";
+import { getLocationHintOptions } from "./helpers";
+import type { Env } from "./types";
+import {
+  OpenAIAuthBroker,
+  type OpenAIImportBoundaryResult,
+  type OpenAIAuthStatusResult,
+  type OpenAIRuntimeAuthBoundaryResult,
+  type OpenAIRuntimeAuthResult,
+  type SeedOpenAIAuthInput,
+  type StoredOpenAIAuth,
+} from "./openai-auth-broker";
 
-const OPENAI_TOKENS_KEY = "openai:oauth:tokens";
-const OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const DEFAULT_EXPIRES_IN_SECONDS = 3600;
-const REFRESH_BUFFER_MS = 60_000;
+export type { SeedOpenAIAuthInput, StoredOpenAIAuth } from "./openai-auth-broker";
 
-interface OpenAITokenClaims {
-  chatgpt_account_id?: string;
-  organizations?: Array<{ id?: string }>;
-  "https://api.openai.com/auth"?: {
-    chatgpt_account_id?: string;
-  };
+interface OpenAIAuthHub {
+  importOpenAIAuth(input: SeedOpenAIAuthInput): Promise<OpenAIImportBoundaryResult>;
+  exchangeOpenAIRuntimeAuth(rejectedAccessTokenSha256?: string): Promise<OpenAIRuntimeAuthBoundaryResult>;
+  getOpenAIAuthStatus(refresh?: boolean): Promise<OpenAIAuthStatusResult>;
 }
 
-interface OpenAITokenResponse {
+export interface OpenAIUsableAuth {
   access_token: string;
-  refresh_token?: string;
-  id_token?: string;
-  expires_in?: number;
-}
-
-export interface StoredOpenAIAuth {
-  access_token: string;
-  refresh_token: string;
-  id_token?: string;
-  account_id?: string;
+  account_id: string;
   expires_at: number;
 }
 
-export interface SeedOpenAIAuthInput {
-  access_token: string;
-  refresh_token: string;
-  id_token?: string;
-  expires_in?: number;
+type OpenAIRuntimeExchangeResult =
+  | OpenAIRuntimeAuthBoundaryResult
+  | OpenAIRuntimeAuthResult;
+
+let fallbackBrokers = new WeakMap<object, OpenAIAuthBroker>();
+
+function hasHub(env: Env): boolean {
+  return Boolean((env as unknown as { HUB?: unknown }).HUB);
 }
 
-let refreshPromise: Promise<StoredOpenAIAuth> | null = null;
+function hub(env: Env): OpenAIAuthHub {
+  const id = env.HUB.idFromName("hub");
+  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as OpenAIAuthHub;
+}
 
-function decodeBase64UrlJson<T>(value: string): T | undefined {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padding = "=".repeat((4 - (normalized.length % 4)) % 4);
-
-  try {
-    const binary = atob(normalized + padding);
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    return JSON.parse(new TextDecoder().decode(bytes)) as T;
-  } catch {
-    return undefined;
+function fallbackBroker(env: Env): OpenAIAuthBroker {
+  const key = env as unknown as object;
+  let broker = fallbackBrokers.get(key);
+  if (!broker) {
+    broker = new OpenAIAuthBroker(env);
+    fallbackBrokers.set(key, broker);
   }
-}
-
-function parseJwtClaims(token: string): OpenAITokenClaims | undefined {
-  const parts = token.split(".");
-  if (parts.length !== 3) return undefined;
-  return decodeBase64UrlJson<OpenAITokenClaims>(parts[1]);
-}
-
-function extractAccountIdFromClaims(claims: OpenAITokenClaims): string | undefined {
-  return (
-    claims.chatgpt_account_id ||
-    claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
-    claims.organizations?.[0]?.id
-  );
-}
-
-function extractAccountIdFromTokens(tokens: {
-  access_token: string;
-  id_token?: string;
-}): string | undefined {
-  if (tokens.id_token) {
-    const claims = parseJwtClaims(tokens.id_token);
-    const accountId = claims && extractAccountIdFromClaims(claims);
-    if (accountId) return accountId;
-  }
-
-  const accessClaims = parseJwtClaims(tokens.access_token);
-  return accessClaims ? extractAccountIdFromClaims(accessClaims) : undefined;
-}
-
-async function readStoredTokens(env: Env): Promise<StoredOpenAIAuth | null> {
-  return (await env.ENVS_KV.get<StoredOpenAIAuth>(OPENAI_TOKENS_KEY, "json")) ?? null;
-}
-
-async function writeStoredTokens(env: Env, auth: StoredOpenAIAuth): Promise<void> {
-  await env.ENVS_KV.put(OPENAI_TOKENS_KEY, JSON.stringify(auth));
-}
-
-function buildStoredTokens(
-  tokens: {
-    access_token: string;
-    refresh_token: string;
-    id_token?: string;
-    expires_in?: number;
-  },
-  previous?: StoredOpenAIAuth,
-): StoredOpenAIAuth {
-  const accountId =
-    extractAccountIdFromTokens({
-      access_token: tokens.access_token,
-      id_token: tokens.id_token ?? previous?.id_token,
-    }) ?? previous?.account_id;
-
-  return {
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token,
-    id_token: tokens.id_token ?? previous?.id_token,
-    account_id: accountId,
-    expires_at: Date.now() + (tokens.expires_in ?? DEFAULT_EXPIRES_IN_SECONDS) * 1000,
-  };
+  return broker;
 }
 
 export async function seedTokens(env: Env, input: SeedOpenAIAuthInput): Promise<StoredOpenAIAuth> {
-  const stored = buildStoredTokens(input);
-  await writeStoredTokens(env, stored);
-  return stored;
+  // Test and migration helper only. Production imports always cross HubDO.
+  if (hasHub(env)) throw new Error("OpenAI credentials must be imported through HubDO");
+  return await fallbackBroker(env).seedForTests(input);
 }
 
-export async function validateAndSeedTokens(env: Env, input: SeedOpenAIAuthInput): Promise<StoredOpenAIAuth> {
-  const candidate = buildStoredTokens(input);
-  return await refreshAccessToken(env, candidate);
+export async function validateAndSeedTokens(
+  env: Env,
+  input: SeedOpenAIAuthInput,
+): Promise<StoredOpenAIAuth | OpenAIUsableAuth> {
+  const result = hasHub(env)
+    ? await hub(env).importOpenAIAuth(input)
+    : await fallbackBroker(env).import(input);
+  if (!result.ok) throw new Error(result.message);
+  if ("stored" in result) return result.stored;
+  return {
+    access_token: result.credential.accessToken,
+    account_id: result.credential.accountId,
+    expires_at: Date.parse(result.credential.expiresAt),
+  };
+}
+
+export async function exchangeOpenAIRuntimeAuth(
+  env: Env,
+  rejectedAccessTokenSha256?: string,
+): Promise<OpenAIRuntimeExchangeResult> {
+  return hasHub(env)
+    ? await hub(env).exchangeOpenAIRuntimeAuth(rejectedAccessTokenSha256)
+    : await fallbackBroker(env).runtimeAuth(rejectedAccessTokenSha256);
 }
 
 export async function refreshAccessToken(
   env: Env,
   currentAuth?: StoredOpenAIAuth,
-): Promise<StoredOpenAIAuth> {
-  const existing = currentAuth ?? await readStoredTokens(env);
-  if (!existing) {
-    throw rpcError("ServiceUnavailable", "OpenAI auth not seeded");
-  }
-
-  const response = await fetch("https://auth.openai.com/oauth/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: existing.refresh_token,
-      client_id: OPENAI_OAUTH_CLIENT_ID,
-    }).toString(),
+): Promise<StoredOpenAIAuth | OpenAIUsableAuth> {
+  if (currentAuth && !hasHub(env)) await fallbackBroker(env).seedForTests({
+    access_token: currentAuth.access_token,
+    refresh_token: currentAuth.refresh_token,
+    id_token: currentAuth.id_token,
+    expires_in: Math.max(1, Math.floor((currentAuth.expires_at - Date.now()) / 1000)),
   });
-
-  if (!response.ok) {
-    throw rpcError("ServiceUnavailable", `OpenAI token refresh failed: ${response.status}`);
-  }
-
-  const payload = await response.json<OpenAITokenResponse>();
-  if (!payload.access_token) {
-    throw rpcError("ServiceUnavailable", "OpenAI token refresh returned no access token");
-  }
-
-  const refreshed = buildStoredTokens(
-    {
-      access_token: payload.access_token,
-      refresh_token: payload.refresh_token ?? existing.refresh_token,
-      id_token: payload.id_token,
-      expires_in: payload.expires_in,
-    },
-    existing,
+  const result = await exchangeOpenAIRuntimeAuth(
+    env,
+    currentAuth ? await sha256Hex(currentAuth.access_token) : await rejectedCurrentTokenHash(env),
   );
-
-  await writeStoredTokens(env, refreshed);
-  return refreshed;
-}
-
-export async function getValidOpenAIAuth(env: Env): Promise<StoredOpenAIAuth> {
-  const stored = await readStoredTokens(env);
-  if (!stored) {
-    throw rpcError("ServiceUnavailable", "OpenAI auth not seeded");
-  }
-
-  if (stored.expires_at > Date.now() + REFRESH_BUFFER_MS) {
-    return stored;
-  }
-
-  if (!refreshPromise) {
-    refreshPromise = refreshAccessToken(env, stored).finally(() => {
-      refreshPromise = null;
-    });
-  }
-
-  return refreshPromise;
-}
-
-export async function getStatus(
-  env: Env,
-): Promise<{ authenticated: boolean; status: ChatGPTAuthStatus; expires_at?: number; account_id?: string }> {
-  const stored = await readStoredTokens(env);
-  if (!stored) return { authenticated: false, status: "missing" };
-
-  if (stored.expires_at <= Date.now() + REFRESH_BUFFER_MS) {
-    if (refreshPromise) {
-      return {
-        authenticated: true,
-        status: "refreshing",
-        expires_at: stored.expires_at,
-        account_id: stored.account_id,
-      };
-    }
-
-    try {
-      const refreshed = await refreshAccessToken(env, stored);
-      return {
-        authenticated: true,
-        status: "connected",
-        expires_at: refreshed.expires_at,
-        account_id: refreshed.account_id,
-      };
-    } catch {
-      return {
-        authenticated: false,
-        status: "needs_reconnect",
-        expires_at: stored.expires_at,
-        account_id: stored.account_id,
-      };
-    }
-  }
-
+  if (!result.ok) throw new Error(result.message);
+  if ("stored" in result) return result.stored;
   return {
-    authenticated: true,
-    status: "connected",
-    expires_at: stored.expires_at,
-    account_id: stored.account_id,
+    access_token: result.credential.accessToken,
+    account_id: result.credential.accountId,
+    expires_at: Date.parse(result.credential.expiresAt),
   };
 }
 
+async function rejectedCurrentTokenHash(env: Env): Promise<string | undefined> {
+  if (hasHub(env)) return undefined;
+  const stored = await env.ENVS_KV.get<StoredOpenAIAuth>("openai:oauth:tokens", "json");
+  return stored ? await sha256Hex(stored.access_token) : undefined;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function getValidOpenAIAuth(env: Env): Promise<StoredOpenAIAuth | OpenAIUsableAuth> {
+  const result = await exchangeOpenAIRuntimeAuth(env);
+  if (!result.ok) throw new Error(result.message);
+  if ("stored" in result) return result.stored;
+  return {
+    access_token: result.credential.accessToken,
+    account_id: result.credential.accountId,
+    expires_at: Date.parse(result.credential.expiresAt),
+  };
+}
+
+export async function getStatus(env: Env): Promise<OpenAIAuthStatusResult> {
+  return hasHub(env)
+    ? await hub(env).getOpenAIAuthStatus(true)
+    : await fallbackBroker(env).getStatus({ refresh: true });
+}
+
+export async function getReadOnlyStatus(env: Env): Promise<OpenAIAuthStatusResult> {
+  return hasHub(env)
+    ? await hub(env).getOpenAIAuthStatus(false)
+    : await fallbackBroker(env).getReadOnlyStatus();
+}
+
 export function resetOpenAIAuthStateForTests(): void {
-  refreshPromise = null;
+  fallbackBrokers = new WeakMap<object, OpenAIAuthBroker>();
 }

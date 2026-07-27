@@ -95,14 +95,14 @@ export function normalizeHostedToolError(error: unknown): HostedToolError {
   }
 
   if (error instanceof Error) {
-    const message = error.message.trim() || "Hosted tool failed unexpectedly.";
+    const message = error.message.trim() || "Agent tool failed unexpectedly.";
     if (/timeout/i.test(message)) {
       return { code: "timeout", message, retryable: true };
     }
     if (/(unauthorized|forbidden|not authorized|auth)/i.test(message)) {
       return { code: "auth", message };
     }
-    if (/(unavailable|temporarily unavailable|gateway)/i.test(message)) {
+    if (/(unavailable|temporarily unavailable)/i.test(message)) {
       return { code: "unavailable", message, retryable: true };
     }
     return { code: "internal", message };
@@ -110,7 +110,7 @@ export function normalizeHostedToolError(error: unknown): HostedToolError {
 
   return {
     code: "internal",
-    message: "Hosted tool failed unexpectedly.",
+    message: "Agent tool failed unexpectedly.",
   };
 }
 
@@ -203,8 +203,6 @@ export interface HostedToolRegistryOptions {
   savePlanDefaults?: {
     repoId: string;
     planArtifactId: string;
-    expectedVersion: number;
-    currentMainCommit: string | null;
   };
 }
 
@@ -307,7 +305,6 @@ export function createHostedToolRegistry(
   };
   const savePlan = async (input: Record<string, unknown>) => {
     const markdown = getInputString(input, "markdown");
-    const title = getInputString(input, "title");
     if (markdown === undefined) {
       return fail("invalid_input", "markdown is required");
     }
@@ -315,24 +312,12 @@ export function createHostedToolRegistry(
       return fail("unavailable", "Plan saving is unavailable in this chat.", { retryable: true });
     }
 
-    const result = await artifactStore.savePlan({
+    const artifact = await artifactStore.savePlan({
       repoId: savePlanDefaults.repoId,
       id: savePlanDefaults.planArtifactId,
-      expectedVersion: savePlanDefaults.expectedVersion,
       markdown,
-      ...(title ? { title } : {}),
-      currentMainCommit: savePlanDefaults.currentMainCommit,
     });
-    if (result.status === "ok") {
-      savePlanDefaults.expectedVersion = result.version;
-      return ok({ status: "ok", version: result.version });
-    }
-    return ok({
-      status: "conflict",
-      currentVersion: result.currentVersion,
-      ...(result.currentTitle ? { currentTitle: result.currentTitle } : {}),
-      ...(result.currentMarkdownDigest ? { currentMarkdownDigest: result.currentMarkdownDigest } : {}),
-    });
+    return ok({ status: "ok", version: artifact.version ?? 1 });
   };
   return new Map<HostedToolName, HostedTool>([
     [
@@ -433,7 +418,7 @@ export function createHostedToolRegistry(
       buildTool(
         {
           name: "save_memory",
-          description: "Persist a short note for future hosted agents.",
+          description: "Persist a short note for future agents.",
           parameters: {
             type: "object",
             properties: {
@@ -493,7 +478,6 @@ export function createHostedToolRegistry(
           parameters: {
             type: "object",
             properties: {
-              title: { type: "string", description: "Optional updated plan title" },
               markdown: { type: "string", description: "Full standalone Markdown plan body" },
             },
             required: ["markdown"],
@@ -594,7 +578,7 @@ export function getHostedToolsForAgent(
   return spec.toolNames.map((name) => {
     const tool = registry.get(name);
     if (!tool) {
-      throw new Error(`Hosted tool is not registered: ${name}`);
+      throw new Error(`Agent tool is not registered: ${name}`);
     }
     return tool;
   });

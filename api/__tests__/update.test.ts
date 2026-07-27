@@ -1,15 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-const { resolveWorkerServiceNameMock, resolveAccountForHostnameMock } = vi.hoisted(() => ({
+const { resolveWorkerServiceNameMock } = vi.hoisted(() => ({
   resolveWorkerServiceNameMock: vi.fn(async () => "tiller-hub"),
-  resolveAccountForHostnameMock: vi.fn(),
 }));
 
 vi.mock("../setup/cloudflare", () => ({
   resolveWorkerServiceName: resolveWorkerServiceNameMock,
-}));
-
-vi.mock("../access/cloudflare-api", () => ({
-  resolveAccountForHostname: resolveAccountForHostnameMock,
 }));
 
 import { checkForUpdate, compareVersions } from "../update/check-release";
@@ -21,7 +16,11 @@ import {
   reconcileContainerApplication,
   resolveAccountAndScript,
 } from "../update/cloudflare-deploy";
-import { parseTillerUpdateMetadata } from "../update/metadata";
+import {
+  fetchLatestReleaseUpdateMetadata,
+  parseTillerUpdateMetadata,
+  UPDATE_SERVICE_URL,
+} from "../update/metadata";
 import type { UpdateManifest } from "../update/types";
 
 function updateMarker(sourceId: string, version = "0.2.0") {
@@ -36,6 +35,8 @@ function updateMarker(sourceId: string, version = "0.2.0") {
     managedFiles: ["package.json", "wrangler.jsonc"],
   };
 }
+
+const RUNTIME_SHA = "0123456789abcdef0123456789abcdef01234567";
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -52,6 +53,13 @@ function latestReleaseResponse(version = "0.2.0"): Response {
   });
 }
 
+function latestUpdateServiceResponse(latestUpdate = updateMarker("latest-source")): Response {
+  return jsonResponse({
+    update: latestUpdate,
+    releaseNotesUrl: `https://github.com/paperwing-dev/tiller-hub/releases/tag/tiller-hub-v${latestUpdate.version}`,
+  });
+}
+
 function requestUrl(input: RequestInfo | URL): string {
   return input instanceof Request ? input.url : String(input);
 }
@@ -59,6 +67,9 @@ function requestUrl(input: RequestInfo | URL): string {
 function mockLatestReleaseFetch(latestUpdate = updateMarker("latest-source")) {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = requestUrl(input);
+    if (url === UPDATE_SERVICE_URL) {
+      return latestUpdateServiceResponse(latestUpdate);
+    }
     if (url.endsWith("/repos/paperwing-dev/tiller-hub/releases/latest")) {
       return latestReleaseResponse(latestUpdate.version);
     }
@@ -92,15 +103,8 @@ const manifest: UpdateManifest = {
       instance_type: "basic",
     },
     {
-      class_name: "ScmBootstrapDO",
-      app_name_suffix: "scmbootstrapdo",
-      image: "docker.io/jamieatlason/tiller-scm:v2",
-      max_instances: 2,
-      instance_type: "basic",
-    },
-    {
-      class_name: "ScmOperationDO",
-      app_name_suffix: "scmoperationdo",
+      class_name: "GitHubJobDO",
+      app_name_suffix: "githubjobdo",
       image: "docker.io/jamieatlason/tiller-scm:v2",
       max_instances: 2,
       instance_type: "basic",
@@ -124,6 +128,143 @@ describe("parseTillerUpdateMetadata", () => {
     const { version: _version, ...withoutVersion } = updateMarker("current-source");
     expect(parseTillerUpdateMetadata(withoutVersion)).toBeNull();
   });
+
+  it("accepts valid self-host runtime metadata", () => {
+    const parsed = parseTillerUpdateMetadata({
+      ...updateMarker("current-source"),
+      selfHostRuntime: {
+        imageSourceId: RUNTIME_SHA,
+        sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${RUNTIME_SHA}`,
+      },
+    });
+
+    expect(parsed?.selfHostRuntime).toEqual({
+      imageSourceId: RUNTIME_SHA,
+      sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${RUNTIME_SHA}`,
+    });
+  });
+
+  it("rejects malformed optional self-host runtime metadata", () => {
+    expect(parseTillerUpdateMetadata({
+      ...updateMarker("current-source"),
+      selfHostRuntime: {
+        imageSourceId: RUNTIME_SHA,
+        sandboxImage: "docker.io/jamieatlason/tiller-sandbox:stable",
+      },
+    })).toBeNull();
+
+    expect(parseTillerUpdateMetadata({
+      ...updateMarker("current-source"),
+      selfHostRuntime: {
+        imageSourceId: RUNTIME_SHA,
+        sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${"f".repeat(40)}`,
+      },
+    })).toBeNull();
+  });
+});
+
+describe("fetchLatestReleaseUpdateMetadata", () => {
+  function mockUpdateServiceFallbackFetch(serviceResponse: Response | ((init?: RequestInit) => Promise<Response>), latestUpdate = updateMarker("github-latest", "0.3.0")) {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url === UPDATE_SERVICE_URL) {
+        return typeof serviceResponse === "function" ? serviceResponse(init) : serviceResponse;
+      }
+      if (url.endsWith("/repos/paperwing-dev/tiller-hub/releases/latest")) {
+        return latestReleaseResponse(latestUpdate.version);
+      }
+      if (url.endsWith(`/paperwing-dev/tiller-hub/tiller-hub-v${latestUpdate.version}/tiller-update.json`)) {
+        return jsonResponse(latestUpdate);
+      }
+      return jsonResponse({ message: "Not Found" }, 404);
+    });
+  }
+
+  it("falls back to GitHub when the update service returns non-2xx", async () => {
+    const fetchMock = mockUpdateServiceFallbackFetch(jsonResponse({ error: "unavailable" }, 503));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchLatestReleaseUpdateMetadata({
+      currentVersion: "0.1.1",
+      channel: "release",
+    });
+
+    expect(result.update.sourceId).toBe("github-latest");
+    expect(fetchMock.mock.calls.map((call) => requestUrl(call[0]))).toEqual([
+      UPDATE_SERVICE_URL,
+      "https://api.github.com/repos/paperwing-dev/tiller-hub/releases/latest",
+      "https://raw.githubusercontent.com/paperwing-dev/tiller-hub/tiller-hub-v0.3.0/tiller-update.json",
+    ]);
+  });
+
+  it("falls back to GitHub when the update service returns malformed JSON shape", async () => {
+    const fetchMock = mockUpdateServiceFallbackFetch(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchLatestReleaseUpdateMetadata({
+      currentVersion: "0.1.1",
+      channel: "release",
+    });
+
+    expect(result.update.sourceId).toBe("github-latest");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("falls back to GitHub when the update service returns invalid update metadata", async () => {
+    const invalidUpdate = {
+      ...updateMarker("service-latest", "0.3.0"),
+      sourceRepo: "paperwing-dev/not-tiller",
+    };
+    const fetchMock = mockUpdateServiceFallbackFetch(jsonResponse({
+      update: invalidUpdate,
+      releaseNotesUrl: "https://example.com/release",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchLatestReleaseUpdateMetadata({
+      currentVersion: "0.1.1",
+      channel: "release",
+    });
+
+    expect(result.update.sourceId).toBe("github-latest");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("falls back to GitHub when the update service times out", async () => {
+    const fetchMock = mockUpdateServiceFallbackFetch((init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchLatestReleaseUpdateMetadata({
+      currentVersion: "0.1.1",
+      channel: "release",
+      timeoutMs: 1,
+    });
+
+    expect(result.update.sourceId).toBe("github-latest");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("skips the update service when TILLER_UPDATE_SERVICE_DISABLED is set", async () => {
+    const fetchMock = mockLatestReleaseFetch(updateMarker("github-latest", "0.3.0"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchLatestReleaseUpdateMetadata({
+      currentVersion: "0.1.1",
+      channel: "release",
+      updateServiceDisabled: "1",
+    });
+
+    expect(result.update.sourceId).toBe("github-latest");
+    expect(fetchMock.mock.calls.map((call) => requestUrl(call[0]))).toEqual([
+      "https://api.github.com/repos/paperwing-dev/tiller-hub/releases/latest",
+      "https://raw.githubusercontent.com/paperwing-dev/tiller-hub/tiller-hub-v0.3.0/tiller-update.json",
+    ]);
+  });
 });
 
 afterEach(() => {
@@ -131,7 +272,6 @@ afterEach(() => {
   vi.unstubAllGlobals();
   resolveWorkerServiceNameMock.mockReset();
   resolveWorkerServiceNameMock.mockResolvedValue("tiller-hub");
-  resolveAccountForHostnameMock.mockReset();
 });
 
 describe("checkForUpdate", () => {
@@ -182,7 +322,14 @@ describe("checkForUpdate", () => {
 
     const result = await checkForUpdate(env as never);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(UPDATE_SERVICE_URL);
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      headers: {
+        "X-Tiller-Version": "0.1.1",
+        "X-Tiller-Channel": "release",
+      },
+    });
     expect(result.updateAvailable).toBe(true);
     expect(result.buildDiagnostics.channel).toBe("release");
   });
@@ -207,16 +354,55 @@ describe("checkForUpdate", () => {
 
     const result = await checkForUpdate(env as never);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls.map((call) => requestUrl(call[0]))).toEqual([
-      "https://api.github.com/repos/paperwing-dev/tiller-hub/releases/latest",
-      "https://raw.githubusercontent.com/paperwing-dev/tiller-hub/tiller-hub-v0.2.0/tiller-update.json",
+      UPDATE_SERVICE_URL,
     ]);
     expect(result.currentUpdate.sourceId).toBe("current-source");
     expect(result.latestUpdate.sourceId).toBe("latest-source");
     expect(result.releaseNotesUrl).toBe("https://github.com/paperwing-dev/tiller-hub/releases/tag/tiller-hub-v0.2.0");
     expect(result.updateAvailable).toBe(true);
     expect(env.ENVS_KV.put).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses fresh embedded current update metadata when a cache hit has the same source id", async () => {
+    const currentUpdate = {
+      ...updateMarker("current-source"),
+      selfHostRuntime: {
+        imageSourceId: RUNTIME_SHA,
+        sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${RUNTIME_SHA}`,
+      },
+    };
+    vi.stubGlobal("__TILLER_VERSION__", "0.1.1");
+    vi.stubGlobal("__TILLER_CURRENT_UPDATE__", currentUpdate);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const env = {
+      ENVS_KV: {
+        get: vi.fn().mockResolvedValue({
+          updateAvailable: true,
+          currentUpdate: updateMarker("current-source"),
+          latestUpdate: updateMarker("latest-source"),
+          buildDiagnostics: {
+            channel: "release",
+            version: "0.1.1",
+            workersCiCommitSha: null,
+            workersCiBranch: null,
+          },
+          releaseNotesUrl: "https://example.com/release",
+        }),
+        put: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+
+    const result = await checkForUpdate(env as never);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(env.ENVS_KV.put).not.toHaveBeenCalled();
+    expect(result.currentUpdate.selfHostRuntime).toEqual(currentUpdate.selfHostRuntime);
+    expect(result.latestUpdate.sourceId).toBe("latest-source");
+    expect(result.updateAvailable).toBe(true);
   });
 
   it("uses source identity even when the running Hub version is newer than the latest public release tag", async () => {
@@ -235,8 +421,7 @@ describe("checkForUpdate", () => {
     const result = await checkForUpdate(env as never);
 
     expect(fetchMock.mock.calls.map((call) => requestUrl(call[0]))).toEqual([
-      "https://api.github.com/repos/paperwing-dev/tiller-hub/releases/latest",
-      "https://raw.githubusercontent.com/paperwing-dev/tiller-hub/tiller-hub-v0.1.1/tiller-update.json",
+      UPDATE_SERVICE_URL,
     ]);
     expect(result.currentUpdate.version).toBe("0.2.35");
     expect(result.latestUpdate.version).toBe("0.1.1");
@@ -316,14 +501,14 @@ describe("checkForUpdate", () => {
 });
 
 describe("buildTillerBindings", () => {
-  it("preserves inherited vars and identifies missing resources", () => {
+  it("preserves active inherited vars, drops retired origin vars, and identifies missing resources", () => {
     const result = buildTillerBindings(
       {
         bindings: [
           { type: "plain_text", name: "DO_LOCATION_HINT", text: "wnam" },
           { type: "plain_text", name: "HUB_PUBLIC_URL", text: "https://tiller.example.com" },
           { type: "plain_text", name: "WORKER_SERVICE_NAME", text: "tiller-hub" },
-          { type: "plain_text", name: "WORKERS_DEV_ALIAS_DISABLED", text: "true" },
+          { type: "plain_text", name: "TILLER_UPDATE_SERVICE_DISABLED", text: "1" },
           { type: "kv_namespace", name: "ENVS_KV", namespace_id: "kv-123" },
         ],
       },
@@ -333,9 +518,7 @@ describe("buildTillerBindings", () => {
     expect(result.bindings).toEqual(
       expect.arrayContaining([
         { type: "plain_text", name: "DO_LOCATION_HINT", text: "wnam" },
-        { type: "plain_text", name: "HUB_PUBLIC_URL", text: "https://tiller.example.com" },
-        { type: "plain_text", name: "WORKER_SERVICE_NAME", text: "tiller-hub" },
-        { type: "plain_text", name: "WORKERS_DEV_ALIAS_DISABLED", text: "true" },
+        { type: "plain_text", name: "TILLER_UPDATE_SERVICE_DISABLED", text: "1" },
         { type: "kv_namespace", name: "ENVS_KV", namespace_id: "kv-123" },
         { type: "durable_object_namespace", name: "HUB", class_name: "HubDO" },
         { type: "ai", name: "AI" },
@@ -344,6 +527,8 @@ describe("buildTillerBindings", () => {
         { type: "plain_text", name: "ENABLED_ENV_HARNESSES", text: "claude-code,codex" },
       ]),
     );
+    expect(result.bindings.map((binding) => binding.name)).not.toContain("HUB_PUBLIC_URL");
+    expect(result.bindings.map((binding) => binding.name)).not.toContain("WORKER_SERVICE_NAME");
     expect(result.missingResources.kv).toEqual([]);
     expect(result.missingResources.r2).toEqual([
       { type: "r2_bucket", name: "BUCKET", name_derive: "worker" },
@@ -494,19 +679,17 @@ describe("container manifest helpers", () => {
         bindings: [
           ...manifest.bindings,
           { type: "durable_object_namespace", name: "SANDBOX", class_name: "SandboxDO" },
-          { type: "durable_object_namespace", name: "SCM_BOOTSTRAP", class_name: "ScmBootstrapDO" },
-          { type: "durable_object_namespace", name: "SCM_OPERATION", class_name: "ScmOperationDO" },
+          { type: "durable_object_namespace", name: "GITHUB_JOB", class_name: "GitHubJobDO" },
         ],
       },
-      "ScmBootstrapDO",
-    )).toBe("SCM_BOOTSTRAP");
+      "GitHubJobDO",
+    )).toBe("GITHUB_JOB");
   });
 
-  it("builds known names for desired and legacy container suffixes", () => {
+  it("builds known names for desired container suffixes", () => {
     expect(Array.from(buildKnownContainerNames("tiller-hub", manifest.containers)).sort()).toEqual([
+      "tiller-hub-githubjobdo",
       "tiller-hub-sandboxdo",
-      "tiller-hub-scmbootstrapdo",
-      "tiller-hub-scmoperationdo",
     ]);
   });
 });

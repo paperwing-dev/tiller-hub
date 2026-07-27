@@ -38,7 +38,7 @@ export function pickPrimaryEnvSession(
 ): StoredSession | null {
   return sessions.find(
     (session) =>
-      isManagedSessionForEnv(session, envSlug)
-      && getManagedSessionRole(session) === "lead",
+      isManagedSessionForEnv(session, envSlug) &&
+      getManagedSessionRole(session) === "lead",
   ) ?? null;
 }

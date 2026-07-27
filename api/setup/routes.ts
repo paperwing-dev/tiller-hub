@@ -2,30 +2,20 @@ import { Hono } from "hono";
 import type { HonoEnv, Env } from "../types";
 import { getLocationHintOptions, getSandboxStub } from "../helpers";
 import { listEnvViews } from "../env/view";
-import { normalizeCloudflareUiError } from "../cloudflare-errors";
 import { getIdleTimeoutMinutes, getSecret, invalidateConfigCache } from "./config";
 import {
-  inferCloudflareAccessJwtConfig,
-  verifyCfAccessJwt,
-  verifyInferredCloudflareAccessToken,
-} from "../auth";
-import { deriveManagedMachineHostnames } from "../machine-hosts";
+  resolveSetupStatus,
+  resolveWorkersDevAccessOnboardingStatus,
+} from "./status-resolver";
+import { isLocalDevRequest } from "../protection";
+import { parseCanonicalWorkersDevHostname } from "../canonical-workers-dev";
+import { readWorkersDevAccessLifecycle } from "../workers-dev-access/records";
 import {
-  resolveWorkerServiceName,
-  verifyWorkerDomainAccess,
-} from "./cloudflare";
-import { getRouteKind, resolveProtectionState } from "../protection";
-import {
-  assertNoUnsupportedWildcardCoverage,
-  findExactAndWildcardApps,
-} from "../access/manage";
-import { ACCESS_CONFIG_CLAIM_KEYS } from "../access/config-keys";
-import {
-  listAccessApps,
-  listServiceTokens,
-  resolveAccountForHostname,
-} from "../access/cloudflare-api";
-import { resolveSetupStatus } from "./status-resolver";
+  CLOUDFLARE_IDLE_TIMEOUT_MAX_MINUTES,
+  CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES,
+  isCloudflareIdleTimeoutMinutes,
+} from "../../shared/cloudflare-timeout";
+import { normalizeBillingMode, type BillingMode } from "../../shared/billing";
 
 // Keys that can be managed via the settings page.
 const CONFIGURABLE_KEYS = new Set([
@@ -44,24 +34,7 @@ function getHub(env: Env) {
   const id = env.HUB.idFromName("hub");
   return env.HUB.get(id, getLocationHintOptions(env)) as unknown as {
     setConfig(key: string, value: string): void;
-    claimWorkersDevAccessConfig(input: {
-      audience: string;
-      teamDomain: string;
-    }): {
-      claimed: boolean;
-      audience: string | null;
-      teamDomain: string | null;
-    };
   };
-}
-
-async function hasAnyAccessConfigValue(env: Env): Promise<boolean> {
-  for (const key of ACCESS_CONFIG_CLAIM_KEYS) {
-    if ((await getSecret(env, key, { fresh: true }))?.trim()) {
-      return true;
-    }
-  }
-  return false;
 }
 
 // ── Routes ─────────────────────────────────────────────────────────
@@ -69,16 +42,29 @@ async function hasAnyAccessConfigValue(env: Env): Promise<boolean> {
 const setupRoutes = new Hono<HonoEnv>();
 
 setupRoutes.get("/api/setup/status", async (c) => {
+  c.header("Cache-Control", "no-store");
+  if (!isLocalDevRequest(c.env, c.req.raw)) {
+    const lifecycle = await readWorkersDevAccessLifecycle(c.env);
+    if (!lifecycle.configured) {
+      const origin = new URL(c.req.url).origin;
+      parseCanonicalWorkersDevHostname(new URL(c.req.url).hostname);
+      return c.json(resolveWorkersDevAccessOnboardingStatus(c.env, origin));
+    }
+  }
   return c.json(await resolveSetupStatus(c.env, c.req.raw));
 });
 
 setupRoutes.post("/api/setup", async (c) => {
-  const body = await c.req.json<{ secrets?: Record<string, string> }>();
-  if (!body.secrets || typeof body.secrets !== "object") {
-    return c.json({ error: "Request body must contain a `secrets` object" }, 400);
+  const body = await c.req.json<{
+    secrets?: Record<string, string>;
+    settings?: { claudeBillingMode?: BillingMode | null; openaiBillingMode?: BillingMode | null };
+  } | null>();
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "Request body must be an object" }, 400);
   }
+  const secrets = body.secrets && typeof body.secrets === "object" ? body.secrets : {};
 
-  const entries = Object.entries(body.secrets).filter(
+  const entries = Object.entries(secrets).filter(
     ([, v]) => typeof v === "string" && v.length > 0,
   );
   const invalid = entries.filter(([k]) => !CONFIGURABLE_KEYS.has(k as ConfigurableKey));
@@ -89,13 +75,45 @@ setupRoutes.post("/api/setup", async (c) => {
     );
   }
 
-  if (entries.length === 0) {
-    return c.json({ error: "No valid secrets provided" }, 400);
+  const rawSettings = body.settings;
+  if (rawSettings !== undefined && (!rawSettings || typeof rawSettings !== "object" || Array.isArray(rawSettings))) {
+    return c.json({ error: "settings must be an object" }, 400);
+  }
+  const unknownSettingKeys = rawSettings
+    ? Object.keys(rawSettings).filter((key) => key !== "claudeBillingMode" && key !== "openaiBillingMode")
+    : [];
+  if (unknownSettingKeys.length > 0) {
+    return c.json({ error: `Invalid settings: ${unknownSettingKeys.join(", ")}` }, 400);
+  }
+  const settingEntries = rawSettings
+    ? Object.entries(rawSettings).filter(([, value]) => value !== undefined)
+    : [];
+  for (const [key, value] of settingEntries) {
+    if (value === null) {
+      return c.json({ error: `${key} cannot be reset to null after activation` }, 400);
+    }
+    if (!normalizeBillingMode(value)) {
+      return c.json({ error: `${key} must be 'subscription' or 'api'` }, 400);
+    }
+  }
+
+  if (entries.length === 0 && settingEntries.length === 0) {
+    return c.json({ error: "No valid secrets or settings provided" }, 400);
+  }
+
+  const idleTimeout = entries.find(([key]) => key === "IDLE_TIMEOUT_MINUTES");
+  if (idleTimeout && !isCloudflareIdleTimeoutMinutes(Number(idleTimeout[1]))) {
+    return c.json({
+      error: `IDLE_TIMEOUT_MINUTES must be an integer between ${CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES} and ${CLOUDFLARE_IDLE_TIMEOUT_MAX_MINUTES}`,
+    }, 400);
   }
 
   const hub = getHub(c.env);
   for (const [key, value] of entries) {
     await hub.setConfig(key, value);
+  }
+  for (const [key, value] of settingEntries) {
+    await hub.setConfig(key, value as BillingMode);
   }
 
   invalidateConfigCache();
@@ -115,86 +133,7 @@ setupRoutes.post("/api/setup", async (c) => {
     }
   }
 
-  return c.json({ ok: true, saved: entries.map(([k]) => k) });
-});
-
-setupRoutes.post("/api/setup/workers-dev-access", async (c) => {
-  const protection = await resolveProtectionState(c.env, c.req.url);
-  if (getRouteKind(c.req.url) !== "workers-dev") {
-    return c.json({ error: "workers.dev Access setup only applies to workers.dev routes." }, 400);
-  }
-
-  if (protection.accessConfigured) {
-    return c.json({
-      ok: true,
-      status: await resolveSetupStatus(c.env, c.req.raw),
-    });
-  }
-  if (await hasAnyAccessConfigValue(c.env)) {
-    return c.json({
-      error: "workers.dev Access claim can only run before Access config exists.",
-      code: "access_config_not_empty",
-    }, 409);
-  }
-
-  const rawBody = await c.req.text().catch(() => "");
-  const trimmedBody = rawBody.trim();
-  if (trimmedBody && trimmedBody !== "{}") {
-    return c.json({
-      error: "workers.dev Access claim does not accept request body fields.",
-      code: "body_not_supported",
-    }, 400);
-  }
-
-  const token = c.req.header("Cf-Access-Jwt-Assertion")?.trim() ?? "";
-  if (!token) {
-    return c.json({
-      error: "Cloudflare Access did not send a JWT. If you just enabled Access, wait a bit, reload Tiller through Access, then verify again.",
-      code: "missing_access_jwt",
-      hint: "Cloudflare Access can take about 30 seconds to start sending the JWT after you turn it on. Reload this page after the wait, sign in if prompted, then verify again.",
-    }, 400);
-  }
-
-  let inferred: { audience: string; issuer: string };
-  try {
-    inferred = inferCloudflareAccessJwtConfig(token);
-    await verifyInferredCloudflareAccessToken(token, inferred);
-  } catch (error) {
-    return c.json({
-      error: error instanceof Error ? error.message : "Invalid Cloudflare Access JWT",
-      code: "invalid_access_jwt",
-    }, 400);
-  }
-
-  const hub = getHub(c.env);
-  const claim = await hub.claimWorkersDevAccessConfig({
-    audience: inferred.audience,
-    teamDomain: inferred.issuer,
-  });
-  invalidateConfigCache();
-
-  if (!claim.claimed) {
-    try {
-      await verifyCfAccessJwt(c.req.raw, c.env);
-    } catch {
-      return c.json({ error: "Unauthorized" }, 401);
-    }
-  }
-
-  return c.json({
-    ok: true,
-    status: await resolveSetupStatus(c.env, c.req.raw),
-  });
-});
-
-setupRoutes.post("/api/setup/custom-domain", async (c) => {
-  return c.json(
-    {
-      error:
-        "Custom domains are now configured through Tiller Self Host setup. Run `tiller host setup --hub-url <workersDevHubUrl>` from the protected workers.dev hub URL.",
-    },
-    400,
-  );
+  return c.json({ ok: true, saved: [...entries, ...settingEntries].map(([k]) => k) });
 });
 
 setupRoutes.post("/api/setup/verify-model-auth", async (c) => {
@@ -268,45 +207,6 @@ setupRoutes.post("/api/setup/verify-model-auth", async (c) => {
 
   const allOk = results.every((r) => r.ok);
   return c.json({ ok: allOk, results });
-});
-
-setupRoutes.post("/api/setup/verify-cloudflare-token", async (c) => {
-  const body = await c.req.json<{ hostname?: string; apiToken?: string }>();
-  const hostname = body.hostname?.trim() ?? "";
-  const apiToken = body.apiToken?.trim() ?? "";
-
-  if (!hostname) {
-    return c.json({ error: "Custom domain hostname is required" }, 400);
-  }
-  if (!apiToken) {
-    return c.json({ error: "Cloudflare API token is required" }, 400);
-  }
-
-  try {
-    const workerServiceName = await resolveWorkerServiceName(c.env, c.req.url);
-    const resolved = await resolveAccountForHostname(apiToken, hostname);
-    const managedHosts = deriveManagedMachineHostnames(`https://${resolved.hostname}`);
-    await verifyWorkerDomainAccess(apiToken, resolved.accountId);
-    const apps = await listAccessApps(apiToken, resolved.accountId);
-    await listServiceTokens(apiToken, resolved.accountId);
-    for (const candidate of [
-      resolved.hostname,
-      managedHosts.gatewayHostname,
-    ].filter((value): value is string => Boolean(value))) {
-      assertNoUnsupportedWildcardCoverage(candidate, findExactAndWildcardApps(candidate, apps));
-    }
-
-    return c.json({
-      ok: true,
-      hostname: resolved.hostname,
-      zoneName: resolved.zoneName,
-      workerServiceName,
-      gatewayHostname: managedHosts.gatewayHostname,
-    });
-  } catch (error) {
-    const normalized = normalizeCloudflareUiError(error, hostname);
-    return c.json(normalized, normalized.status);
-  }
 });
 
 export default setupRoutes;

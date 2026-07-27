@@ -15,6 +15,9 @@ export function githubRepositoryKey(selection: Pick<GitHubRepositorySelection, "
 
 export function formatGitHubRepositoryError(error: unknown): string {
   if (error instanceof ApiActionError) {
+    if (error.code === "github_app_repository_list_failed" && /rate limit exceeded/i.test(error.message)) {
+      return "GitHub's API rate limit is temporarily exhausted. Repositories will appear after GitHub resets it; reinstalling the App will not help.";
+    }
     switch (error.code) {
       case "github_app_public_hub_disabled":
         return "Public workers.dev hubs cannot add repositories. Configure a protected hub or use localhost.";

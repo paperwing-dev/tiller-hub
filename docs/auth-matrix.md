@@ -1,171 +1,90 @@
-# Tiller Auth Matrix
+# Tiller Authentication Matrix
 
-This is the current auth and config surface for `tiller-hub`, `tiller`, and
-`tiller-harness`.
+Execution placement and provider billing are independent. Settings stores the
+execution backend for new workloads plus `claudeBillingMode` and
+`openaiBillingMode`. Each workload freezes both placement and its applicable
+provider route before dispatch.
 
-The important split is:
+## Deployment Inputs
 
-- execution backend: Cloudflare Containers or a registered runner
-- harness auth path: gateway subscription route, direct API credentials, or direct provider credentials
+| Name | Required | Purpose |
+| --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | Local/CI deploys | Deploy Worker resources. |
+| `CLOUDFLARE_ACCOUNT_ID` | Local/CI deploys | Select the Cloudflare account without discovery. |
+| `TILLER_REGION` | Deploy-button flow | R2 and Durable Object placement. |
+| `WRANGLER_CI_OVERRIDE_NAME` | Workers Builds | Selected Worker name. |
 
-## Deployment-time credentials
+Production origin and Access trust are not supplied by `HUB_PUBLIC_URL` or
+scalar `CF_ACCESS_*` secrets. They come from the canonical workers.dev trust
+and credential records in `HubDO`.
 
-These are used to deploy the worker, not during normal runtime.
+## Hub Model and Repository Inputs
 
-| Name | Where used | Required | Notes |
-| --- | --- | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | Wrangler deploys / CI | Yes | Standard Cloudflare API token for deploy-time operations. |
-| `CLOUDFLARE_ACCOUNT_ID` | Wrangler deploys / CI | Sometimes | Useful when Wrangler cannot infer the account automatically. |
-| `TILLER_REGION` | Deploy flow | Yes for the deploy-button path | One of `wnam`, `enam`, `weur`, `eeur`, `apac`, or `oc`. |
-| `WRANGLER_CI_OVERRIDE_NAME` | Workers Builds | Auto-set by Cloudflare | Selected Worker name from Cloudflare's setup page. Tiller uses it for generated resource names. |
+| Name | Use |
+| --- | --- |
+| `ENABLED_ENV_HARNESSES` | Comma-separated `claude-code`, `codex`, and `opencode`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude subscription billing. |
+| `ANTHROPIC_API_KEY` | Claude API billing. |
+| `OPENAI_API_KEY` | OpenAI API billing; never consulted by an active subscription profile. |
+| `TILLER_WORKERS_AI_ACCOUNT_ID` / `TILLER_WORKERS_AI_API_TOKEN` | Explicit Workers AI credentials when no bound `AI` service is used. |
+| `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY` | GitHub App repository access. |
+| `DO_LOCATION_HINT` | Durable Object placement override. |
+| `LOCAL_DEV_ONLY_BACKEND` | Contributor loopback development only. |
 
-Optional power-user deploy inputs:
+Imported Codex subscription credentials are stored and refreshed by `HubDO`.
+Refresh credentials are never passed to runtimes.
 
-| Name | Where used | Required | Notes |
-| --- | --- | --- | --- |
-| `TILLER_WORKER_NAME` | `npm run deploy` | Optional | Local explicit Worker name override. Useful when deploying more than one hosted hub in the same account. |
-| `TILLER_CUSTOM_DOMAIN` | `npm run deploy` | Optional | Deploys directly to a protected custom domain instead of `workers.dev`. |
-| `TILLER_ACCESS_EMAILS` | `npm run deploy` | Required with `TILLER_CUSTOM_DOMAIN` | Comma- or newline-separated emails allowed through Cloudflare Access. |
-| `CF_ACCESS_CLIENT_ID` | local `tiller` only | Optional | Not required for deploy. Useful for protected custom-domain hubs. |
-| `CF_ACCESS_CLIENT_SECRET` | local `tiller` only | Optional | Same role as `CF_ACCESS_CLIENT_ID`. |
+## Canonical Access Principals
 
-## Hosted `tiller-hub` runtime bindings and secrets
+| Principal | Signed Access identity | Allowed scope |
+| --- | --- | --- |
+| Owner | Canonical normalized email and no service identity | UI plus owner-only Settings, credential issuance, Access renewal, and cleanup manifest. |
+| Service | No email and canonical service-client `common_name` | CLI, machine daemon, runtimes, callbacks, ordinary HTTP, and WebSockets. |
+| Callback bypass | Exact allowlisted method/path | GitHub webhook and Access broker proof/completion only. |
+| Local development | Loopback request | Contributor-only relaxed boundary. |
 
-These are the live bindings or secrets used by the deployed worker.
+Owner-only routes reject the shared service principal. Raw Access client headers
+are consumed at Cloudflare's edge and are not Worker authentication.
 
-| Name | Required | Used for | Notes |
-| --- | --- | --- | --- |
-| `HUB_PUBLIC_URL` | Optional | Public hub URL handed to containers | If unset, `tiller-hub` derives it from the incoming request origin. |
-| `CF_ACCESS_CLIENT_ID` | Optional | Cloudflare Access service token | Required only when the hub is on a protected custom domain. |
-| `CF_ACCESS_CLIENT_SECRET` | Optional | Cloudflare Access service token | Same role as `CF_ACCESS_CLIENT_ID`. |
-| `TILLER_GATEWAY_TUNNEL_ID` | Auto-managed | Stored gateway tunnel bootstrap | Written by `Publish & Protect` when the protected gateway tunnel is provisioned. |
-| `TILLER_GATEWAY_TUNNEL_NAME` | Auto-managed | Stored gateway tunnel bootstrap | Defaults to `tiller-gateway`. |
-| `TILLER_GATEWAY_TUNNEL_TOKEN` | Auto-managed | Stored gateway tunnel bootstrap | Used by `tiller host` to run the managed gateway tunnel. |
-| `TILLER_GATEWAY_TUNNEL_TARGET_PORT` | Auto-managed | Stored gateway tunnel bootstrap | Currently `8788`. |
-| `DEFAULT_NAMESPACE` | Yes | Default namespace selection | Current system still assumes a default namespace exists. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Optional | Claude subscription auth in containers | Current subscription path for Claude containers. |
-| `ANTHROPIC_API_KEY` | Optional | Anthropic API auth in containers | Used when Claude auth resolves to API mode. |
-| `OPENAI_API_KEY` | Optional | Codex API key fallback | Used when no active Codex gateway subscription route exists. |
-| `TILLER_OPENCODE_PROXY_TOKEN` | Internal | OpenCode hub proxy auth | Generated automatically by the hub and injected into OpenCode containers. |
-| `OPENAI_MODEL` | Optional | Hosted Research model override | Defaults are defined by agent specs if unset. |
-| `GITHUB_APP_ID` / `GITHUB_APP_CLIENT_ID` / `GITHUB_APP_SLUG` / `GITHUB_APP_PRIVATE_KEY` | Optional | GitHub repo access | Stored in HubDO config by the GitHub App setup flow. Repository add/env creation only uses repos selected in this App installation. Public `workers.dev` hubs cannot add repos. |
-| `DO_LOCATION_HINT` | Optional | Hub Durable Object placement override | Usually injected automatically from `TILLER_REGION`. |
+## Local Configuration
 
-## Runtime-discovered local services
+Values live in `~/.config/tiller/config.json` or `TILLER_CONFIG_PATH`.
 
-These are no longer configured as worker secrets.
+| Key / environment variable | Purpose |
+| --- | --- |
+| `hubUrl` / `HUB_URL` | Exact workers.dev origin; localhost is allowed only for development. |
+| `clientId` / `CF_ACCESS_CLIENT_ID` | Installation service client ID delivered by encrypted browser connection. |
+| `clientSecret` / `CF_ACCESS_CLIENT_SECRET` | Installation service secret delivered by encrypted browser connection. |
+| `machineId` | Generated persistent machine UUID; it cannot be overridden by the environment. |
+| `displayName` / `TILLER_MACHINE_DISPLAY_NAME` | Human-readable hostname or label. |
+| `localRunnerPort` / `TILLER_LOCAL_RUNNER_PORT` | Loopback runner port, default `8789`. |
+| `localRunnerImage` / `TILLER_LOCAL_RUNNER_IMAGE` | Managed sandbox image. |
 
-`tiller-hub` discovers them from machine registration in `HubDO`:
+Config normalization prefers a stored workers.dev URL, strips retired aliases,
+custom-domain attempts, public flags, promotion state, enable tokens, and
+hostname identity, and preserves valid Access credentials and machine UUID.
 
-- active runner:
-  - used only for host backend env lifecycle
-- active gateway:
-  - used for Codex subscription routing from hosted features and remote Codex envs
+## Runtime Provider Inputs
 
-Removed worker-secret paths:
+| Route | Supervisor input |
+| --- | --- |
+| Claude subscription | `CLAUDE_CODE_OAUTH_TOKEN` |
+| Claude API | `ANTHROPIC_API_KEY` |
+| Codex subscription | App-server mode plus a scoped runtime-auth callback capability |
+| Codex API direct CLI | `OPENAI_API_KEY` and direct-CLI mode |
+| Codex API app-server | `OPENAI_API_KEY` and app-server mode |
+| OpenCode Workers AI | Hub proxy model ID and scoped proxy token |
 
-- `LOCAL_RUNNER_URL`
-- `LOCAL_RUNNER_TOKEN`
-- `RESEARCH_RELAY_URL`
-- `RESEARCH_RELAY_TOKEN`
+The supervisor strips Access credentials, runtime capabilities, refresh
+credentials, callback tokens, and bridge secrets before spawning child
+TUI/tool/model-command processes.
 
-## Local `tiller` config
+## Machine Readiness
 
-These values live in `~/.config/tiller/config.json` or equivalent env vars.
+Your machine reuses the installation-wide service credential. A healthy
+advertisement includes its UUID, display name, Docker/runner checks, protocol
+versions, and exact runtime image. Readiness expires with the health lease.
 
-| Key / Env | Required | Used for | Notes |
-| --- | --- | --- | --- |
-| `hubUrl` / `HUB_URL` | Yes | Target hub URL | Example: `https://tiller.example.com`. |
-| `clientId` / `CF_ACCESS_CLIENT_ID` | Optional | Cloudflare Access service token | Required when the hub is on a protected custom domain. Ignored for `workers.dev` hubs. |
-| `clientSecret` / `CF_ACCESS_CLIENT_SECRET` | Optional | Cloudflare Access service token | Same role as `clientId`. |
-| `gatewayTunnelName` / `TILLER_GATEWAY_TUNNEL_NAME` | Optional | Legacy local gateway named tunnel | Defaults to `tiller-gateway`. Fallback only when hub-managed gateway bootstrap is unavailable. |
-| `gatewayHostname` / `TILLER_GATEWAY_HOSTNAME` | Optional | Public gateway hostname | Defaults to `tiller-gateway.<hub-domain>`. |
-| `localRunnerPort` / `TILLER_LOCAL_RUNNER_PORT` | Optional | Local runner listen port | Defaults to `8789`. |
-| `gatewayPort` / `TILLER_GATEWAY_PORT` | Optional | Local gateway listen port | Defaults to `8788`. |
-| `localRunnerImage` / `TILLER_LOCAL_RUNNER_IMAGE` | Optional | Local sandbox image | Defaults to `docker.io/jamieatlason/tiller-sandbox:stable`. Override it when you want a custom or SHA-pinned host image. |
-| `cloudflaredConfigPath` / `TILLER_CLOUDFLARED_CONFIG_PATH` | Optional | Legacy tunnel config path | Defaults to `~/.cloudflared/config.yml`. Fallback only for locally managed named tunnels. |
-
-## Minimal supported setups
-
-### Hosted hub only
-
-Required:
-
-- `DEFAULT_NAMESPACE`
-- provider auth for whichever harnesses you actually use
-
-Notes:
-
-- OpenCode uses the hub's built-in Workers AI binding through an internal hub proxy.
-- AI Gateway is intentionally out of scope for this v1 harness path.
-
-Optional:
-
-- `HUB_PUBLIC_URL`
-- `CF_ACCESS_CLIENT_ID`
-- `CF_ACCESS_CLIENT_SECRET`
-
-### Hosted hub + laptop-local execution
-
-Required on the machine:
-
-- `hubUrl`
-- `clientId` and `clientSecret`, only if the hub is a protected custom domain
-- Docker
-- local image matching `localRunnerImage` (default: `docker.io/jamieatlason/tiller-sandbox:stable`)
-
-Optional:
-
-- a different `localRunnerImage` if you want to pin a SHA or custom build
-
-### Hosted hub + home-network gateway
-
-Required on the machine:
-
-- `hubUrl`
-- `clientId` and `clientSecret`, only if the hub is a protected custom domain
-- `tiller host`
-- imported Codex subscription login available in Tiller
-
-Normal path:
-
-- finish `Publish & Protect` so the hub stores the managed gateway tunnel bootstrap
-- run `tiller host setup`
-- run `tiller host`
-
-Legacy fallback:
-
-- local Cloudflare tunnel credentials when using a manually managed named tunnel
-
-Optional:
-
-- `OPENAI_API_KEY` in the hub as fallback when the gateway is offline
-
-### Hosted hub + OpenCode on Workers AI
-
-Required on the hub:
-
-- `DEFAULT_NAMESPACE`
-
-Notes:
-
-- No local `opencode login` state is required.
-- No extra Cloudflare Workers AI API credentials are required.
-- No AI Gateway route is used in v1.
-
-## Explicitly removed legacy items
-
-These are no longer part of the active runtime surface:
-
-- `LOCAL_RUNNER_URL`
-- `LOCAL_RUNNER_TOKEN`
-- `RESEARCH_RELAY_URL`
-- `RESEARCH_RELAY_TOKEN`
-- `TILLER_RESEARCH_RELAY_HOSTNAME`
-- `TILLER_RESEARCH_RELAY_PORT`
-- `TILLER_RESEARCH_RELAY_TOKEN`
-- `FLY_API_TOKEN`
-- `R2_ACCESS_KEY_ID`
-- `R2_SECRET_ACCESS_KEY`
-- `R2_ENDPOINT`
-- `CF_ACCESS_TEAM_DOMAIN`
+An unavailable placement or provider route fails closed. There is no
+cross-backend, cross-billing, auth-file, or API-key fallback during an active
+lifecycle.

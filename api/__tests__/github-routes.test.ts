@@ -24,6 +24,9 @@ const mocks = vi.hoisted(() => {
     resolveProtectionState: vi.fn(async () => ({
       protectionMode: state.protectionMode,
     })),
+    handleGitHubWebhook: vi.fn(),
+    mintGitHubInstallationToken: vi.fn(),
+    validateGitHubBridgeRequest: vi.fn(),
   };
 });
 
@@ -63,7 +66,31 @@ vi.mock("../protection", () => ({
   resolveProtectionState: mocks.resolveProtectionState,
 }));
 
-const { default: githubRoutes } = await import("../github/routes");
+vi.mock("../github/app", async () => {
+  const actual = await vi.importActual<typeof import("../github/app")>("../github/app");
+  return {
+    ...actual,
+    mintGitHubInstallationToken: mocks.mintGitHubInstallationToken,
+  };
+});
+
+vi.mock("../github/bridge", async () => {
+  const actual = await vi.importActual<typeof import("../github/bridge")>("../github/bridge");
+  return {
+    ...actual,
+    validateGitHubBridgeRequest: mocks.validateGitHubBridgeRequest,
+  };
+});
+
+vi.mock("../github/webhook-service", () => ({
+  handleGitHubWebhook: mocks.handleGitHubWebhook,
+}));
+
+const {
+  default: githubRoutes,
+  MAX_GITHUB_WEBHOOK_BODY_BYTES,
+} = await import("../github/routes");
+const { GitHubAppError } = await import("../github/app");
 
 function createApp() {
   const app = new Hono<HonoEnv>();
@@ -71,13 +98,36 @@ function createApp() {
   return app;
 }
 
-function createEnv() {
+function createEnv(workersDevHostname = "demo.preview.workers.dev") {
   const setConfig = vi.fn();
+  const trust = {
+    version: 1,
+    ownerEmail: "owner@example.com",
+    accountId: "account-1",
+    workerName: workersDevHostname.split(".")[0],
+    workersDevHostname,
+    issuer: "https://team.cloudflareaccess.com",
+    audience: "audience-1",
+    serviceTokenId: "service-token-1",
+    serviceClientId: "client.access",
+    configuredAt: "2026-07-17T00:00:00.000Z",
+  };
   return {
     env: {
       HUB: {
         idFromName: vi.fn(() => "hub-id"),
-        get: vi.fn(() => ({ setConfig })),
+        get: vi.fn(() => ({
+          setConfig,
+          getWorkersDevAccessLifecycle: vi.fn(async () => ({
+            configured: true,
+            workersDevHostname,
+            tokenExpiresAt: "2027-07-17T00:00:00.000Z",
+            renewalRecommended: false,
+          })),
+          getWorkersDevAccessTrust: vi.fn(async (hostname: string) => (
+            hostname === workersDevHostname ? trust : null
+          )),
+        })),
       },
     } as any,
     setConfig,
@@ -92,6 +142,79 @@ describe("GitHub App routes", () => {
     mocks.state.localDev = false;
     mocks.state.protectionMode = "public";
     mocks.state.privateKeyInvalid = false;
+  });
+
+  it("passes a bounded webhook body and signature headers to the existing HMAC handler", async () => {
+    const app = createApp();
+    const { env } = createEnv();
+    const payload = '{"zen":"keep it logically awesome"}';
+    mocks.handleGitHubWebhook.mockResolvedValue({
+      status: 202,
+      body: { ok: true },
+    });
+
+    const response = await app.request("https://hub.example.com/api/github/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": "sha256=signed",
+      },
+      body: payload,
+    }, env);
+
+    expect(response.status).toBe(202);
+    expect(mocks.handleGitHubWebhook).toHaveBeenCalledOnce();
+    const [receivedEnv, receivedRequest, receivedBody] = mocks.handleGitHubWebhook.mock.calls[0];
+    expect(receivedEnv).toBe(env);
+    expect((receivedRequest as Request).headers.get("X-Hub-Signature-256"))
+      .toBe("sha256=signed");
+    expect(new TextDecoder().decode(receivedBody as ArrayBuffer)).toBe(payload);
+  });
+
+  it("rejects an oversized declared webhook body before HMAC verification", async () => {
+    const app = createApp();
+    const { env } = createEnv();
+
+    const response = await app.request("https://hub.example.com/api/github/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(MAX_GITHUB_WEBHOOK_BODY_BYTES + 1),
+      },
+      body: "{}",
+    }, env);
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "github_webhook_payload_too_large",
+    });
+    expect(mocks.handleGitHubWebhook).not.toHaveBeenCalled();
+  });
+
+  it("rejects a streamed webhook body that crosses the limit before HMAC verification", async () => {
+    const app = createApp();
+    const { env } = createEnv();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(MAX_GITHUB_WEBHOOK_BODY_BYTES));
+        controller.enqueue(new Uint8Array(1));
+        controller.close();
+      },
+    });
+    const request = new Request("https://hub.example.com/api/github/webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: stream,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+
+    const response = await app.request(request, undefined, env);
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "github_webhook_payload_too_large",
+    });
+    expect(mocks.handleGitHubWebhook).not.toHaveBeenCalled();
   });
 
   it("blocks GitHub App setup and token minting on public hubs", async () => {
@@ -122,6 +245,43 @@ describe("GitHub App routes", () => {
     });
   });
 
+  it.each([
+    ["github_app_missing_installation", 404],
+    ["github_app_repo_not_selected", 403],
+    ["github_app_missing_permissions", 403],
+  ] as const)("preserves %s from live token minting", async (code, status) => {
+    const app = createApp();
+    const { env } = createEnv();
+    mocks.state.protectionMode = "cf-access";
+    mocks.validateGitHubBridgeRequest.mockResolvedValue({
+      ok: true,
+      record: {
+        id: "bridge-1",
+        subject: { type: "github-planner", jobSlug: "planner-1", repoId: "42" },
+      },
+      repo: {
+        owner: "owner",
+        repo: "repo",
+        fullName: "owner/repo",
+        htmlUrl: "https://github.com/owner/repo",
+      },
+    });
+    mocks.mintGitHubInstallationToken.mockRejectedValue(
+      new GitHubAppError(code, code, status),
+    );
+
+    const response = await app.request("https://hub.example.com/api/github/token?repo=owner/repo", {}, env);
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toMatchObject({ code });
+    expect(mocks.validateGitHubBridgeRequest).toHaveBeenCalled();
+    expect(mocks.mintGitHubInstallationToken).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ fullName: "owner/repo" }),
+      { access: "read" },
+    );
+  });
+
   it("reports configured status only when GitHub App access is allowed", async () => {
     const app = createApp();
     const { env } = createEnv();
@@ -147,6 +307,35 @@ describe("GitHub App routes", () => {
       installUrl: "https://github.com/apps/tiller-test/installations/new",
       manageUrl: "https://github.com/settings/installations",
     });
+  });
+
+  it("clears stale webhook-configured status when manual app config is saved", async () => {
+    const app = createApp();
+    const { env, setConfig } = createEnv();
+    mocks.state.protectionMode = "cf-access";
+    mocks.state.config = {
+      GITHUB_APP_ID: "123",
+      GITHUB_APP_CLIENT_ID: "Iv1.client",
+      GITHUB_APP_SLUG: "old-app",
+      GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\\nkey\\n-----END PRIVATE KEY-----",
+      GITHUB_APP_WEBHOOK_SECRET: "old-secret",
+      GITHUB_APP_WEBHOOK_CONFIGURED: "true",
+    };
+
+    const res = await app.request("https://hub.example.com/api/github/app-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        appId: "456",
+        clientId: "Iv1.next",
+        slug: "manual-app",
+        privateKey: "-----BEGIN PRIVATE KEY-----\\nkey\\n-----END PRIVATE KEY-----",
+        webhookSecret: "manual-secret",
+      }),
+    }, env);
+
+    expect(res.status).toBe(200);
+    expect(setConfig).toHaveBeenCalledWith("GITHUB_APP_WEBHOOK_CONFIGURED", "false");
   });
 
   it("returns GitHub App selected repositories for protected hubs", async () => {
@@ -300,15 +489,29 @@ describe("GitHub App routes", () => {
     expect(githubAction.origin).toBe("https://github.com");
     expect(githubAction.pathname).toBe("/settings/apps/new");
     expect(manifest).toMatchObject({
-      name: expect.stringMatching(/^hub-[a-z0-9]{6}$/),
-      redirect_url: "https://hub.example.com/api/github/manifest/callback",
-      setup_url: "https://hub.example.com/api/github/install/callback",
+      name: expect.stringMatching(/^demo-[a-z0-9]{6}$/),
+      redirect_url: "https://demo.preview.workers.dev/api/github/manifest/callback",
+      setup_url: "https://demo.preview.workers.dev/api/github/install/callback",
       setup_on_update: true,
       default_permissions: { contents: "write", metadata: "read", pull_requests: "write" },
-      default_events: [],
+      default_events: ["pull_request", "push"],
       request_oauth_on_install: false,
+      hook_attributes: {
+        url: "https://demo.preview.workers.dev/api/github/webhook",
+        active: true,
+      },
     });
-    expect(manifest).not.toHaveProperty("hook_attributes");
+    expect(manifest.hook_attributes).not.toHaveProperty("secret");
+    expect(mocks.getOrCreateSecret).toHaveBeenCalledWith(
+      env,
+      "GITHUB_APP_MANIFEST_SIGNING_KEY",
+      expect.any(Function),
+    );
+    expect(mocks.getOrCreateSecret).not.toHaveBeenCalledWith(
+      env,
+      "GITHUB_APP_WEBHOOK_SECRET",
+      expect.any(Function),
+    );
     expect(state).toContain(".");
 
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
@@ -316,6 +519,7 @@ describe("GitHub App routes", () => {
       client_id: "Iv1.converted",
       slug: "converted-app",
       pem: "-----BEGIN PRIVATE KEY-----\nconverted\n-----END PRIVATE KEY-----",
+      webhook_secret: "github-generated-webhook-secret",
     }), {
       status: 201,
       headers: { "Content-Type": "application/json" },
@@ -324,12 +528,12 @@ describe("GitHub App routes", () => {
 
     const callback = await app.request(
       `https://hub.example.com/api/github/manifest/callback?code=manifest-code&state=${encodeURIComponent(state)}`,
-      { headers: { Accept: "application/json" } },
+      {},
       env,
     );
 
-    expect(callback.status).toBe(200);
-    await expect(callback.json()).resolves.toMatchObject({ ok: true });
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe("https://demo.preview.workers.dev/");
     expect(fetchMock).toHaveBeenCalledWith(
       "https://api.github.com/app-manifests/manifest-code/conversions",
       expect.objectContaining({ method: "POST" }),
@@ -341,12 +545,17 @@ describe("GitHub App routes", () => {
       "GITHUB_APP_PRIVATE_KEY",
       "-----BEGIN PRIVATE KEY-----\nconverted\n-----END PRIVATE KEY-----",
     );
+    expect(setConfig).toHaveBeenCalledWith(
+      "GITHUB_APP_WEBHOOK_SECRET",
+      "github-generated-webhook-secret",
+    );
+    expect(setConfig).toHaveBeenCalledWith("GITHUB_APP_WEBHOOK_CONFIGURED", "true");
     expect(mocks.invalidateConfigCache).toHaveBeenCalled();
   });
 
   it("keeps generated GitHub App names within GitHub's length limit", async () => {
     const app = createApp();
-    const { env } = createEnv();
+    const { env } = createEnv("tiller-hub-32.personal-infrastructure.workers.dev");
     mocks.state.protectionMode = "cf-access";
 
     const setup = await app.request(
@@ -368,7 +577,7 @@ describe("GitHub App routes", () => {
     expect(manifest.name.length).toBeLessThanOrEqual(32);
   });
 
-  it("renders a simple install callback page without trusting query params", async () => {
+  it("returns an installation callback to the server-derived Tiller origin", async () => {
     const app = createApp();
     const { env } = createEnv();
     mocks.state.protectionMode = "cf-access";
@@ -379,9 +588,9 @@ describe("GitHub App routes", () => {
       env,
     );
 
-    expect(callback.status).toBe(200);
-    expect(callback.headers.get("content-type")).toContain("text/html");
-    await expect(callback.text()).resolves.toContain("Installation updated");
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe("https://demo.preview.workers.dev/");
+    expect(callback.headers.get("location")).not.toContain("spoofed");
   });
 
   it("tests write access from a selected GitHub App repository claim", async () => {

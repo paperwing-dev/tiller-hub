@@ -2,7 +2,6 @@ export const SCM_FORMAT_VERSION = 1;
 export const SCM_ARTIFACT_SUFFIX = ".tar.zst";
 export const SCM_ARTIFACT_CONTENT_TYPE = "application/zstd";
 
-export const REPO_GIT_ARTIFACTS_PREFIX = "repos";
 export const ENV_SNAPSHOTS_PREFIX = "envs";
 
 export const ENV_SNAPSHOT_DURABILITY_EXCLUDES = [
@@ -14,10 +13,6 @@ export const ENV_SNAPSHOT_DURABILITY_EXCLUDES = [
   "/.terraform",
   "/.claude/settings.local.json",
 ] as const;
-
-export const DEFAULT_REPO_MERGE_LOCK_LEASE_MS = 30_000;
-export const MIN_REPO_MERGE_LOCK_LEASE_MS = 5_000;
-export const MAX_REPO_MERGE_LOCK_LEASE_MS = 5 * 60_000;
 
 function normalizeSnapshotPath(path: string): string {
   if (!path) return "/";
@@ -33,15 +28,4 @@ export function matchesSnapshotExcludePrefix(path: string, prefix: string): bool
 
 export function shouldExcludeFromEnvSnapshot(path: string): boolean {
   return ENV_SNAPSHOT_DURABILITY_EXCLUDES.some((prefix) => matchesSnapshotExcludePrefix(path, prefix));
-}
-
-export function resolveRepoMergeLockLeaseMs(requestedLeaseMs?: number | null): number {
-  if (!requestedLeaseMs || !Number.isFinite(requestedLeaseMs)) {
-    return DEFAULT_REPO_MERGE_LOCK_LEASE_MS;
-  }
-
-  return Math.min(
-    MAX_REPO_MERGE_LOCK_LEASE_MS,
-    Math.max(MIN_REPO_MERGE_LOCK_LEASE_MS, Math.trunc(requestedLeaseMs)),
-  );
 }

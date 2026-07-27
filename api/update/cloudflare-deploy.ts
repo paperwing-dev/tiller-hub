@@ -2,7 +2,6 @@ import { Buffer } from "node:buffer";
 import { hash as blake3Hash } from "blake3-wasm/esm/browser/index.js";
 import type { Env } from "../types";
 import { CloudflareApiError } from "../cloudflare-errors";
-import { resolveAccountForHostname } from "../access/cloudflare-api";
 import { resolveWorkerServiceName } from "../setup/cloudflare";
 import type {
   ManifestKvBinding,
@@ -15,9 +14,7 @@ import type {
 const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
 const INHERITED_VARS = [
   "DO_LOCATION_HINT",
-  "HUB_PUBLIC_URL",
-  "WORKER_SERVICE_NAME",
-  "WORKERS_DEV_ALIAS_DISABLED",
+  "TILLER_UPDATE_SERVICE_DISABLED",
 ] as const;
 
 interface CloudflareEnvelope<T> {
@@ -272,11 +269,7 @@ export async function resolveAccountAndScript(
 
   const hostname = normalizeWorkerHost(requestUrl);
   if (!hostname.endsWith(".workers.dev")) {
-    const resolved = await resolveAccountForHostname(apiToken, hostname);
-    return {
-      accountId: resolved.accountId,
-      scriptName,
-    };
+    throw new Error("Hub updates require the exact canonical workers.dev origin.");
   }
 
   const accounts = await listAccessibleAccounts(apiToken);

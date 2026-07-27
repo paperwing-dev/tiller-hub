@@ -1,16 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import { Button, LinkButton } from "@cloudflare/kumo/components/button";
+import { Input } from "@cloudflare/kumo/components/input";
+import { Select } from "@cloudflare/kumo/components/select";
 import { useToast } from "./Toast";
 import type { GitHubAccessTestResult, SetupStatus } from "./api";
-import { ApiActionError, detectSelfUpdateRepo, setupWorkersDevAccess, submitSetup, testGitHubAppAccess } from "./api";
+import { detectSelfUpdateRepo, startWorkersDevAccessOAuth, submitSetup, testGitHubAppAccess } from "./api";
 import { githubRepositoryKey, useGitHubRepositories } from "./useGitHubRepositories";
+import { KIMI_K2_7_CODE } from "../shared/harness-catalog";
 
 const HUB_URL = window.location.origin;
-const ACCESS_PROPAGATION_WAIT_SECONDS = 15;
-
-function workerDomainsDashboardUrl(workerName: string): string {
-  return `https://dash.cloudflare.com/?to=/:account/workers/services/view/${encodeURIComponent(workerName)}/production/domains`;
-}
-
 type ModelAuthMode = "subscription" | "api" | "api-key";
 
 function SetupSteps({ active }: { active: "access" | "github" }) {
@@ -29,14 +27,14 @@ function SetupSteps({ active }: { active: "access" | "github" }) {
             key={step.id}
             className={`rounded-lg border px-3 py-2 ${
               done
-                ? "border-[#1a7f37]/25 bg-[#f0fff4]"
+                ? "border-kumo-success/25 bg-kumo-success-tint"
                 : current
-                  ? "border-[#0969da]/40 bg-[#ddf4ff]"
-                  : "border-[#d0d7de] bg-white"
+                  ? "border-kumo-info/40 bg-kumo-info-tint"
+                  : "border-kumo-line bg-kumo-base"
             }`}
           >
-            <p className="text-xs font-semibold text-[#24292f]">Step {index + 1} of 2</p>
-            <p className="mt-1 text-sm font-medium text-[#24292f]">{step.label}</p>
+            <p className="text-xs font-semibold text-kumo-default">Step {index + 1} of 2</p>
+            <p className="mt-1 text-sm font-medium text-kumo-default">{step.label}</p>
           </div>
         );
       })}
@@ -50,13 +48,10 @@ interface SetupWizardProps {
 }
 
 export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
-  const [busyAction, setBusyAction] = useState<"model" | "verify-access" | "test-github" | null>(null);
+  const [busyAction, setBusyAction] = useState<"model" | "connect-access" | "test-github" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [errorHint, setErrorHint] = useState<string | null>(null);
   const [waitingForGitHub, setWaitingForGitHub] = useState(false);
-  const [accessWaitUntil, setAccessWaitUntil] = useState<number | null>(null);
-  const [accessWaitNow, setAccessWaitNow] = useState(() => Date.now());
-  const accessAutoReloadedRef = useRef(false);
   const [selectedRepoKey, setSelectedRepoKey] = useState("");
   const [githubTest, setGithubTest] = useState<GitHubAccessTestResult | null>(null);
   const busy = busyAction !== null;
@@ -66,22 +61,15 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
   const selectedRepo = githubRepositories.repositories.find(
     (selection) => githubRepositoryKey(selection) === selectedRepoKey,
   ) ?? null;
-  const selfHostModelOptions = status.isLocalDev || status.deploymentMode === "self-host";
-  const initialModelMode: ModelAuthMode =
-    selfHostModelOptions && status.modelAuthMode === "subscription"
-    || status.modelAuthMode === "api"
-    || status.modelAuthMode === "api-key"
-      ? status.modelAuthMode
-      : selfHostModelOptions && status.hasClaudeSubscription
-        ? "subscription"
-        : status.hasOpenAIKey
-          ? "api-key"
-          : "api";
-  const [modelMode, setModelMode] = useState<ModelAuthMode>(initialModelMode);
+  const selfHostModelOptions = status.isLocalDev;
+  const [modelMode, setModelMode] = useState<ModelAuthMode>("api");
   const [modelCredential, setModelCredential] = useState("");
   const addToast = useToast();
-  const codexVisible =
-    status.enabledHarnesses.includes("codex") || status.hasOpenAIKey || status.hasChatGPTAuth;
+  const openAiApiKeyVisible =
+    status.enabledHarnesses.includes("codex")
+    || status.enabledHarnesses.includes("opencode")
+    || status.hasOpenAIKey
+    || status.hasChatGPTAuth;
 
   useEffect(() => {
     if (!githubRepositories.repositories.length) {
@@ -102,30 +90,6 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
   }, [onRefresh, status.setupPhase]);
-
-  useEffect(() => {
-    if (!accessWaitUntil) return undefined;
-    const reloadAfterWait = () => {
-      if (accessAutoReloadedRef.current) return;
-      accessAutoReloadedRef.current = true;
-      setAccessWaitUntil(null);
-      window.location.reload();
-    };
-
-    if (Date.now() >= accessWaitUntil) {
-      reloadAfterWait();
-      return undefined;
-    }
-
-    const timer = window.setInterval(() => {
-      const now = Date.now();
-      setAccessWaitNow(now);
-      if (now >= accessWaitUntil) {
-        reloadAfterWait();
-      }
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [accessWaitUntil]);
 
   async function advanceModelAccess() {
     if (!modelCredential.trim()) {
@@ -148,7 +112,7 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
       await onRefresh();
       addToast({
         title: "Setup complete",
-        body: "Model access is saved. Open Settings when you want to publish, protect, or prepare CLI access.",
+        body: "Model access is saved. Open Settings to choose an execution backend.",
         variant: "success",
       });
       setModelCredential("");
@@ -160,36 +124,16 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
     }
   }
 
-  const accessWaitRemaining = accessWaitUntil
-    ? Math.max(0, Math.ceil((accessWaitUntil - accessWaitNow) / 1000))
-    : 0;
-  const accessWaitActive = accessWaitRemaining > 0;
-
-  async function verifyWorkersDevAccess() {
-    setBusyAction("verify-access");
+  async function connectWorkersDevAccess() {
+    setBusyAction("connect-access");
     setError(null);
     setErrorHint(null);
     try {
-      const nextStatus = await setupWorkersDevAccess(HUB_URL);
-      await onRefresh();
-      addToast({
-        title: "Access verified",
-        body: nextStatus.setupPhase === "complete"
-          ? "Tiller is ready."
-          : "Cloudflare Access is saved. Continue with GitHub setup.",
-        variant: "success",
-      });
+      const job = await startWorkersDevAccessOAuth(HUB_URL);
+      window.location.assign(job.connectUrl);
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Cloudflare Access did not send a valid JWT. If you just enabled Access, wait a bit, reload through Access, then verify again.",
-      );
-      setErrorHint(err instanceof ApiActionError && err.hint
-        ? err.hint
-        : "Cloudflare Access can take about 30 seconds to start sending the JWT after you turn it on. Reload this page after the wait, sign in if prompted, then verify again.");
-    } finally {
       setBusyAction(null);
+      setError(err instanceof Error ? err.message : "Cloudflare connection could not start.");
     }
   }
 
@@ -225,89 +169,67 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
   }
 
   if (status.setupPhase === "protect-hub") {
-    const hubHostname = new URL(status.currentOrigin || status.hubUrl).hostname;
-    const workerLabel = status.workerServiceName || hubHostname.split(".")[0] || "this Worker";
-    const workerDomainsUrl = workerDomainsDashboardUrl(workerLabel);
+    const hubHostname = new URL(status.workersDevHubUrl!).hostname;
     return (
-      <div className="flex-1 overflow-y-auto bg-white">
+      <div className="flex-1 overflow-y-auto bg-kumo-base">
         <main className="mx-auto w-full max-w-3xl px-6 py-8">
           <SetupSteps active="access" />
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#57606a]">Required setup</p>
-          <h1 className="mt-2 text-2xl font-semibold text-[#24292f]">Protect this hub</h1>
-          <p className="mt-2 text-sm text-[#57606a]">
-            Cloudflare Access must protect <code>{hubHostname}</code> before Tiller accepts model keys,
-            repositories, environments, or CLI setup.
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-kumo-subtle">Required setup</p>
+          <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">Connect Cloudflare and protect Tiller</h1>
+          <p className="mt-2 text-sm text-kumo-subtle">
+            Tiller uses Cloudflare OAuth to verify the owner and configure the narrow Access boundary for this Hub.
           </p>
 
-          <section className="mt-6 rounded-xl border border-[#d0d7de] bg-white p-5">
-            <h2 className="text-base font-semibold text-[#24292f]">Enable Access in Cloudflare</h2>
-            <p className="mt-1 text-xs text-[#57606a]">
-              Open this Worker&apos;s Domains page and turn on Access for the workers.dev route.
-            </p>
+          <section className="mt-6 rounded-xl border border-kumo-line bg-kumo-base p-5">
+            <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">Exact workers.dev hostname</p>
+            <code className="mt-2 block break-all rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-default">
+              {hubHostname}
+            </code>
 
-            <ol className="mt-4 list-decimal space-y-2 pl-5 text-xs text-[#57606a]">
-              <li>Open <code>Domains</code> for <code>{workerLabel}</code>.</li>
-              <li>Turn on Cloudflare Access for <code>{hubHostname}</code>.</li>
-              <li>Return here and wait for the automatic reload. Sign in if prompted, then click <code>Verify</code>.</li>
-            </ol>
-
-            <div className="mt-5 flex flex-wrap gap-3">
-              <a
-                href={workerDomainsUrl}
-                target="_blank"
-                rel="noreferrer"
-                onClick={() => {
-                  const now = Date.now();
-                  accessAutoReloadedRef.current = false;
-                  setAccessWaitNow(now);
-                  setAccessWaitUntil(now + ACCESS_PROPAGATION_WAIT_SECONDS * 1000);
-                  setError(null);
-                  setErrorHint(null);
-                }}
-                className="rounded-lg bg-[#0969da] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#0a5bc4]"
-              >
-                Open Domains
-              </a>
-            </div>
-
-            <div className="mt-4 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2 text-xs text-[#9a6700]">
-              Cloudflare Access can take about {ACCESS_PROPAGATION_WAIT_SECONDS} seconds to start sending the JWT after you turn it on.
-              {accessWaitActive ? ` Tiller will reload automatically in ${accessWaitRemaining}s.` : " If you just changed it, start the timer before verifying."}
-            </div>
-          </section>
-
-          <section className="mt-4 rounded-xl border border-[#d0d7de] bg-white p-5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h2 className="text-base font-semibold text-[#24292f]">Reload automatically, then verify</h2>
-                <p className="mt-1 text-xs text-[#57606a]">
-                  Wait about {ACCESS_PROPAGATION_WAIT_SECONDS} seconds after enabling Access. Tiller will reload this page, then Verify works after the page loads through Cloudflare Access.
+            <h2 className="mt-5 text-base font-semibold text-kumo-strong">Two Access applications</h2>
+            <div className="mt-3 grid gap-3">
+              <div className="rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
+                <p className="text-sm font-semibold text-kumo-default">Tiller callbacks</p>
+                <p className="mt-1 text-xs text-kumo-subtle">
+                  Three reserved callback paths on <code>{hubHostname}</code>. Tiller accepts only the exact authenticated endpoints below:
+                </p>
+                <ul className="mt-2 grid gap-1 text-xs text-kumo-subtle">
+                  <li><code>/api/github/webhook</code></li>
+                  <li><code>/api/setup/workers-dev-access/broker/proof</code></li>
+                  <li><code>/api/setup/workers-dev-access/broker/complete</code></li>
+                </ul>
+              </div>
+              <div className="rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
+                <p className="text-sm font-semibold text-kumo-default">Tiller Hub</p>
+                <p className="mt-1 text-xs text-kumo-subtle">
+                  The exact host <code>{hubHostname}</code>, limited to the OAuth owner and the Tiller service token.
                 </p>
               </div>
-              <div className="flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  onClick={() => window.location.reload()}
-                  disabled={accessWaitActive}
-                  className="rounded-lg border border-[#d0d7de] bg-white px-4 py-2 text-sm font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa] disabled:opacity-40"
-                >
-                  {accessWaitActive ? `Reloading in ${accessWaitRemaining}s` : "Reload now"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void verifyWorkersDevAccess()}
-                  disabled={busy || accessWaitActive}
-                  className="rounded-lg border border-[#0969da] bg-white px-4 py-2 text-sm font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-40"
-                >
-                  {accessWaitActive ? `Wait ${accessWaitRemaining}s` : busyAction === "verify-access" ? "Verifying..." : "Verify Access"}
-                </button>
-              </div>
+            </div>
+
+            <div className="mt-3 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
+              <p className="text-sm font-semibold text-kumo-default">Owner sign-in</p>
+              <p className="mt-1 text-xs text-kumo-subtle">
+                Tiller reuses a Cloudflare identity provider restricted to account members. If this account does not have one,
+                Tiller creates <code>Tiller owner sign-in</code> and attaches it only to Tiller Hub. Existing identity providers
+                and defaults are not changed.
+              </p>
+            </div>
+
+            <div className="mt-5">
+              <Button
+                variant="primary"
+                onClick={() => void connectWorkersDevAccess()}
+                disabled={busy}
+                loading={busyAction === "connect-access"}
+              >
+                {busyAction === "connect-access" ? "Opening Cloudflare..." : "Connect Cloudflare and protect Tiller"}
+              </Button>
             </div>
 
             {error && (
-              <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+              <div className="mt-4 rounded-lg border border-kumo-danger/30 bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger">
                 <p className="font-medium">{error}</p>
-                {errorHint && <p className="mt-1 text-xs text-red-700/90">{errorHint}</p>}
               </div>
             )}
           </section>
@@ -320,110 +242,97 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
     const createUrl = `${HUB_URL}/api/github/manifest/setup`;
     const installUrl = status.githubAppInstallUrl ?? `${HUB_URL}/api/github/install`;
     return (
-      <div className="flex-1 overflow-y-auto bg-white">
+      <div className="flex-1 overflow-y-auto bg-kumo-base">
         <main className="mx-auto w-full max-w-3xl px-6 py-8">
           <SetupSteps active="github" />
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#57606a]">Required setup</p>
-          <h1 className="mt-2 text-2xl font-semibold text-[#24292f]">Connect GitHub</h1>
-          <p className="mt-2 text-sm text-[#57606a]">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-kumo-subtle">Required setup</p>
+          <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">Connect GitHub</h1>
+          <p className="mt-2 text-sm text-kumo-subtle">
             Tiller needs a GitHub App for coding repos. Cloudflare&apos;s deploy-button GitHub connection is separate.
           </p>
 
-          <section className="mt-6 rounded-xl border border-[#d0d7de] bg-white p-5">
-            <h2 className="text-base font-semibold text-[#24292f]">Create and install the app</h2>
-            <ol className="mt-4 list-decimal space-y-2 pl-5 text-xs text-[#57606a]">
+          <section className="mt-6 rounded-xl border border-kumo-line bg-kumo-base p-5">
+            <h2 className="text-base font-semibold text-kumo-strong">Create and install the app</h2>
+            <ol className="mt-4 list-decimal space-y-2 pl-5 text-xs text-kumo-subtle">
               <li>Create the Tiller GitHub App in GitHub.</li>
               <li>Install it on the repositories Tiller should use, and optionally on the generated hub repo for self-updates.</li>
-              <li>Return here, refresh status, then test one selected repository.</li>
+              <li>GitHub returns to Tiller automatically. Test one selected repository after installation.</li>
             </ol>
 
             <div className="mt-5 flex flex-wrap gap-3">
               {!status.githubAppConfigured && (
-                <a
+                <LinkButton
                   href={createUrl}
-                  target="_blank"
-                  rel="noreferrer"
+                  external
+                  variant="primary"
                   onClick={() => setWaitingForGitHub(true)}
-                  className="rounded-lg bg-[#0969da] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#0a5bc4]"
                 >
                   Create GitHub App
-                </a>
+                </LinkButton>
               )}
               {status.githubAppConfigured && (
-                <a
-                  href={installUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="rounded-lg bg-[#0969da] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#0a5bc4]"
-                >
+                <LinkButton href={installUrl} external variant="primary">
                   Install on repositories
-                </a>
+                </LinkButton>
               )}
-              <button
-                type="button"
-                onClick={() => void onRefresh()}
-                className="rounded-lg border border-[#d0d7de] bg-white px-4 py-2 text-sm font-medium text-[#24292f] transition-colors hover:bg-[#f6f8fa]"
-              >
+              <Button variant="secondary" onClick={() => void onRefresh()}>
                 Refresh status
-              </button>
+              </Button>
             </div>
 
             {waitingForGitHub && !status.githubAppConfigured && (
-              <div className="mt-4 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2 text-xs text-[#9a6700]">
-                GitHub opened in another tab. Return here after creation and refresh status.
+              <div className="mt-4 rounded-lg border border-kumo-warning/30 bg-kumo-warning-tint px-3 py-2 text-xs text-kumo-warning">
+                GitHub opened in another tab. That tab returns to Tiller automatically after creation.
               </div>
             )}
 
             {status.githubAppConfigured && (
-              <div className="mt-4 rounded-lg border border-[#1a7f37]/25 bg-[#f0fff4] px-3 py-2 text-xs text-[#1a7f37]">
+              <div className="mt-4 rounded-lg border border-kumo-success/25 bg-kumo-success-tint px-3 py-2 text-xs text-kumo-success">
                 GitHub App created{status.githubAppSlug ? `: ${status.githubAppSlug}` : ""}.
               </div>
             )}
           </section>
 
           {status.githubAppConfigured && (
-            <section className="mt-4 rounded-xl border border-[#d0d7de] bg-white p-5">
+            <section className="mt-4 rounded-xl border border-kumo-line bg-kumo-base p-5">
               <div className="flex flex-wrap items-end gap-3">
-                <label className="grid min-w-[220px] flex-1 gap-1">
-                  <span className="text-xs font-medium text-[#24292f]">Repository</span>
-                  <select
-                    value={selectedRepoKey}
-                    onChange={(event) => {
-                      setSelectedRepoKey(event.target.value);
-                      setGithubTest(null);
-                    }}
-                    disabled={busy || githubRepositories.loading}
-                    className="rounded-lg border border-[#d0d7de] bg-white px-3 py-2 text-sm text-[#24292f] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30 disabled:opacity-50"
-                  >
-                    <option value="">
-                      {githubRepositories.loading
-                        ? "Loading repositories..."
-                        : githubRepositories.repositories.length === 0
-                          ? "No selected repositories"
-                          : "Select repository"}
-                    </option>
-                    {githubRepositories.repositories.map((selection) => (
-                      <option key={githubRepositoryKey(selection)} value={githubRepositoryKey(selection)}>
-                        {selection.fullName}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <button
-                  type="button"
+                <Select
+                  label="Repository"
+                  className="min-w-[220px] flex-1"
+                  value={selectedRepoKey || null}
+                  onValueChange={(value) => {
+                    setSelectedRepoKey(value ?? "");
+                    setGithubTest(null);
+                  }}
+                  disabled={busy || githubRepositories.loading}
+                  loading={githubRepositories.loading}
+                  placeholder={
+                    githubRepositories.loading
+                      ? "Loading repositories..."
+                      : githubRepositories.repositories.length === 0
+                        ? "No selected repositories"
+                        : "Select repository"
+                  }
+                  items={githubRepositories.repositories.map((selection) => ({
+                    label: selection.fullName,
+                    value: githubRepositoryKey(selection),
+                  }))}
+                />
+                <Button
+                  variant="primary"
                   onClick={() => void testGitHubAccess()}
                   disabled={busy || githubRepositories.loading || !selectedRepo}
-                  className="rounded-lg border border-[#0969da] bg-white px-4 py-2 text-sm font-medium text-[#0969da] transition-colors hover:bg-[#ddf4ff] disabled:opacity-40"
+                  loading={busyAction === "test-github"}
                 >
                   {busyAction === "test-github" ? "Testing..." : "Test repository"}
-                </button>
+                </Button>
               </div>
 
               {githubRepositories.error && (
-                <div className="mt-4 rounded-lg border border-[#d4a72c]/30 bg-[#fff8c5] px-3 py-2 text-sm text-[#9a6700]">
+                <div className="mt-4 rounded-lg border border-kumo-warning/30 bg-kumo-warning-tint px-3 py-2 text-sm text-kumo-warning">
                   <p className="font-medium">{githubRepositories.error}</p>
-                  <p className="mt-1 text-xs text-[#9a6700]/90">
-                    Install the GitHub App on at least one repository, then refresh status.
+                  <p className="mt-1 text-xs text-kumo-warning/90">
+                    After the issue above is resolved, refresh status.
                   </p>
                 </div>
               )}
@@ -431,8 +340,8 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
               {githubTest && (
                 <div className={`mt-4 rounded-lg border px-3 py-2 text-sm ${
                   githubTest.ok
-                    ? "border-[#1a7f37]/25 bg-[#f0fff4] text-[#1a7f37]"
-                    : "border-[#d4a72c]/30 bg-[#fff8c5] text-[#9a6700]"
+                    ? "border-kumo-success/25 bg-kumo-success-tint text-kumo-success"
+                    : "border-kumo-warning/30 bg-kumo-warning-tint text-kumo-warning"
                 }`}>
                   <p className="font-medium">
                     {githubTest.ok ? "Repository access ready" : "Repository access needs attention"}
@@ -441,8 +350,8 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
                 </div>
               )}
 
-              <div className="mt-4 rounded-lg border border-[#d0d7de] bg-[#f6f8fa] px-3 py-2 text-sm text-[#57606a]">
-                <p className="font-medium text-[#24292f]">
+              <div className="mt-4 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-subtle">
+                <p className="font-medium text-kumo-default">
                   Self-update repo: {status.selfUpdateRepo.status}
                 </p>
                 <p className="mt-1 text-xs">
@@ -455,9 +364,9 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
               </div>
 
               {error && (
-                <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                <div className="mt-4 rounded-lg border border-kumo-danger/30 bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger">
                   <p className="font-medium">{error}</p>
-                  {errorHint && <p className="mt-1 text-xs text-red-700/90">{errorHint}</p>}
+                  {errorHint && <p className="mt-1 text-xs text-kumo-danger/90">{errorHint}</p>}
                 </div>
               )}
             </section>
@@ -468,34 +377,34 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto bg-white">
+    <div className="flex-1 overflow-y-auto bg-kumo-base">
       <main className="mx-auto w-full max-w-3xl px-6 py-8">
-        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#57606a]">Optional setup</p>
-        <h1 className="mt-2 text-2xl font-semibold text-[#24292f]">Add model keys</h1>
-        <p className="mt-2 text-sm text-[#57606a]">
-          Kimi K2.5 runs through Cloudflare Workers AI. Add a key only if you also want Claude or Codex API access.
+        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-kumo-subtle">Optional setup</p>
+        <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">Add model keys</h1>
+        <p className="mt-2 text-sm text-kumo-subtle">
+          {KIMI_K2_7_CODE.label} runs through Cloudflare Workers AI. Add a key for Claude, Codex, or OpenAI-backed OpenCode models.
         </p>
 
         {status.workersAiConfigured && (
-          <div className="mt-5 rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-800">
-            Kimi K2.5 is ready.
+          <div className="mt-5 rounded-lg border border-kumo-success/25 bg-kumo-success-tint px-3 py-2 text-sm text-kumo-success">
+            {KIMI_K2_7_CODE.label} is ready.
           </div>
         )}
 
-        <section className="mt-6 rounded-xl border border-[#d0d7de] bg-[#f6f8fa] p-5">
-          <div className={`grid gap-3 ${codexVisible || selfHostModelOptions ? "md:grid-cols-2" : ""}`}>
+        <section className="mt-6 rounded-xl border border-kumo-line bg-kumo-recessed p-5">
+          <div className={`grid gap-3 ${openAiApiKeyVisible || selfHostModelOptions ? "md:grid-cols-2" : ""}`}>
             {selfHostModelOptions && (
               <button
                 type="button"
                 onClick={() => setModelMode("subscription")}
                 className={`rounded-lg border px-4 py-3 text-left transition-colors ${
                   modelMode === "subscription"
-                    ? "border-[#0969da] bg-[#ddf4ff]"
-                    : "border-[#d0d7de] bg-white hover:border-[#0969da]/40"
+                    ? "border-kumo-focus bg-kumo-info-tint"
+                    : "border-kumo-line bg-kumo-base hover:border-kumo-focus/40"
                 }`}
               >
-                <p className="text-sm font-semibold text-[#24292f]">Claude subscription</p>
-                <p className="mt-1 text-xs text-[#57606a]">For Self Host.</p>
+                <p className="text-sm font-semibold text-kumo-default">Claude subscription</p>
+                <p className="mt-1 text-xs text-kumo-subtle">For workloads on Your machine.</p>
               </button>
             )}
             <button
@@ -503,60 +412,59 @@ export default function SetupWizard({ status, onRefresh }: SetupWizardProps) {
               onClick={() => setModelMode("api")}
               className={`rounded-lg border px-4 py-3 text-left transition-colors ${
                 modelMode === "api"
-                  ? "border-[#0969da] bg-[#ddf4ff]"
-                  : "border-[#d0d7de] bg-white hover:border-[#0969da]/40"
+                  ? "border-kumo-focus bg-kumo-info-tint"
+                  : "border-kumo-line bg-kumo-base hover:border-kumo-focus/40"
               }`}
             >
-              <p className="text-sm font-semibold text-[#24292f]">Anthropic API key</p>
-              <p className="mt-1 text-xs text-[#57606a]">For Claude.</p>
+              <p className="text-sm font-semibold text-kumo-default">Anthropic API key</p>
+              <p className="mt-1 text-xs text-kumo-subtle">For Claude.</p>
             </button>
-            {codexVisible && (
+            {openAiApiKeyVisible && (
               <button
                 type="button"
                 onClick={() => setModelMode("api-key")}
                 className={`rounded-lg border px-4 py-3 text-left transition-colors ${
                   modelMode === "api-key"
-                    ? "border-[#0969da] bg-[#ddf4ff]"
-                    : "border-[#d0d7de] bg-white hover:border-[#0969da]/40"
+                    ? "border-kumo-focus bg-kumo-info-tint"
+                    : "border-kumo-line bg-kumo-base hover:border-kumo-focus/40"
                 }`}
               >
-                <p className="text-sm font-semibold text-[#24292f]">OpenAI API key</p>
-                <p className="mt-1 text-xs text-[#57606a]">For Codex.</p>
+                <p className="text-sm font-semibold text-kumo-default">OpenAI API key</p>
+                <p className="mt-1 text-xs text-kumo-subtle">For Codex and OpenAI-backed OpenCode models.</p>
               </button>
             )}
           </div>
 
-          <label className="mt-5 block">
-            <span className="text-xs font-medium text-[#24292f]">
-              {modelMode === "subscription"
-                ? "Claude Code OAuth token"
-                : modelMode === "api"
-                  ? "Anthropic API key"
-                  : "OpenAI API key"}
-            </span>
-            <input
+          <div className="mt-5">
+            <Input
               type="password"
+              label={
+                modelMode === "subscription"
+                  ? "Claude Code OAuth token"
+                  : modelMode === "api"
+                    ? "Anthropic API key"
+                    : "OpenAI API key"
+              }
               value={modelCredential}
               onChange={(e) => setModelCredential(e.target.value)}
               placeholder="Paste key"
               disabled={busy}
-              className="mt-2 w-full rounded-lg border border-[#d0d7de] bg-white px-3 py-2 text-sm text-[#24292f] placeholder:text-[#6e7781] focus:border-[#0969da] focus:outline-none focus:ring-1 focus:ring-[#0969da]/30"
             />
-          </label>
+          </div>
 
           <div className="mt-5 flex justify-end">
-            <button
-              type="button"
+            <Button
+              variant="primary"
               onClick={() => void advanceModelAccess()}
               disabled={busy || !modelCredential.trim()}
-              className="rounded-lg bg-[#0969da] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#0a5bc4] disabled:opacity-40"
+              loading={busyAction === "model"}
             >
               {busyAction === "model" ? "Saving..." : "Save key"}
-            </button>
+            </Button>
           </div>
         </section>
 
-        {error && <p className="mt-6 text-sm text-red-600">{error}</p>}
+        {error && <p className="mt-6 text-sm text-kumo-danger">{error}</p>}
       </main>
     </div>
   );

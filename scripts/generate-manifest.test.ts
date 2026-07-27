@@ -3,7 +3,7 @@ import { buildManifestContainers, buildPlainTextBindings } from "./generate-mani
 
 const envKeys = [
   "CONTAINER_IMAGE_TAG",
-  "SCM_BOOTSTRAP_IMAGE_TAG",
+  "GITHUB_JOB_IMAGE_TAG",
   "TILLER_MANIFEST_REQUIRE_PINNED_IMAGES",
 ];
 
@@ -31,7 +31,7 @@ describe("generate-manifest container images", () => {
   it("uses the same SHA-pinned image overrides as hub deploy", () => {
     rememberEnv();
     process.env.CONTAINER_IMAGE_TAG = "docker.io/jamieatlason/tiller-sandbox:abc123";
-    process.env.SCM_BOOTSTRAP_IMAGE_TAG = "docker.io/jamieatlason/tiller-scm:abc123";
+    process.env.GITHUB_JOB_IMAGE_TAG = "docker.io/jamieatlason/tiller-scm:abc123";
     process.env.TILLER_MANIFEST_REQUIRE_PINNED_IMAGES = "1";
 
     expect(buildManifestContainers({
@@ -45,31 +45,31 @@ describe("generate-manifest container images", () => {
           instance_type: "standard-1",
         },
         {
-          class_name: "ScmBootstrapDO",
-          name: "tiller-hub-scm-bootstrap",
-          image: "docker.io/jamieatlason/tiller-scm:stable",
-          max_instances: 2,
-          instance_type: "basic",
-        },
-        {
-          class_name: "ScmOperationDO",
-          name: "tiller-hub-scm-operation",
+          class_name: "GitHubJobDO",
+          name: "tiller-hub-github-job",
           image: "docker.io/jamieatlason/tiller-scm:stable",
           max_instances: 4,
           instance_type: "basic",
         },
+        {
+          class_name: "PlannerRunDO",
+          name: "tiller-hub-planner-run",
+          image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          max_instances: 10,
+          instance_type: "standard-1",
+        },
       ],
     })).toMatchObject([
       { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123" },
-      { class_name: "ScmBootstrapDO", image: "docker.io/jamieatlason/tiller-scm:abc123" },
-      { class_name: "ScmOperationDO", image: "docker.io/jamieatlason/tiller-scm:abc123" },
+      { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:abc123" },
+      { class_name: "PlannerRunDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123" },
     ]);
   });
 
   it("fails release manifest generation when a managed container remains stable", () => {
     rememberEnv();
     delete process.env.CONTAINER_IMAGE_TAG;
-    delete process.env.SCM_BOOTSTRAP_IMAGE_TAG;
+    delete process.env.GITHUB_JOB_IMAGE_TAG;
     process.env.TILLER_MANIFEST_REQUIRE_PINNED_IMAGES = "1";
 
     expect(() => buildManifestContainers({
@@ -80,6 +80,13 @@ describe("generate-manifest container images", () => {
           name: "tiller-hub-sandbox",
           image: "docker.io/jamieatlason/tiller-sandbox:stable",
           max_instances: 2,
+          instance_type: "standard-1",
+        },
+        {
+          class_name: "PlannerRunDO",
+          name: "tiller-hub-planner-run",
+          image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          max_instances: 10,
           instance_type: "standard-1",
         },
       ],

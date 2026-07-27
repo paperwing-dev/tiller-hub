@@ -58,13 +58,17 @@ export class ReviewerChatAgent extends AIChatAgent<Env> {
     };
     const repoId = readRequiredBodyString(options, "repoId");
     const threadId = readRequiredBodyString(options, "threadId");
-    const loadedRepo = await loadRepo(this.appEnv, repoId, "selected-write");
+    const loadedRepo = await loadRepo(this.appEnv, repoId);
     if (!loadedRepo.ok) {
       throw new Error(typeof loadedRepo.body.error === "string" ? loadedRepo.body.error : `Repo not found: ${repoId}`);
     }
     const repo = loadedRepo.repo;
 
-    const artifactStore = getArtifactStoreStub(this.appEnv, repo.meta.repoId);
+    const artifactStore = getArtifactStoreStub(
+      this.appEnv,
+      repo.meta.repoId,
+      repo.meta.artifactStoreGeneration,
+    );
     const registryRow = await artifactStore.getReviewer(threadId);
     if (!registryRow || registryRow.repoId !== repo.meta.repoId) {
       throw new Error(`Reviewer thread not found: ${threadId}`);

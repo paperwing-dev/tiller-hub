@@ -1,19 +1,18 @@
 import type { Env, EnvMeta } from "../types";
 import { loadEnvView } from "../env/view";
-import { getScmOperationStore } from "../scm/operation-store";
-import { loadRepo, type RepoWorkspace } from "../repo/access";
+import { loadTrackedRepo, type RepoWorkspace } from "../repo/access";
 import { canonicalizeGitHubRepo } from "./repo";
 import type { CanonicalGitHubRepo } from "./repo";
 
 const BRIDGE_PREFIX = "github-bridge:";
 const INTERACTIVE_TTL_SECONDS = 7 * 24 * 60 * 60;
-const BOOTSTRAP_TTL_SECONDS = 6 * 60 * 60;
-const SCM_OPERATION_TTL_SECONDS = 2 * 60 * 60;
+const GITHUB_PLANNER_TTL_SECONDS = 12 * 60 * 60;
+const GITHUB_ENV_PUBLISH_TTL_SECONDS = 2 * 60 * 60;
 
 export type GitHubBridgeSubject =
-  | { type: "interactive-env"; envSlug: string }
-  | { type: "repo-bootstrap"; bootstrapSlug: string; repoId: string }
-  | { type: "scm-operation"; jobSlug: string; envSlug: string; repoId: string; operationId: string };
+  | { type: "interactive-env"; envSlug: string; incarnationId?: string; startOpId?: string }
+  | { type: "github-planner"; jobSlug: string; repoId: string }
+  | { type: "github-env-publish"; jobSlug: string; envSlug: string; repoId: string; operationId: string };
 
 export interface GitHubBridgeRecord {
   id: string;
@@ -32,6 +31,8 @@ export interface GitHubBridgeCredentials {
   expiresAt: string;
 }
 
+export type GitHubBridgeTokenAccess = "read" | "write";
+
 export interface GitHubBridgeValidationFailure {
   ok: false;
   status: number;
@@ -44,6 +45,19 @@ export interface GitHubBridgeValidationFailure {
 export type GitHubBridgeValidationResult =
   | { ok: true; record: GitHubBridgeRecord; repo: CanonicalGitHubRepo }
   | GitHubBridgeValidationFailure;
+
+function bridgeRepoMismatchFailure(
+  error = "GitHub bridge is not allowed to access the requested repository.",
+): GitHubBridgeValidationFailure {
+  return {
+    ok: false,
+    status: 403,
+    body: {
+      error,
+      code: "github_bridge_repo_mismatch",
+    },
+  };
+}
 
 function bridgeKey(id: string): string {
   return `${BRIDGE_PREFIX}${id}`;
@@ -73,10 +87,10 @@ function ttlForSubject(subject: GitHubBridgeSubject): number {
   switch (subject.type) {
     case "interactive-env":
       return INTERACTIVE_TTL_SECONDS;
-    case "repo-bootstrap":
-      return BOOTSTRAP_TTL_SECONDS;
-    case "scm-operation":
-      return SCM_OPERATION_TTL_SECONDS;
+    case "github-planner":
+      return GITHUB_PLANNER_TTL_SECONDS;
+    case "github-env-publish":
+      return GITHUB_ENV_PUBLISH_TTL_SECONDS;
   }
 }
 
@@ -107,16 +121,28 @@ function isInactiveEnvStatus(status: EnvMeta["status"] | undefined): boolean {
 async function validateSubjectRepoAccess(
   env: Env,
   repoId: string,
+  allowedRepo: string,
 ): Promise<GitHubBridgeValidationFailure | null> {
   const result = await loadSubjectRepo(env, repoId);
-  return result.ok ? null : result;
+  if (!result.ok) return result;
+
+  let storedRepo: CanonicalGitHubRepo;
+  try {
+    storedRepo = canonicalizeGitHubRepo(result.repo.meta.githubFullName, { allowOwnerRepo: true });
+  } catch {
+    return bridgeRepoMismatchFailure("GitHub bridge subject no longer matches the stored repository.");
+  }
+  if (result.repo.meta.repoId !== repoId || storedRepo.fullName !== allowedRepo) {
+    return bridgeRepoMismatchFailure("GitHub bridge subject no longer matches the stored repository.");
+  }
+  return null;
 }
 
 async function loadSubjectRepo(
   env: Env,
   repoId: string,
 ): Promise<{ ok: true; repo: RepoWorkspace } | GitHubBridgeValidationFailure> {
-  const loadedRepo = await loadRepo(env, repoId, "selected-write");
+  const loadedRepo = await loadTrackedRepo(env, repoId);
   if (loadedRepo.ok) return loadedRepo;
   return {
     ok: false,
@@ -139,45 +165,34 @@ async function validateSubject(env: Env, record: GitHubBridgeRecord): Promise<Gi
         },
       };
     }
-    const repoFailure = await validateSubjectRepoAccess(env, meta.repoId);
+    const repoFailure = await validateSubjectRepoAccess(env, meta.repoId, record.allowedRepo);
     if (repoFailure) return repoFailure;
     return null;
   }
 
-  if (subject.type === "repo-bootstrap") {
-    const loadedRepo = await loadSubjectRepo(env, subject.repoId);
-    if (!loadedRepo.ok) return loadedRepo;
-    if (loadedRepo.repo.meta.gitStatus !== "pending") {
+  const repoFailure = await validateSubjectRepoAccess(env, subject.repoId, record.allowedRepo);
+  if (repoFailure) return repoFailure;
+  if (subject.type === "github-planner") {
+    return null;
+  }
+  if (subject.type === "github-env-publish") {
+    const meta = await loadEnvView(env, subject.envSlug).catch(() => null);
+    if (
+      !meta ||
+      meta.repoId !== subject.repoId ||
+      meta.githubPublishOperationId !== subject.operationId ||
+      meta.githubPublishStatus !== "publishing"
+    ) {
       return {
         ok: false,
         status: 403,
         body: {
-          error: "GitHub bridge bootstrap subject is no longer pending.",
+          error: "GitHub bridge publish subject is no longer the active pending operation.",
           code: "github_bridge_subject_inactive",
         },
       };
     }
     return null;
-  }
-
-  const repoFailure = await validateSubjectRepoAccess(env, subject.repoId);
-  if (repoFailure) return repoFailure;
-  const operation = await getScmOperationStore(env, subject.repoId).getOperation(subject.operationId);
-  const meta = await loadEnvView(env, subject.envSlug).catch(() => null);
-  if (
-    !operation ||
-    operation.status !== "pending" ||
-    operation.envSlug !== subject.envSlug ||
-    meta?.scmOperationId !== subject.operationId
-  ) {
-    return {
-      ok: false,
-      status: 403,
-      body: {
-        error: "GitHub bridge SCM subject is no longer the active pending operation.",
-        code: "github_bridge_subject_inactive",
-      },
-    };
   }
   return null;
 }
@@ -219,6 +234,10 @@ export function bridgeCredentialsToEnvVars(credentials: GitHubBridgeCredentials)
     TILLER_GITHUB_BRIDGE_SECRET: credentials.secret,
     TILLER_GITHUB_ALLOWED_REPO: credentials.allowedRepo,
   };
+}
+
+export function githubBridgeTokenAccess(record: GitHubBridgeRecord): GitHubBridgeTokenAccess {
+  return record.subject.type === "github-env-publish" ? "write" : "read";
 }
 
 export async function validateGitHubBridgeRequest(
@@ -292,14 +311,7 @@ export async function validateGitHubBridgeRequest(
     };
   }
   if (record.allowedRepo !== repo.fullName) {
-    return {
-      ok: false,
-      status: 403,
-      body: {
-        error: "GitHub bridge is not allowed to access the requested repository.",
-        code: "github_bridge_repo_mismatch",
-      },
-    };
+    return bridgeRepoMismatchFailure();
   }
 
   const subjectFailure = await validateSubject(env, record);
@@ -344,22 +356,70 @@ export async function revokeGitHubBridgesForInteractiveEnv(env: Env, envSlug: st
   );
 }
 
-export async function revokeGitHubBridgesForRepoBootstrap(env: Env, repoId: string): Promise<void> {
+export async function revokeGitHubBridgeForEnvironmentStart(
+  env: Env,
+  input: { bridgeId: string; envSlug: string; incarnationId: string; startOpId: string },
+): Promise<boolean> {
+  const bridgeId = input.bridgeId.trim();
+  if (!bridgeId) return false;
+  const key = bridgeKey(bridgeId);
+  const record = parseRecord(await env.ENVS_KV.get(key));
+  if (!record) return true;
+  if (
+    record.id !== bridgeId
+    || record.subject.type !== "interactive-env"
+    || record.subject.envSlug !== input.envSlug
+    || record.subject.incarnationId !== input.incarnationId
+    || record.subject.startOpId !== input.startOpId
+  ) return false;
+  if (record.revokedAt) return true;
+  const expiresAtMs = Date.parse(record.expiresAt);
+  await env.ENVS_KV.put(key, JSON.stringify({
+    ...record,
+    revokedAt: new Date().toISOString(),
+  } satisfies GitHubBridgeRecord), {
+    expirationTtl: Number.isFinite(expiresAtMs)
+      ? Math.max(60, Math.ceil((expiresAtMs - Date.now()) / 1000))
+      : 60,
+  });
+  return true;
+}
+
+export async function revokeGitHubBridgesForEnvironmentStart(
+  env: Env,
+  input: { envSlug: string; incarnationId: string; startOpId: string },
+): Promise<void> {
   await updateMatchingBridgeRecords(
     env,
-    (record) => record.subject.type === "repo-bootstrap" && record.subject.repoId === repoId,
+    (record) => record.subject.type === "interactive-env"
+      && record.subject.envSlug === input.envSlug
+      && record.subject.incarnationId === input.incarnationId
+      && record.subject.startOpId === input.startOpId,
   );
 }
 
-export async function revokeGitHubBridgesForScmOperation(
+export async function revokeGitHubBridgesForEnvPublish(
   env: Env,
   args: { repoId: string; operationId: string },
 ): Promise<void> {
   await updateMatchingBridgeRecords(
     env,
     (record) =>
-      record.subject.type === "scm-operation" &&
+      record.subject.type === "github-env-publish" &&
       record.subject.repoId === args.repoId &&
       record.subject.operationId === args.operationId,
+  );
+}
+
+export async function revokeGitHubBridgesForPlannerJob(
+  env: Env,
+  args: { repoId: string; jobSlug: string },
+): Promise<void> {
+  await updateMatchingBridgeRecords(
+    env,
+    (record) =>
+      record.subject.type === "github-planner" &&
+      record.subject.repoId === args.repoId &&
+      record.subject.jobSlug === args.jobSlug,
   );
 }

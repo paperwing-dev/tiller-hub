@@ -47,9 +47,12 @@ vi.mock("../setup/config", () => ({
 
 const {
   checkGitHubRepoInstallationAccess,
+  isGitHubAppInstallationReady,
   listGitHubAppRepositories,
   mintGitHubInstallationToken,
+  resolveGitHubAppBotCommitIdentity,
   resolveGitHubAppRepositorySelection,
+  resolveGitHubAppRepositorySelectionById,
 } = await import("../github/app");
 
 function configureApp(overrides: Record<string, string> = {}) {
@@ -84,6 +87,32 @@ describe("GitHub App installation tokens", () => {
     vi.unstubAllGlobals();
     configureApp();
     mocks.state.issuer = "";
+  });
+
+  it("resolves the app bot's canonical commit identity", async () => {
+    const fetchMock = mockGitHubFetch([
+      {
+        status: 200,
+        body: {
+          id: 24680,
+          login: "tiller-test[bot]",
+        },
+      },
+    ]);
+
+    await expect(resolveGitHubAppBotCommitIdentity({} as any, "installation-token")).resolves.toEqual({
+      name: "tiller-test[bot]",
+      email: "24680+tiller-test[bot]@users.noreply.github.com",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.github.com/users/tiller-test%5Bbot%5D",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer installation-token",
+          "User-Agent": "tiller-hub",
+        }),
+      }),
+    );
   });
 
   it("mints a repo-scoped read-only installation token using the client ID issuer", async () => {
@@ -395,6 +424,30 @@ describe("GitHub App installation tokens", () => {
     );
   });
 
+  it("checks setup readiness from installation permissions without enumerating repositories", async () => {
+    configureApp({ GITHUB_APP_ID: "setup-ready-app" });
+    const fetchMock = mockGitHubFetch([
+      {
+        status: 200,
+        body: [{
+          id: 1001,
+          permissions: { contents: "write", metadata: "read", pull_requests: "write" },
+          repository_selection: "selected",
+        }],
+      },
+    ]);
+
+    await expect(isGitHubAppInstallationReady({} as any)).resolves.toBe(true);
+    await expect(isGitHubAppInstallationReady({} as any)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.github.com/app/installations?per_page=100&page=1",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer app-jwt" }),
+      }),
+    );
+  });
+
   it("rejects fabricated selected repo claims that do not match the current app repository list", async () => {
     mockGitHubFetch([
       {
@@ -437,6 +490,53 @@ describe("GitHub App installation tokens", () => {
     })).rejects.toMatchObject({
       code: "github_app_repo_not_selected",
       status: 403,
+    });
+  });
+
+  it("resolves selected repositories by installation and repository id after a repo rename", async () => {
+    mockGitHubFetch([
+      {
+        status: 200,
+        body: [
+          {
+            id: 1001,
+            permissions: { contents: "write", metadata: "read", pull_requests: "write" },
+          },
+        ],
+      },
+      {
+        status: 201,
+        body: {
+          token: "installation-list-token",
+          expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+          permissions: { contents: "write", metadata: "read", pull_requests: "write" },
+        },
+      },
+      {
+        status: 200,
+        body: {
+          repositories: [
+            {
+              id: 42,
+              full_name: "owner/renamed",
+              html_url: "https://github.com/owner/renamed",
+              private: false,
+              default_branch: "trunk",
+            },
+          ],
+        },
+      },
+    ]);
+
+    await expect(resolveGitHubAppRepositorySelectionById({} as any, {
+      repositoryId: 42,
+      installationId: 1001,
+    })).resolves.toMatchObject({
+      repositoryId: 42,
+      installationId: 1001,
+      fullName: "owner/renamed",
+      repoUrl: "https://github.com/owner/renamed",
+      defaultBranch: "trunk",
     });
   });
 });

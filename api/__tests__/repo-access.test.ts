@@ -38,17 +38,23 @@ const {
   loadRepo,
   loadRepoForRequest,
   loadRepoProjection,
-  loadStoredRepoForDeletion,
+  loadTrackedRepoForRequest,
   shouldFailPendingOperationForRepoAccessCode,
 } = await import("../repo/access");
 
 function makeRepoMeta(overrides: Partial<RepoMeta> = {}): RepoMeta {
+  const mainCommit = overrides.mainCommit === undefined ? "main-1" : overrides.mainCommit;
   return {
     repoId: "repo-1",
     repoUrl: "https://github.com/test/repo",
+    scmModel: "github",
     githubInstallationId: 123,
     githubFullName: "test/repo",
-    mainCommit: "main-1",
+    githubDefaultBranch: "main",
+    githubDefaultBranchHeadSha: overrides.githubDefaultBranchHeadSha === undefined ? mainCommit : overrides.githubDefaultBranchHeadSha,
+    githubWebhookConfigured: false,
+    githubWebhookError: null,
+    mainCommit,
     gitArtifactId: "git-1",
     gitStatus: "ready",
     gitError: null,
@@ -97,14 +103,14 @@ describe("repo access boundary", () => {
   });
 
   it("returns canonical selected-write failures", async () => {
-    await expect(loadRepo({} as any, "", "selected-write")).resolves.toMatchObject({
+    await expect(loadRepo({} as any, "")).resolves.toMatchObject({
       ok: false,
       status: 400,
       body: { code: "repo_id_required" },
     });
 
     mocks.getSelectedRepoWorkspaceForRepoId.mockResolvedValueOnce(null);
-    await expect(loadRepo({} as any, "missing", "selected-write")).resolves.toMatchObject({
+    await expect(loadRepo({} as any, "missing")).resolves.toMatchObject({
       ok: false,
       status: 404,
       body: { code: "repo_not_found" },
@@ -118,26 +124,10 @@ describe("repo access boundary", () => {
       mocks.getSelectedRepoWorkspaceForRepoId.mockRejectedValueOnce(
         new mocks.GitHubAppError(code, code, status),
       );
-      await expect(loadRepo({} as any, "repo-1", "selected-write")).resolves.toMatchObject({
+      await expect(loadRepo({} as any, "repo-1")).resolves.toMatchObject({
         ok: false,
         status,
         body: { code },
-      });
-    }
-  });
-
-  it("adds canonical git readiness checks for selected-write-with-git", async () => {
-    for (const meta of [
-      { gitStatus: "pending" as const, gitArtifactId: null, mainCommit: null },
-      { gitStatus: "ready" as const, gitArtifactId: null, mainCommit: "main-1" },
-      { gitStatus: "ready" as const, gitArtifactId: "git-1", mainCommit: null },
-      { gitStatus: "repair-required" as const, gitArtifactId: null, mainCommit: null, gitError: "clone failed" },
-    ]) {
-      mocks.getSelectedRepoWorkspaceForRepoId.mockResolvedValueOnce(makeRepo(meta));
-      await expect(loadRepo({} as any, "repo-1", "selected-write-with-git")).resolves.toMatchObject({
-        ok: false,
-        status: 409,
-        body: { code: "repo_git_not_ready" },
       });
     }
   });
@@ -149,7 +139,6 @@ describe("repo access boundary", () => {
       {} as any,
       new Request("https://hub.example.com/api/repos/repo-1"),
       "repo-1",
-      "selected-write",
     );
 
     expect(result).toMatchObject({
@@ -160,11 +149,11 @@ describe("repo access boundary", () => {
     expect(mocks.getSelectedRepoWorkspaceForRepoId).not.toHaveBeenCalled();
   });
 
-  it("allows deletion to use stored repo access but keeps the request gate", async () => {
+  it("loads tracked repository state for requests without live GitHub validation", async () => {
     const repo = makeRepo();
     mocks.getRepoWorkspaceForRepoId.mockResolvedValue(repo);
 
-    const allowed = await loadStoredRepoForDeletion(
+    const allowed = await loadTrackedRepoForRequest(
       {} as any,
       new Request("https://hub.example.com/api/repos/repo-1"),
       "repo-1",
@@ -174,9 +163,27 @@ describe("repo access boundary", () => {
     expect(mocks.getRepoWorkspaceForRepoId).toHaveBeenCalledWith({}, "repo-1");
     expect(mocks.getSelectedRepoWorkspaceForRepoId).not.toHaveBeenCalled();
 
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValueOnce(null);
+    await expect(
+      loadTrackedRepoForRequest({} as any, new Request("https://hub.example.com"), "missing"),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: 404,
+      body: { code: "repo_not_found" },
+    });
+
+    mocks.getRepoWorkspaceForRepoId.mockRejectedValueOnce(new Error("workspace unavailable"));
+    await expect(
+      loadTrackedRepoForRequest({} as any, new Request("https://hub.example.com"), "repo-1"),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: 409,
+      body: { code: "repo_metadata_unavailable", error: "workspace unavailable" },
+    });
+
     vi.clearAllMocks();
     mocks.isGitHubAppAllowedForRequest.mockResolvedValue(false);
-    await expect(loadStoredRepoForDeletion({} as any, new Request("https://hub.example.com"), "repo-1")).resolves.toMatchObject({
+    await expect(loadTrackedRepoForRequest({} as any, new Request("https://hub.example.com"), "repo-1")).resolves.toMatchObject({
       ok: false,
       status: 403,
       body: { code: "github_app_public_hub_disabled" },

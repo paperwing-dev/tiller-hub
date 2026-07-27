@@ -108,23 +108,14 @@ describe("applyUpdate", () => {
       .mockResolvedValueOnce({
         bindings: [
           { type: "durable_object_namespace", name: "SANDBOX", namespace_id: "ns-sandbox" },
-          { type: "durable_object_namespace", name: "SCM_BOOTSTRAP", namespace_id: "ns-scm" },
-          { type: "durable_object_namespace", name: "SCM_OPERATION", namespace_id: "ns-scm-op" },
+          { type: "durable_object_namespace", name: "GITHUB_JOB", namespace_id: "ns-github-job" },
         ],
       });
     mocks.findDurableObjectBindingNameForClass.mockImplementation((_manifest: unknown, className: string) =>
-      className === "ScmBootstrapDO"
-        ? "SCM_BOOTSTRAP"
-        : className === "ScmOperationDO"
-          ? "SCM_OPERATION"
-          : "SANDBOX",
+      className === "GitHubJobDO" ? "GITHUB_JOB" : "SANDBOX",
     );
     mocks.findDurableObjectNamespaceId.mockImplementation((_settings: unknown, bindingName: string) =>
-      bindingName === "SCM_BOOTSTRAP"
-        ? "ns-scm"
-        : bindingName === "SCM_OPERATION"
-          ? "ns-scm-op"
-          : "ns-sandbox",
+      bindingName === "GITHUB_JOB" ? "ns-github-job" : "ns-sandbox",
     );
     mocks.listContainerApplications.mockResolvedValue([
       {
@@ -134,8 +125,7 @@ describe("applyUpdate", () => {
     ]);
     mocks.buildKnownContainerNames.mockReturnValue(new Set([
       "tiller-hub-sandboxdo",
-      "tiller-hub-scmbootstrapdo",
-      "tiller-hub-scmoperationdo",
+      "tiller-hub-githubjobdo",
     ]));
 
     const archive = gzipSync(Buffer.from("irrelevant"));
@@ -149,8 +139,7 @@ describe("applyUpdate", () => {
           migrations: [],
           bindings: [
             { type: "durable_object_namespace", name: "SANDBOX", class_name: "SandboxDO" },
-            { type: "durable_object_namespace", name: "SCM_BOOTSTRAP", class_name: "ScmBootstrapDO" },
-            { type: "durable_object_namespace", name: "SCM_OPERATION", class_name: "ScmOperationDO" },
+            { type: "durable_object_namespace", name: "GITHUB_JOB", class_name: "GitHubJobDO" },
           ],
           containers: [
             {
@@ -161,15 +150,8 @@ describe("applyUpdate", () => {
               instance_type: "basic",
             },
             {
-              class_name: "ScmBootstrapDO",
-              app_name_suffix: "scmbootstrapdo",
-              image: "docker.io/jamieatlason/tiller-scm:v2",
-              max_instances: 2,
-              instance_type: "basic",
-            },
-            {
-              class_name: "ScmOperationDO",
-              app_name_suffix: "scmoperationdo",
+              class_name: "GitHubJobDO",
+              app_name_suffix: "githubjobdo",
               image: "docker.io/jamieatlason/tiller-scm:v2",
               max_instances: 4,
               instance_type: "basic",
@@ -195,10 +177,10 @@ describe("applyUpdate", () => {
   });
 
   it("reconciles existing containers and creates newly introduced manifest containers", async () => {
-    await expect(applyUpdate({} as never, "https://tiller.example.com/api/update/apply", "cf-token"))
+    await expect(applyUpdate({} as never, "https://demo.preview.workers.dev/api/update/apply", "cf-token"))
       .resolves.toEqual({ ok: true });
 
-    expect(mocks.reconcileContainerApplication).toHaveBeenCalledTimes(3);
+    expect(mocks.reconcileContainerApplication).toHaveBeenCalledTimes(2);
     expect(mocks.reconcileContainerApplication.mock.calls[0]?.[2]).toMatchObject({
       class_name: "SandboxDO",
     });
@@ -206,30 +188,18 @@ describe("applyUpdate", () => {
       id: "app-sandbox",
     });
     expect(mocks.reconcileContainerApplication.mock.calls[1]?.[2]).toMatchObject({
-      class_name: "ScmBootstrapDO",
+      class_name: "GitHubJobDO",
     });
     expect(mocks.reconcileContainerApplication.mock.calls[1]?.[3]).toBeNull();
-    expect(mocks.reconcileContainerApplication.mock.calls[2]?.[2]).toMatchObject({
-      class_name: "ScmOperationDO",
-    });
-    expect(mocks.reconcileContainerApplication.mock.calls[2]?.[3]).toBeNull();
 
-    expect(mocks.createContainerApplication).toHaveBeenCalledTimes(2);
+    expect(mocks.createContainerApplication).toHaveBeenCalledTimes(1);
     expect(mocks.createContainerApplication).toHaveBeenNthCalledWith(
       1,
       "cf-token",
       "acc-123",
       "tiller-hub",
-      expect.objectContaining({ class_name: "ScmBootstrapDO" }),
-      "ns-scm",
-    );
-    expect(mocks.createContainerApplication).toHaveBeenNthCalledWith(
-      2,
-      "cf-token",
-      "acc-123",
-      "tiller-hub",
-      expect.objectContaining({ class_name: "ScmOperationDO" }),
-      "ns-scm-op",
+      expect.objectContaining({ class_name: "GitHubJobDO" }),
+      "ns-github-job",
     );
     expect(mocks.deleteContainerApplication).not.toHaveBeenCalled();
     expect(mocks.clearUpdateCheckCache).toHaveBeenCalledOnce();

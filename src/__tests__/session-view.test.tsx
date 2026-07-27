@@ -21,6 +21,13 @@ vi.mock("../VoiceAgent", () => ({
   default: () => null,
 }));
 
+vi.mock("../EnvReviewPanel", () => ({
+  default: ({ harnessInputReady }: { harnessInputReady: boolean }) => React.createElement(
+    "div",
+    { "data-testid": "env-review-panel", "data-harness-input-ready": String(harnessInputReady) },
+  ),
+}));
+
 vi.mock("@cloudflare/voice/react", () => ({
   useVoiceAgent: () => ({
     status: "idle",
@@ -60,6 +67,27 @@ function makeSession() {
 }
 
 describe("SessionView", () => {
+  it("keeps harness actions unavailable until terminal recovery and fast-lane capability are ready", () => {
+    const render = (terminalFastLane: boolean) => renderToString(
+      <SessionView
+        session={makeSession()}
+        env={{ slug: "demo-env", repoId: "repo-1", status: "running", harness: "codex" }}
+        hubUrl="https://example.com"
+        onWsMessage={{ current: null }}
+        wsSend={{ current: null }}
+        connected
+        terminalFastLane={terminalFastLane}
+        updateLastSeq={() => undefined}
+        permissions={[]}
+        onPermissionResolved={() => undefined}
+        onRecoverEnv={() => undefined}
+      />,
+    );
+
+    expect(render(false)).toContain('data-harness-input-ready="false"');
+    expect(render(true)).toContain('data-harness-input-ready="false"');
+  });
+
   it("does not render the legacy message composer", () => {
     const html = renderToString(
       <SessionView
@@ -82,6 +110,30 @@ describe("SessionView", () => {
 
     expect(html).not.toContain("Type a message");
     expect(html).not.toContain(">Send<");
+  });
+
+  it("shows the global CLI install command in the reminder", () => {
+    const html = renderToString(
+      <SessionView
+        session={makeSession()}
+        env={{
+          slug: "demo-env",
+          status: "running",
+          harness: "codex",
+        }}
+        hubUrl="https://example.com"
+        onWsMessage={{ current: null }}
+        wsSend={{ current: null }}
+        connected
+        updateLastSeq={() => undefined}
+        permissions={[]}
+        onPermissionResolved={() => undefined}
+        onRecoverEnv={() => undefined}
+      />,
+    );
+
+    expect(html).toContain("npm install -g @paperwing-dev/tiller");
+    expect(html).not.toContain("npm install @paperwing.dev/tiller");
   });
 
   it("does not render a duplicate Stop control for interactive env-backed sessions", () => {

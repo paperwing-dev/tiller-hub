@@ -9,14 +9,5 @@ CLAUDE_CODE_OAUTH_TOKEN=
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 #
-# Localhost development already defaults to the local runner backend through
-# `wrangler.dev.jsonc`. Override `LOCAL_RUNNER_URL` only if your runner listens
-# somewhere other than `http://127.0.0.1:8789`.
-DEFAULT_RUNNER_BACKEND=local
-LOCAL_RUNNER_URL=http://127.0.0.1:8789
-RESEARCH_RELAY_URL=
-#
-# Optional: only needed when `LOCAL_RUNNER_URL` points at a non-loopback runner.
-LOCAL_RUNNER_TOKEN=
-CF_ACCESS_CLIENT_ID=
-CF_ACCESS_CLIENT_SECRET=
+# Localhost development already uses `LOCAL_DEV_ONLY_BACKEND=true` from
+# `wrangler.dev.jsonc`; start `tiller host` separately for local containers.

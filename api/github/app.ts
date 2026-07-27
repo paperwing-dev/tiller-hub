@@ -11,6 +11,8 @@ export const GITHUB_APP_CONFIG_KEYS = [
   "GITHUB_APP_SLUG",
   "GITHUB_APP_PRIVATE_KEY",
   "GITHUB_APP_MANIFEST_SIGNING_KEY",
+  "GITHUB_APP_WEBHOOK_SECRET",
+  "GITHUB_APP_WEBHOOK_CONFIGURED",
 ] as const;
 
 export interface GitHubAppConfig {
@@ -19,6 +21,8 @@ export interface GitHubAppConfig {
   slug: string;
   privateKey: string;
   manifestSigningKey?: string;
+  webhookSecret?: string;
+  webhookConfigured?: boolean;
 }
 
 export type GitHubInstallationAccess = "read" | "write";
@@ -93,6 +97,16 @@ interface GitHubTokenResponse {
   permissions?: Record<string, string>;
 }
 
+interface GitHubUserResponse {
+  id?: number;
+  login?: string;
+}
+
+export interface GitHubCommitIdentity {
+  name: string;
+  email: string;
+}
+
 export interface GitHubAppRepositorySelection {
   repositoryId: number;
   installationId: number;
@@ -110,6 +124,10 @@ export interface GitHubAppRepositoryWarning {
 
 const TOKEN_CACHE_SKEW_MS = 60_000;
 const tokenCache = new Map<string, { token: GitHubInstallationToken; usableUntilMs: number }>();
+const botIdentityCache = new Map<string, GitHubCommitIdentity>();
+const INSTALLATION_READY_CACHE_MS = 5 * 60_000;
+const INSTALLATION_NOT_READY_CACHE_MS = 10_000;
+const installationReadyCache = new Map<string, { ready: boolean; usableUntilMs: number }>();
 const GITHUB_APP_INSTALLATION_MANAGE_URL = "https://github.com/settings/installations";
 const GITHUB_APP_PERMISSION_SETS = {
   read: {
@@ -146,6 +164,8 @@ export async function getGitHubAppConfig(env: Env): Promise<GitHubAppConfig | nu
   const clientId = readRequiredConfig(config, "GITHUB_APP_CLIENT_ID");
   const slug = readRequiredConfig(config, "GITHUB_APP_SLUG");
   const privateKeyRaw = readRequiredConfig(config, "GITHUB_APP_PRIVATE_KEY");
+  const webhookSecret = readRequiredConfig(config, "GITHUB_APP_WEBHOOK_SECRET");
+  const webhookConfigured = config.GITHUB_APP_WEBHOOK_CONFIGURED?.trim() === "true";
   if (!appId || !clientId || !slug || !privateKeyRaw) {
     return null;
   }
@@ -158,7 +178,46 @@ export async function getGitHubAppConfig(env: Env): Promise<GitHubAppConfig | nu
     ...(config.GITHUB_APP_MANIFEST_SIGNING_KEY?.trim()
       ? { manifestSigningKey: config.GITHUB_APP_MANIFEST_SIGNING_KEY.trim() }
       : {}),
+    ...(webhookSecret ? { webhookSecret } : {}),
+    ...(webhookConfigured ? { webhookConfigured } : {}),
   };
+}
+
+export async function resolveGitHubAppBotCommitIdentity(
+  env: Env,
+  installationToken: string,
+): Promise<GitHubCommitIdentity> {
+  const config = await getGitHubAppConfig(env);
+  if (!config) {
+    throw new GitHubAppError("GitHub App is not configured.", "github_app_not_configured", 409);
+  }
+  const login = `${config.slug}[bot]`;
+  const cached = botIdentityCache.get(login);
+  if (cached) return cached;
+
+  const response = await fetch(`https://api.github.com/users/${encodeURIComponent(login)}`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${installationToken}`,
+      "User-Agent": "tiller-hub",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  const body = await response.json<GitHubUserResponse>().catch(() => ({}));
+  if (!response.ok || !Number.isSafeInteger(body.id) || !body.id || body.login !== login) {
+    throw new GitHubAppError(
+      `Failed to resolve GitHub App bot ${login}: HTTP ${response.status}.`,
+      "github_app_bot_identity_unavailable",
+      502,
+    );
+  }
+
+  const identity = {
+    name: login,
+    email: `${body.id}+${login}@users.noreply.github.com`,
+  };
+  botIdentityCache.set(login, identity);
+  return identity;
 }
 
 export async function saveGitHubAppConfig(
@@ -169,6 +228,8 @@ export async function saveGitHubAppConfig(
     slug: string;
     privateKey: string;
     manifestSigningKey?: string | null;
+    webhookSecret?: string | null;
+    webhookConfigured?: boolean | null;
   },
 ): Promise<GitHubAppConfig> {
   const appId = input.appId.trim();
@@ -190,6 +251,14 @@ export async function saveGitHubAppConfig(
   if (input.manifestSigningKey?.trim()) {
     await hub.setConfig("GITHUB_APP_MANIFEST_SIGNING_KEY", input.manifestSigningKey.trim());
   }
+  if (input.webhookSecret?.trim()) {
+    await hub.setConfig("GITHUB_APP_WEBHOOK_SECRET", input.webhookSecret.trim());
+  }
+  if (input.webhookConfigured === true) {
+    await hub.setConfig("GITHUB_APP_WEBHOOK_CONFIGURED", "true");
+  } else {
+    await hub.setConfig("GITHUB_APP_WEBHOOK_CONFIGURED", "false");
+  }
 
   return {
     appId,
@@ -197,7 +266,19 @@ export async function saveGitHubAppConfig(
     slug,
     privateKey,
     ...(input.manifestSigningKey?.trim() ? { manifestSigningKey: input.manifestSigningKey.trim() } : {}),
+    ...(input.webhookSecret?.trim() ? { webhookSecret: input.webhookSecret.trim() } : {}),
+    ...(input.webhookConfigured === true ? { webhookConfigured: true } : {}),
   };
+}
+
+export function createGitHubWebhookSecret(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function getOrCreateGitHubWebhookSecret(env: Env): Promise<string> {
+  return await getOrCreateSecret(env, "GITHUB_APP_WEBHOOK_SECRET", createGitHubWebhookSecret);
 }
 
 export async function isGitHubAppAllowedForRequest(env: Env, request: Request): Promise<boolean> {
@@ -668,6 +749,34 @@ async function listGitHubAppInstallations(jwt: string): Promise<GitHubInstallati
   return installations;
 }
 
+/**
+ * Setup readiness only needs a valid installation with the required
+ * permissions. Enumerating every repository here consumes the installation's
+ * API rate limit and can incorrectly send an established Hub back to setup
+ * during a transient repository-listing failure.
+ */
+export async function isGitHubAppInstallationReady(env: Env): Promise<boolean> {
+  const config = await getGitHubAppConfig(env);
+  if (!config) return false;
+
+  const cacheKey = `${config.appId}:${config.clientId}`;
+  const cached = installationReadyCache.get(cacheKey);
+  if (cached && cached.usableUntilMs > Date.now()) {
+    return cached.ready;
+  }
+
+  const jwt = await createGitHubAppJwt(config);
+  const installations = await listGitHubAppInstallations(jwt);
+  const ready = installations.some((installation) =>
+    Boolean(installation.id) && hasRequiredPermissions(installation.permissions, "write")
+  );
+  installationReadyCache.set(cacheKey, {
+    ready,
+    usableUntilMs: Date.now() + (ready ? INSTALLATION_READY_CACHE_MS : INSTALLATION_NOT_READY_CACHE_MS),
+  });
+  return ready;
+}
+
 export async function listGitHubAppRepositories(env: Env): Promise<{
   repositories: GitHubAppRepositorySelection[];
   warnings: GitHubAppRepositoryWarning[];
@@ -780,6 +889,45 @@ export async function resolveGitHubAppRepositorySelection(
     }
     throw new GitHubAppError(
       `${requested.fullName} is not selected in the configured GitHub App installation with required write permissions.`,
+      "github_app_repo_not_selected",
+      403,
+    );
+  }
+  return match;
+}
+
+export async function resolveGitHubAppRepositorySelectionById(
+  env: Env,
+  claim: {
+    repositoryId: number;
+    installationId: number;
+  },
+): Promise<GitHubAppRepositorySelection> {
+  if (
+    !Number.isInteger(claim.repositoryId) ||
+    claim.repositoryId <= 0 ||
+    !Number.isInteger(claim.installationId) ||
+    claim.installationId <= 0
+  ) {
+    throw new GitHubAppError("repositoryId and installationId must be positive integers.", "github_app_repo_claim_invalid", 400);
+  }
+  const { repositories, warnings } = await listGitHubAppRepositories(env);
+  const match = repositories.find((repository) =>
+    repository.repositoryId === claim.repositoryId &&
+    repository.installationId === claim.installationId
+  );
+  if (!match) {
+    const warning = warnings.find((candidate) => candidate.installationId === claim.installationId)
+      ?? (repositories.length === 0 ? warnings[0] : undefined);
+    if (warning) {
+      throw new GitHubAppError(
+        warning.message,
+        warning.code,
+        warning.code === "github_app_missing_installation" ? 404 : warning.code === "github_app_missing_permissions" ? 403 : 502,
+      );
+    }
+    throw new GitHubAppError(
+      `Repository ${claim.repositoryId} is not selected in the configured GitHub App installation with required write permissions.`,
       "github_app_repo_not_selected",
       403,
     );

@@ -10,6 +10,7 @@ describe("mergeWranglerJsonc", () => {
         "TILLER_REGION": "wnam",
         "HUB_PUBLIC_URL": "https://tiller.example.com",
         "WORKER_SERVICE_NAME": "adam-tiller",
+        "TILLER_UPDATE_SERVICE_DISABLED": "1",
         "USER_DEFINED": "keep"
       },
       "compatibility_date": "2024-01-01",
@@ -34,6 +35,8 @@ describe("mergeWranglerJsonc", () => {
       "name": "tiller-hub",
       "vars": {
         "TILLER_REGION": "weur",
+        "HUB_PUBLIC_URL": "https://retired.preview.workers.dev",
+        "WORKER_SERVICE_NAME": "retired-upstream-name",
         "ENABLED_ENV_HARNESSES": "claude-code,codex,opencode"
       },
       "compatibility_date": "2026-05-27",
@@ -65,11 +68,12 @@ describe("mergeWranglerJsonc", () => {
     expect(merged.preview_urls).toBe(false);
     expect(merged.vars).toMatchObject({
       TILLER_REGION: "wnam",
-      HUB_PUBLIC_URL: "https://tiller.example.com",
-      WORKER_SERVICE_NAME: "adam-tiller",
+      TILLER_UPDATE_SERVICE_DISABLED: "1",
       USER_DEFINED: "keep",
       ENABLED_ENV_HARNESSES: "claude-code,codex,opencode",
     });
+    expect(merged.vars).not.toHaveProperty("HUB_PUBLIC_URL");
+    expect(merged.vars).not.toHaveProperty("WORKER_SERVICE_NAME");
     expect(merged.kv_namespaces[0]).toMatchObject({ binding: "ENVS_KV", id: "kv-live" });
     expect(merged.r2_buckets[0]).toMatchObject({ binding: "BUCKET", bucket_name: "adam-tiller-bucket" });
     expect(merged.durable_objects.bindings[0]).toMatchObject({ name: "HUB", script_name: "adam-tiller" });

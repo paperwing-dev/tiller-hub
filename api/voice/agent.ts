@@ -8,6 +8,7 @@ import {
 import type { HubDO } from "../hub";
 import { getLocationHintOptions } from "../helpers";
 import type { Env } from "../types";
+import { KIMI_K2_7_CODE } from "../../shared/harness-catalog";
 
 // ── Hub stub type ───────────────────────────────────────────────────
 
@@ -23,7 +24,7 @@ interface ToolCall {
 
 // ── System prompt ───────────────────────────────────────────────────
 
-const SUMMARY_MODEL = "@cf/moonshotai/kimi-k2.5";
+const SUMMARY_MODEL = KIMI_K2_7_CODE.providerModel;
 
 function getDirectReply(transcript: string): string | null {
   const text = transcript.trim().toLowerCase();

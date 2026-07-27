@@ -1,23 +1,60 @@
 import {
+  hasExplicitGitHubPublishFields,
   hasExplicitEnvScmFields,
   hasExplicitRepoScmFields,
+  isExecutionPlacement,
   isEnvHarness,
   isEnvStatus,
   isRepoGitStatus,
 } from "../api/types";
 import type {
   StoredSession,
-  StoredMessage,
   StoredPermission,
   StoredMachine,
   WsServerMessage,
   EnvMeta,
   RepoMeta,
   EnvHarness,
+  HarnessSettings,
   StartupDiagnosticsState,
 } from "../api/types";
 import type { HostedAgentMetadata } from "../api/agent-core/types";
-import type { Artifact, ArtifactRef, PlanArtifact, PlanStatus, ReviewerRegistryEntry } from "../api/coordination/types";
+import {
+  isHarnessCredentialRequirement,
+  isHarnessProviderKind,
+  validateHarnessSettings,
+} from "../shared/harness-catalog";
+import {
+  isCloudflareIdleTimeoutMinutes,
+} from "../shared/cloudflare-timeout";
+import type {
+  Artifact,
+  AgentRoute,
+  AgentSkillDefinition,
+  ArtifactRef,
+  PlanArtifact,
+  PlanContribution,
+  PlannerEffort,
+  PlannerProviderMetadata,
+  PlannerRun,
+  PlannerRunEvent,
+  PlanStatus,
+  ReviewerRegistryEntry,
+  PlanSkillInvocation,
+  RepoPlanWriterSettings,
+  PlanWriterState,
+  PlanWriterProvider,
+  ThreadMessage,
+} from "../api/coordination/types";
+import type {
+  EnvReviewFeedback,
+  EnvReviewRun,
+  EnvReviewRunEvent,
+  EnvReviewSession,
+  EnvReviewState,
+  EnvReviewTab,
+  ReviewSkillInvocation,
+} from "../api/env-review/types";
 import type {
   HubUpdateRepoCandidate,
   HubUpdateRepoState,
@@ -26,10 +63,10 @@ import type {
   UpdateBuildDiagnostics,
   UpdateCheckResult,
 } from "../api/update/types";
+import type { BillingMode } from "../shared/billing";
+import { TerminalRecoveryOverflowError } from "./terminal-recovery";
 
-const DEFAULT_ENABLED_HARNESSES: EnvHarness[] = ["claude-code", "codex", "opencode"];
 const HOSTED_AGENT_IDS = [
-  "plan-chat",
   "reviewer-chat",
 ] as const;
 const RUNTIME_KINDS = ["think", "direct-tools", "container"] as const;
@@ -67,8 +104,32 @@ function readIntegerOr(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isInteger(value) ? value : fallback;
 }
 
+function normalizeHarnessPresentation(
+  value: unknown,
+): EnvMeta["harnessPresentation"] {
+  if (!isRecord(value)) return undefined;
+  const modelLabel = readString(value.modelLabel);
+  const credentialRequirement = readString(value.credentialRequirement);
+  const providerKind = readString(value.providerKind);
+  const providerLabel = readString(value.providerLabel);
+  if (
+    !modelLabel
+    || !isHarnessCredentialRequirement(credentialRequirement)
+    || !isHarnessProviderKind(providerKind)
+    || !providerLabel
+  ) {
+    return undefined;
+  }
+  return {
+    modelLabel,
+    credentialRequirement,
+    providerKind,
+    providerLabel,
+  };
+}
+
 function readPlanStatusOr(value: unknown, fallback: PlanStatus = "draft"): PlanStatus {
-  return value === "draft" || value === "todo" || value === "completed" || value === "archived"
+  return value === "draft" || value === "evaluating" || value === "todo" || value === "completed" || value === "archived"
     ? value
     : fallback;
 }
@@ -116,26 +177,6 @@ function normalizeStoredSession(payload: unknown): StoredSession | null {
   };
 }
 
-function normalizeStoredMessage(payload: unknown): StoredMessage | null {
-  if (!isRecord(payload)) return null;
-  const id = readString(payload.id);
-  const sessionId = readString(payload.session_id);
-  if (!id || !sessionId) return null;
-
-  const content = typeof payload.content === "string"
-    ? payload.content
-    : JSON.stringify(payload.content ?? null);
-
-  return {
-    id,
-    session_id: sessionId,
-    content,
-    seq: readIntegerOr(payload.seq, 0),
-    local_id: readNullableString(payload.local_id),
-    created_at: readStringOr(payload.created_at, ""),
-  };
-}
-
 function normalizeStoredPermission(payload: unknown): StoredPermission | null {
   if (!isRecord(payload)) return null;
   const id = readString(payload.id);
@@ -180,25 +221,72 @@ function normalizeStoredMachine(payload: unknown): StoredMachine | null {
 function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
   if (!isRecord(payload)) return null;
   const slug = readString(payload.slug);
+  const incarnationId = readString(payload.incarnationId);
   const repoUrl = readString(payload.repoUrl);
   const repoId = readString(payload.repoId);
-  const backend = payload.backend === "cf" || payload.backend === "host" ? payload.backend : null;
+  const executionPlacement = isExecutionPlacement(payload.executionPlacement)
+    ? payload.executionPlacement
+    : null;
   const harness = readString(payload.harness);
   const createdAt = readString(payload.createdAt);
   const updatedAt = readString(payload.updatedAt);
   const status = readString(payload.status);
-  if (!slug || !repoUrl || !repoId || !backend || !harness || !createdAt || !updatedAt || !status) return null;
+  if (
+    !slug
+    || !incarnationId
+    || !repoUrl
+    || !repoId
+    || !executionPlacement
+    || payload.backend !== executionPlacement.backend
+    || !harness
+    || !createdAt
+    || !updatedAt
+    || !status
+  ) return null;
   if (!isEnvHarness(harness)) return null;
   if (!isEnvStatus(status)) return null;
   if (!hasExplicitEnvScmFields(payload)) return null;
+  const harnessSettings = validateHarnessSettings(harness, payload.harnessSettings);
 
   return {
     ...(payload as Partial<EnvMeta>),
     slug,
+    incarnationId,
+    sidebarSlot: typeof payload.sidebarSlot === "number"
+      && Number.isInteger(payload.sidebarSlot)
+      && payload.sidebarSlot > 0
+      ? payload.sidebarSlot
+      : undefined,
     repoUrl,
     repoId,
-    backend,
+    scmModel: "github",
+    backend: executionPlacement.backend,
+    executionPlacement,
     harness,
+    harnessSettings,
+    harnessPresentation: harnessSettings
+      ? normalizeHarnessPresentation(payload.harnessPresentation)
+      : undefined,
+    scheduledRun: isRecord(payload.scheduledRun)
+      && (payload.scheduledRun.state === "scheduled"
+        || payload.scheduledRun.state === "running"
+        || payload.scheduledRun.state === "completed"
+        || payload.scheduledRun.state === "interrupted"
+        || payload.scheduledRun.state === "failed")
+      && typeof payload.scheduledRun.runAtMs === "number"
+      && Number.isFinite(payload.scheduledRun.runAtMs)
+      && typeof payload.scheduledRun.timeZone === "string"
+      ? {
+          state: payload.scheduledRun.state,
+          ...(payload.scheduledRun.stage === "implementing" || payload.scheduledRun.stage === "saving"
+            ? { stage: payload.scheduledRun.stage }
+            : {}),
+          runAtMs: payload.scheduledRun.runAtMs,
+          timeZone: payload.scheduledRun.timeZone,
+          ...(typeof payload.scheduledRun.error === "string" ? { error: payload.scheduledRun.error } : {}),
+          ...(payload.scheduledRun.cleanupRequired === true ? { cleanupRequired: true } : {}),
+        }
+      : undefined,
     createdAt,
     updatedAt,
     status,
@@ -218,6 +306,46 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
     scmLastCompletedAt: payload.scmLastCompletedAt,
     scmLastDurationMs: payload.scmLastDurationMs,
     scmLastTimings: payload.scmLastTimings,
+    githubBaseBranch: readNullableString(payload.githubBaseBranch),
+    githubBaseCommitSha: readNullableString(payload.githubBaseCommitSha),
+    githubBranch: readNullableString(payload.githubBranch),
+    githubHeadCommitSha: readNullableString(payload.githubHeadCommitSha),
+    githubPrNumber: typeof payload.githubPrNumber === "number" && Number.isInteger(payload.githubPrNumber) ? payload.githubPrNumber : null,
+    githubPrUrl: readNullableString(payload.githubPrUrl),
+    githubPrState: payload.githubPrState === "open" || payload.githubPrState === "closed" || payload.githubPrState === "merged" ? payload.githubPrState : null,
+    githubMergedAt: readNullableString(payload.githubMergedAt),
+    githubPublishStatus:
+      payload.githubPublishStatus === "publishing" ||
+      payload.githubPublishStatus === "published" ||
+      payload.githubPublishStatus === "up-to-date" ||
+      payload.githubPublishStatus === "failed" ||
+      payload.githubPublishStatus === "attention" ||
+      payload.githubPublishStatus === "merged"
+        ? payload.githubPublishStatus
+        : "idle",
+    githubPublishOperationId: readNullableString(payload.githubPublishOperationId),
+    githubPublishError: readNullableString(payload.githubPublishError),
+    githubLastPublishedAt: readNullableString(payload.githubLastPublishedAt),
+    githubLastPublishedWorkspaceHash: readNullableString(payload.githubLastPublishedWorkspaceHash),
+    githubPendingPublish: isRecord(payload.githubPendingPublish)
+      ? {
+          operationId: readStringOr(payload.githubPendingPublish.operationId, ""),
+          status:
+            payload.githubPendingPublish.status === "pushed" ||
+            payload.githubPendingPublish.status === "finalizing" ||
+            payload.githubPendingPublish.status === "failed"
+              ? payload.githubPendingPublish.status
+              : "starting",
+          branch: readStringOr(payload.githubPendingPublish.branch, ""),
+          baseCommitSha: readStringOr(payload.githubPendingPublish.baseCommitSha, ""),
+          workspaceHash: readStringOr(payload.githubPendingPublish.workspaceHash, ""),
+          expectedPriorHead: readNullableString(payload.githubPendingPublish.expectedPriorHead),
+          pushedCommitSha: readNullableString(payload.githubPendingPublish.pushedCommitSha),
+          startedAt: readStringOr(payload.githubPendingPublish.startedAt, ""),
+          updatedAt: readStringOr(payload.githubPendingPublish.updatedAt, ""),
+          error: readNullableString(payload.githubPendingPublish.error),
+        }
+      : null,
   } as EnvMeta;
 }
 
@@ -235,13 +363,36 @@ function normalizeRepoMetaObject(payload: unknown): RepoMeta | null {
   if (!repoId || !repoUrl || !githubInstallationId || !githubFullName || !createdAt || !updatedAt || !gitStatus) return null;
   if (!isRepoGitStatus(gitStatus)) return null;
   if (!hasExplicitRepoScmFields(payload)) return null;
+  const githubPublish = payload.githubPublish === undefined
+    ? undefined
+    : payload.githubPublish === null
+      ? null
+      : hasExplicitGitHubPublishFields(payload.githubPublish)
+        ? {
+            status: payload.githubPublish.status,
+            branch: payload.githubPublish.branch,
+            commitSha: payload.githubPublish.commitSha ?? null,
+            prNumber: payload.githubPublish.prNumber ?? null,
+            prUrl: payload.githubPublish.prUrl ?? null,
+            sourceEnvSlug: payload.githubPublish.sourceEnvSlug ?? null,
+            operationId: payload.githubPublish.operationId ?? null,
+            updatedAt: payload.githubPublish.updatedAt,
+            error: payload.githubPublish.error ?? null,
+          }
+        : undefined;
+  if (payload.githubPublish !== undefined && githubPublish === undefined) return null;
 
   return {
     ...(payload as Partial<RepoMeta>),
     repoId,
     repoUrl,
+    scmModel: payload.scmModel === "github" ? "github" : "github",
     githubInstallationId,
     githubFullName,
+    githubDefaultBranch: readNullableString(payload.githubDefaultBranch),
+    githubDefaultBranchHeadSha: readNullableString(payload.githubDefaultBranchHeadSha),
+    githubWebhookConfigured: readBooleanOr(payload.githubWebhookConfigured, false),
+    githubWebhookError: readNullableString(payload.githubWebhookError),
     mainCommit: payload.mainCommit,
     gitArtifactId: payload.gitArtifactId,
     gitStatus,
@@ -255,6 +406,7 @@ function normalizeRepoMetaObject(payload: unknown): RepoMeta | null {
     createdAt,
     updatedAt,
     bootstrappedFromRef: readNullableString(payload.bootstrappedFromRef),
+    ...(githubPublish === undefined ? {} : { githubPublish }),
   } as RepoMeta;
 }
 
@@ -292,18 +444,382 @@ function normalizeReviewerRegistryEntry(payload: unknown): ReviewerRegistryEntry
   const threadId = readString(payload.threadId);
   const planArtifactId = readString(payload.planArtifactId);
   const repoId = readString(payload.repoId);
-  const reviewerModel = readString(payload.reviewerModel);
+  const provider = readString(payload.provider);
+  const model = readString(payload.model);
+  const effort = payload.effort === "low" || payload.effort === "medium" || payload.effort === "high"
+    || payload.effort === "xhigh" || payload.effort === "ultra" || payload.effort === "max"
+    ? payload.effort
+    : null;
+  const skill = readString(payload.skill);
+  const reviewerModel = readString(payload.reviewerModel) ?? model;
   const createdAt = readString(payload.createdAt);
   const updatedAt = readString(payload.updatedAt);
-  if (!threadId || !planArtifactId || !repoId || !reviewerModel || !createdAt || !updatedAt) return null;
+  if (!threadId || !planArtifactId || !repoId || !provider || !model || !reviewerModel || !createdAt || !updatedAt) return null;
   return {
     threadId,
     planArtifactId,
     repoId,
+    provider,
+    model,
+    ...(effort ? { effort } : {}),
+    ...(skill ? { skill } : {}),
+    role: "reviewer",
+    ...(readNullableString(payload.runId) ? { runId: readNullableString(payload.runId) ?? undefined } : {}),
+    ...(payload.status === "queued" || payload.status === "running" || payload.status === "saving" || payload.status === "completed" || payload.status === "failed" || payload.status === "cancelled"
+      ? { status: payload.status }
+      : {}),
+    ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
     reviewerModel,
     ...(readNullableString(payload.removedAt) ? { removedAt: readNullableString(payload.removedAt) ?? undefined } : {}),
     createdAt,
     updatedAt,
+  };
+}
+
+function normalizePlannerEffortId(payload: unknown): PlannerEffort | null {
+  return payload === "low"
+    || payload === "medium"
+    || payload === "high"
+    || payload === "xhigh"
+    || payload === "ultra"
+    || payload === "max"
+    ? payload
+    : null;
+}
+
+function normalizePlannerEfforts(payload: unknown): PlannerProviderMetadata["efforts"] {
+  return normalizeArrayResponse(payload)
+    .map((effort) => {
+      if (!isRecord(effort)) return null;
+      const id = normalizePlannerEffortId(effort.id);
+      const displayName = readString(effort.displayName);
+      return id && displayName ? { id, displayName } : null;
+    })
+    .filter(isPresent);
+}
+
+function normalizePlannerProviderModel(payload: unknown): PlannerProviderMetadata["models"][number] | null {
+  if (!isRecord(payload)) return null;
+  const id = readString(payload.id);
+  const displayName = readString(payload.displayName);
+  const authStatus = payload.authStatus === "available" || payload.authStatus === "missing" || payload.authStatus === "unavailable"
+    ? payload.authStatus
+    : null;
+  if (!id || !displayName || !authStatus) return null;
+  const efforts = normalizePlannerEfforts(payload.efforts);
+  const defaultEffort = normalizePlannerEffortId(payload.defaultEffort);
+  return {
+    id,
+    displayName,
+    available: readBooleanOr(payload.available, false),
+    authStatus,
+    ...(readNullableString(payload.disabledReason) ? { disabledReason: readNullableString(payload.disabledReason) ?? undefined } : {}),
+    ...(efforts.length ? { efforts } : {}),
+    ...(defaultEffort && efforts.some((effort) => effort.id === defaultEffort) ? { defaultEffort } : {}),
+  };
+}
+
+function normalizePlannerProvider(payload: unknown): PlannerProviderMetadata | null {
+  if (!isRecord(payload) || !isRecord(payload.capabilities)) return null;
+  const id = readString(payload.id);
+  const displayName = readString(payload.displayName);
+  const authStatus = payload.authStatus === "available" || payload.authStatus === "missing" || payload.authStatus === "unavailable"
+    ? payload.authStatus
+    : null;
+  if (!id || !displayName || !authStatus) return null;
+  const efforts = normalizePlannerEfforts(payload.efforts);
+  const defaultEffort = normalizePlannerEffortId(payload.defaultEffort);
+  if (!defaultEffort || !efforts.some((effort) => effort.id === defaultEffort)) return null;
+  return {
+    id,
+    displayName,
+    available: readBooleanOr(payload.available, false),
+    authStatus,
+    disabledReasons: normalizeStringArray(payload.disabledReasons),
+    capabilities: {
+      writer: readBooleanOr(payload.capabilities.writer, false),
+      reviewer: readBooleanOr(payload.capabilities.reviewer, false),
+      chatContinuation: readBooleanOr(payload.capabilities.chatContinuation, false),
+      cancellation: readBooleanOr(payload.capabilities.cancellation, false),
+      planDelta: readBooleanOr(payload.capabilities.planDelta, false),
+      checklist: readBooleanOr(payload.capabilities.checklist, false),
+    },
+    models: normalizeArrayResponse(payload.models).map(normalizePlannerProviderModel).filter(isPresent),
+    efforts,
+    defaultEffort,
+  };
+}
+
+function normalizeAgentRoute(payload: unknown): AgentRoute | null {
+  if (!isRecord(payload)) return null;
+  const key = readString(payload.key);
+  const label = readString(payload.label);
+  const harness = payload.harness === "codex" || payload.harness === "claude-code" || payload.harness === "opencode"
+    ? payload.harness
+    : null;
+  const provider = readString(payload.provider);
+  const model = readString(payload.model);
+  const modelId = readString(payload.modelId);
+  if (!key || !label || !harness || !provider || !model || !modelId) return null;
+  return payload as unknown as AgentRoute;
+}
+
+function normalizeAgentSkill(payload: unknown): AgentSkillDefinition | null {
+  if (!isRecord(payload)) return null;
+  if (
+    !readString(payload.id)
+    || (payload.surface !== "plan" && payload.surface !== "review")
+    || !readString(payload.command)
+    || !readString(payload.label)
+    || !readString(payload.sharedInstructions)
+    || !Array.isArray(payload.agents)
+    || payload.agents.length < 1
+    || payload.agents.length > 4
+  ) return null;
+  return payload as unknown as AgentSkillDefinition;
+}
+
+export type {
+  AgentRoute,
+  AgentSkillDefinition,
+  PlanSkillInvocation,
+  RepoPlanWriterSettings,
+  ReviewSkillInvocation,
+};
+
+function normalizePlanContribution(payload: unknown): PlanContribution | null {
+  if (!isRecord(payload)) return null;
+  const id = readString(payload.id);
+  const repoId = readString(payload.repoId);
+  const planArtifactId = readString(payload.planArtifactId);
+  const provider = readString(payload.provider);
+  const model = readString(payload.model);
+  const text = readString(payload.text);
+  const createdAt = readString(payload.createdAt);
+  const updatedAt = readString(payload.updatedAt);
+  const status = payload.status === "pending" || payload.status === "incorporated" || payload.status === "dismissed"
+    ? payload.status
+    : null;
+  if (!id || !repoId || !planArtifactId || !provider || !model || !text || !status || !createdAt || !updatedAt) return null;
+  return {
+    id,
+    repoId,
+    planArtifactId,
+    sourceKind: payload.sourceKind === "reviewer_message"
+      || payload.sourceKind === "reviewer_run"
+      || payload.sourceKind === "skill_guidance"
+      ? payload.sourceKind
+      : "manual",
+    provider,
+    model,
+    text,
+    status,
+    createdAt,
+    updatedAt,
+    ...(readNullableString(payload.sourceRunId) ? { sourceRunId: readNullableString(payload.sourceRunId) ?? undefined } : {}),
+    ...(readNullableString(payload.sourceThreadId) ? { sourceThreadId: readNullableString(payload.sourceThreadId) ?? undefined } : {}),
+    ...(readNullableString(payload.sourceMessageId) ? { sourceMessageId: readNullableString(payload.sourceMessageId) ?? undefined } : {}),
+    ...(typeof payload.sourcePlanVersion === "number" ? { sourcePlanVersion: payload.sourcePlanVersion } : {}),
+    ...(readNullableString(payload.skill) ? { skill: readNullableString(payload.skill) ?? undefined } : {}),
+    ...(readNullableString(payload.incorporatedAt) ? { incorporatedAt: readNullableString(payload.incorporatedAt) ?? undefined } : {}),
+    ...(readNullableString(payload.dismissedAt) ? { dismissedAt: readNullableString(payload.dismissedAt) ?? undefined } : {}),
+  };
+}
+
+function normalizePlannerRunInput(payload: unknown): PlannerRun["input"] | undefined {
+  if (!isRecord(payload)) return undefined;
+  const skillSnapshot = isRecord(payload.skillSnapshot)
+    && readString(payload.skillSnapshot.id)
+    && readString(payload.skillSnapshot.command)
+    && readString(payload.skillSnapshot.label)
+    && readString(payload.skillSnapshot.instructions)
+    ? {
+      id: readString(payload.skillSnapshot.id) ?? "",
+      command: readString(payload.skillSnapshot.command) ?? "",
+      label: readString(payload.skillSnapshot.label) ?? "",
+      instructions: readString(payload.skillSnapshot.instructions) ?? "",
+    }
+    : null;
+  const skillDefinitionSnapshot = normalizeAgentSkill(payload.skillDefinitionSnapshot);
+  const basis = isRecord(payload.basis)
+    && readString(payload.basis.artifactId)
+    && readString(payload.basis.title)
+    && typeof payload.basis.markdown === "string"
+    && typeof payload.basis.version === "number"
+    ? payload.basis as unknown as NonNullable<PlannerRun["input"]>["basis"]
+    : null;
+  const effort = payload.effort === "low"
+    || payload.effort === "medium"
+    || payload.effort === "high"
+    || payload.effort === "xhigh"
+    || payload.effort === "ultra"
+    || payload.effort === "max"
+    ? payload.effort
+    : null;
+  return {
+    ...(readNullableString(payload.instruction) ? { instruction: readNullableString(payload.instruction) ?? undefined } : {}),
+    ...(typeof payload.sourcePlanVersion === "number" ? { sourcePlanVersion: payload.sourcePlanVersion } : {}),
+    ...(payload.githubBaseCommitSha === null
+      ? { githubBaseCommitSha: null }
+      : readNullableString(payload.githubBaseCommitSha)
+        ? { githubBaseCommitSha: readNullableString(payload.githubBaseCommitSha) ?? undefined }
+        : {}),
+    ...(skillSnapshot ? { skillSnapshot } : {}),
+    ...(skillDefinitionSnapshot ? { skillDefinitionSnapshot } : {}),
+    ...(basis ? { basis } : {}),
+    ...(effort ? { effort } : {}),
+  };
+}
+
+function normalizePlannerRun(payload: unknown): PlannerRun | null {
+  if (!isRecord(payload)) return null;
+  const runId = readString(payload.runId);
+  const repoId = readString(payload.repoId);
+  const planArtifactId = readString(payload.planArtifactId);
+  const role = payload.role === "reviewer" ? payload.role : null;
+  const provider = readString(payload.provider);
+  const model = readString(payload.model);
+  const status = payload.status === "queued" || payload.status === "running" || payload.status === "saving" || payload.status === "completed" || payload.status === "failed" || payload.status === "cancelled"
+    ? payload.status
+    : null;
+  const startedAt = readString(payload.startedAt);
+  if (!runId || !repoId || !planArtifactId || !role || !provider || !model || !status || !startedAt) return null;
+  const input = normalizePlannerRunInput(payload.input);
+  const skillRunRole = payload.skillRunRole === "child_initial"
+    || payload.skillRunRole === "child_followup"
+    || payload.skillRunRole === "overview"
+    ? payload.skillRunRole
+    : null;
+  const runtime = isRecord(payload.runtime)
+    && (payload.runtime.backend === "cf" || payload.runtime.backend === "host")
+    && readString(payload.runtime.jobSlug)
+    ? payload.runtime as unknown as NonNullable<PlannerRun["runtime"]>
+    : null;
+  const codexAuthMode = payload.codexAuthMode === "subscription" || payload.codexAuthMode === "api-key"
+    ? payload.codexAuthMode
+    : null;
+  return {
+    runId,
+    repoId,
+    planArtifactId,
+    role,
+    provider,
+    model,
+    status,
+    startedAt,
+    ...(readNullableString(payload.skill) ? { skill: readNullableString(payload.skill) ?? undefined } : {}),
+    ...(readNullableString(payload.completedAt) ? { completedAt: readNullableString(payload.completedAt) ?? undefined } : {}),
+    ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
+    ...(readNullableString(payload.threadId) ? { threadId: readNullableString(payload.threadId) ?? undefined } : {}),
+    ...(readNullableString(payload.skillInvocationId) ? { skillInvocationId: readNullableString(payload.skillInvocationId) ?? undefined } : {}),
+    ...(readNullableString(payload.skillAgentId) ? { skillAgentId: readNullableString(payload.skillAgentId) ?? undefined } : {}),
+    ...(skillRunRole ? { skillRunRole } : {}),
+    ...(runtime ? { runtime } : {}),
+    ...(codexAuthMode ? { codexAuthMode } : {}),
+    ...(readNullableString(payload.lastContactAt) ? { lastContactAt: readNullableString(payload.lastContactAt) ?? undefined } : {}),
+    ...(input ? { input } : {}),
+  };
+}
+
+function normalizePlannerRunEvent(payload: unknown): PlannerRunEvent | null {
+  if (!isRecord(payload)) return null;
+  const runId = readString(payload.runId);
+  const repoId = readString(payload.repoId);
+  const planArtifactId = readString(payload.planArtifactId);
+  const type = readString(payload.type);
+  const createdAt = readString(payload.createdAt);
+  if (!runId || !repoId || !planArtifactId || !type || !createdAt) return null;
+  return {
+    runId,
+    repoId,
+    planArtifactId,
+    seq: readIntegerOr(payload.seq, 0),
+    type,
+    ...(readNullableString(payload.message) ? { message: readNullableString(payload.message) ?? undefined } : {}),
+    ...(payload.data === undefined ? {} : { data: payload.data }),
+    createdAt,
+  };
+}
+
+function normalizeThreadMessage(payload: unknown): ThreadMessage | null {
+  if (!isRecord(payload)) return null;
+  const id = readString(payload.id);
+  const threadId = readString(payload.threadId);
+  const senderSessionId = readString(payload.senderSessionId);
+  const createdAt = readString(payload.createdAt);
+  if (!id || !threadId || !senderSessionId || !createdAt) return null;
+  return {
+    id,
+    threadId,
+    seq: readIntegerOr(payload.seq, 0),
+    senderSessionId,
+    kind: payload.kind === "status" || payload.kind === "question" || payload.kind === "ack" ? payload.kind : "chat",
+    body: payload.body,
+    ...(readNullableString(payload.localId) ? { localId: readNullableString(payload.localId) ?? undefined } : {}),
+    artifactIds: normalizeStringArray(payload.artifactIds),
+    createdAt,
+  };
+}
+
+function normalizeEnvReviewSession(payload: unknown): EnvReviewSession | null {
+  if (!isRecord(payload)) return null;
+  const envSlug = readString(payload.envSlug);
+  const repoId = readString(payload.repoId);
+  const mainSessionId = readString(payload.mainSessionId);
+  if (!envSlug || !repoId || !mainSessionId) return null;
+  return payload as EnvReviewSession;
+}
+
+function normalizeEnvReviewTab(payload: unknown): EnvReviewTab | null {
+  if (!isRecord(payload)) return null;
+  const threadId = readString(payload.threadId);
+  const envSlug = readString(payload.envSlug);
+  const repoId = readString(payload.repoId);
+  const provider = readString(payload.provider);
+  const model = readString(payload.model);
+  if (!threadId || !envSlug || !repoId || !provider || !model) return null;
+  return payload as EnvReviewTab;
+}
+
+function normalizeEnvReviewRun(payload: unknown): EnvReviewRun | null {
+  if (!isRecord(payload)) return null;
+  const runId = readString(payload.runId);
+  const threadId = readString(payload.threadId);
+  const envSlug = readString(payload.envSlug);
+  const repoId = readString(payload.repoId);
+  if (!runId || !threadId || !envSlug || !repoId) return null;
+  return payload as EnvReviewRun;
+}
+
+function normalizeEnvReviewRunEvent(payload: unknown): EnvReviewRunEvent | null {
+  if (!isRecord(payload)) return null;
+  const runId = readString(payload.runId);
+  const type = readString(payload.type);
+  const createdAt = readString(payload.createdAt);
+  if (!runId || !type || !createdAt) return null;
+  return payload as EnvReviewRunEvent;
+}
+
+function normalizeEnvReviewFeedback(payload: unknown): EnvReviewFeedback | null {
+  if (!isRecord(payload)) return null;
+  const feedbackId = readString(payload.feedbackId);
+  const runId = readString(payload.runId);
+  const text = readString(payload.text);
+  if (!feedbackId || !runId || !text) return null;
+  return payload as EnvReviewFeedback;
+}
+
+function normalizeEnvReviewState(payload: unknown): EnvReviewState {
+  if (!isRecord(payload)) {
+    throw new Error("Malformed env review state");
+  }
+  const session = normalizeEnvReviewSession(payload.session);
+  if (!session) throw new Error("Malformed env review session");
+  return {
+    session,
+    tabs: normalizeArrayResponse(payload.tabs).map(normalizeEnvReviewTab).filter(isPresent),
+    runs: normalizeArrayResponse(payload.runs).map(normalizeEnvReviewRun).filter(isPresent),
+    feedback: normalizeArrayResponse(payload.feedback).map(normalizeEnvReviewFeedback).filter(isPresent),
   };
 }
 
@@ -366,25 +882,20 @@ function normalizeVerifyModelAuthResult(payload: unknown): VerifyModelAuthResult
   };
 }
 
-function normalizeVerifyCloudflareTokenResult(payload: unknown): {
-  ok: true;
-  hostname: string;
-  zoneName: string;
-  workerServiceName: string | null;
-  gatewayHostname: string | null;
-} | null {
-  if (!isRecord(payload)) return null;
-  const hostname = readString(payload.hostname);
-  const zoneName = readString(payload.zoneName);
-  if (!hostname || !zoneName) return null;
+function normalizeCodexRouteStatus(value: unknown): SetupStatus["codexRouteStatus"] {
+  return isCodexRouteStatus(value)
+    ? value
+    : "unavailable";
+}
 
-  return {
-    ok: true,
-    hostname,
-    zoneName,
-    workerServiceName: readNullableString(payload.workerServiceName),
-    gatewayHostname: readNullableString(payload.gatewayHostname),
-  };
+function isCodexRouteStatus(value: unknown): value is SetupStatus["codexRouteStatus"] {
+  return value === "available"
+    || value === "backend_offline"
+    || value === "runtime_update_required"
+    || value === "environment_not_connected"
+    || value === "authentication_unavailable"
+    || value === "direct_api"
+    || value === "unavailable";
 }
 
 function normalizeUpdateMetadata(payload: unknown): TillerUpdateMetadata | null {
@@ -557,7 +1068,27 @@ export type {
   UpdateBuildDiagnostics,
   UpdateCheckResult,
 } from "../api/update/types";
-export type { Artifact, ArtifactRef, PlanArtifact, PlanStatus, ReviewerRegistryEntry } from "../api/coordination/types";
+export type {
+  Artifact,
+  ArtifactRef,
+  PlanArtifact,
+  PlanContribution,
+  PlannerEffort,
+  PlannerProviderMetadata,
+  PlannerRun,
+  PlannerRunEvent,
+  PlanStatus,
+  ReviewerRegistryEntry,
+  ThreadMessage,
+} from "../api/coordination/types";
+export type {
+  EnvReviewFeedback,
+  EnvReviewRun,
+  EnvReviewRunEvent,
+  EnvReviewSession,
+  EnvReviewState,
+  EnvReviewTab,
+} from "../api/env-review/types";
 
 function normalizeRepoArtifactState(
   payload: unknown,
@@ -579,210 +1110,137 @@ function normalizeRepoArtifactState(
   };
 }
 
-function normalizeEnabledHarnesses(value: unknown): EnvHarness[] {
-  const harnesses = normalizeArrayResponse(value)
-    .map((item) => (item === "claude-code" || item === "codex" || item === "opencode") ? item : null)
-    .filter(isPresent);
-  return harnesses.length > 0 ? harnesses : DEFAULT_ENABLED_HARNESSES;
+const SETUP_BOOLEAN_FIELDS = [
+  "needsSetup",
+  "isLocalDev",
+  "modelAuthConfigured",
+  "workersAiConfigured",
+  "hasClaudeSubscription",
+  "hasAnthropicKey",
+  "hasChatGPTAuth",
+  "hasOpenAIKey",
+  "openaiPlannerConfigured",
+  "openaiPlannerAvailable",
+  "hostRegistered",
+  "renewalRecommended",
+  "hostConnected",
+  "githubAppAvailable",
+  "githubAppConfigured",
+  "githubAppReady",
+  "githubAppPublicHubDisabled",
+] as const;
+
+const SETUP_STATUS_KEYS = [
+  ...SETUP_BOOLEAN_FIELDS,
+  "setupPhase",
+  "workersDevHubUrl",
+  "claudeBillingMode",
+  "openaiBillingMode",
+  "chatgptAuthStatus",
+  "codexRouteStatus",
+  "openaiPlannerRoute",
+  "openaiPlannerReason",
+  "codexBackendReadiness",
+  "enabledHarnesses",
+  "protectionMode",
+  "tokenExpiresAt",
+  "idleTimeoutMinutes",
+  "canonicalMainBootstrapDepth",
+  "githubAppSlug",
+  "githubAppInstallUrl",
+  "githubAppManageUrl",
+  "buildDiagnostics",
+  "selfUpdateRepo",
+] as const;
+
+function isNullableSetupString(value: unknown): boolean {
+  return value === null || typeof value === "string";
 }
 
-function normalizeSetupStatus(payload: unknown, hubUrl: string): SetupStatus {
-  const fallbackHostKind = hubUrl.includes(".workers.dev") ? "workers-dev" : "custom-domain";
+function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void {
+  if (Object.keys(payload).sort().join(",") !== [...SETUP_STATUS_KEYS].sort().join(",")) {
+    throw new Error("Malformed setup status: exact current setup schema is required.");
+  }
+  for (const field of SETUP_BOOLEAN_FIELDS) {
+    if (typeof payload[field] !== "boolean") {
+      throw new Error(`Malformed setup status: ${field} must be boolean.`);
+    }
+  }
+  if (
+    (
+      payload.setupPhase !== "protect-hub"
+      && payload.setupPhase !== "github-app"
+      && payload.setupPhase !== "model-access"
+      && payload.setupPhase !== "complete"
+    )
+    || payload.needsSetup !== (payload.setupPhase !== "complete")
+    || (payload.setupPhase === "protect-hub" && typeof payload.workersDevHubUrl !== "string")
+    || (payload.protectionMode !== "public" && payload.protectionMode !== "cf-access")
+    || !Array.isArray(payload.enabledHarnesses)
+    || payload.enabledHarnesses.length === 0
+    || payload.enabledHarnesses.some((value) =>
+      value !== "claude-code" && value !== "codex" && value !== "opencode"
+    )
+    || !isCloudflareIdleTimeoutMinutes(payload.idleTimeoutMinutes)
+    || typeof payload.canonicalMainBootstrapDepth !== "number"
+    || !Number.isInteger(payload.canonicalMainBootstrapDepth)
+    || payload.canonicalMainBootstrapDepth < 0
+    || typeof payload.githubAppManageUrl !== "string"
+    || !isRecord(payload.codexBackendReadiness)
+    || !isCodexRouteStatus(payload.codexRouteStatus)
+    || !isCodexRouteStatus(payload.codexBackendReadiness.cf)
+    || !isCodexRouteStatus(payload.codexBackendReadiness.host)
+    || !isRecord(payload.buildDiagnostics)
+    || !isRecord(payload.selfUpdateRepo)
+  ) {
+    throw new Error("Malformed setup status: current setup schema is required.");
+  }
+  for (const field of [
+    "workersDevHubUrl",
+    "tokenExpiresAt",
+    "openaiPlannerReason",
+    "githubAppSlug",
+    "githubAppInstallUrl",
+  ] as const) {
+    if (!isNullableSetupString(payload[field])) {
+      throw new Error(`Malformed setup status: ${field} must be a string or null.`);
+    }
+  }
+  if (
+    (payload.claudeBillingMode !== null
+      && payload.claudeBillingMode !== "subscription"
+      && payload.claudeBillingMode !== "api")
+    || (payload.openaiBillingMode !== null
+      && payload.openaiBillingMode !== "subscription"
+      && payload.openaiBillingMode !== "api")
+    || (
+      payload.chatgptAuthStatus !== "missing"
+      && payload.chatgptAuthStatus !== "connected"
+      && payload.chatgptAuthStatus !== "refreshing"
+      && payload.chatgptAuthStatus !== "needs_reconnect"
+      && payload.chatgptAuthStatus !== "temporarily_unavailable"
+    )
+    || (
+      payload.openaiPlannerRoute !== null
+      && payload.openaiPlannerRoute !== "api-key"
+      && payload.openaiPlannerRoute !== "subscription-app-server"
+    )
+  ) {
+    throw new Error("Malformed setup status: current setup enum values are required.");
+  }
+}
+
+function normalizeSetupStatus(payload: unknown): SetupStatus {
   if (!isRecord(payload)) {
-    return {
-      needsSetup: false,
-      setupPhase: "complete",
-      isLocalDev: false,
-      currentOrigin: hubUrl,
-      hubUrl,
-      deploymentMode: "hosted",
-      selfHostStatus: "not-enabled",
-      selfHostSetupAttemptId: null,
-      workersDevHubUrl: fallbackHostKind === "workers-dev" ? hubUrl : null,
-      routeKind: fallbackHostKind,
-      workerServiceName: null,
-      modelAuthConfigured: false,
-      modelAuthMode: null,
-      hostedInfrastructureReady: false,
-      hostedBlockingReasons: ["Status response was unavailable."],
-      hostedModelReady: false,
-      hostedModelBlockingReasons: ["Status response was unavailable."],
-      selfHostReady: false,
-      selfHostBlockingReasons: ["Status response was unavailable."],
-      workersAiConfigured: false,
-      hasClaudeSubscription: false,
-      hasAnthropicKey: false,
-      hasChatGPTAuth: false,
-      chatgptAuthStatus: "missing",
-      hasOpenAIKey: false,
-      codexRouteStatus: "unavailable",
-      openaiPlannerConfigured: false,
-      openaiPlannerAvailable: false,
-      openaiPlannerRoute: null,
-      openaiPlannerReason: null,
-      hostRegistered: false,
-      hostRegisteredMode: "none",
-      hostGatewayAvailable: false,
-      hostGatewayConfigured: false,
-      hostGatewayMode: "none",
-      enabledHarnesses: DEFAULT_ENABLED_HARNESSES,
-      protectionMode: "public",
-      protectionCanAutomate: false,
-      serviceTokenConfigured: false,
-      gatewayHostname: null,
-      browserProtected: false,
-      gatewayProvisioned: false,
-      gatewayTunnelConfigured: false,
-      gatewaySupportAvailable: false,
-      gatewaySupportReason: null,
-      workersDevCutoverPending: false,
-      unsupportedProtectionConfig: false,
-      workersDevAliasDisabled: false,
-      protectionAppDomain: null,
-      accessConfigured: false,
-      accessIssuer: null,
-      accessJwksUrl: null,
-      hostConnected: false,
-      hostConnectionMode: "none",
-      idleTimeoutMinutes: 10,
-      canonicalMainBootstrapDepth: 0,
-      githubAppAvailable: false,
-      githubAppConfigured: false,
-      githubAppReady: false,
-      githubAppSlug: null,
-      githubAppInstallUrl: null,
-      githubAppManageUrl: "https://github.com/settings/installations",
-      githubAppPublicHubDisabled: true,
-      buildDiagnostics: normalizeBuildDiagnostics(null),
-      selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
-    };
+    throw new Error("Malformed setup status: expected an object.");
   }
 
-  const legacyRouteKind = payload.hostKind === "workers-dev" || payload.hostKind === "custom-domain"
-    ? payload.hostKind
-    : fallbackHostKind;
-  const routeKind = payload.routeKind === "workers-dev" || payload.routeKind === "custom-domain"
-    ? payload.routeKind
-    : legacyRouteKind;
-  const deploymentMode = payload.deploymentMode === "self-host" ? "self-host" : "hosted";
-  const selfHostStatus = payload.selfHostStatus === "setup-in-progress"
-    || payload.selfHostStatus === "enabled"
-    || payload.selfHostStatus === "offline"
-    || payload.selfHostStatus === "ready"
-    || payload.selfHostStatus === "not-enabled"
-    ? payload.selfHostStatus
-    : deploymentMode === "self-host"
-      ? readBooleanOr(payload.selfHostReady)
-        ? "ready"
-        : "offline"
-      : "not-enabled";
-  const modelAuthMode = payload.modelAuthMode === "subscription"
-    || payload.modelAuthMode === "api"
-    || payload.modelAuthMode === "api-key"
-    ? payload.modelAuthMode
-    : null;
-  const hostGatewayMode = payload.hostGatewayMode === "quick"
-    || payload.hostGatewayMode === "named"
-    || payload.hostGatewayMode === "none"
-    ? payload.hostGatewayMode
-    : "none";
-  const hostRegisteredMode = payload.hostRegisteredMode === "session" ? "session" : "none";
-  const protectionMode = payload.protectionMode === "cf-access" ? "cf-access" : "public";
-  const hostConnectionMode = payload.hostConnectionMode === "session" ? "session" : "none";
-  const setupPhase = payload.setupPhase === "protect-hub"
-    || payload.setupPhase === "github-app"
-    || payload.setupPhase === "model-access"
-    || payload.setupPhase === "complete"
-    ? payload.setupPhase
-    : readBooleanOr(payload.needsSetup)
-      ? "model-access"
-      : "complete";
-
+  assertCurrentSetupStatusPayload(payload);
+  const current = payload as unknown as SetupStatus;
   return {
-    needsSetup: setupPhase !== "complete",
-    setupPhase,
-    isLocalDev: readBooleanOr(payload.isLocalDev),
-    currentOrigin: readStringOr(payload.currentOrigin, hubUrl),
-    hubUrl: readStringOr(payload.hubUrl, hubUrl),
-    deploymentMode,
-    selfHostStatus,
-    selfHostSetupAttemptId: readNullableString(payload.selfHostSetupAttemptId),
-    workersDevHubUrl: readNullableString(payload.workersDevHubUrl),
-    routeKind,
-    workerServiceName: readNullableString(payload.workerServiceName),
-    modelAuthConfigured: readBooleanOr(payload.modelAuthConfigured),
-    modelAuthMode,
-    hostedInfrastructureReady: readBooleanOr(payload.hostedInfrastructureReady),
-    hostedBlockingReasons: normalizeArrayResponse(payload.hostedBlockingReasons)
-      .map(readString)
-      .filter(isPresent),
-    hostedModelReady: readBooleanOr(payload.hostedModelReady),
-    hostedModelBlockingReasons: normalizeArrayResponse(payload.hostedModelBlockingReasons)
-      .map(readString)
-      .filter(isPresent),
-    selfHostReady: readBooleanOr(payload.selfHostReady),
-    selfHostBlockingReasons: normalizeArrayResponse(payload.selfHostBlockingReasons)
-      .map(readString)
-      .filter(isPresent),
-    workersAiConfigured: readBooleanOr(payload.workersAiConfigured),
-    hasClaudeSubscription: readBooleanOr(payload.hasClaudeSubscription),
-    hasAnthropicKey: readBooleanOr(payload.hasAnthropicKey),
-    hasChatGPTAuth: readBooleanOr(payload.hasChatGPTAuth),
-    chatgptAuthStatus: payload.chatgptAuthStatus === "connected"
-      || payload.chatgptAuthStatus === "refreshing"
-      || payload.chatgptAuthStatus === "needs_reconnect"
-      || payload.chatgptAuthStatus === "missing"
-      ? payload.chatgptAuthStatus
-      : readBooleanOr(payload.hasChatGPTAuth)
-        ? "connected"
-        : "missing",
-    hasOpenAIKey: readBooleanOr(payload.hasOpenAIKey),
-    codexRouteStatus: payload.codexRouteStatus === "available"
-      || payload.codexRouteStatus === "gateway_offline"
-      || payload.codexRouteStatus === "host_offline"
-      || payload.codexRouteStatus === "api_fallback"
-      || payload.codexRouteStatus === "unavailable"
-      ? payload.codexRouteStatus
-      : "unavailable",
-    openaiPlannerConfigured: readBooleanOr(payload.openaiPlannerConfigured),
-    openaiPlannerAvailable: readBooleanOr(payload.openaiPlannerAvailable),
-    openaiPlannerRoute: payload.openaiPlannerRoute === "api-key" || payload.openaiPlannerRoute === "subscription-gateway"
-      ? payload.openaiPlannerRoute
-      : null,
-    openaiPlannerReason: readNullableString(payload.openaiPlannerReason),
-    hostRegistered: readBooleanOr(payload.hostRegistered),
-    hostRegisteredMode,
-    hostGatewayAvailable: readBooleanOr(payload.hostGatewayAvailable),
-    hostGatewayConfigured: readBooleanOr(payload.hostGatewayConfigured),
-    hostGatewayMode,
-    enabledHarnesses: normalizeEnabledHarnesses(payload.enabledHarnesses),
-    protectionMode,
-    protectionCanAutomate: readBooleanOr(payload.protectionCanAutomate),
-    serviceTokenConfigured: readBooleanOr(payload.serviceTokenConfigured),
-    gatewayHostname: readNullableString(payload.gatewayHostname),
-    browserProtected: readBooleanOr(payload.browserProtected),
-    gatewayProvisioned: readBooleanOr(payload.gatewayProvisioned),
-    gatewayTunnelConfigured: readBooleanOr(payload.gatewayTunnelConfigured),
-    gatewaySupportAvailable: readBooleanOr(payload.gatewaySupportAvailable),
-    gatewaySupportReason: readNullableString(payload.gatewaySupportReason),
-    workersDevCutoverPending: readBooleanOr(payload.workersDevCutoverPending),
-    unsupportedProtectionConfig: readBooleanOr(payload.unsupportedProtectionConfig),
-    workersDevAliasDisabled: readBooleanOr(payload.workersDevAliasDisabled),
-    protectionAppDomain: readNullableString(payload.protectionAppDomain),
-    accessConfigured: readBooleanOr(payload.accessConfigured),
-    accessIssuer: readNullableString(payload.accessIssuer),
-    accessJwksUrl: readNullableString(payload.accessJwksUrl),
-    hostConnected: readBooleanOr(payload.hostConnected),
-    hostConnectionMode,
-    idleTimeoutMinutes: readNumberOr(payload.idleTimeoutMinutes, 10),
-    canonicalMainBootstrapDepth: readNumberOr(payload.canonicalMainBootstrapDepth, 0),
-    githubAppAvailable: readBooleanOr(payload.githubAppAvailable),
-    githubAppConfigured: readBooleanOr(payload.githubAppConfigured),
-    githubAppReady: readBooleanOr(payload.githubAppReady),
-    githubAppSlug: readNullableString(payload.githubAppSlug),
-    githubAppInstallUrl: readNullableString(payload.githubAppInstallUrl),
-    githubAppManageUrl: readStringOr(payload.githubAppManageUrl, "https://github.com/settings/installations"),
-    githubAppPublicHubDisabled: readBooleanOr(payload.githubAppPublicHubDisabled),
+    ...current,
+    enabledHarnesses: [...current.enabledHarnesses],
+    codexBackendReadiness: { ...current.codexBackendReadiness },
     buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
     selfUpdateRepo: normalizeHubUpdateRepoState(payload.selfUpdateRepo),
   };
@@ -794,9 +1252,42 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
   switch (payload.type) {
     case "pong":
       return { type: "pong" };
+    case "capabilities":
+      return {
+        type: "capabilities",
+        terminalFastLane: readBooleanOr(payload.terminalFastLane),
+      };
     case "error": {
       const message = readString(payload.message);
       return message ? { type: "error", message } : null;
+    }
+    case "terminal-input-ack": {
+      const sessionId = readString(payload.sessionId);
+      const clientId = readString(payload.clientId);
+      const inputSeq = readIntegerOr(payload.inputSeq, 0);
+      if (!sessionId || !clientId || inputSeq <= 0) return null;
+      return {
+        type: "terminal-input-ack",
+        sessionId,
+        clientId,
+        inputSeq,
+        ok: readBooleanOr(payload.ok),
+        ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
+      };
+    }
+    case "terminal-control-ack": {
+      const sessionId = readString(payload.sessionId);
+      const clientId = readString(payload.clientId);
+      const controlSeq = readIntegerOr(payload.controlSeq, 0);
+      if (!sessionId || !clientId || controlSeq <= 0) return null;
+      return {
+        type: "terminal-control-ack",
+        sessionId,
+        clientId,
+        controlSeq,
+        ok: readBooleanOr(payload.ok),
+        ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
+      };
     }
     case "message-received": {
       const id = readString(payload.id);
@@ -854,6 +1345,12 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
       const repoId = readString(payload.repoId);
       return repoId ? { type: "repo-remove", repoId } : null;
     }
+    case "plan-artifact-updated":
+    case "plan-writer-state": {
+      const repoId = readString(payload.repoId);
+      const planArtifactId = readString(payload.planArtifactId);
+      return repoId && planArtifactId ? { type: payload.type, repoId, planArtifactId } : null;
+    }
     case "repo-main-changed": {
       const repoId = readString(payload.repoId);
       const repoUrl = readString(payload.repoUrl);
@@ -903,6 +1400,58 @@ async function parseApiError(
 
 // ── REST helpers ──────────────────────────────────────────────────
 
+async function readJsonWithinLimit(
+  response: Response,
+  maxBytes: number,
+  onBytes: (receivedBytes: number) => void,
+): Promise<unknown> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new TerminalRecoveryOverflowError();
+  }
+
+  if (!response.body) {
+    const text = await response.text();
+    const receivedBytes = new TextEncoder().encode(text).byteLength;
+    if (receivedBytes > maxBytes) {
+      throw new TerminalRecoveryOverflowError();
+    }
+    onBytes(receivedBytes);
+    return JSON.parse(text);
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new TerminalRecoveryOverflowError();
+      }
+      onBytes(totalBytes);
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+
+  const payload = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    payload.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(payload));
+}
+
 export async function fetchSessions(hubUrl: string): Promise<StoredSession[]> {
   const res = await fetch(`${hubUrl}/api/sessions`, {
     credentials: "include",
@@ -917,8 +1466,22 @@ export async function fetchSessions(hubUrl: string): Promise<StoredSession[]> {
 export async function fetchMessages(
   hubUrl: string,
   sessionId: string,
-  opts: { limit?: number; beforeSeq?: number; afterSeq?: number } = {},
-): Promise<StoredMessage[]> {
+  opts: {
+    limit?: number;
+    beforeSeq?: number;
+    afterSeq?: number;
+    maxBytes: number;
+    signal: AbortSignal;
+    onBytes(receivedBytes: number): void;
+  },
+): Promise<Array<{
+  id: string;
+  session_id: string;
+  content: unknown;
+  seq: number;
+  local_id: string | null;
+  created_at: string;
+}>> {
   const params = new URLSearchParams();
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.beforeSeq != null) params.set("before_seq", String(opts.beforeSeq));
@@ -926,11 +1489,41 @@ export async function fetchMessages(
   const qs = params.toString() ? `?${params}` : "";
   const res = await fetch(`${hubUrl}/api/sessions/${sessionId}/messages${qs}`, {
     credentials: "include",
+    signal: opts.signal,
   });
   if (!res.ok) throw new Error(`Failed to fetch messages: ${res.status}`);
-  return normalizeArrayResponse(await res.json().catch(() => null))
-    .map((message) => normalizeStoredMessage(message))
-    .filter(isPresent);
+  const payload = await readJsonWithinLimit(res, opts.maxBytes, opts.onBytes);
+  if (!Array.isArray(payload)) throw new Error("Invalid terminal history response");
+  return payload.map((message) => {
+    if (
+      !isRecord(message) ||
+      typeof message.id !== "string" ||
+      message.id.length === 0 ||
+      message.session_id !== sessionId ||
+      typeof message.content !== "string" ||
+      !Number.isInteger(message.seq) ||
+      (message.seq as number) < 1 ||
+      !("local_id" in message) ||
+      (message.local_id !== null && typeof message.local_id !== "string") ||
+      typeof message.created_at !== "string"
+    ) {
+      throw new Error("Invalid terminal history response");
+    }
+    let content: unknown;
+    try {
+      content = JSON.parse(message.content);
+    } catch {
+      throw new Error("Invalid terminal history response");
+    }
+    return {
+      id: message.id,
+      session_id: message.session_id,
+      content,
+      seq: message.seq as number,
+      local_id: message.local_id ?? null,
+      created_at: message.created_at,
+    };
+  });
 }
 
 export async function fetchPendingPermissions(hubUrl: string, sessionId: string): Promise<StoredPermission[]> {
@@ -1014,23 +1607,32 @@ export async function fetchEnvStartupDiagnostics(
   };
 }
 
+export interface CreateEnvOptions {
+  harness: EnvHarness;
+  planSelection?: StartupPlanSelection;
+  harnessSettings?: HarnessSettings;
+  schedule?: { runAtMs: number; timeZone: string };
+}
+
 export async function createEnv(
   hubUrl: string,
   repoId: string,
-  backend: "cf" | "host",
-  harness: EnvHarness,
-  authMode?: "auto" | "subscription" | "api",
-  codexAuthPreference?: "auto" | "subscription" | "api-key",
-  planSelection?: StartupPlanSelection,
+  options: CreateEnvOptions,
 ): Promise<EnvMeta> {
+  const {
+    harness,
+    planSelection,
+    harnessSettings,
+    schedule,
+  } = options;
   const res = await fetch(`${hubUrl}/api/envs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify({ repoId, backend, harness, authMode, codexAuthPreference, planSelection }),
+    body: JSON.stringify({ repoId, harness, planSelection, harnessSettings, schedule }),
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error?: string };
     throw new Error(body.error || `Failed to create env: ${res.status}`);
   }
   const env = normalizeEnvMetaObject(await res.json().catch(() => null));
@@ -1040,10 +1642,18 @@ export async function createEnv(
   return env;
 }
 
+export async function cancelScheduledRun(hubUrl: string, slug: string): Promise<void> {
+  const res = await fetch(`${hubUrl}/api/envs/${slug}/scheduled-run/cancel`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to cancel Scheduled Run: ${res.status}`);
+}
+
 export async function startEnv(
   hubUrl: string,
   slug: string,
-  options?: { planSelection?: StartupPlanSelection },
+  options?: { harnessSettings?: HarnessSettings },
 ): Promise<{ ok: boolean; slug: string; status: string }> {
   const res = await fetch(`${hubUrl}/api/envs/${slug}/start`, {
     method: "POST",
@@ -1082,25 +1692,24 @@ export async function syncEnv(hubUrl: string, slug: string): Promise<void> {
   if (!res.ok) throw new Error(`Failed to sync env: ${res.status}`);
 }
 
-export async function mergeEnvIntoMain(
+export async function publishEnvDraftPr(
   hubUrl: string,
   slug: string,
 ): Promise<{
   ok: boolean;
   slug: string;
-  repoId: string;
   operationId?: string;
   pending?: boolean;
-  action?: "already-current" | "merged" | "conflicted";
-  conflictCount?: number;
-  previousMainCommit?: string | null;
-  currentMainCommit?: string | null;
+  noChanges?: boolean;
+  branch?: string | null;
+  prNumber?: number | null;
+  prUrl?: string | null;
 }> {
-  const res = await fetch(`${hubUrl}/api/envs/${slug}/merge-into-main`, {
+  const res = await fetch(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/github/publish-draft-pr`, {
     method: "POST",
     credentials: "include",
   });
-  if (!res.ok) throw await parseApiError(res, `Promote to Main failed: ${res.status}`);
+  if (!res.ok) throw await parseApiError(res, `Publish Draft PR failed: ${res.status}`);
   return res.json();
 }
 
@@ -1120,10 +1729,10 @@ export interface EnvChangesResponse {
   slug: string;
   repoId: string;
   repoUrl: string;
-  comparisonBasis: "promote-preview";
+  comparisonBasis: "draft-pr-diff";
   oldCommit: string | null;
   newBaseCommit: string | null;
-  branchStatus: "ready-to-merge" | "up-to-date";
+  branchStatus: "ready-to-merge" | "up-to-date" | "behind-main" | "needs-attention";
   summary: {
     total: number;
     added: number;
@@ -1149,7 +1758,7 @@ export async function fetchEnvChanges(hubUrl: string, slug: string): Promise<Env
   const res = await fetch(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/changes`, {
     credentials: "include",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to load promote preview: ${res.status}`);
+  if (!res.ok) throw await parseApiError(res, `Failed to load draft diff: ${res.status}`);
   return res.json();
 }
 
@@ -1164,27 +1773,6 @@ export async function fetchEnvChangeFile(
     credentials: "include",
   });
   if (!res.ok) throw await parseApiError(res, `Failed to load file diff: ${res.status}`);
-  return res.json();
-}
-
-export async function updateEnvFromMain(
-  hubUrl: string,
-  slug: string,
-): Promise<{
-  ok: boolean;
-  slug: string;
-  repoId: string;
-  operationId?: string;
-  pending?: boolean;
-  action?: "updated-from-main" | "up-to-date" | "conflicted";
-  currentMainCommit?: string | null;
-  branchStatus?: "ready-to-merge" | "up-to-date" | "needs-attention";
-}> {
-  const res = await fetch(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/update-from-main`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Update from Main failed: ${res.status}`);
   return res.json();
 }
 
@@ -1255,6 +1843,299 @@ export async function fetchRepoArtifacts(
   return normalizeRepoArtifactState(await res.json().catch(() => null));
 }
 
+export async function fetchPlannerProviders(
+  hubUrl: string,
+  repoId: string,
+): Promise<{ providers: PlannerProviderMetadata[]; skillRoutes: AgentRoute[] }> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/planner-providers`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch planner providers: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  return {
+    providers: isRecord(body)
+      ? normalizeArrayResponse(body.providers).map(normalizePlannerProvider).filter(isPresent)
+      : [],
+    skillRoutes: isRecord(body)
+      ? normalizeArrayResponse(body.skillRoutes).map(normalizeAgentRoute).filter(isPresent)
+      : [],
+  };
+}
+
+export async function fetchEnvReviewState(
+  hubUrl: string,
+  envSlug: string,
+  sessionId: string,
+): Promise<EnvReviewState> {
+  const params = new URLSearchParams({ sessionId });
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch env review state: ${res.status}`);
+  return normalizeEnvReviewState(await res.json().catch(() => null));
+}
+
+export async function addEnvReviewer(
+  hubUrl: string,
+  envSlug: string,
+  input: { sessionId: string; provider: string; model: string; effort?: PlannerEffort },
+): Promise<EnvReviewState> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to add env reviewer: ${res.status}`);
+  return normalizeEnvReviewState(await res.json().catch(() => null));
+}
+
+export async function removeEnvReviewer(
+  hubUrl: string,
+  envSlug: string,
+  threadId: string,
+  sessionId: string,
+): Promise<EnvReviewState> {
+  const params = new URLSearchParams({ sessionId });
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}?${params}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to remove env reviewer: ${res.status}`);
+  return normalizeEnvReviewState(await res.json().catch(() => null));
+}
+
+export async function startEnvReviewRun(
+  hubUrl: string,
+  envSlug: string,
+  threadId: string,
+  input: {
+    sessionId: string;
+    taskKind: string;
+    customTask?: string | null;
+    provider?: string;
+    model?: string;
+    effort?: PlannerEffort;
+  },
+): Promise<EnvReviewState> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to start env review: ${res.status}`);
+  return normalizeEnvReviewState(await res.json().catch(() => null));
+}
+
+export async function cancelEnvReviewRun(
+  hubUrl: string,
+  envSlug: string,
+  runId: string,
+  input: { sessionId: string },
+): Promise<EnvReviewState> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to cancel env review: ${res.status}`);
+  return normalizeEnvReviewState(await res.json().catch(() => null));
+}
+
+export async function fetchEnvReviewMessages(
+  hubUrl: string,
+  envSlug: string,
+  threadId: string,
+  sessionId: string,
+): Promise<ThreadMessage[]> {
+  const params = new URLSearchParams({ sessionId });
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/messages?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch env reviewer messages: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  return isRecord(body)
+    ? normalizeArrayResponse(body.messages).map(normalizeThreadMessage).filter(isPresent)
+    : [];
+}
+
+export async function sendEnvReviewMessage(
+  hubUrl: string,
+  envSlug: string,
+  threadId: string,
+  input: { sessionId: string; text: string },
+): Promise<{ run: EnvReviewRun | null; messages: ThreadMessage[]; state: EnvReviewState }> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to send env reviewer message: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body)) throw new Error("Malformed env reviewer message response");
+  return {
+    run: normalizeEnvReviewRun(body.run),
+    messages: normalizeArrayResponse(body.messages).map(normalizeThreadMessage).filter(isPresent),
+    state: normalizeEnvReviewState(body.state),
+  };
+}
+
+export async function fetchEnvReviewRun(
+  hubUrl: string,
+  envSlug: string,
+  runId: string,
+  sessionId: string,
+  afterSeq?: number,
+): Promise<{ run: EnvReviewRun; events: EnvReviewRunEvent[] }> {
+  const params = new URLSearchParams({ sessionId });
+  if (afterSeq != null) params.set("afterSeq", String(afterSeq));
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/runs/${encodeURIComponent(runId)}?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch env review run: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const run = isRecord(body) ? normalizeEnvReviewRun(body.run) : null;
+  if (!run) throw new Error("Malformed env review run response");
+  return {
+    run,
+    events: isRecord(body)
+      ? normalizeArrayResponse(body.events).map(normalizeEnvReviewRunEvent).filter(isPresent)
+      : [],
+  };
+}
+
+export interface ReviewSkillInvocationDetail {
+  invocation: ReviewSkillInvocation;
+  tabs: EnvReviewTab[];
+  runs: EnvReviewRun[];
+}
+
+export async function invokeReviewSkill(
+  hubUrl: string,
+  envSlug: string,
+  parentThreadId: string,
+  skillId: string,
+  input: { sessionId: string; requestId: string; overviewMode?: "auto" | "manual" },
+): Promise<{ kind: "preset"; run: EnvReviewRun } | ({ kind: "fanout" } & ReviewSkillInvocationDetail)> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(parentThreadId)}/skills/${encodeURIComponent(skillId)}/invoke`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to invoke Review skill: ${res.status}`);
+  return await res.json() as any;
+}
+
+export async function fetchReviewSkillInvocations(
+  hubUrl: string,
+  envSlug: string,
+  sessionId: string,
+  options: { cursor?: string | null; limit?: number } = {},
+): Promise<{ invocations: Array<Record<string, unknown>>; nextCursor: string | null }> {
+  const params = new URLSearchParams({ sessionId });
+  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.limit) params.set("limit", String(options.limit));
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Review skill history: ${res.status}`);
+  return await res.json() as any;
+}
+
+export async function fetchReviewSkillInvocation(
+  hubUrl: string,
+  envSlug: string,
+  sessionId: string,
+  invocationId: string,
+): Promise<ReviewSkillInvocationDetail> {
+  const params = new URLSearchParams({ sessionId });
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Review skill invocation: ${res.status}`);
+  return await res.json() as ReviewSkillInvocationDetail;
+}
+
+export async function updateReviewSkillControls(
+  hubUrl: string,
+  envSlug: string,
+  invocationId: string,
+  input: { sessionId: string; overviewMode: "auto" | "manual"; includedMessageIds: string[] },
+): Promise<ReviewSkillInvocation> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/controls`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to update Overview controls: ${res.status}`);
+  const body = await res.json() as { invocation: ReviewSkillInvocation };
+  return body.invocation;
+}
+
+export async function sendReviewSkillOverview(
+  hubUrl: string,
+  envSlug: string,
+  invocationId: string,
+  input: { sessionId: string; guidance?: string | null },
+): Promise<Record<string, unknown>> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/overview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to send Review Overview: ${res.status}`);
+  return await res.json() as Record<string, unknown>;
+}
+
+export async function cancelReviewSkillInvocation(
+  hubUrl: string,
+  envSlug: string,
+  invocationId: string,
+  sessionId: string,
+): Promise<ReviewSkillInvocation> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ sessionId }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to cancel Review skill invocation: ${res.status}`);
+  const body = await res.json() as { invocation: ReviewSkillInvocation };
+  return body.invocation;
+}
+
+export async function markEnvReviewFeedback(
+  hubUrl: string,
+  envSlug: string,
+  feedbackId: string,
+  status: "pending" | "sent" | "dismiss",
+  input: { sessionId: string; deliveredText?: string | null },
+): Promise<EnvReviewFeedback> {
+  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/feedback/${encodeURIComponent(feedbackId)}/${status}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to update env review feedback: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const feedback = isRecord(body) ? normalizeEnvReviewFeedback(body.feedback) : null;
+  if (!feedback) throw new Error("Malformed env review feedback response");
+  return feedback;
+}
+
 export async function createPlan(
   hubUrl: string,
   repoId: string,
@@ -1271,6 +2152,27 @@ export async function createPlan(
   const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
   if (!artifact) {
     throw new Error("Malformed plan response");
+  }
+  return artifact;
+}
+
+export async function savePlan(
+  hubUrl: string,
+  repoId: string,
+  id: string,
+  markdown: string,
+): Promise<Artifact> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ markdown }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to save plan: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
+  if (!artifact) {
+    throw new Error("Malformed save plan response");
   }
   return artifact;
 }
@@ -1318,6 +2220,448 @@ export async function discardPlan(
   return artifact;
 }
 
+export async function fetchPlanContributions(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+): Promise<PlanContribution[]> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch contributions: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  return isRecord(body)
+    ? normalizeArrayResponse(body.contributions).map(normalizePlanContribution).filter(isPresent)
+    : [];
+}
+
+function normalizePlanWriterState(payload: unknown): PlanWriterState | null {
+  if (!isRecord(payload)) return null;
+  const lifecycle = payload.lifecycle === "not_running" || payload.lifecycle === "starting" || payload.lifecycle === "running"
+    ? payload.lifecycle
+    : null;
+  const provider: PlanWriterProvider | null = payload.provider === "claude-code" || payload.provider === "codex"
+    ? payload.provider
+    : null;
+  const effort = normalizePlannerEffortId(payload.effort);
+  const synchronization = isRecord(payload.synchronization) ? payload.synchronization : null;
+  const syncState = synchronization?.state === "up_to_date"
+    || synchronization?.state === "saving"
+    || synchronization?.state === "sync_failed"
+    ? synchronization.state
+    : null;
+  if (!lifecycle || !syncState || typeof payload.editable !== "boolean") return null;
+  return {
+    lifecycle,
+    generation: Number.isInteger(payload.generation) ? payload.generation as number : null,
+    provider,
+    model: readNullableString(payload.model),
+    effort,
+    basisCommit: readNullableString(payload.basisCommit),
+    terminalId: readNullableString(payload.terminalId),
+    ...(payload.codexAuthMode === "subscription" || payload.codexAuthMode === "api-key"
+      ? { codexAuthMode: payload.codexAuthMode }
+      : {}),
+    ...(readNullableString(payload.stopReason) ? { stopReason: readNullableString(payload.stopReason) as PlanWriterState["stopReason"] } : {}),
+    ...(readNullableString(payload.startupError) ? { startupError: readNullableString(payload.startupError) ?? undefined } : {}),
+    ...(readNullableString(payload.cleanupError) ? { cleanupError: readNullableString(payload.cleanupError) ?? undefined } : {}),
+    synchronization: {
+      state: syncState,
+      ...(readNullableString(synchronization?.error) ? { error: readNullableString(synchronization?.error) ?? undefined } : {}),
+    },
+    editable: payload.editable,
+  };
+}
+
+export async function fetchPlanWriter(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+): Promise<PlanWriterState> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan Writer: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
+  if (!writer) throw new Error("Malformed Plan Writer response");
+  return writer;
+}
+
+export async function startPlanWriter(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  input: { provider?: PlanWriterProvider; model?: string; effort?: PlannerEffort } = {},
+): Promise<PlanWriterState> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw await parseApiError(new Response(JSON.stringify(body), { status: res.status, headers: { "Content-Type": "application/json" } }), `Failed to start Plan Writer: ${res.status}`);
+  const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
+  if (!writer) throw new Error("Malformed Plan Writer response");
+  return writer;
+}
+
+export async function stopPlanWriter(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  expectedGeneration: number,
+): Promise<PlanWriterState> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ expectedGeneration }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to stop Plan Writer: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
+  if (!writer) throw new Error("Malformed Plan Writer response");
+  return writer;
+}
+
+export async function fetchAgentSkills(
+  hubUrl: string,
+  repoId: string,
+  surface: "plan" | "review",
+): Promise<AgentSkillDefinition[]> {
+  const params = new URLSearchParams({ surface });
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch ${surface} skills: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  return isRecord(body)
+    ? normalizeArrayResponse(body.skills).map(normalizeAgentSkill).filter(isPresent)
+    : [];
+}
+
+export async function createAgentSkill(
+  hubUrl: string,
+  repoId: string,
+  input: Omit<AgentSkillDefinition, "id" | "origin" | "customized" | "createdAt" | "updatedAt">,
+): Promise<AgentSkillDefinition> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to create skill: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const skill = isRecord(body) ? normalizeAgentSkill(body.skill) : null;
+  if (!skill) throw new Error("Malformed skill response");
+  return skill;
+}
+
+export async function updateAgentSkill(
+  hubUrl: string,
+  repoId: string,
+  surface: "plan" | "review",
+  skillId: string,
+  input: Partial<AgentSkillDefinition>,
+): Promise<AgentSkillDefinition> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills/${surface}/${encodeURIComponent(skillId)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to save skill: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const skill = isRecord(body) ? normalizeAgentSkill(body.skill) : null;
+  if (!skill) throw new Error("Malformed skill response");
+  return skill;
+}
+
+export async function deleteAgentSkill(
+  hubUrl: string,
+  repoId: string,
+  surface: "plan" | "review",
+  skillId: string,
+): Promise<AgentSkillDefinition | null> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills/${surface}/${encodeURIComponent(skillId)}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to delete skill: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  return isRecord(body) ? normalizeAgentSkill(body.skill) : null;
+}
+
+export async function fetchRepoPlanWriterSettings(hubUrl: string, repoId: string): Promise<RepoPlanWriterSettings> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plan-writer-settings`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan Writer Settings: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Plan Writer Settings response");
+  return body.settings as unknown as RepoPlanWriterSettings;
+}
+
+export async function updateRepoPlanWriterSettings(
+  hubUrl: string,
+  repoId: string,
+  input: Pick<RepoPlanWriterSettings, "routeKey" | "effort" | "fastMode" | "planFormat">,
+): Promise<RepoPlanWriterSettings> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plan-writer-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to save Plan Writer Settings: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Plan Writer Settings response");
+  return body.settings as unknown as RepoPlanWriterSettings;
+}
+
+export interface PlanSkillInvocationDetail {
+  invocation: PlanSkillInvocation;
+  reviewers: ReviewerRegistryEntry[];
+  runs: PlannerRun[];
+}
+
+export async function invokePlanSkill(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  skillId: string,
+  requestId: string,
+): Promise<{ kind: "fanout" } & PlanSkillInvocationDetail> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skills/${encodeURIComponent(skillId)}/invoke`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ requestId }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to invoke Plan skill: ${res.status}`);
+  return await res.json() as { kind: "fanout" } & PlanSkillInvocationDetail;
+}
+
+export async function fetchPlanSkillInvocations(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  options: { cursor?: string | null; limit?: number } = {},
+): Promise<{ invocations: Array<Record<string, unknown>>; nextCursor: string | null }> {
+  const params = new URLSearchParams();
+  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.limit) params.set("limit", String(options.limit));
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan skill history: ${res.status}`);
+  return await res.json() as any;
+}
+
+export async function fetchPlanSkillInvocation(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  invocationId: string,
+): Promise<PlanSkillInvocationDetail> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations/${encodeURIComponent(invocationId)}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan skill invocation: ${res.status}`);
+  return await res.json() as PlanSkillInvocationDetail;
+}
+
+export async function cancelPlanSkillInvocation(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  invocationId: string,
+): Promise<PlanSkillInvocation> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations/${encodeURIComponent(invocationId)}/cancel`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to cancel Plan skill invocation: ${res.status}`);
+  const body = await res.json() as { invocation: PlanSkillInvocation };
+  return body.invocation;
+}
+
+export async function forwardPlanSkillReports(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  invocationId: string,
+  input: { requestId: string; messageIds: string[]; guidance?: string | null },
+): Promise<{ contributions: PlanContribution[] }> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations/${encodeURIComponent(invocationId)}/forward`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to forward Plan skill reports: ${res.status}`);
+  return await res.json() as { contributions: PlanContribution[] };
+}
+
+export async function createPlanContribution(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  input: {
+    text: string;
+    provider: string;
+    model: string;
+    skill?: string;
+    sourceRunId?: string;
+    sourceThreadId?: string;
+  },
+): Promise<PlanContribution> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to create contribution: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
+  if (!contribution) throw new Error("Malformed contribution response");
+  return contribution;
+}
+
+export async function dismissPlanContribution(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  contributionId: string,
+): Promise<PlanContribution> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions/${contributionId}/dismiss`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to dismiss contribution: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
+  if (!contribution) throw new Error("Malformed contribution response");
+  return contribution;
+}
+
+export async function incorporatePlanContribution(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  contributionId: string,
+): Promise<PlanContribution> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions/${contributionId}/incorporate`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to mark contribution incorporated: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
+  if (!contribution) throw new Error("Malformed contribution response");
+  return contribution;
+}
+
+export async function sendReviewerMessageToWriter(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  threadId: string,
+  messageId: string,
+): Promise<{ contribution: PlanContribution; created: boolean }> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages/${messageId}/send-to-writer`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: "{}",
+    },
+  );
+  if (!res.ok) throw await parseApiError(res, `Failed to send feedback to writer: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
+  if (!contribution) throw new Error("Malformed send-to-writer response");
+  return {
+    contribution,
+    created: isRecord(body) ? body.created === true : false,
+  };
+}
+
+export async function fetchPlannerRun(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  runId: string,
+  afterSeq?: number,
+): Promise<{ run: PlannerRun; events: PlannerRunEvent[] }> {
+  const params = new URLSearchParams();
+  if (afterSeq != null) params.set("afterSeq", String(afterSeq));
+  const qs = params.toString() ? `?${params}` : "";
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/${runId}${qs}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch planner run: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const run = isRecord(body) ? normalizePlannerRun(body.run) : null;
+  if (!run) throw new Error("Malformed planner run response");
+  return {
+    run,
+    events: isRecord(body) ? normalizeArrayResponse(body.events).map(normalizePlannerRunEvent).filter(isPresent) : [],
+  };
+}
+
+export async function fetchLatestPlannerRun(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  role: "reviewer",
+  threadId: string,
+): Promise<{ run: PlannerRun | null; events: PlannerRunEvent[] }> {
+  const params = new URLSearchParams();
+  params.set("role", role);
+  if (threadId) params.set("threadId", threadId);
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/latest?${params}`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch latest planner run: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const run = isRecord(body) && body.run != null ? normalizePlannerRun(body.run) : null;
+  return {
+    run,
+    events: isRecord(body) ? normalizeArrayResponse(body.events).map(normalizePlannerRunEvent).filter(isPresent) : [],
+  };
+}
+
+export async function cancelPlannerRun(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  runId: string,
+): Promise<PlannerRun> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/${runId}/cancel`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to cancel planner run: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const run = isRecord(body) ? normalizePlannerRun(body.run) : null;
+  if (!run) throw new Error("Malformed cancel response");
+  return run;
+}
+
 export async function fetchPlanReviewers(
   hubUrl: string,
   repoId: string,
@@ -1338,13 +2682,13 @@ export async function addPlanReviewer(
   hubUrl: string,
   repoId: string,
   artifactId: string,
-  reviewerModel: string,
-): Promise<ReviewerRegistryEntry> {
+  input: { provider: string; model: string; effort: PlannerEffort },
+): Promise<{ reviewer: ReviewerRegistryEntry; run?: PlannerRun }> {
   const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify({ reviewerModel }),
+    body: JSON.stringify(input),
   });
   if (!res.ok) throw await parseApiError(res, `Failed to add reviewer: ${res.status}`);
   const body = await res.json().catch(() => null);
@@ -1352,7 +2696,11 @@ export async function addPlanReviewer(
   if (!reviewer) {
     throw new Error("Malformed reviewer response");
   }
-  return reviewer;
+  const run = isRecord(body) ? normalizePlannerRun(body.run) : null;
+  return {
+    reviewer,
+    ...(run ? { run } : {}),
+  };
 }
 
 export async function removePlanReviewer(
@@ -1366,6 +2714,46 @@ export async function removePlanReviewer(
     credentials: "include",
   });
   if (!res.ok) throw await parseApiError(res, `Failed to remove reviewer: ${res.status}`);
+}
+
+export async function fetchReviewerMessages(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  threadId: string,
+): Promise<ThreadMessage[]> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch reviewer messages: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  return isRecord(body)
+    ? normalizeArrayResponse(body.messages).map(normalizeThreadMessage).filter(isPresent)
+    : [];
+}
+
+export async function sendReviewerMessage(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  threadId: string,
+  text: string,
+): Promise<{ run: PlannerRun | null; message: ThreadMessage }> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to send reviewer message: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  const message = isRecord(body) ? normalizeThreadMessage(body.message) : null;
+  if (!message) throw new Error("Malformed reviewer message response");
+  return {
+    run: isRecord(body) ? normalizePlannerRun(body.run) : null,
+    message,
+  };
 }
 
 export async function createRepo(
@@ -1501,27 +2889,260 @@ export async function fetchRepo(hubUrl: string, repoId: string): Promise<RepoMet
   return repo;
 }
 
-export async function bootstrapRepoGitArtifact(
+export interface RepoSessionEnvVar {
+  name: string;
+  updatedAt: string;
+}
+
+export interface RepoMcpServer {
+  id: string;
+  label: string;
+  url: string;
+  enabled: boolean;
+}
+
+export interface RepoMcpServerInput {
+  id?: string;
+  label: string;
+  url: string;
+  enabled: boolean;
+}
+
+export type CloudflareMcpConnectionStatus = "not_connected" | "connected" | "reauth_required";
+
+export interface RepoCloudflareMcpStatus {
+  integrationId: string;
+  serverId: string;
+  label: string;
+  mcpUrl: string;
+  status: CloudflareMcpConnectionStatus;
+  connected: boolean;
+  enabled: boolean;
+  scopes: string[];
+  expiresAt: number | null;
+  account: { id: string | null; name: string | null } | null;
+  lastAuthError: string | null;
+  lastAuthErrorAt: string | null;
+}
+
+function normalizeRepoSessionEnvVar(payload: unknown): RepoSessionEnvVar | null {
+  if (!isRecord(payload)) return null;
+  const name = readString(payload.name);
+  const updatedAt = readString(payload.updatedAt);
+  if (!name || !updatedAt) return null;
+  return { name, updatedAt };
+}
+
+export async function fetchRepoSessionEnv(
   hubUrl: string,
   repoId: string,
-): Promise<{ ok: true; repoId: string; gitStatus: string; gitArtifactId?: string | null }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/git-artifact/bootstrap`, {
+): Promise<RepoSessionEnvVar[]> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/session-env`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to fetch session env: ${res.status}`);
+  }
+  if (!isRecord(body)) {
+    throw new Error("Malformed session env response");
+  }
+  return normalizeArrayResponse<unknown>(body.vars)
+    .map(normalizeRepoSessionEnvVar)
+    .filter(isPresent);
+}
+
+export async function patchRepoSessionEnv(
+  hubUrl: string,
+  repoId: string,
+  patch: { set?: Record<string, string>; delete?: string[] },
+): Promise<RepoSessionEnvVar[]> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/session-env`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    cache: "no-store",
+    body: JSON.stringify(patch),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to update session env: ${res.status}`);
+  }
+  if (!isRecord(body)) {
+    throw new Error("Malformed session env response");
+  }
+  return normalizeArrayResponse<unknown>(body.vars)
+    .map(normalizeRepoSessionEnvVar)
+    .filter(isPresent);
+}
+
+function normalizeRepoMcpServer(payload: unknown): RepoMcpServer | null {
+  if (!isRecord(payload)) return null;
+  const id = readString(payload.id);
+  const label = readString(payload.label);
+  const url = readString(payload.url);
+  if (!id || !label || !url || typeof payload.enabled !== "boolean") return null;
+  return {
+    id,
+    label,
+    url,
+    enabled: payload.enabled,
+  };
+}
+
+export async function fetchRepoMcpServers(
+  hubUrl: string,
+  repoId: string,
+): Promise<RepoMcpServer[]> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/mcp-servers`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to fetch MCP servers: ${res.status}`);
+  }
+  if (!isRecord(body)) {
+    throw new Error("Malformed MCP servers response");
+  }
+  return normalizeArrayResponse<unknown>(body.servers)
+    .map(normalizeRepoMcpServer)
+    .filter(isPresent);
+}
+
+export async function putRepoMcpServers(
+  hubUrl: string,
+  repoId: string,
+  servers: RepoMcpServerInput[],
+): Promise<RepoMcpServer[]> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/mcp-servers`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    cache: "no-store",
+    body: JSON.stringify({ servers }),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to update MCP servers: ${res.status}`);
+  }
+  if (!isRecord(body)) {
+    throw new Error("Malformed MCP servers response");
+  }
+  return normalizeArrayResponse<unknown>(body.servers)
+    .map(normalizeRepoMcpServer)
+    .filter(isPresent);
+}
+
+function normalizeRepoCloudflareMcpStatus(payload: unknown): RepoCloudflareMcpStatus | null {
+  if (!isRecord(payload)) return null;
+  const integrationId = readString(payload.integrationId);
+  const serverId = readString(payload.serverId);
+  const label = readString(payload.label);
+  const mcpUrl = readString(payload.mcpUrl);
+  const status = payload.status === "not_connected" || payload.status === "connected" || payload.status === "reauth_required"
+    ? payload.status
+    : null;
+  if (!integrationId || !serverId || !label || !mcpUrl || !status) return null;
+  const account = isRecord(payload.account)
+    ? {
+      id: readNullableString(payload.account.id),
+      name: readNullableString(payload.account.name),
+    }
+    : null;
+  return {
+    integrationId,
+    serverId,
+    label,
+    mcpUrl,
+    status,
+    connected: readBooleanOr(payload.connected),
+    enabled: readBooleanOr(payload.enabled),
+    scopes: normalizeArrayResponse<unknown>(payload.scopes).filter((scope): scope is string => typeof scope === "string"),
+    expiresAt: typeof payload.expiresAt === "number" && Number.isFinite(payload.expiresAt) ? payload.expiresAt : null,
+    account,
+    lastAuthError: readNullableString(payload.lastAuthError),
+    lastAuthErrorAt: readNullableString(payload.lastAuthErrorAt),
+  };
+}
+
+function readRepoCloudflareMcpStatusBody(body: unknown): RepoCloudflareMcpStatus {
+  if (!isRecord(body)) {
+    throw new Error("Malformed Cloudflare MCP response");
+  }
+  const integration = normalizeRepoCloudflareMcpStatus(body.integration);
+  if (!integration) {
+    throw new Error("Malformed Cloudflare MCP response");
+  }
+  return integration;
+}
+
+export async function fetchRepoCloudflareMcpStatus(
+  hubUrl: string,
+  repoId: string,
+): Promise<RepoCloudflareMcpStatus> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to fetch Cloudflare MCP status: ${res.status}`);
+  }
+  return readRepoCloudflareMcpStatusBody(body);
+}
+
+export async function connectRepoCloudflareMcp(
+  hubUrl: string,
+  repoId: string,
+): Promise<{ authorizeUrl: string; expiresAt: number }> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp/connect`, {
     method: "POST",
     credentials: "include",
+    cache: "no-store",
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error || `Failed to bootstrap canonical main: ${res.status}`);
-  }
   const body = await res.json().catch(() => null);
-  return {
-    ok: true,
-    repoId: isRecord(body) ? readStringOr(body.repoId, repoId) : repoId,
-    gitStatus: isRecord(body) ? readStringOr(body.gitStatus, "pending") : "pending",
-    ...(isRecord(body) && ("gitArtifactId" in body)
-      ? { gitArtifactId: readNullableString(body.gitArtifactId) }
-      : {}),
-  };
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to start Cloudflare MCP connection: ${res.status}`);
+  }
+  if (!isRecord(body) || typeof body.authorizeUrl !== "string" || typeof body.expiresAt !== "number") {
+    throw new Error("Malformed Cloudflare MCP connect response");
+  }
+  return { authorizeUrl: body.authorizeUrl, expiresAt: body.expiresAt };
+}
+
+export async function setRepoCloudflareMcpEnabled(
+  hubUrl: string,
+  repoId: string,
+  enabled: boolean,
+): Promise<RepoCloudflareMcpStatus> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp/${enabled ? "enable" : "disable"}`, {
+    method: "POST",
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to update Cloudflare MCP: ${res.status}`);
+  }
+  return readRepoCloudflareMcpStatusBody(body);
+}
+
+export async function disconnectRepoCloudflareMcp(
+  hubUrl: string,
+  repoId: string,
+): Promise<RepoCloudflareMcpStatus> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp/disconnect`, {
+    method: "POST",
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to disconnect Cloudflare MCP: ${res.status}`);
+  }
+  return readRepoCloudflareMcpStatusBody(body);
 }
 
 // ── Setup / Settings helpers ─────────────────────────────────────
@@ -1530,57 +3151,28 @@ export interface SetupStatus {
   needsSetup: boolean;
   setupPhase: "protect-hub" | "github-app" | "model-access" | "complete";
   isLocalDev: boolean;
-  currentOrigin: string;
-  hubUrl: string;
-  deploymentMode: "hosted" | "self-host";
-  selfHostStatus: "not-enabled" | "setup-in-progress" | "enabled" | "offline" | "ready";
-  selfHostSetupAttemptId: string | null;
   workersDevHubUrl: string | null;
-  routeKind: "workers-dev" | "custom-domain";
-  workerServiceName: string | null;
   modelAuthConfigured: boolean;
-  modelAuthMode: "subscription" | "api" | "api-key" | null;
-  hostedInfrastructureReady: boolean;
-  hostedBlockingReasons: string[];
-  hostedModelReady: boolean;
-  hostedModelBlockingReasons: string[];
-  selfHostReady: boolean;
-  selfHostBlockingReasons: string[];
+  claudeBillingMode: BillingMode | null;
+  openaiBillingMode: BillingMode | null;
   workersAiConfigured: boolean;
   hasClaudeSubscription: boolean;
   hasAnthropicKey: boolean;
   hasChatGPTAuth: boolean;
-  chatgptAuthStatus: "missing" | "connected" | "refreshing" | "needs_reconnect";
+  chatgptAuthStatus: "missing" | "connected" | "refreshing" | "needs_reconnect" | "temporarily_unavailable";
   hasOpenAIKey: boolean;
-  codexRouteStatus: "available" | "gateway_offline" | "host_offline" | "api_fallback" | "unavailable";
+  codexRouteStatus: "available" | "backend_offline" | "runtime_update_required" | "environment_not_connected" | "authentication_unavailable" | "direct_api" | "unavailable";
   openaiPlannerConfigured: boolean;
   openaiPlannerAvailable: boolean;
-  openaiPlannerRoute: "api-key" | "subscription-gateway" | null;
+  openaiPlannerRoute: "api-key" | "subscription-app-server" | null;
   openaiPlannerReason: string | null;
+  codexBackendReadiness: { cf: SetupStatus["codexRouteStatus"]; host: SetupStatus["codexRouteStatus"] };
   hostRegistered: boolean;
-  hostRegisteredMode: "none" | "session";
-  hostGatewayAvailable: boolean;
-  hostGatewayConfigured: boolean;
-  hostGatewayMode: "none" | "quick" | "named";
   enabledHarnesses: EnvHarness[];
   protectionMode: "public" | "cf-access";
-  protectionCanAutomate: boolean;
-  serviceTokenConfigured: boolean;
-  gatewayHostname: string | null;
-  browserProtected: boolean;
-  gatewayProvisioned: boolean;
-  gatewayTunnelConfigured: boolean;
-  gatewaySupportAvailable: boolean;
-  gatewaySupportReason: string | null;
-  workersDevCutoverPending: boolean;
-  unsupportedProtectionConfig: boolean;
-  workersDevAliasDisabled: boolean;
-  protectionAppDomain: string | null;
-  accessConfigured: boolean;
-  accessIssuer: string | null;
-  accessJwksUrl: string | null;
+  tokenExpiresAt: string | null;
+  renewalRecommended: boolean;
   hostConnected: boolean;
-  hostConnectionMode: "none" | "session";
   idleTimeoutMinutes: number;
   canonicalMainBootstrapDepth: number;
   githubAppAvailable: boolean;
@@ -1594,12 +3186,127 @@ export interface SetupStatus {
   selfUpdateRepo: HubUpdateRepoState;
 }
 
+export type ExecutionSelection =
+  | { target: "cf" }
+  | { target: "host"; machineId: string };
+export type HostIncompatibilityCode =
+  | "runner_protocol"
+  | "runtime_auth_protocol"
+  | "runtime_image";
+export type ExecutionHostStatus =
+  | { state: "not_connected" }
+  | {
+      state: "incompatible";
+      machineId: string;
+      displayName: string;
+      code: HostIncompatibilityCode;
+    }
+  | { state: "ready"; machineId: string; displayName: string };
+export type SelectedHostStatus =
+  | { state: "offline"; machineId: string; displayName: string }
+  | Exclude<ExecutionHostStatus, { state: "not_connected" }>;
+export interface ExecutionStatus {
+  selected: ExecutionSelection;
+  selectedHost: SelectedHostStatus | null;
+  candidate: ExecutionHostStatus;
+  executionReady: boolean;
+}
+
+function normalizeExecutionHostStatus(value: unknown): ExecutionHostStatus | null {
+  if (!isRecord(value)) return null;
+  if (value.state === "not_connected") return { state: "not_connected" };
+  const machineId = typeof value.machineId === "string" ? value.machineId.trim() : "";
+  const displayName = typeof value.displayName === "string" ? value.displayName.trim() : "";
+  if (!machineId || !displayName) return null;
+  if (value.state === "ready") return { state: "ready", machineId, displayName };
+  if (
+    value.state === "incompatible"
+    && (
+      value.code === "runner_protocol"
+      || value.code === "runtime_auth_protocol"
+      || value.code === "runtime_image"
+    )
+  ) {
+    return { state: "incompatible", machineId, displayName, code: value.code };
+  }
+  return null;
+}
+
+function normalizeExecutionStatus(value: unknown): ExecutionStatus {
+  if (!isRecord(value) || !isRecord(value.selected)) {
+    throw new Error("Malformed execution status response");
+  }
+  const selected: ExecutionSelection | null = value.selected.target === "cf"
+    ? { target: "cf" }
+    : value.selected.target === "host" && typeof value.selected.machineId === "string"
+      ? { target: "host", machineId: value.selected.machineId }
+      : null;
+  const candidate = normalizeExecutionHostStatus(value.candidate);
+  let selectedHost: SelectedHostStatus | null = null;
+  if (value.selectedHost !== null && value.selectedHost !== undefined) {
+    if (
+      isRecord(value.selectedHost)
+      && value.selectedHost.state === "offline"
+      && typeof value.selectedHost.machineId === "string"
+      && typeof value.selectedHost.displayName === "string"
+    ) {
+      selectedHost = {
+        state: "offline",
+        machineId: value.selectedHost.machineId,
+        displayName: value.selectedHost.displayName,
+      };
+    } else {
+      const normalized = normalizeExecutionHostStatus(value.selectedHost);
+      if (normalized?.state !== "not_connected") selectedHost = normalized;
+    }
+  }
+  if (!selected || !candidate || typeof value.executionReady !== "boolean") {
+    throw new Error("Malformed execution status response");
+  }
+  return { selected, selectedHost, candidate, executionReady: value.executionReady };
+}
+
+export async function fetchExecutionStatus(hubUrl: string): Promise<ExecutionStatus> {
+  const response = await fetch(`${hubUrl}/api/execution/status`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!response.ok) throw await parseApiError(response, "Failed to load execution status.");
+  return normalizeExecutionStatus(await response.json().catch(() => null));
+}
+
+export async function setExecutionBackend(
+  hubUrl: string,
+  selection:
+    | { target: "cf" }
+    | { target: "host"; expectedMachineId: string },
+): Promise<ExecutionStatus> {
+  const response = await fetch(`${hubUrl}/api/settings/execution-backend`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    cache: "no-store",
+    body: JSON.stringify(selection),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = isRecord(body) && typeof body.message === "string"
+      ? body.message
+      : isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : "Failed to change execution backend.";
+    throw new Error(message);
+  }
+  return normalizeExecutionStatus(body);
+}
+
 export async function fetchSetupStatus(hubUrl: string): Promise<SetupStatus> {
   const res = await fetch(`${hubUrl}/api/setup/status`, {
     credentials: "include",
+    cache: "no-store",
   });
   if (!res.ok) throw new Error(`Failed to fetch setup status: ${res.status}`);
-  return normalizeSetupStatus(await res.json().catch(() => null), hubUrl);
+  return normalizeSetupStatus(await res.json().catch(() => null));
 }
 
 export interface SeedOpenAIAuthInput {
@@ -1628,115 +3335,6 @@ export async function seedOpenAIAuth(
     ...(isRecord(body) && typeof body.expires_at === "number" ? { expires_at: body.expires_at } : {}),
     ...(isRecord(body) && typeof body.account_id === "string" ? { account_id: body.account_id } : {}),
   };
-}
-
-export type HostStatusState =
-  | "not-registered"
-  | "registered-offline"
-  | "connected-no-gateway"
-  | "gateway-unavailable"
-  | "gateway-available";
-
-export interface HostStatusMachine {
-  machineId: string;
-  connectedAt: string;
-  gatewayUrl?: string;
-  gatewayTunnelType?: "quick" | "named";
-  codexSubscription: boolean;
-  claudeSubscription: boolean;
-}
-
-export interface HostStatus {
-  registered: boolean;
-  connected: boolean;
-  gatewayConfigured: boolean;
-  gatewayAvailable: boolean;
-  state: HostStatusState;
-  machine: HostStatusMachine | null;
-}
-
-function deriveHostStatusState(
-  registered: boolean,
-  connected: boolean,
-  gatewayConfigured: boolean,
-  gatewayAvailable: boolean,
-): HostStatusState {
-  if (!registered) {
-    return "not-registered";
-  }
-  if (!connected) {
-    return "registered-offline";
-  }
-  if (!gatewayConfigured) {
-    return "connected-no-gateway";
-  }
-  if (!gatewayAvailable) {
-    return "gateway-unavailable";
-  }
-  return "gateway-available";
-}
-
-function normalizeHostStatus(payload: unknown): HostStatus {
-  if (!isRecord(payload)) {
-    return {
-      registered: false,
-      connected: false,
-      gatewayConfigured: false,
-      gatewayAvailable: false,
-      state: "not-registered",
-      machine: null,
-    };
-  }
-
-  const rawMachine = payload.machine;
-  let machine: HostStatusMachine | null = null;
-  if (isRecord(rawMachine)) {
-    const machineId = readString(rawMachine.machineId);
-    const connectedAt = readString(rawMachine.connectedAt);
-    if (machineId && connectedAt) {
-      const tunnelType = rawMachine.gatewayTunnelType === "quick" || rawMachine.gatewayTunnelType === "named"
-        ? rawMachine.gatewayTunnelType
-        : undefined;
-      const gatewayUrl = readNullableString(rawMachine.gatewayUrl) ?? undefined;
-      machine = {
-        machineId,
-        connectedAt,
-        ...(gatewayUrl ? { gatewayUrl } : {}),
-        ...(tunnelType ? { gatewayTunnelType: tunnelType } : {}),
-        codexSubscription: readBooleanOr(rawMachine.codexSubscription),
-        claudeSubscription: readBooleanOr(rawMachine.claudeSubscription),
-      };
-    }
-  }
-
-  const registered = readBooleanOr(payload.registered, machine != null);
-  const connected = readBooleanOr(payload.connected);
-  const gatewayConfigured = readBooleanOr(payload.gatewayConfigured, Boolean(machine?.gatewayUrl));
-  const gatewayAvailable = readBooleanOr(payload.gatewayAvailable, connected && gatewayConfigured);
-  const state = payload.state === "not-registered"
-    || payload.state === "registered-offline"
-    || payload.state === "connected-no-gateway"
-    || payload.state === "gateway-unavailable"
-    || payload.state === "gateway-available"
-    ? payload.state
-    : deriveHostStatusState(registered, connected, gatewayConfigured, gatewayAvailable);
-
-  return {
-    registered,
-    connected,
-    gatewayConfigured,
-    gatewayAvailable,
-    state,
-    machine,
-  };
-}
-
-export async function fetchHostStatus(hubUrl: string): Promise<HostStatus> {
-  const res = await fetch(`${hubUrl}/api/host/status`, {
-    credentials: "include",
-  });
-  if (!res.ok) throw new Error(`Failed to fetch host status: ${res.status}`);
-  return normalizeHostStatus(await res.json().catch(() => null));
 }
 
 export interface VerifyModelAuthResult {
@@ -1785,6 +3383,23 @@ export async function submitSetup(
   return body;
 }
 
+export async function saveBillingMode(
+  hubUrl: string,
+  provider: "claude" | "openai",
+  mode: BillingMode,
+): Promise<{ ok: boolean; saved?: string[]; error?: string }> {
+  const key = provider === "claude" ? "claudeBillingMode" : "openaiBillingMode";
+  const res = await fetch(`${hubUrl}/api/setup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ settings: { [key]: mode } }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `Failed to save billing mode: ${res.status}`);
+  return body;
+}
+
 export async function saveGitHubAppConfig(
   hubUrl: string,
   input: {
@@ -1805,7 +3420,7 @@ export async function saveGitHubAppConfig(
     throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `GitHub App setup failed: ${res.status}`);
   }
   if (isRecord(body) && isRecord(body.status)) {
-    return normalizeSetupStatus(body.status, hubUrl);
+    return normalizeSetupStatus(body.status);
   }
   return await fetchSetupStatus(hubUrl);
 }
@@ -1868,58 +3483,38 @@ export async function testGitHubAppAccess(hubUrl: string, selection: GitHubRepos
   };
 }
 
-export async function verifyCloudflareToken(
-  hubUrl: string,
-  options: { hostname: string; apiToken: string },
-): Promise<{
-  ok: true;
-  hostname: string;
-  zoneName: string;
-  workerServiceName: string | null;
-  gatewayHostname: string | null;
-}> {
-  const res = await fetch(`${hubUrl}/api/setup/verify-cloudflare-token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(options),
-  });
-  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw buildApiActionError(body, `Cloudflare token verification failed: ${res.status}`);
-  const result = normalizeVerifyCloudflareTokenResult(body);
-  if (!result) {
-    throw new Error("Malformed Cloudflare token verification response");
-  }
-  return result;
+export interface WorkersDevAccessOAuthStart {
+  jobId: string;
+  connectUrl: string;
+  expiresAt: string;
 }
 
-export async function setupWorkersDevAccess(
+async function startWorkersDevAccessOAuthAt(
   hubUrl: string,
-): Promise<SetupStatus> {
-  const res = await fetch(`${hubUrl}/api/setup/workers-dev-access`, {
+  path: string,
+): Promise<WorkersDevAccessOAuthStart> {
+  const res = await fetch(`${hubUrl}${path}`, {
     method: "POST",
     credentials: "include",
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw buildApiActionError(body, `workers.dev Access setup failed: ${res.status}`);
-  if (isRecord(body) && isRecord(body.status)) {
-    return normalizeSetupStatus(body.status, hubUrl);
+  if (!res.ok) throw buildApiActionError(body, `Cloudflare connection failed: ${res.status}`);
+  if (!isRecord(body)) throw new Error("Malformed Cloudflare connection response");
+  const jobId = readString(body.jobId);
+  const connectUrl = readString(body.connectUrl);
+  const expiresAt = readString(body.expiresAt);
+  if (!jobId || !connectUrl || !expiresAt) {
+    throw new Error("Malformed Cloudflare connection response");
   }
-  return await fetchSetupStatus(hubUrl);
+  return { jobId, connectUrl, expiresAt };
 }
 
-export async function returnToHostedTiller(hubUrl: string): Promise<{ ok: boolean; redirectUrl: string }> {
-  const res = await fetch(`${hubUrl}/api/setup/self-host/return-to-hosted`, {
-    method: "POST",
-    credentials: "include",
-    cache: "no-store",
-  });
-  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw buildApiActionError(body, `Return to Hosted Tiller failed: ${res.status}`);
-  return {
-    ok: isRecord(body) && body.ok === true,
-    redirectUrl: isRecord(body) ? readStringOr(body.redirectUrl, hubUrl) : hubUrl,
-  };
+export function startWorkersDevAccessOAuth(hubUrl: string): Promise<WorkersDevAccessOAuthStart> {
+  return startWorkersDevAccessOAuthAt(hubUrl, "/api/setup/workers-dev-access/oauth/start");
+}
+
+export function renewWorkersDevAccess(hubUrl: string): Promise<WorkersDevAccessOAuthStart> {
+  return startWorkersDevAccessOAuthAt(hubUrl, "/api/settings/workers-dev-access/oauth/start");
 }
 
 export async function checkForUpdate(hubUrl: string): Promise<UpdateCheckResult> {
@@ -2000,17 +3595,22 @@ const BACKOFF_STEPS = [1, 2, 5, 10, 30]; // seconds
 
 /** Minimal message shape forwarded to the live callback and SessionView. */
 export type LiveMessage = {
+  id: string;
   sessionId: string;
   content: unknown;
-  seq?: number;
+  seq: number;
+  localId?: string;
 };
 
 export interface WsHandlers {
   onConnected?: () => void;
   onDisconnected?: () => void;
   onReconnectExhausted?: () => void;
+  onCapabilities?: (capabilities: Extract<WsServerMessage, { type: "capabilities" }>) => void;
   onMachineUpdated?: (machine: StoredMachine) => void;
   onMessage?: (msg: Extract<WsServerMessage, { type: "message-received" }>) => void;
+  onTerminalInputAck?: (msg: Extract<WsServerMessage, { type: "terminal-input-ack" }>) => void;
+  onTerminalControlAck?: (msg: Extract<WsServerMessage, { type: "terminal-control-ack" }>) => void;
   onSessionUpdated?: (session: StoredSession) => void;
   onSessionDeleted?: (sessionId: string) => void;
   onPermissionCreated?: (permission: StoredPermission) => void;
@@ -2019,6 +3619,8 @@ export interface WsHandlers {
   onEnvRemove?: (slug: string) => void;
   onRepoUpsert?: (repo: RepoMeta) => void;
   onRepoRemove?: (repoId: string) => void;
+  onPlanArtifactUpdated?: (repoId: string, planArtifactId: string) => void;
+  onPlanWriterState?: (repoId: string, planArtifactId: string) => void;
   onRepoMainChanged?: (
     repoId: string,
     repoUrl: string,
@@ -2031,7 +3633,7 @@ export interface WsHandlers {
 
 export interface ReconnectingWebSocket {
   close(): void;
-  send(data: unknown): void;
+  send(data: unknown): boolean;
   reconnect(): void;
 }
 
@@ -2045,16 +3647,23 @@ export function createReconnectingWebSocket(
   let retryCount = 0;
   let retryTimeout: ReturnType<typeof setTimeout> | null = null;
   let active = true;
-  let currentSocket: { close: () => void; send: (data: unknown) => void } | null = null;
-  let pingInterval: ReturnType<typeof setInterval> | null = null;
+  let currentSocket: { close: () => void; send: (data: unknown) => boolean } | null = null;
+  let connectionGeneration = 0;
 
   function connect() {
+    const generation = ++connectionGeneration;
     const wsUrl = hubUrl.replace(/^http/, "ws").replace(/\/$/, "");
     const ws = new WebSocket(`${wsUrl}/parties/hub/hub`);
+    let pingInterval: ReturnType<typeof setInterval> | null = null;
+    const isCurrent = () => active && generation === connectionGeneration;
 
     ws.addEventListener("open", () => {
+      if (!isCurrent()) {
+        ws.close();
+        return;
+      }
       pingInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (isCurrent() && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "ping" }));
         }
       }, 30_000);
@@ -2063,6 +3672,7 @@ export function createReconnectingWebSocket(
     });
 
     ws.addEventListener("message", (event) => {
+      if (!isCurrent()) return;
       let parsed: unknown;
       try {
         parsed = JSON.parse(event.data as string);
@@ -2072,8 +3682,17 @@ export function createReconnectingWebSocket(
 
       const dispatchMessage = (msg: WsServerMessage) => {
         switch (msg.type) {
+          case "capabilities":
+            handlers.onCapabilities?.(msg);
+            break;
           case "message-received":
             handlers.onMessage?.(msg);
+            break;
+          case "terminal-input-ack":
+            handlers.onTerminalInputAck?.(msg);
+            break;
+          case "terminal-control-ack":
+            handlers.onTerminalControlAck?.(msg);
             break;
           case "machine-updated":
             handlers.onMachineUpdated?.(msg.machine);
@@ -2101,6 +3720,12 @@ export function createReconnectingWebSocket(
             break;
           case "repo-remove":
             handlers.onRepoRemove?.(msg.repoId);
+            break;
+          case "plan-artifact-updated":
+            handlers.onPlanArtifactUpdated?.(msg.repoId, msg.planArtifactId);
+            break;
+          case "plan-writer-state":
+            handlers.onPlanWriterState?.(msg.repoId, msg.planArtifactId);
             break;
           case "repo-main-changed":
             handlers.onRepoMainChanged?.(
@@ -2132,9 +3757,9 @@ export function createReconnectingWebSocket(
     ws.addEventListener("close", (event) => {
       if (pingInterval) clearInterval(pingInterval);
       pingInterval = null;
+      if (!isCurrent()) return;
       currentSocket = null;
       handlers.onDisconnected?.();
-      if (!active) return;
       // 4001 = server-side auth rejection; retrying with same credentials won't help
       if (event.code === 4001) {
         handlers.onReconnectExhausted?.();
@@ -2147,12 +3772,21 @@ export function createReconnectingWebSocket(
       const step = BACKOFF_STEPS[Math.min(retryCount, BACKOFF_STEPS.length - 1)];
       const delay = step * (0.5 + Math.random() * 0.5) * 1000;
       retryCount++;
-      retryTimeout = setTimeout(connect, delay);
+      retryTimeout = setTimeout(() => {
+        retryTimeout = null;
+        connect();
+      }, delay);
     });
 
     currentSocket = {
       close: () => ws.close(),
-      send: (data) => ws.send(JSON.stringify(data)),
+      send: (data) => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          return false;
+        }
+        ws.send(JSON.stringify(data));
+        return true;
+      },
     };
   }
 
@@ -2161,19 +3795,25 @@ export function createReconnectingWebSocket(
   return {
     close() {
       active = false;
+      connectionGeneration += 1;
       if (retryTimeout) clearTimeout(retryTimeout);
-      currentSocket?.close();
+      retryTimeout = null;
+      const previous = currentSocket;
       currentSocket = null;
+      previous?.close();
     },
     send(data) {
-      currentSocket?.send(data);
+      return currentSocket?.send(data) ?? false;
     },
     reconnect() {
       active = true;
       retryCount = 0;
+      connectionGeneration += 1;
       if (retryTimeout) clearTimeout(retryTimeout);
-      currentSocket?.close();
+      retryTimeout = null;
+      const previous = currentSocket;
       currentSocket = null;
+      previous?.close();
       connect();
     },
   };

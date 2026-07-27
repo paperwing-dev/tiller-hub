@@ -1,16 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_REPO_MERGE_LOCK_LEASE_MS,
   ENV_SNAPSHOT_DURABILITY_EXCLUDES,
-  MAX_REPO_MERGE_LOCK_LEASE_MS,
-  MIN_REPO_MERGE_LOCK_LEASE_MS,
-  resolveRepoMergeLockLeaseMs,
   shouldExcludeFromEnvSnapshot,
 } from "../scm/constants";
 import {
   buildEnvBranchName,
   buildEnvSnapshotKey,
-  buildRepoGitArtifactKey,
   normalizeScmArtifactMetadata,
 } from "../scm/artifacts";
 import {
@@ -18,17 +13,11 @@ import {
   createInitialEnvScmState,
   createInitialRepoScmState,
   deriveBranchBackedEnvStatus,
+  isEnvTransitioning,
   parseScmBooleanFlag,
-  resolveRequestedStartupPlanId,
 } from "../scm/model";
 
 describe("SCM artifact layout", () => {
-  it("builds the canonical repo git artifact key", () => {
-    expect(buildRepoGitArtifactKey({ repoId: "repo-123", generationId: "g42" })).toBe(
-      "repos/repo-123/git-artifacts/g42.tar.zst",
-    );
-  });
-
   it("builds the env snapshot key", () => {
     expect(buildEnvSnapshotKey({ envSlug: "auth-cleanup", snapshotId: "s7" })).toBe(
       "envs/auth-cleanup/snapshots/s7.tar.zst",
@@ -70,18 +59,6 @@ describe("env snapshot exclusions", () => {
   });
 });
 
-describe("repo merge lock lease defaults", () => {
-  it("uses the default lease when no override is provided", () => {
-    expect(resolveRepoMergeLockLeaseMs()).toBe(DEFAULT_REPO_MERGE_LOCK_LEASE_MS);
-  });
-
-  it("clamps the lease into the supported range", () => {
-    expect(resolveRepoMergeLockLeaseMs(1)).toBe(MIN_REPO_MERGE_LOCK_LEASE_MS);
-    expect(resolveRepoMergeLockLeaseMs(MAX_REPO_MERGE_LOCK_LEASE_MS * 10)).toBe(MAX_REPO_MERGE_LOCK_LEASE_MS);
-    expect(resolveRepoMergeLockLeaseMs(15_000)).toBe(15_000);
-  });
-});
-
 describe("SCM model defaults", () => {
   it("parses boolean config flags conservatively", () => {
     expect(parseScmBooleanFlag("true")).toBe(true);
@@ -120,6 +97,25 @@ describe("SCM model defaults", () => {
       TILLER_BRANCH_NAME: "env/auth-cleanup",
     });
   });
+
+  it("keeps active GitHub publishing in the live-sync transition set", () => {
+    const stable = {
+      status: "stopped" as const,
+      scmOperationType: null,
+      githubPublishStatus: "idle" as const,
+      githubPublishOperationId: null,
+    };
+
+    expect(isEnvTransitioning(stable)).toBe(false);
+    expect(isEnvTransitioning({
+      ...stable,
+      githubPublishStatus: "publishing",
+    })).toBe(true);
+    expect(isEnvTransitioning({
+      ...stable,
+      githubPublishOperationId: "operation-1",
+    })).toBe(true);
+  });
 });
 
 describe("branch-backed env behavior", () => {
@@ -155,26 +151,6 @@ describe("branch-backed env behavior", () => {
         },
       ),
     ).toBe("ready-to-merge");
-  });
-
-  it("freezes startup plan selection for branch-backed envs", () => {
-    expect(
-      resolveRequestedStartupPlanId(
-        {
-          startupPlanId: "plan-1",
-        },
-        undefined,
-      ),
-    ).toBe("plan-1");
-
-    expect(() =>
-      resolveRequestedStartupPlanId(
-        {
-          startupPlanId: "plan-1",
-        },
-        "plan-2",
-      ),
-    ).toThrow(/freeze the startup plan/);
   });
 
   it("preserves an existing ready-to-merge status when git ancestry is unavailable", () => {

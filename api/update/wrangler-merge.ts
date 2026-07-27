@@ -2,10 +2,13 @@ import { parse, printParseErrorCode, type ParseError } from "jsonc-parser";
 
 const PRESERVED_VAR_KEYS = new Set([
   "TILLER_REGION",
+  "DO_LOCATION_HINT",
+  "TILLER_UPDATE_SERVICE_DISABLED",
+]);
+
+const RETIRED_VAR_KEYS = new Set([
   "HUB_PUBLIC_URL",
   "WORKER_SERVICE_NAME",
-  "WORKERS_DEV_ALIAS_DISABLED",
-  "DO_LOCATION_HINT",
 ]);
 
 const TILLER_OWNED_VAR_KEYS = new Set([
@@ -61,13 +64,21 @@ function mergeVars(
   const upstream = isRecord(upstreamVars) ? upstreamVars : {};
   const merged: Record<string, unknown> = { ...upstream };
 
+  for (const key of RETIRED_VAR_KEYS) {
+    delete merged[key];
+  }
+
   for (const key of PRESERVED_VAR_KEYS) {
     if (key in current) merged[key] = current[key];
   }
 
   for (const [key, value] of Object.entries(current)) {
     if (key in upstream) continue;
-    if (PRESERVED_VAR_KEYS.has(key) || TILLER_OWNED_VAR_KEYS.has(key)) continue;
+    if (
+      PRESERVED_VAR_KEYS.has(key)
+      || TILLER_OWNED_VAR_KEYS.has(key)
+      || RETIRED_VAR_KEYS.has(key)
+    ) continue;
     merged[key] = value;
   }
 

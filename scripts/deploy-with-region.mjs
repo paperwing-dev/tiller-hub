@@ -5,16 +5,9 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { parse, printParseErrorCode } from "jsonc-parser";
-import {
-  ensureProtectedCustomDomain,
-  normalizeScriptCloudflareError,
-  probeHubState,
-  resolveAccountForHostname,
-  verifyBootstrapAccess,
-  waitForHubAvailability,
-} from "./access-bootstrap.mjs";
 
 export const VALID_TILLER_REGIONS = ["wnam", "enam", "weur", "eeur", "apac", "oc"];
+export const TILLER_REGION_PLACEHOLDER = "choose-region";
 
 const VALID_TILLER_REGION_SET = new Set(VALID_TILLER_REGIONS);
 const ROOT_WRANGLER_CONFIG = "wrangler.jsonc";
@@ -25,20 +18,15 @@ const TILLER_WORKER_NAME_VAR = "TILLER_WORKER_NAME";
 const WRANGLER_CI_OVERRIDE_NAME_VAR = "WRANGLER_CI_OVERRIDE_NAME";
 const DO_LOCATION_HINT_VAR = "DO_LOCATION_HINT";
 const R2_BUCKET_BINDING = "BUCKET";
-const CUSTOM_DOMAIN_ENV = "TILLER_CUSTOM_DOMAIN";
-const ACCESS_EMAILS_ENV = "TILLER_ACCESS_EMAILS";
-const ACCESS_TEAM_DOMAIN_ENV = "CF_ACCESS_TEAM_DOMAIN";
-const TILLER_ACCESS_TEAM_DOMAIN_ENV = "TILLER_ACCESS_TEAM_DOMAIN";
 const CLOUDFLARE_API_TOKEN_ENV = "CLOUDFLARE_API_TOKEN";
 const CLOUDFLARE_ACCOUNT_ID_ENV = "CLOUDFLARE_ACCOUNT_ID";
-const CLOUDFLARE_DEFAULT_ACCOUNT_ID_ENV = "CLOUDFLARE_DEFAULT_ACCOUNT_ID";
 const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
 const HUB_PUBLIC_URL_VAR = "HUB_PUBLIC_URL";
 const WORKER_SERVICE_NAME_VAR = "WORKER_SERVICE_NAME";
-const WORKERS_DEV_ALIAS_DISABLED_VAR = "WORKERS_DEV_ALIAS_DISABLED";
+const RETIRED_WORKERS_DEV_ALIAS_DISABLED_VAR = "WORKERS_DEV_ALIAS_DISABLED";
 const DOTENV_FILE = ".env";
 const CONTAINER_IMAGE_TAG_ENV = "CONTAINER_IMAGE_TAG";
-const SCM_BOOTSTRAP_IMAGE_TAG_ENV = "SCM_BOOTSTRAP_IMAGE_TAG";
+const GITHUB_JOB_IMAGE_TAG_ENV = "GITHUB_JOB_IMAGE_TAG";
 
 class CommandError extends Error {
   constructor(message, { code, stderr, stdout } = {}) {
@@ -135,11 +123,16 @@ async function loadDotEnv(rootDir) {
 export function normalizeTillerRegion(rawValue) {
   if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
     throw new Error(
-      `Missing ${TILLER_REGION_VAR}. Set it in ${ROOT_WRANGLER_CONFIG} to one of: ${VALID_TILLER_REGIONS.join(", ")}.`,
+      `Missing ${TILLER_REGION_VAR}. Choose one before deployment: ${VALID_TILLER_REGIONS.join(", ")}.`,
     );
   }
 
   const value = rawValue.trim().toLowerCase();
+  if (value === TILLER_REGION_PLACEHOLDER) {
+    throw new Error(
+      `${TILLER_REGION_VAR} is still "${TILLER_REGION_PLACEHOLDER}". Choose one before deployment: ${VALID_TILLER_REGIONS.join(", ")}.`,
+    );
+  }
   if (!VALID_TILLER_REGION_SET.has(value)) {
     throw new Error(
       `Invalid ${TILLER_REGION_VAR} "${rawValue}". Use one of: ${VALID_TILLER_REGIONS.join(", ")}.`,
@@ -147,6 +140,15 @@ export function normalizeTillerRegion(rawValue) {
   }
 
   return value;
+}
+
+export function resolveTillerRegion(rootConfig, env = process.env) {
+  const explicitRegion = env[TILLER_REGION_VAR];
+  return normalizeTillerRegion(
+    typeof explicitRegion === "string" && explicitRegion.trim()
+      ? explicitRegion
+      : rootConfig?.vars?.[TILLER_REGION_VAR],
+  );
 }
 
 export function normalizeWorkerName(rawValue, source = "Worker name") {
@@ -208,17 +210,6 @@ export function extractBucketLocation(bucketInfo) {
   return typeof location === "string" ? location.toLowerCase() : null;
 }
 
-export function normalizeEmailList(rawValue) {
-  if (typeof rawValue !== "string") return [];
-  const deduped = new Set();
-  for (const item of rawValue.split(/[\n,]/)) {
-    const email = item.trim().toLowerCase();
-    if (!email) continue;
-    deduped.add(email);
-  }
-  return [...deduped];
-}
-
 function getNpxCommand() {
   return process.platform === "win32" ? "npx.cmd" : "npx";
 }
@@ -275,36 +266,6 @@ function runWrangler(args, options) {
   return runCommand(getNpxCommand(), ["wrangler", ...args], options);
 }
 
-export async function ensureWranglerAccountId(
-  {
-    customDomain,
-    apiToken,
-    accountId = process.env[CLOUDFLARE_ACCOUNT_ID_ENV]?.trim() || "",
-    legacyAccountId = process.env[CLOUDFLARE_DEFAULT_ACCOUNT_ID_ENV]?.trim() || "",
-  },
-  options = {},
-) {
-  const explicitAccountId = accountId || legacyAccountId;
-  if (explicitAccountId) {
-    process.env[CLOUDFLARE_ACCOUNT_ID_ENV] = explicitAccountId;
-    return explicitAccountId;
-  }
-
-  if (!customDomain || !apiToken) {
-    return null;
-  }
-
-  const resolver = options.resolveAccountForHostnameImpl ?? resolveAccountForHostname;
-  const resolved = await resolver(apiToken, customDomain);
-  const resolvedAccountId = resolved?.accountId?.trim();
-  if (!resolvedAccountId) {
-    throw new Error(`Could not determine the Cloudflare account for ${customDomain}.`);
-  }
-
-  process.env[CLOUDFLARE_ACCOUNT_ID_ENV] = resolvedAccountId;
-  return resolvedAccountId;
-}
-
 async function getBucketInfo(bucketName) {
   try {
     const { stdout } = await runWrangler(
@@ -349,14 +310,14 @@ async function listContainerApplications(apiToken, accountId) {
   });
 }
 
-function getContainerImageOverride(className, { sandboxImageTag = "", scmBootstrapImageTag = "" } = {}) {
-  if (className === "SandboxDO") return sandboxImageTag;
-  if (className === "ScmBootstrapDO" || className === "ScmOperationDO") return scmBootstrapImageTag;
+function getContainerImageOverride(className, { sandboxImageTag = "", githubJobImageTag = "" } = {}) {
+  if (className === "SandboxDO" || className === "PlannerRunDO") return sandboxImageTag;
+  if (className === "GitHubJobDO") return githubJobImageTag;
   return "";
 }
 
 function isManagedContainerClass(className) {
-  return className === "SandboxDO" || className === "ScmBootstrapDO" || className === "ScmOperationDO";
+  return className === "SandboxDO" || className === "GitHubJobDO" || className === "PlannerRunDO";
 }
 
 export function deriveContainerApplicationName(workerName, className) {
@@ -396,14 +357,14 @@ export function rewriteContainerApplicationNames(
 
 export function needsLiveContainerImageLookup(
   containers,
-  { sandboxImageTag = "", scmBootstrapImageTag = "" } = {},
+  { sandboxImageTag = "", githubJobImageTag = "" } = {},
 ) {
   if (!Array.isArray(containers) || containers.length === 0) return false;
 
   return containers.some((container) => {
     const override = getContainerImageOverride(container.class_name, {
       sandboxImageTag,
-      scmBootstrapImageTag,
+      githubJobImageTag,
     });
     return !override && typeof container?.name === "string" && container.name.length > 0
       && isManagedContainerClass(container.class_name);
@@ -414,7 +375,7 @@ export function resolveContainerImages(
   containers,
   {
     sandboxImageTag = process.env[CONTAINER_IMAGE_TAG_ENV]?.trim() || "",
-    scmBootstrapImageTag = process.env[SCM_BOOTSTRAP_IMAGE_TAG_ENV]?.trim() || "",
+    githubJobImageTag = process.env[GITHUB_JOB_IMAGE_TAG_ENV]?.trim() || "",
     liveContainerImages = new Map(),
   } = {},
 ) {
@@ -423,7 +384,7 @@ export function resolveContainerImages(
   return (containers ?? []).map((container) => {
     const override = getContainerImageOverride(container.class_name, {
       sandboxImageTag,
-      scmBootstrapImageTag,
+      githubJobImageTag,
     });
     if (override) {
       return {
@@ -501,10 +462,9 @@ export function buildDeployConfig(
   {
     bucketName,
     region,
-    customDomain,
     workerName,
     sandboxImageTag,
-    scmBootstrapImageTag,
+    githubJobImageTag,
     liveContainerImages,
     resolvedContainers,
   } = {},
@@ -520,7 +480,7 @@ export function buildDeployConfig(
   delete vars[TILLER_WORKER_NAME_VAR];
   delete vars[HUB_PUBLIC_URL_VAR];
   delete vars[WORKER_SERVICE_NAME_VAR];
-  delete vars[WORKERS_DEV_ALIAS_DISABLED_VAR];
+  delete vars[RETIRED_WORKERS_DEV_ALIAS_DISABLED_VAR];
   vars[DO_LOCATION_HINT_VAR] = region;
 
   nextConfig.vars = vars;
@@ -531,23 +491,9 @@ export function buildDeployConfig(
     },
   ];
 
-  if (customDomain) {
-    vars[HUB_PUBLIC_URL_VAR] = `https://${customDomain}`;
-    vars[WORKER_SERVICE_NAME_VAR] = workerName;
-    vars[WORKERS_DEV_ALIAS_DISABLED_VAR] = "true";
-    nextConfig.workers_dev = false;
-    nextConfig.preview_urls = false;
-    nextConfig.routes = [
-      {
-        pattern: customDomain,
-        custom_domain: true,
-      },
-    ];
-  } else {
-    nextConfig.workers_dev = true;
-    nextConfig.preview_urls = false;
-    delete nextConfig.routes;
-  }
+  nextConfig.workers_dev = true;
+  nextConfig.preview_urls = false;
+  delete nextConfig.routes;
 
   if (nextConfig.containers?.length) {
     const deploymentContainers = workerName
@@ -559,7 +505,7 @@ export function buildDeployConfig(
     const nextContainers = resolvedContainers
       ?? resolveContainerImages(deploymentContainers, {
         sandboxImageTag,
-        scmBootstrapImageTag,
+        githubJobImageTag,
         liveContainerImages,
       }).map((resolution) => resolution.container);
     nextConfig.containers = structuredClone(nextContainers);
@@ -589,38 +535,20 @@ async function main() {
   const rootConfigPath = path.join(rootDir, ROOT_WRANGLER_CONFIG);
   const rootConfig = await readJsoncFile(rootConfigPath);
   const workerName = resolveWorkerName(rootConfig);
-  const region = normalizeTillerRegion(rootConfig?.vars?.[TILLER_REGION_VAR]);
+  // Deploy-button users fill the checked-in blank on Cloudflare's
+  // configuration page. Maintainer and local deploys may instead provide an
+  // explicit environment override. The legacy sentinel remains rejected so a
+  // cached or older template can never become a geographic default.
+  const region = resolveTillerRegion(rootConfig);
   const bucketName = deriveBucketName(workerName);
-  const customDomain = rootConfig?.vars?.[CUSTOM_DOMAIN_ENV]?.trim() || process.env[CUSTOM_DOMAIN_ENV]?.trim() || "";
   const apiToken = process.env[CLOUDFLARE_API_TOKEN_ENV]?.trim() || "";
-  const accessTeamDomain = process.env[ACCESS_TEAM_DOMAIN_ENV]?.trim()
-    || process.env[TILLER_ACCESS_TEAM_DOMAIN_ENV]?.trim()
-    || "";
+  const accountId = process.env[CLOUDFLARE_ACCOUNT_ID_ENV]?.trim() || "";
   const sandboxImageTag = process.env[CONTAINER_IMAGE_TAG_ENV]?.trim() || "";
-  const scmBootstrapImageTag = process.env[SCM_BOOTSTRAP_IMAGE_TAG_ENV]?.trim() || "";
-  const emails = normalizeEmailList(process.env[ACCESS_EMAILS_ENV] ?? "");
+  const githubJobImageTag = process.env[GITHUB_JOB_IMAGE_TAG_ENV]?.trim() || "";
 
   console.log(`Using Worker name: ${workerName}`);
   console.log(`Using ${TILLER_REGION_VAR}=${region}`);
   console.log(`Resolved R2 bucket name: ${bucketName}`);
-
-  if (customDomain && (!apiToken || emails.length === 0)) {
-    throw new Error(
-      `Custom-domain deploys require ${CLOUDFLARE_API_TOKEN_ENV} and ${ACCESS_EMAILS_ENV} in ${DOTENV_FILE} or the environment.`,
-    );
-  }
-
-  const hubUrl = customDomain ? `https://${customDomain}` : "";
-  let existingHubState = "missing";
-  let resolvedAccountId = "";
-  let accessVerification = null;
-  if (customDomain) existingHubState = await probeHubState(hubUrl);
-  if (customDomain) {
-    console.log(`Verifying Cloudflare API access for ${customDomain}...`);
-    accessVerification = await verifyBootstrapAccess(apiToken, customDomain);
-    resolvedAccountId = accessVerification.accountId;
-  }
-  resolvedAccountId = await ensureWranglerAccountId({ customDomain, apiToken, accountId: resolvedAccountId }) || "";
 
   const existingBucket = await getBucketInfo(bucketName);
   if (existingBucket) {
@@ -654,14 +582,14 @@ async function main() {
   });
   const needsLiveLookup = needsLiveContainerImageLookup(deploymentContainers, {
     sandboxImageTag,
-    scmBootstrapImageTag,
+    githubJobImageTag,
   });
   let liveContainerImages = new Map();
   if (needsLiveLookup) {
-    if (apiToken && resolvedAccountId) {
+    if (apiToken && accountId) {
       liveContainerImages = await resolveLiveContainerImages(
         apiToken,
-        resolvedAccountId,
+        accountId,
         deploymentContainers,
       );
     } else {
@@ -670,76 +598,25 @@ async function main() {
   }
   const resolvedContainerImages = resolveContainerImages(deploymentContainers, {
     sandboxImageTag,
-    scmBootstrapImageTag,
+    githubJobImageTag,
     liveContainerImages,
   });
   logResolvedContainerImages(resolvedContainerImages);
   const resolvedContainers = resolvedContainerImages.map((resolution) => resolution.container);
-  const customDeployConfig = buildDeployConfig(generatedDeployConfig, {
-    bucketName,
-    region,
-    customDomain: customDomain || undefined,
-    workerName,
-    resolvedContainers,
-  });
-  const fallbackDeployConfig = buildDeployConfig(generatedDeployConfig, {
+  const deployConfig = buildDeployConfig(generatedDeployConfig, {
     bucketName,
     region,
     workerName,
     resolvedContainers,
   });
 
-  const customTempConfigPath = await writeTempConfig(generatedDeployConfigPath, customDeployConfig);
-  await deployWithConfig(customTempConfigPath);
-
-  if (!customDomain) {
-    return;
-  }
-
-  try {
-    console.log(`Waiting for ${hubUrl} to become reachable...`);
-    let lastWaitMessage = "";
-    const waitOptions = {
-      onRetry({ attempt, attempts, message }) {
-        if (message !== lastWaitMessage || attempt === 1 || attempt === attempts || attempt % 6 === 0) {
-          console.log(`Waiting for ${hubUrl} (${attempt}/${attempts}): ${message}`);
-          lastWaitMessage = message;
-        }
-      },
-    };
-    const availability = await waitForHubAvailability(hubUrl, {}, waitOptions);
-    if (availability === "protected") {
-      console.log(`Cloudflare Access is already active for ${hubUrl}. Skipping Access setup on this deploy.`);
-      if (!accessVerification?.exactAppExists) {
-        console.log("If this is not an existing Tiller-managed protected hub, finish Access setup from the UI instead.");
-      }
-      return;
-    }
-
-    console.log(`Enabling Cloudflare Access for ${hubUrl}...`);
-    const result = await ensureProtectedCustomDomain(hubUrl, {
-      apiToken,
-      emails,
-      accessTeamDomain,
-    });
-
-    console.log(`Protected hub deployed at ${hubUrl}`);
-    console.log(`Cloudflare Access client ID: ${result.clientId}`);
-    console.log("Store the returned client ID and secret if you also want to run the local tiller client against this protected hub.");
-  } catch (error) {
-    if (existingHubState === "missing") {
-      console.error("Custom-domain protection failed. Rolling back to the public workers.dev deployment.");
-      const fallbackTempConfigPath = await writeTempConfig(generatedDeployConfigPath, fallbackDeployConfig);
-      await deployWithConfig(fallbackTempConfigPath);
-    }
-    throw error;
-  }
+  const tempConfigPath = await writeTempConfig(generatedDeployConfigPath, deployConfig);
+  await deployWithConfig(tempConfigPath);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
-    const hostname = process.env[CUSTOM_DOMAIN_ENV]?.trim() || "";
-    console.error(normalizeScriptCloudflareError(error, hostname));
+    console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });
 }

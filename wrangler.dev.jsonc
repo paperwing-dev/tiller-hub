@@ -25,6 +25,10 @@
 	"durable_objects": {
 		"bindings": [
 			{
+				"name": "SCHEDULED_RUN_CAPACITY",
+				"class_name": "ScheduledRunCapacityDO"
+			},
+			{
 				"name": "ENV_LIFECYCLE",
 				"class_name": "EnvLifecycleDO"
 			},
@@ -41,28 +45,20 @@
 				"class_name": "SandboxDO"
 			},
 			{
-				"name": "REPO_MERGE_LOCK",
-				"class_name": "RepoMergeLockDO"
-			},
-			{
 				"name": "TILLER_VOICE",
 				"class_name": "TillerVoice"
 			},
 			{
-				"name": "SCM_BOOTSTRAP",
-				"class_name": "ScmBootstrapDO"
+				"name": "GITHUB_JOB",
+				"class_name": "GitHubJobDO"
 			},
 			{
-				"name": "SCM_OPERATION",
-				"class_name": "ScmOperationDO"
+				"name": "THREAD",
+				"class_name": "ThreadDO"
 			},
 			{
 				"name": "WORKSPACE",
 				"class_name": "WorkspaceDO"
-			},
-			{
-				"name": "PLAN_CHAT",
-				"class_name": "PlanChatAgent"
 			},
 			{
 				"name": "REVIEWER_CHAT",
@@ -193,6 +189,35 @@
 			"deleted_classes": [
 				"ResearchChatAgent",
 				"CartographerChatAgent"
+			]
+		},
+		{
+			"tag": "v20",
+			"new_sqlite_classes": [
+				"ThreadDO"
+			]
+		},
+		{
+			"tag": "v21",
+			"deleted_classes": [
+				"PlanChatAgent"
+			]
+		},
+		{
+			"tag": "v22",
+			"new_sqlite_classes": [
+				"GitHubJobDO"
+			],
+			"deleted_classes": [
+				"RepoMergeLockDO",
+				"ScmOperationDO",
+				"ScmBootstrapDO"
+			]
+		},
+		{
+			"tag": "v23",
+			"new_sqlite_classes": [
+				"ScheduledRunCapacityDO"
 			]
 		}
 	],

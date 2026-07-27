@@ -1,10 +1,12 @@
-import { getEnvLifecycleStub, getLocationHintOptions, getWorkspaceStub } from "../helpers";
-import type { HubDO } from "../hub";
-import type { EnvDefinition, EnvLifecycleState, Env, EnvMeta } from "../types";
 import {
-  getEnvDefinitionKey,
-  persistEnvSummary,
-} from "../plan/store";
+  getEnvLifecycleStub,
+  getEnvReviewStub,
+  getLocationHintOptions,
+  getWorkspaceStub,
+} from "../helpers";
+import type { HubDO } from "../hub";
+import type { EnvDefinition, EnvLifecycleState, Env, EnvMeta, RunnerCommandClaim } from "../types";
+import { getEnvDefinitionKey } from "../plan/store";
 import { getRunnerBackend } from "./runner-backends";
 import { normalizeRunnerStatus } from "./status";
 import {
@@ -12,21 +14,13 @@ import {
   deleteScmArtifact,
   parseEnvSnapshotIdFromKey,
 } from "../scm/artifacts";
-import {
-  requireExplicitStoredEnvMeta,
-  projectEnvSummary,
-} from "../sync/projectors";
+import { deleteReviewSnapshotArtifacts } from "../env-review/snapshots";
+import { requireExplicitStoredEnvMeta } from "../sync/projectors";
 import { listManagedSessionIdsForEnv } from "../session-attachment";
-import {
-  reconcileEnvScmOperationState as reconcileEnvScmOperationStateInternal,
-  reconcileEnvScmOperationStateForRead,
-} from "../scm/env-state";
-import { revokeCodexGatewaySessionsForEnv } from "../gateway-session";
 import { revokeGitHubBridgesForInteractiveEnv } from "../github/bridge";
-import { envExists, loadEnvView } from "./view";
 
 export { buildEnvMetaFromLayers } from "./state";
-export { envExists, listEnvViews, loadEnvView } from "./view";
+export { envExists, envSlugReserved, listEnvViews, loadEnvView } from "./view";
 
 export function getHub(
   env: Env,
@@ -39,6 +33,9 @@ export function getHub(
   | "addMessage"
   | "getAllSessions"
   | "deleteSession"
+  | "revokeCloudflareMcpProxyTokensForEnv"
+  | "revokeCloudflareMcpProxyTokenForStart"
+  | "revokeCloudflareMcpProxyTokensForStart"
 > {
   const hubId = env.HUB.idFromName("hub");
   return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as Pick<
@@ -50,7 +47,60 @@ export function getHub(
     | "addMessage"
     | "getAllSessions"
     | "deleteSession"
+    | "revokeCloudflareMcpProxyTokensForEnv"
+    | "revokeCloudflareMcpProxyTokenForStart"
+    | "revokeCloudflareMcpProxyTokensForStart"
   >;
+}
+
+export async function revokeCloudflareMcpProxyTokensForStartBestEffort(
+  hub: Pick<HubDO, "revokeCloudflareMcpProxyTokensForStart">,
+  input: { envSlug: string; incarnationId: string; startOpId: string },
+): Promise<boolean> {
+  if (typeof hub.revokeCloudflareMcpProxyTokensForStart !== "function") return false;
+  try {
+    await Promise.resolve(hub.revokeCloudflareMcpProxyTokensForStart(input));
+    return true;
+  } catch (err) {
+    console.error(
+      `[envs] Failed to revoke scoped Cloudflare MCP proxy tokens for ${input.envSlug}:`,
+      err instanceof Error ? err.message : String(err),
+    );
+    return false;
+  }
+}
+
+export async function revokeCloudflareMcpProxyTokenForStartBestEffort(
+  hub: Pick<HubDO, "revokeCloudflareMcpProxyTokenForStart">,
+  input: { credentialId: string; envSlug: string; incarnationId: string; startOpId: string },
+): Promise<boolean> {
+  if (typeof hub.revokeCloudflareMcpProxyTokenForStart !== "function") return false;
+  try {
+    return await Promise.resolve(hub.revokeCloudflareMcpProxyTokenForStart(input));
+  } catch (err) {
+    console.error(
+      `[envs] Failed to revoke scoped Cloudflare MCP proxy token for ${input.envSlug}:`,
+      err instanceof Error ? err.message : String(err),
+    );
+    return false;
+  }
+}
+
+export async function revokeCloudflareMcpProxyTokensForEnvBestEffort(
+  hub: Pick<HubDO, "revokeCloudflareMcpProxyTokensForEnv">,
+  envSlug: string,
+  options: { logFailures?: boolean } = {},
+): Promise<boolean> {
+  if (typeof hub.revokeCloudflareMcpProxyTokensForEnv !== "function") return true;
+  try {
+    await Promise.resolve(hub.revokeCloudflareMcpProxyTokensForEnv(envSlug));
+    return true;
+  } catch (err) {
+    if (options.logFailures !== false) {
+      console.error(`[envs] Failed to revoke Cloudflare MCP proxy tokens for ${envSlug}:`, err instanceof Error ? err.message : String(err));
+    }
+    return false;
+  }
 }
 
 export function clearEnvError(meta: EnvMeta): EnvMeta {
@@ -60,29 +110,30 @@ export function clearEnvError(meta: EnvMeta): EnvMeta {
   return next;
 }
 
-export function clearAuthWarning(meta: EnvMeta): EnvMeta {
-  const next = { ...meta };
-  delete next.authWarning;
-  return next;
-}
-
 export function parseEnvMeta(raw: string): EnvMeta {
   return requireExplicitStoredEnvMeta(JSON.parse(raw) as EnvMeta);
 }
 
 export function buildEnvDefinition(meta: EnvMeta): EnvDefinition {
+  if (
+    !meta.incarnationId?.trim()
+    || meta.scmModel !== "github"
+    || !meta.executionPlacement
+  ) {
+    throw new Error(
+      `Environment ${meta.slug} is missing immutable workload identity or execution placement.`,
+    );
+  }
   return {
     slug: meta.slug,
+    incarnationId: meta.incarnationId,
+    ...(meta.sidebarSlot ? { sidebarSlot: meta.sidebarSlot } : {}),
     repoId: meta.repoId,
-    backend: meta.backend,
+    scmModel: meta.scmModel,
+    executionPlacement: meta.executionPlacement,
     harness: meta.harness,
-    ...(meta.authMode ? { authMode: meta.authMode } : {}),
     ...(meta.resolvedAuthMode ? { resolvedAuthMode: meta.resolvedAuthMode } : {}),
-    ...(meta.codexAuthPreference ? { codexAuthPreference: meta.codexAuthPreference } : {}),
     ...(meta.codexAuthMode ? { codexAuthMode: meta.codexAuthMode } : {}),
-    ...(meta.opencodeProvider ? { opencodeProvider: meta.opencodeProvider } : {}),
-    ...(meta.opencodeModel ? { opencodeModel: meta.opencodeModel } : {}),
-    ...(meta.modelRoute ? { modelRoute: meta.modelRoute } : {}),
     startupPlanId: meta.startupPlanId,
     branchName: meta.branchName,
     createdAt: meta.createdAt,
@@ -116,6 +167,7 @@ export async function deleteEnvSnapshotArtifacts(
     );
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
+  await deleteReviewSnapshotArtifacts(bucket, envSlug);
 }
 
 export async function readLifecycleState(
@@ -128,25 +180,15 @@ export async function readLifecycleState(
 
 export async function projectAndPersistEnvSummary(
   env: Env,
-  hub: Pick<HubDO, "broadcastEnvUpsert">,
+  _hub: Pick<HubDO, "broadcastEnvUpsert">,
   slug: string,
   options?: {
     broadcast?: boolean;
   },
 ): Promise<EnvMeta | null> {
-  if (!(await envExists(env, slug))) {
-    return null;
-  }
-  const meta = await loadEnvView(env, slug);
-  if (!meta) {
-    return null;
-  }
-
-  await persistEnvSummary(env, meta);
-  if (options?.broadcast !== false) {
-    await hub.broadcastEnvUpsert(projectEnvSummary(meta));
-  }
-  return meta;
+  return getEnvLifecycleStub(env, slug).persistOwnedProjection({
+    broadcast: options?.broadcast !== false,
+  });
 }
 
 export async function projectEnvMetaWithLifecycle(
@@ -160,18 +202,6 @@ export async function projectEnvMetaWithLifecycle(
   ) ?? meta;
 }
 
-export async function reconcileEnvScmOperationState(
-  env: Env,
-  meta: EnvMeta,
-  _options?: { persist?: boolean },
-): Promise<EnvMeta> {
-  return await reconcileEnvScmOperationStateInternal(env, meta, async (projectedMeta) => {
-    return await projectAndPersistEnvSummary(env, getHub(env), projectedMeta.slug, {
-      broadcast: false,
-    });
-  });
-}
-
 export async function projectEnvMetaForAction(
   env: Env,
   meta: EnvMeta,
@@ -179,10 +209,9 @@ export async function projectEnvMetaForAction(
 ): Promise<{ meta: EnvMeta; liveStatus: string }> {
   const liveStatus = normalizeRunnerStatus(await backend.getStatus(meta).catch(() => "unknown"));
   const projectedMeta = await projectEnvMetaWithLifecycle(env, meta);
-  const reconciledMeta = await reconcileEnvScmOperationState(env, projectedMeta);
 
   return {
-    meta: reconciledMeta,
+    meta: projectedMeta,
     liveStatus,
   };
 }
@@ -191,35 +220,51 @@ export async function projectEnvMetaForRead(
   env: Env,
   meta: EnvMeta,
 ): Promise<EnvMeta> {
-  return await reconcileEnvScmOperationStateForRead(env, meta);
+  void env;
+  return meta;
 }
 
 /**
- * Destroy a single environment: workspace DO, runner backend, KV entry, then broadcast "deleted".
+ * Destroy a single environment. The assigned host runner is confirmed absent
+ * before any workspace, snapshot, session, or definition data is removed.
  * Caller is responsible for marking the env as "deleting" beforehand.
  */
 export async function destroyEnv(
   env: Env,
   meta: EnvMeta,
-  hub: Pick<HubDO, "broadcastEnvRemove" | "getAllSessions" | "deleteSession">,
-  options?: { broadcast?: boolean },
+  hub: Pick<HubDO, "broadcastEnvRemove" | "getAllSessions" | "deleteSession" | "revokeCloudflareMcpProxyTokensForEnv">,
+  options?: {
+    broadcast?: boolean;
+    runnerCommand?: RunnerCommandClaim;
+    skipRunnerDestroy?: boolean;
+  },
 ): Promise<void> {
-  await revokeCodexGatewaySessionsForEnv(env, meta.slug).catch((err) => {
-    console.error(`[envs] Failed to revoke Codex gateway sessions for ${meta.slug}:`, err instanceof Error ? err.message : String(err));
-  });
   await revokeGitHubBridgesForInteractiveEnv(env, meta.slug).catch((err) => {
     console.error(`[envs] Failed to revoke GitHub bridge records for ${meta.slug}:`, err instanceof Error ? err.message : String(err));
   });
+  await revokeCloudflareMcpProxyTokensForEnvBestEffort(hub, meta.slug);
+  if (!options?.skipRunnerDestroy) {
+    const backend = await getRunnerBackend(env, meta.backend);
+    if (meta.backend === "host") {
+      await backend.destroy(meta, options?.runnerCommand ? { runnerCommand: options.runnerCommand } : undefined);
+    } else {
+      try {
+        await backend.destroy(meta);
+      } catch (err) {
+        console.error(`[envs] Cloudflare runner destroy failed for ${meta.slug}, continuing durable cleanup:`, err instanceof Error ? err.message : String(err));
+      }
+    }
+  }
+  // Review history is removed only after every one-shot runtime has confirmed
+  // absence. This keeps an offline assigned machine from being hidden by
+  // deleting the environment's discoverable definition.
+  const attachedSessionIds = listManagedSessionIdsForEnv(
+    await hub.getAllSessions(),
+    meta.slug,
+  );
+  await getEnvReviewStub(env, meta.slug).finalizeEnvironmentDeletion(attachedSessionIds);
   const workspaceStub = getWorkspaceStub(env, meta.slug);
   await workspaceStub.destroyWorkspace();
-  try {
-    const backend = await getRunnerBackend(env, meta.backend);
-    await backend.destroy(meta);
-  } catch (err) {
-    // Host may be unavailable. Still clean up the KV entry so the env does not become a zombie.
-    console.error(`[envs] Backend destroy failed for ${meta.slug}, cleaning up anyway:`, err instanceof Error ? err.message : String(err));
-  }
-  const attachedSessionIds = listManagedSessionIdsForEnv(await hub.getAllSessions(), meta.slug);
   if (attachedSessionIds.length > 0) {
     await Promise.all(attachedSessionIds.map(async (sessionId) => {
       try {
@@ -231,8 +276,13 @@ export async function destroyEnv(
   }
   await deleteEnvSnapshotArtifacts(env.BUCKET, meta.slug);
   await env.ENVS_KV.delete(meta.slug);
+  // Lifecycle finalization is the durable success boundary for a fenced
+  // Delete. Propagate failure so the caller can abort the deletion and restore
+  // visibility for an idempotent retry; swallowing it can leave mutable state
+  // reserving an otherwise invisible slug forever.
+  await getEnvLifecycleStub(env, meta.slug).finalizeDeletion();
+  // The definition is the discoverable ownership record and is removed last.
   await env.ENVS_KV.delete(getEnvDefinitionKey(meta.slug));
-  await getEnvLifecycleStub(env, meta.slug).clearMutableState().catch(() => {});
   if (options?.broadcast !== false) {
     await hub.broadcastEnvRemove(meta.slug);
   }

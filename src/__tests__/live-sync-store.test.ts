@@ -14,11 +14,13 @@ import {
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
   return {
     slug: "test-env",
+    incarnationId: "incarnation-1",
     repoUrl: "https://github.com/user/repo",
     repoId: "repo-1",
+    scmModel: "github",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
-    runnerMachineId: "machine-123",
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
     status: "running",

@@ -12,11 +12,13 @@ import {
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
   return {
     slug: "test-env",
+    incarnationId: "incarnation-1",
     repoUrl: "https://github.com/user/repo",
     repoId: "repo-1",
+    scmModel: "github",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
-    runnerMachineId: "machine-123",
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
     status: "running",
@@ -29,13 +31,16 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
 }
 
 function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
+  const mainCommit = overrides.mainCommit === undefined ? "main-a" : overrides.mainCommit;
   return {
     repoId: "repo-1",
     repoUrl: "https://github.com/user/repo",
     githubInstallationId: 98765,
     githubFullName: "user/repo",
     ...createInitialRepoScmState(),
-    mainCommit: "main-a",
+    githubDefaultBranch: overrides.githubDefaultBranch ?? "main",
+    githubDefaultBranchHeadSha: overrides.githubDefaultBranchHeadSha === undefined ? mainCommit : overrides.githubDefaultBranchHeadSha,
+    mainCommit,
     gitArtifactId: "artifact-1",
     gitStatus: "ready",
     createdAt: "2024-01-01T00:00:00.000Z",
@@ -76,6 +81,25 @@ describe("upsertEnvMeta", () => {
       bootMessage: "Ready",
       updatedAt: "2024-01-02T00:00:00.000Z",
     });
+  });
+
+  it("does not let a late pre-profile update replace a newer Codex auth projection", () => {
+    const profileBacked = makeEnv({
+      harness: "codex",
+      codexAuthMode: "subscription",
+      updatedAt: "2024-01-01T00:00:00.001Z",
+      status: "starting",
+    });
+    const preProfile = makeEnv({
+      harness: "codex",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "starting",
+    });
+
+    const result = upsertEnvMeta([profileBacked], preProfile);
+
+    expect(result.changed).toBe(false);
+    expect(result.items[0]).toMatchObject({ codexAuthMode: "subscription" });
   });
 
   it("throws when an incoming env summary omits updatedAt", () => {
@@ -139,8 +163,9 @@ describe("getDisplayEnvBranchStatus", () => {
       branchStatus: "up-to-date",
       baseMainCommit: "main-a",
       lastKnownMainCommit: "main-a",
+      githubBaseCommitSha: "main-a",
     });
-    const repo = makeRepo({ mainCommit: "main-b" });
+    const repo = makeRepo({ mainCommit: "main-b", githubDefaultBranchHeadSha: "main-b" });
 
     expect(getDisplayEnvBranchStatus(env, repo)).toBe("behind-main");
   });

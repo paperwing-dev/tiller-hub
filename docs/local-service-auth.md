@@ -1,110 +1,75 @@
-# Local Service Auth
+# Machine Service Authentication
 
-This note explains the current auth model between deployed `tiller-hub`, the
-Tiller Host backend, and the home-network gateway.
+`tiller host` maintains one authenticated service session to the canonical
+workers.dev Hub. The installation-wide Cloudflare Access credential is shared
+by the CLI, machine service, runtime harnesses, callbacks, HTTP, and
+WebSockets. It is not a per-machine credential.
 
-## Roles
+## Identity and Readiness
 
-- runner:
-  - manages local Docker environments for `backend: "host"` through the active host session
-- gateway:
-  - routes Codex subscription traffic from hosted Plan/Research and remote Codex envs
+Machine setup generates and persists a UUID. The hostname is advertised
+separately as `displayName` and is never used as execution provenance.
 
-They may run on the same machine, but the system treats them as separate
-services.
+`machine-alive` binds the authenticated socket to that UUID only. A subsequent
+fresh advertisement must report:
 
-## Discovery model
+- healthy Docker and local runner checks;
+- runner command protocol 1;
+- runtime-auth protocol 1; and
+- the Hub-compatible runtime image.
 
-The deployed hub no longer reads runner or gateway URLs from worker secrets.
+Only then can it claim the one live machine slot. A different live UUID is
+rejected. For duplicate sockets with the same UUID, the newest healthy
+advertisement is command-active.
 
-Instead:
+## Runner Control
 
-1. `tiller` or `tiller host` registers a host service in `HubDO`
-2. the same host process can also register a public gateway URL when gateway tunneling is available
-3. `tiller-hub` selects the newest active runner and newest active gateway independently
+The Hub does not discover runner URLs from Worker secrets. Fenced commands
+travel over the authenticated machine session:
 
-That removes the old secret-managed service-discovery paths:
+1. lifecycle state identifies the workload's stored machine UUID;
+2. `HubDO` verifies that exact UUID is currently healthy and routable;
+3. `HubDO` sends the command to its command-active socket;
+4. the machine daemon forwards it to the loopback runner; and
+5. the runner acknowledges the exact command generation, operation ID, and
+   desired state.
 
-- `LOCAL_RUNNER_URL`
-- `LOCAL_RUNNER_TOKEN`
-- `RESEARCH_RELAY_URL`
-- `RESEARCH_RELAY_TOKEN`
+No command is redirected to the current Settings selection or another machine.
 
-## Public access model
+The retired `LOCAL_RUNNER_URL`, `LOCAL_RUNNER_TOKEN`,
+`RESEARCH_RELAY_URL`, and `RESEARCH_RELAY_TOKEN` paths remain unsupported.
 
-For custom-domain deployments, the public gateway hostname sits behind
-Cloudflare Access:
+## Cloudflare Access
 
-- `https://tiller-gateway.example.com`
+Service calls send the canonical Access client ID and secret to Cloudflare.
+The Worker trusts only Cloudflare's verified application JWT. A service
+principal must have no owner email and a signed `common_name` equal to the
+canonical service client ID.
 
-Requests from the deployed hub include:
+Raw credential headers are not origin authentication. Custom-domain scalar
+`CF_ACCESS_*` trust is unsupported.
 
-- `CF-Access-Client-Id`
-- `CF-Access-Client-Secret`
+## Runtime Authentication
 
-Those headers are the only app-to-service auth layer in the current design.
-The old extra bearer-token layer has been removed for this iteration.
+Codex subscription runtimes start app-server on a private Unix socket. The
+supervisor presents a scoped callback capability to the Hub, which verifies
+the stored environment start, writer generation, or review run before issuing
+an access token.
 
-## Request flows
+Refresh credentials, Access credentials, bridge secrets, and callback
+capabilities are excluded from child process environments. See
+[codex-runtime-auth.md](codex-runtime-auth.md).
 
-### Tiller Host backend
+## Failure Behavior
 
-1. Browser calls deployed `tiller-hub`
-2. `tiller-hub` decides an env uses `backend: "host"`
-3. `tiller-hub` looks up the active host registration
-4. `tiller-hub` sends a runner-control request through `HubDO`
-5. Tiller Host receives the request over its hub session connection
-6. Tiller Host starts or manages the local Docker container
+- No healthy advertised machine: new machine-selected work returns the selected
+  backend error.
+- Stored machine offline: existing work returns delete/recreate guidance.
+- Runtime image or protocol mismatch: Settings reports the incompatibility;
+  there is no alternate backend.
+- Lifecycle owner replaced or cancelled: the old callback is rejected and
+  never rebound.
+- Destroy not acknowledged: durable workload state remains intact.
 
-### Codex gateway routing
-
-1. Browser calls deployed `tiller-hub`
-2. Hosted Plan/Research or remote Codex env launch needs a Codex route
-3. `tiller-hub` looks up the active gateway registration
-4. `tiller-hub` calls the gateway URL
-5. Cloudflare Access validates the request when the gateway is on a protected custom domain
-6. The gateway forwards Codex traffic to `https://chatgpt.com/backend-api/codex/responses`
-
-If no healthy gateway is registered, `tiller-hub` falls back to `OPENAI_API_KEY`
-when that key is configured.
-
-## Localhost behavior
-
-When services are loopback-only:
-
-- runner control stays on the hub session path
-- gateway calls go directly to `http://127.0.0.1:<gateway-port>`
-
-Cloudflare Access is only required on the public hostname path.
-
-## Operational failure modes
-
-### Cloudflare Access headers missing or wrong
-
-Symptoms:
-
-- requests fail before they hit the runner or gateway
-- Cloudflare returns a login or deny response
-
-### Runner offline
-
-Symptoms:
-
-- host backend env creation/start fails
-- Cloudflare backend envs are unaffected
-
-### Gateway offline
-
-Symptoms:
-
-- hosted Plan/Research and remote Codex envs stop using the subscription route
-- if `OPENAI_API_KEY` is configured, they fall back automatically
-- if `OPENAI_API_KEY` is not configured, Codex-backed hosted features become unavailable
-
-## Relevant code
-
-- [runner-backend-host.ts](../api/env/runner-backend-host.ts)
-- [model-route.ts](../api/model-route.ts)
-- [service-registry.ts](../api/service-registry.ts)
-- [runner-server.ts](../../tiller/src/runner-server.ts)
-- [gateway-server.ts](../../tiller/src/gateway-server.ts)
+Loopback URLs and `host.docker.internal` are used only for local process and
+contributor networking; they do not define machine identity.

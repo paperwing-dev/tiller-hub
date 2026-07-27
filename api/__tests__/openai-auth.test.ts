@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getReadOnlyStatus,
   getStatus,
   getValidOpenAIAuth,
   refreshAccessToken,
@@ -73,9 +74,9 @@ describe("openai-auth", () => {
       ok: true,
       status: 200,
       json: async () => ({
-        access_token: createJwt({ chatgpt_account_id: "acct_new" }),
+        access_token: createJwt({ chatgpt_account_id: "acct_old", nonce: "rotated" }),
         refresh_token: "refresh_new",
-        id_token: createJwt({ chatgpt_account_id: "acct_new" }),
+        id_token: createJwt({ chatgpt_account_id: "acct_old" }),
         expires_in: 7200,
       }),
     }));
@@ -84,7 +85,7 @@ describe("openai-auth", () => {
 
     expect(refreshed.access_token).not.toContain("acct_old");
     expect(refreshed.refresh_token).toBe("refresh_new");
-    expect(refreshed.account_id).toBe("acct_new");
+    expect(refreshed.account_id).toBe("acct_old");
     expect(refreshed.expires_at).toBe(Date.now() + 7200 * 1000);
   });
 
@@ -167,7 +168,7 @@ describe("openai-auth", () => {
       ok: true,
       status: 200,
       json: async () => ({
-        access_token: createJwt({ chatgpt_account_id: "acct_new" }),
+        access_token: createJwt({ chatgpt_account_id: "acct_old", nonce: "rotated" }),
         refresh_token: "refresh_new",
         expires_in: 3600,
       }),
@@ -187,5 +188,25 @@ describe("openai-auth", () => {
   it("getStatus reports unauthenticated when nothing is seeded", async () => {
     const env = createTestEnv();
     await expect(getStatus(env)).resolves.toEqual({ authenticated: false, status: "missing" });
+  });
+
+  it("checks scheduled eligibility without refreshing or writing credential state", async () => {
+    const env = createTestEnv();
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    const stored = await seedTokens(env, {
+      access_token: createJwt({ chatgpt_account_id: "acct_scheduled" }),
+      refresh_token: "refreshable-identity",
+      expires_in: 1,
+    });
+    vi.advanceTimersByTime(2_000);
+
+    await expect(getReadOnlyStatus(env)).resolves.toEqual({
+      authenticated: true,
+      status: "connected",
+      expires_at: stored.expires_at,
+      account_id: "acct_scheduled",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

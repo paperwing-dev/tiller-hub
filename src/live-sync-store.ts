@@ -9,6 +9,7 @@ export type DashboardSelection =
   | { type: "env"; envSlug: string }
   | { type: "changes"; envSlug: string }
   | { type: "plan"; repoId: string; planArtifactId?: string | null }
+  | { type: "repo-settings"; repoId: string }
   | { type: "update" }
   | { type: "settings" };
 
@@ -183,6 +184,9 @@ export function reconcileSelectionAfterRepoRemove(
   if (current.type === "plan" && current.repoId === repoId) {
     return { type: "none" };
   }
+  if (current.type === "repo-settings" && current.repoId === repoId) {
+    return { type: "none" };
+  }
   return current;
 }
 
@@ -191,6 +195,9 @@ export function reconcileSelectionAfterRepoRefresh(
   nextRepoIds: Set<string>,
 ): DashboardSelection {
   if (current.type === "plan" && !nextRepoIds.has(current.repoId)) {
+    return { type: "none" };
+  }
+  if (current.type === "repo-settings" && !nextRepoIds.has(current.repoId)) {
     return { type: "none" };
   }
   return current;

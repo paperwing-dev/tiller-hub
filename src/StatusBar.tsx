@@ -11,8 +11,8 @@ export default function StatusBar({ connected, sessionActive = false, pendingPer
     if (!connected) {
       return {
         text: "Offline",
-        dotColor: "bg-red-500",
-        textColor: "text-red-600",
+        dotColor: "bg-kumo-danger",
+        textColor: "text-kumo-danger",
         isPulsing: false,
       };
     }
@@ -20,8 +20,8 @@ export default function StatusBar({ connected, sessionActive = false, pendingPer
     if (!sessionActive) {
       return {
         text: "Session inactive",
-        dotColor: "bg-[#d0d7de]",
-        textColor: "text-[#57606a]",
+        dotColor: "bg-kumo-fill",
+        textColor: "text-kumo-subtle",
         isPulsing: false,
       };
     }
@@ -29,22 +29,22 @@ export default function StatusBar({ connected, sessionActive = false, pendingPer
     if (pendingPermissions > 0) {
       return {
         text: `${pendingPermissions} permission${pendingPermissions > 1 ? "s" : ""} needed`,
-        dotColor: "bg-amber-500",
-        textColor: "text-amber-700",
+        dotColor: "bg-kumo-warning",
+        textColor: "text-kumo-warning",
         isPulsing: true,
       };
     }
 
     return {
       text: "Connected",
-      dotColor: "bg-green-500",
-      textColor: "text-green-700",
+      dotColor: "bg-kumo-success",
+      textColor: "text-kumo-success",
       isPulsing: false,
     };
   }, [connected, sessionActive, pendingPermissions]);
 
   return (
-    <div className="flex items-center justify-between px-4 py-1.5 bg-[#f6f8fa] border-t border-[#d0d7de]">
+    <div className="flex items-center justify-between px-4 py-1.5 bg-kumo-recessed border-t border-kumo-line">
       <div className="flex items-center gap-1.5">
         <span
           className={`h-2 w-2 rounded-full ${status.dotColor} ${status.isPulsing ? "animate-pulse" : ""}`}

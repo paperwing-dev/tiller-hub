@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { HonoEnv } from "../types";
-import { createInitialEnvScmState } from "../scm/model";
+import { isExecutionPlacement, type HonoEnv } from "../types";
+import { createInitialEnvScmState, createInitialRepoScmState } from "../scm/model";
 
 const mocks = vi.hoisted(() => ({
   getArtifactStoreStub: vi.fn(),
@@ -11,7 +11,9 @@ const mocks = vi.hoisted(() => ({
   getRunnerBackend: vi.fn(),
   getSecret: vi.fn(),
   getOrCreateSecret: vi.fn(),
+  getBillingSelections: vi.fn(),
   resolveProtectionState: vi.fn(),
+  refreshGitHubDefaultBranchHeadForRequest: vi.fn(),
 }));
 
 vi.mock("../helpers", async () => {
@@ -40,7 +42,7 @@ vi.mock("../env/runner-backends", () => ({
 vi.mock("../setup/config", () => ({
   getSecret: mocks.getSecret,
   getOrCreateSecret: mocks.getOrCreateSecret,
-  resolveDeploymentModeForRuntime: vi.fn(async () => "hosted"),
+  getBillingSelections: mocks.getBillingSelections,
 }));
 
 vi.mock("../protection", async () => {
@@ -51,7 +53,21 @@ vi.mock("../protection", async () => {
   };
 });
 
+vi.mock("../repo/refresh", () => ({
+  refreshGitHubDefaultBranchHeadForRequest: mocks.refreshGitHubDefaultBranchHeadForRequest,
+}));
+
+vi.mock("../canonical-origin", async () => {
+  const actual = await vi.importActual<typeof import("../canonical-origin")>("../canonical-origin");
+  return {
+    ...actual,
+    resolveCanonicalHubOrigin: vi.fn(async () => "https://demo.preview.workers.dev"),
+    resolveCanonicalRequestOrigin: vi.fn(async (_env: unknown, request: Request) => new URL(request.url).origin),
+  };
+});
+
 const { default: envRoutes } = await import("../env/routes");
+const { startEnvAction } = await import("../env/lifecycle-actions");
 
 function createTestApp() {
   const app = new Hono<HonoEnv>();
@@ -68,6 +84,13 @@ function createExecutionCtx() {
 
 function buildStoredEnvRecord(record: Record<string, unknown>) {
   const slug = typeof record.slug === "string" ? record.slug : "my-env";
+  const requestedPlacement = record.executionPlacement;
+  const executionPlacement = isExecutionPlacement(requestedPlacement)
+    ? requestedPlacement
+    : record.backend === "host"
+      ? { backend: "host" as const, machineId: slug }
+      : { backend: "cf" as const, machineId: null };
+  const backend = executionPlacement.backend;
   const createdAt = typeof record.createdAt === "string" ? record.createdAt : "2024-01-01";
   const branchName = typeof record.branchName === "string" ? record.branchName : undefined;
   const mainCommit =
@@ -77,6 +100,11 @@ function buildStoredEnvRecord(record: Record<string, unknown>) {
         ? record.lastKnownMainCommit
         : null;
 
+  const {
+    executionPlacement: _inputExecutionPlacement,
+    backend: _inputBackend,
+    ...currentRecord
+  } = record;
   return {
     ...createInitialEnvScmState({
       slug,
@@ -85,8 +113,12 @@ function buildStoredEnvRecord(record: Record<string, unknown>) {
       mainCommit,
     }),
     slug,
+    incarnationId: typeof record.incarnationId === "string"
+      ? record.incarnationId
+      : `incarnation-${slug}`,
     repoUrl: typeof record.repoUrl === "string" ? record.repoUrl : "https://github.com/test/repo",
     repoId: typeof record.repoId === "string" ? record.repoId : "repo-1",
+    scmModel: "github" as const,
     createdAt,
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : createdAt,
     status: typeof record.status === "string" ? record.status : "unknown",
@@ -94,8 +126,9 @@ function buildStoredEnvRecord(record: Record<string, unknown>) {
       record.harness === "claude-code" || record.harness === "codex" || record.harness === "opencode"
         ? record.harness
         : "claude-code",
-    ...record,
-    backend: record.backend === "host" ? "host" : "cf",
+    ...currentRecord,
+    backend,
+    executionPlacement,
   };
 }
 
@@ -119,9 +152,10 @@ function createKvStore(
             if (typeof parsed.slug === "string") {
               store.set(`envdef:${parsed.slug}`, JSON.stringify({
                 slug: explicit.slug,
-                repoUrl: explicit.repoUrl,
-                ...(typeof explicit.repoId === "string" ? { repoId: explicit.repoId } : {}),
-                backend: explicit.backend,
+                incarnationId: explicit.incarnationId,
+                repoId: explicit.repoId,
+                scmModel: "github",
+                executionPlacement: explicit.executionPlacement,
                 ...(typeof explicit.harness === "string" ? { harness: explicit.harness } : {}),
                 startupPlanId: explicit.startupPlanId,
                 branchName: explicit.branchName,
@@ -147,6 +181,7 @@ function createKvStore(
     delete: vi.fn().mockImplementation(async (key: string) => {
       store.delete(key);
     }),
+    list: vi.fn().mockResolvedValue({ keys: [], list_complete: true }),
   };
 }
 
@@ -170,7 +205,18 @@ function createLifecycleState(overrides: Record<string, unknown> = {}) {
 function createLifecycleStub() {
   let hydrated = false;
   let current: any = {
+    slug: "opencode-env",
+    incarnationId: "incarnation-opencode-env",
+    repoUrl: "https://github.com/test/repo",
+    repoId: "repo-1",
+    backend: "cf" as const,
+    executionPlacement: { backend: "cf" as const, machineId: null },
+    harness: "opencode" as const,
+    createdAt: "2026-04-10T00:00:00.000Z",
+    startupPlanId: null,
+    branchName: "tiller/env/opencode-env",
     status: "starting",
+    scmModel: "github",
     lifecyclePhase: "starting",
     lifecycleOpId: "start-op-1",
     lifecycleOperation: "start",
@@ -181,15 +227,27 @@ function createLifecycleStub() {
     lifecycleRuntimeReady: false,
     lifecycleUpdatedAt: "2026-04-10T00:00:00.000Z",
     runnerId: null as string | null,
-    runnerMachineId: null as string | null,
     bootMessage: null as string | null,
-    authWarning: null as string | null,
     branchStatus: "up-to-date",
     workspaceDirty: false,
     workspaceNeedsAttention: false,
     workspaceLastSyncedAt: null as string | null,
     baseMainCommit: "main-sha",
     lastKnownMainCommit: "main-sha",
+    githubBaseBranch: "main",
+    githubBaseCommitSha: "main-sha",
+    githubBranch: "tiller/env/opencode-env",
+    githubHeadCommitSha: null,
+    githubPrNumber: null,
+    githubPrUrl: null,
+    githubPrState: null,
+    githubMergedAt: null,
+    githubPublishStatus: "idle",
+    githubPublishOperationId: null,
+    githubPublishError: null,
+    githubLastPublishedAt: null,
+    githubLastPublishedWorkspaceHash: null,
+    githubPendingPublish: null,
     scmOperationType: null as string | null,
     scmOperationId: null as string | null,
     scmOperationPhase: null as string | null,
@@ -205,12 +263,46 @@ function createLifecycleStub() {
     errorAt: null as string | null,
     updatedAt: "2026-04-10T00:00:00.000Z",
   };
+  const claimStart = async (settings: Record<string, unknown>, initial?: Record<string, unknown>) => {
+    if (initial) current = { ...current, ...initial };
+    current = {
+      ...current,
+      status: "starting",
+      harnessSettings: settings,
+      lifecyclePhase: "starting",
+      lifecycleOpId: "start-op-1",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
+    };
+    hydrated = true;
+    return {
+      lifecycle: createLifecycleState(),
+      dispatchGranted: true,
+      harnessSettings: settings,
+    };
+  };
   return {
+    isInitialCreationPending: vi.fn().mockResolvedValue(false),
+    persistOwnedProjection: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
+    getOwnedEnvView: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
+    preparePublicStart: vi.fn().mockResolvedValue({ action: "ordinary" }),
+    getImmutablePlan: vi.fn().mockResolvedValue(null),
+    prepareManualStop: vi.fn().mockResolvedValue({
+      schedulerControlled: true,
+      cleanupRequired: false,
+      preparationInFlight: false,
+    }),
+    claimRunnerCommand: vi.fn().mockImplementation(async (operationId: string, desiredState: string) => ({
+      commandGeneration: 1,
+      operationId,
+      desiredState,
+    })),
     clearMutableState: vi.fn().mockResolvedValue(null),
     clearState: vi.fn().mockResolvedValue(null),
     getState: vi.fn().mockResolvedValue(null),
     getMutableState: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
     peekMutableState: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
+    peekVisibleMutableState: vi.fn().mockImplementation(async () => (hydrated ? current : null)),
     initializeMutableStateFromMeta: vi.fn().mockImplementation(async (meta: Record<string, unknown>) => {
       const status = typeof meta.status === "string" ? meta.status : current.status;
       const updatedAt =
@@ -238,7 +330,6 @@ function createLifecycleStub() {
             ? meta.lifecycleRuntimeReady
             : current.lifecycleRuntimeReady,
         runnerId: typeof meta.runnerId === "string" ? meta.runnerId : current.runnerId,
-        runnerMachineId: typeof meta.runnerMachineId === "string" ? meta.runnerMachineId : current.runnerMachineId,
         bootMessage: typeof meta.bootMessage === "string" ? meta.bootMessage : current.bootMessage,
         branchStatus: typeof meta.branchStatus === "string" ? meta.branchStatus : current.branchStatus,
         workspaceDirty: typeof meta.workspaceDirty === "boolean" ? meta.workspaceDirty : current.workspaceDirty,
@@ -253,40 +344,52 @@ function createLifecycleStub() {
         baseMainCommit: typeof meta.baseMainCommit === "string" ? meta.baseMainCommit : current.baseMainCommit,
         lastKnownMainCommit:
           typeof meta.lastKnownMainCommit === "string" ? meta.lastKnownMainCommit : current.lastKnownMainCommit,
+        githubBaseBranch: typeof meta.githubBaseBranch === "string" ? meta.githubBaseBranch : current.githubBaseBranch,
+        githubBaseCommitSha:
+          typeof meta.githubBaseCommitSha === "string"
+            ? meta.githubBaseCommitSha
+            : typeof meta.baseMainCommit === "string"
+              ? meta.baseMainCommit
+              : current.githubBaseCommitSha,
+        githubBranch: typeof meta.githubBranch === "string" ? meta.githubBranch : current.githubBranch,
         updatedAt,
         lifecycleUpdatedAt: typeof meta.lifecycleUpdatedAt === "string" ? meta.lifecycleUpdatedAt : updatedAt,
       };
       hydrated = true;
       return current;
     }),
-    requestStart: vi.fn().mockImplementation(async () => {
-      const lifecycle = createLifecycleState();
+    initializeAndBeginStart: vi.fn().mockImplementation(async (
+      _definition: Record<string, unknown>,
+      initial: Record<string, unknown>,
+      settings: Record<string, unknown>,
+      authClaim: Record<string, unknown> = {},
+    ) => ({ ...await claimStart(settings, initial), ...authClaim })),
+    beginStart: vi.fn().mockImplementation(async (
+      settings: Record<string, unknown>,
+      authClaim: Record<string, unknown> = {},
+    ) => ({ ...await claimStart(settings), ...authClaim })),
+    requestStop: vi.fn().mockImplementation(async () => {
       current = {
         ...current,
-        status: "starting",
-        lifecyclePhase: "starting",
-        lifecycleOpId: String(lifecycle.activeOpId),
-        lifecycleOperation: String(lifecycle.activeOperation),
-        lifecycleDesiredState: String(lifecycle.desiredState),
-        lifecycleLastRunnerState: null,
-        lifecycleInfraState: "unknown",
-        lifecycleRuntimeReady: false,
-        lifecycleUpdatedAt: String(lifecycle.updatedAt),
-        updatedAt: String(lifecycle.updatedAt),
+        status: "saving",
+        lifecyclePhase: "saving",
+        lifecycleOpId: "stop-op-1",
+        lifecycleOperation: "stop",
+        lifecycleDesiredState: "stopped",
+        lifecycleUpdatedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       };
-      hydrated = true;
-      return lifecycle;
+      return createLifecycleState({
+        phase: "saving",
+        activeOpId: "stop-op-1",
+        activeOperation: "stop",
+        desiredState: "stopped",
+      });
     }),
-    requestStop: vi.fn().mockResolvedValue(null),
     reconcile: vi.fn().mockResolvedValue(null),
     clearLeadHarnessState: vi.fn().mockResolvedValue(current),
     beginStartupDiagnostics: vi.fn().mockResolvedValue(current),
     getStartupDiagnostics: vi.fn().mockResolvedValue({ active: null, lastFailed: null }),
-    setAuthWarning: vi.fn().mockImplementation(async (warning: string | null) => {
-      hydrated = true;
-      current = { ...current, authWarning: warning };
-      return current;
-    }),
     setBootProgress: vi.fn().mockImplementation(async (message: string | null) => {
       hydrated = true;
       current = { ...current, bootMessage: message };
@@ -297,16 +400,27 @@ function createLifecycleStub() {
       current = {
         ...current,
         runnerId: typeof binding.runnerId === "string" ? binding.runnerId : current.runnerId,
-        runnerMachineId: typeof binding.runnerMachineId === "string" ? binding.runnerMachineId : current.runnerMachineId,
       };
       return current;
     }),
-    reportStartupFailure: vi.fn().mockResolvedValue(current),
+    reportStartupFailure: vi.fn().mockImplementation(async (failure: { opId?: string; message?: string }) => {
+      const lifecycle = createLifecycleState({
+        phase: "failed",
+        activeOpId: failure.opId ?? "start-op-1",
+        lastError: failure.message ?? "startup failed",
+      });
+      current = {
+        ...current,
+        status: "failed",
+        lifecyclePhase: "failed",
+        error: lifecycle.lastError,
+        errorAt: lifecycle.updatedAt,
+      };
+      return lifecycle;
+    }),
     reportStartupEvent: vi.fn().mockResolvedValue(null),
     recordStopWorkspaceSynced: vi.fn().mockResolvedValue(current),
     recordWorkspaceSyncFailed: vi.fn().mockResolvedValue(current),
-    setScmProjection: vi.fn().mockResolvedValue(current),
-    clearScmProjection: vi.fn().mockResolvedValue(current),
     setStatus: vi.fn().mockResolvedValue(current),
     setError: vi.fn().mockResolvedValue(current),
     noteInfraReady: vi.fn().mockResolvedValue(null),
@@ -331,9 +445,95 @@ function createLifecycleStub() {
     }),
     noteRunnerStartFailed: vi.fn().mockResolvedValue(null),
     noteRunnerStopped: vi.fn().mockResolvedValue(null),
+    noteFencedRunnerAbsentBeforeScheduledStart: vi.fn().mockResolvedValue(false),
+    noteFencedScheduledStartRejectedBeforeMutation: vi.fn().mockResolvedValue(false),
     noteStopWorkspaceSynced: vi.fn().mockResolvedValue(null),
     noteWorkspaceSyncFailed: vi.fn().mockResolvedValue(null),
     noteStopDispatchFailed: vi.fn().mockResolvedValue(null),
+  };
+}
+
+async function createOpenCodeStartFixture(options: {
+  start?: ReturnType<typeof vi.fn>;
+  committedSettings?: { model: string; effort: string };
+  startupPlanId?: string | null;
+} = {}) {
+  const start = options.start ?? vi.fn().mockResolvedValue({
+    runnerId: "machine-1",
+    backend: "cf",
+  });
+  mocks.getRunnerBackend.mockResolvedValue({
+    start,
+    getStatus: vi.fn().mockResolvedValue("stopped"),
+  });
+  const storedEnv = {
+    slug: "opencode-env",
+    repoUrl: "https://github.com/test/repo",
+    repoId: "repo-1",
+    runnerId: "machine-1",
+    backend: "cf",
+    harness: "opencode",
+    harnessSettings: options.committedSettings ?? { model: "kimi-k2.7-code", effort: "high" },
+    createdAt: "2024-01-01T00:00:00.000Z",
+    status: "stopped",
+    startupPlanId: options.startupPlanId ?? null,
+    baseMainCommit: "main-sha",
+    lastKnownMainCommit: "main-sha",
+  };
+  const kv = createKvStore({ "opencode-env": JSON.stringify(storedEnv) });
+  const lifecycleStub = createLifecycleStub();
+  await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord(storedEnv));
+  mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+  const env = {
+    ENABLED_ENV_HARNESSES: "claude-code,codex,opencode",
+    OPENAI_API_KEY: "selected-openai-key",
+    TILLER_OPENCODE_PROXY_TOKEN: "workers-token",
+    ENVS_KV: kv,
+    HUB: {
+      idFromName: vi.fn().mockReturnValue("hub-id"),
+      get: vi.fn().mockReturnValue({
+        broadcastEnvUpsert: vi.fn().mockResolvedValue(undefined),
+        broadcastEnvRemove: vi.fn(),
+        broadcastRepoUpsert: vi.fn(),
+        broadcastRepoMainChange: vi.fn(),
+        addMessage: vi.fn(),
+        resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
+        revokeCloudflareMcpProxyTokensForEnv: vi.fn().mockResolvedValue(undefined),
+      }),
+    },
+    BUCKET: {
+      put: vi.fn().mockResolvedValue(undefined),
+      delete: vi.fn().mockResolvedValue(undefined),
+      head: vi.fn().mockResolvedValue(null),
+    },
+  };
+  return { app: createTestApp(), env, lifecycleStub, start };
+}
+
+function createOpenCodeCreateEnv(overrides: Record<string, unknown> = {}) {
+  return {
+    ENABLED_ENV_HARNESSES: "claude-code,codex,opencode",
+    TILLER_OPENCODE_PROXY_TOKEN: "proxy-token-123",
+    ENVS_KV: createKvStore({}),
+    HUB: {
+      idFromName: vi.fn().mockReturnValue("hub-id"),
+      get: vi.fn().mockReturnValue({
+        broadcastEnvUpsert: vi.fn().mockResolvedValue(undefined),
+        broadcastEnvRemove: vi.fn(),
+        broadcastRepoUpsert: vi.fn(),
+        broadcastRepoMainChange: vi.fn(),
+        addMessage: vi.fn(),
+        resolveNewExecutionPlacement: vi.fn().mockResolvedValue({ backend: "cf", machineId: null }),
+        resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
+        revokeCloudflareMcpProxyTokensForEnv: vi.fn().mockResolvedValue(undefined),
+      }),
+    },
+    BUCKET: {
+      put: vi.fn().mockResolvedValue(undefined),
+      delete: vi.fn().mockResolvedValue(undefined),
+      head: vi.fn().mockResolvedValue(null),
+    },
+    ...overrides,
   };
 }
 
@@ -346,30 +546,62 @@ describe("OpenCode environment routes", () => {
       listArtifacts: vi.fn().mockReturnValue([]),
       listLatestTodoPlansForMain: vi.fn().mockReturnValue([]),
       listRefs: vi.fn().mockReturnValue([]),
+      reconcileEnvironmentSidebarSlots: vi.fn().mockReturnValue([]),
+      claimEnvironmentSidebarSlot: vi.fn().mockReturnValue({ status: "claimed", slot: 1 }),
+      commitEnvironmentSidebarSlot: vi.fn().mockReturnValue(true),
+      releaseEnvironmentSidebarSlotClaim: vi.fn().mockReturnValue(true),
+      releaseEnvironmentSidebarSlot: vi.fn().mockReturnValue(true),
     });
     mocks.getEnvLifecycleStub.mockReturnValue(createLifecycleStub());
     mocks.getSecret.mockImplementation(async (env: Record<string, unknown>, key: string) => env[key] ?? undefined);
     mocks.getOrCreateSecret.mockImplementation(async (env: Record<string, unknown>, key: string, createValue: () => string) => env[key] ?? createValue());
+    mocks.getBillingSelections.mockResolvedValue({
+      claudeBillingMode: "api",
+      openaiBillingMode: "api",
+    });
     mocks.resolveProtectionState.mockResolvedValue({ protectionMode: "cf-access" });
-    mocks.getRepoWorkspaceForRepoId.mockResolvedValue({
+    const repoWorkspace = {
       meta: {
         repoId: "repo-1",
         repoUrl: "https://github.com/test/repo",
+        githubInstallationId: 98765,
+        githubFullName: "test/repo",
+        ...createInitialRepoScmState(),
+        githubDefaultBranch: "main",
+        githubDefaultBranchHeadSha: "main-sha",
         gitArtifactId: "artifact-1",
         gitStatus: "ready",
         mainCommit: "main-sha",
+        createdAt: "2026-04-09T00:00:00.000Z",
+        updatedAt: "2026-04-09T00:00:00.000Z",
+        bootstrappedFromRef: "HEAD",
       },
       workspace: {
         listWorkspaceHandoffs: vi.fn().mockResolvedValue([]),
         downloadTar: vi.fn().mockResolvedValue(new Uint8Array()),
         readWorkspaceHandoff: vi.fn().mockResolvedValue(null),
       },
+    };
+    mocks.getRepoWorkspaceForRepoId.mockResolvedValue(repoWorkspace);
+    mocks.refreshGitHubDefaultBranchHeadForRequest.mockResolvedValue({
+      repo: repoWorkspace,
+      changed: false,
+      mainChanged: false,
+      failureKind: null,
+      error: null,
+      code: null,
+      status: null,
     });
     mocks.getWorkspaceStub.mockReturnValue({
       destroyWorkspace: vi.fn().mockResolvedValue(undefined),
       restoreFromTar: vi.fn().mockResolvedValue({ fileCount: 7 }),
       clearWorkspacePlanFile: vi.fn().mockResolvedValue(undefined),
       writeWorkspaceFile: vi.fn().mockResolvedValue(undefined),
+      getManifest: vi.fn().mockResolvedValue([]),
+      getHashedManifest: vi.fn().mockResolvedValue([]),
+      readGitHubDeletedWorkspacePaths: vi.fn().mockResolvedValue([]),
+      deleteWorkspaceFiles: vi.fn().mockResolvedValue(undefined),
+      deleteWorkspaceFile: vi.fn().mockResolvedValue(true),
     });
   });
 
@@ -383,7 +615,6 @@ describe("OpenCode environment routes", () => {
         body: JSON.stringify({
           repoId: "repo-1",
           slug: "opencode-env",
-          backend: "cf",
           harness: "opencode",
         }),
       },
@@ -401,7 +632,8 @@ describe("OpenCode environment routes", () => {
             broadcastRepoUpsert: vi.fn(),
             broadcastRepoMainChange: vi.fn(),
             addMessage: vi.fn(),
-            getActiveService: vi.fn().mockResolvedValue(null),
+            resolveNewExecutionPlacement: vi.fn().mockResolvedValue({ backend: "cf", machineId: null }),
+            resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
           }),
         },
         BUCKET: {
@@ -419,9 +651,36 @@ describe("OpenCode environment routes", () => {
     });
   });
 
-  it("creates an OpenCode env on the explicit remote backend and injects the hub proxy auth", async () => {
+  it.each([
+    [{ model: "gpt-5.5" }],
+    [{ model: "claude-fable-5", effort: "max" }],
+  ])("rejects incomplete or cross-harness creation settings before claiming", async (harnessSettings) => {
+    const lifecycleStub = createLifecycleStub();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const response = await createTestApp().request(
+      "https://example.com/api/envs",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoId: "repo-1",
+          slug: "opencode-env",
+          harness: "opencode",
+          harnessSettings,
+        }),
+      },
+      createOpenCodeCreateEnv() as any,
+      createExecutionCtx() as any,
+    );
+
+    expect(response.status).toBe(400);
+    expect(lifecycleStub.initializeAndBeginStart).not.toHaveBeenCalled();
+  });
+
+  it("creates an OpenCode env on the selected Cloudflare backend and injects the hub proxy auth", async () => {
+    const lifecycleStub = createLifecycleStub();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
     const create = vi.fn().mockResolvedValue({
-      runnerMachineId: "machine-1",
       runnerId: "machine-1",
       backend: "cf",
     });
@@ -445,7 +704,8 @@ describe("OpenCode environment routes", () => {
           broadcastRepoUpsert: vi.fn(),
           broadcastRepoMainChange: vi.fn(),
           addMessage: vi.fn(),
-          getActiveService: vi.fn().mockResolvedValue(null),
+          resolveNewExecutionPlacement: vi.fn().mockResolvedValue({ backend: "cf", machineId: null }),
+          resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
         }),
       },
       BUCKET: {
@@ -465,7 +725,6 @@ describe("OpenCode environment routes", () => {
         body: JSON.stringify({
           repoId: "repo-1",
           slug: "opencode-env",
-          backend: "cf",
           harness: "opencode",
         }),
       },
@@ -492,28 +751,159 @@ describe("OpenCode environment routes", () => {
       }),
       expect.objectContaining({
         TILLER_HARNESS: "opencode",
-        TILLER_OPENCODE_BASE_URL: "https://example.com/api/opencode/v1",
+        TILLER_OPENCODE_BASE_URL: "https://demo.preview.workers.dev/api/opencode/v1",
         TILLER_OPENCODE_AUTH_TOKEN: "proxy-token-123",
-        TILLER_OPENCODE_MODEL_ID: "@cf/moonshotai/kimi-k2.5",
+        TILLER_OPENCODE_MODEL_ID: "@cf/moonshotai/kimi-k2.7-code",
       }),
       expect.objectContaining({
         startOpId: "start-op-1",
       }),
     );
 
-    expect(kvPut).toHaveBeenLastCalledWith(
-      "opencode-env",
-      expect.stringContaining("\"harness\":\"opencode\""),
+    expect(lifecycleStub.persistOwnedProjection).toHaveBeenCalledWith({ broadcast: true });
+    await expect(lifecycleStub.getOwnedEnvView()).resolves.toMatchObject({
+      slug: "opencode-env",
+      harness: "opencode",
+      status: "starting",
+    });
+    await expect(lifecycleStub.getOwnedEnvView()).resolves.not.toHaveProperty("opencodeProvider");
+    await expect(lifecycleStub.getOwnedEnvView()).resolves.not.toHaveProperty("opencodeModel");
+    expect(lifecycleStub.initializeAndBeginStart).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      { model: "kimi-k2.7-code", effort: "high" },
+      { claudeAuthMode: null, codexAuthPreference: null },
     );
-    expect(kvPut.mock.lastCall?.[1]).toContain("\"opencodeProvider\":\"cloudflare-workers-ai\"");
-    expect(kvPut.mock.lastCall?.[1]).toContain("\"opencodeModel\":\"@cf/moonshotai/kimi-k2.5\"");
-    const summaryWrites = kvPut.mock.calls.filter(([key]) => key === "opencode-env");
-    expect(summaryWrites[0]?.[1]).toContain("\"status\":\"starting\"");
   });
 
-  it("starts an existing OpenCode env and keeps the Workers AI metadata", async () => {
+  it("reports creation workspace failures against the winning claim without dispatching", async () => {
+    const lifecycleStub = createLifecycleStub();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const create = vi.fn();
+    mocks.getRunnerBackend.mockResolvedValue({ create, getStatus: vi.fn() });
+    mocks.getWorkspaceStub.mockReturnValue({
+      destroyWorkspace: vi.fn().mockRejectedValue(new Error("workspace cleanup failed")),
+    });
+
+    const response = await createTestApp().request(
+      "https://example.com/api/envs",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoId: "repo-1",
+          slug: "opencode-env",
+          harness: "opencode",
+        }),
+      },
+      createOpenCodeCreateEnv() as any,
+      createExecutionCtx() as any,
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({ error: "workspace cleanup failed" });
+    expect(lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
+      opId: "start-op-1",
+      stepId: "workspace-sync",
+      message: "workspace cleanup failed",
+    });
+    expect((await lifecycleStub.getMutableState()).harnessSettings).toEqual({
+      model: "kimi-k2.7-code",
+      effort: "high",
+    });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("reports creation credential failures against the winning claim without dispatching", async () => {
+    const lifecycleStub = createLifecycleStub();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const create = vi.fn();
+    mocks.getRunnerBackend.mockResolvedValue({ create, getStatus: vi.fn() });
+    mocks.getSecret.mockImplementation(async (source: Record<string, unknown>, key: string) => {
+      if (key === "OPENAI_API_KEY") throw new Error("creation credential lookup failed");
+      return source[key] ?? undefined;
+    });
+
+    const response = await createTestApp().request(
+      "https://example.com/api/envs",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoId: "repo-1",
+          slug: "opencode-env",
+          harness: "opencode",
+          harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
+        }),
+      },
+      createOpenCodeCreateEnv({ OPENAI_API_KEY: "present" }) as any,
+      createExecutionCtx() as any,
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "creation credential lookup failed" });
+    expect(lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
+      opId: "start-op-1",
+      stepId: "harness-launch",
+      message: "creation credential lookup failed",
+    });
+    expect((await lifecycleStub.getMutableState()).harnessSettings).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+    });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("launches creation from the claim-returned settings and reports dispatch failure", async () => {
+    const lifecycleStub = createLifecycleStub();
+    const initialize = lifecycleStub.initializeAndBeginStart.getMockImplementation();
+    lifecycleStub.initializeAndBeginStart.mockImplementation(async (...args: any[]) => {
+      const result = await initialize!(...args);
+      return {
+        ...result,
+        harnessSettings: { model: "gpt-5.5", effort: "low" },
+      };
+    });
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const create = vi.fn().mockRejectedValue(new Error("creation dispatch failed"));
+    mocks.getRunnerBackend.mockResolvedValue({ create, getStatus: vi.fn() });
+    const executionCtx = createExecutionCtx();
+
+    const response = await createTestApp().request(
+      "https://example.com/api/envs",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoId: "repo-1",
+          slug: "opencode-env",
+          harness: "opencode",
+        }),
+      },
+      createOpenCodeCreateEnv({ OPENAI_API_KEY: "selected-openai-key" }) as any,
+      executionCtx as any,
+    );
+
+    expect(response.status).toBe(201);
+    await executionCtx.waitUntil.mock.calls[0][0];
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({ harnessSettings: { model: "gpt-5.5", effort: "low" } }),
+      expect.objectContaining({
+        TILLER_OPENCODE_MODEL_ID: "gpt-5.5",
+        TILLER_OPENCODE_REASONING_EFFORT: "low",
+      }),
+      expect.objectContaining({ startOpId: "start-op-1" }),
+    );
+    expect(lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
+      opId: "start-op-1",
+      stepId: "harness-launch",
+      message: "creation dispatch failed",
+      runnerMayExist: true,
+    });
+  });
+
+  it("starts an existing OpenCode env from committed harness settings", async () => {
     const start = vi.fn().mockResolvedValue({
-      runnerMachineId: "machine-1",
       runnerId: "machine-1",
       backend: "cf",
     });
@@ -524,24 +914,25 @@ describe("OpenCode environment routes", () => {
     });
 
     const kvPut = vi.fn().mockResolvedValue(undefined);
+    const storedEnv = {
+      slug: "opencode-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      runnerId: "machine-1",
+      backend: "cf",
+      harness: "opencode",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      status: "stopped",
+      startupPlanId: null,
+      baseMainCommit: "main-sha",
+      lastKnownMainCommit: "main-sha",
+    };
     const kv = createKvStore({
-      "opencode-env": JSON.stringify({
-        slug: "opencode-env",
-        repoUrl: "https://github.com/test/repo",
-        repoId: "repo-1",
-        runnerMachineId: "machine-1",
-        runnerId: "machine-1",
-        backend: "cf",
-        harness: "opencode",
-        opencodeProvider: "cloudflare-workers-ai",
-        opencodeModel: "@cf/moonshotai/kimi-k2.5",
-        createdAt: "2024-01-01T00:00:00.000Z",
-        status: "stopped",
-        startupPlanId: null,
-        baseMainCommit: "main-sha",
-        lastKnownMainCommit: "main-sha",
-      }),
+      "opencode-env": JSON.stringify(storedEnv),
     }, kvPut);
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord(storedEnv));
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
     const env = {
       ENABLED_ENV_HARNESSES: "claude-code,codex,opencode",
       TILLER_OPENCODE_PROXY_TOKEN: "proxy-token-123",
@@ -554,7 +945,7 @@ describe("OpenCode environment routes", () => {
           broadcastRepoUpsert: vi.fn(),
           broadcastRepoMainChange: vi.fn(),
           addMessage: vi.fn(),
-          getActiveService: vi.fn().mockResolvedValue(null),
+          resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
         }),
       },
       BUCKET: {
@@ -567,12 +958,11 @@ describe("OpenCode environment routes", () => {
     const app = createTestApp();
 
     const res = await app.request(
-      "/api/envs/opencode-env/start",
+      "https://hub.example.com/api/envs/opencode-env/start",
       { method: "POST" },
       env as any,
       executionCtx as any,
     );
-
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toMatchObject({
       ok: true,
@@ -590,24 +980,136 @@ describe("OpenCode environment routes", () => {
       }),
       expect.objectContaining({
         TILLER_HARNESS: "opencode",
-        TILLER_OPENCODE_BASE_URL: "http://localhost/api/opencode/v1",
+        TILLER_OPENCODE_BASE_URL: "https://demo.preview.workers.dev/api/opencode/v1",
         TILLER_OPENCODE_AUTH_TOKEN: "proxy-token-123",
-        TILLER_OPENCODE_MODEL_ID: "@cf/moonshotai/kimi-k2.5",
+        TILLER_OPENCODE_MODEL_ID: "@cf/moonshotai/kimi-k2.7-code",
       }),
       expect.objectContaining({
         startOpId: "start-op-1",
       }),
     );
 
-    expect(broadcastEnvUpsert).toHaveBeenCalledWith(
-      expect.objectContaining({ slug: "opencode-env", status: "starting" }),
+    expect(lifecycleStub.persistOwnedProjection).toHaveBeenCalledWith({ broadcast: true });
+    await expect(lifecycleStub.getOwnedEnvView()).resolves.toMatchObject({
+      slug: "opencode-env",
+      harness: "opencode",
+      status: "starting",
+    });
+    await expect(lifecycleStub.getOwnedEnvView()).resolves.not.toHaveProperty("opencodeProvider");
+    await expect(lifecycleStub.getOwnedEnvView()).resolves.not.toHaveProperty("opencodeModel");
+    expect(lifecycleStub.beginStart).toHaveBeenCalledWith(
+      { model: "kimi-k2.7-code", effort: "high" },
+      { claudeAuthMode: null, codexAuthPreference: null },
     );
-    expect(kvPut).toHaveBeenLastCalledWith(
-      "opencode-env",
-      expect.stringContaining("\"harness\":\"opencode\""),
+  });
+
+  it("uses the immutable plan snapshot for a later ordinary Start after the source artifact is gone", async () => {
+    const fixture = await createOpenCodeStartFixture({ startupPlanId: "plan-1" });
+    const capturedPlan = "# Captured plan\n\nImplement the immutable version.";
+    fixture.lifecycleStub.getImmutablePlan.mockResolvedValue({
+      incarnationId: "incarnation-1",
+      artifactId: "plan-1",
+      version: 7,
+      renderedPlanDocument: capturedPlan,
+      createdAt: "2026-07-10T00:00:00.000Z",
+    });
+    const artifactStore = mocks.getArtifactStoreStub(
+      {} as any,
+      "repo-1",
+      "generation-1",
+    ) as any;
+    artifactStore.getArtifact.mockResolvedValue(null);
+    const executionCtx = createExecutionCtx();
+
+    const response = await fixture.app.request(
+      "https://hub.example.com/api/envs/opencode-env/start",
+      { method: "POST" },
+      fixture.env as any,
+      executionCtx as any,
     );
-    expect(kvPut.mock.lastCall?.[1]).toContain("\"opencodeProvider\":\"cloudflare-workers-ai\"");
-    expect(kvPut.mock.lastCall?.[1]).toContain("\"opencodeModel\":\"@cf/moonshotai/kimi-k2.5\"");
-    expect(kvPut.mock.lastCall?.[1]).toContain("\"status\":\"starting\"");
+
+    expect(response.status).toBe(200);
+    await executionCtx.waitUntil.mock.calls[0][0];
+    const encoded = fixture.start.mock.calls[0]?.[1]?.TILLER_STARTUP_PLAN_DOCUMENT_B64;
+    expect(Buffer.from(encoded, "base64").toString("utf8")).toBe(capturedPlan);
+    expect(artifactStore.getArtifact).not.toHaveBeenCalled();
+  });
+
+  it("rejects incomplete restart settings before claiming", async () => {
+    const { app, env, lifecycleStub, start } = await createOpenCodeStartFixture();
+    const response = await app.request(
+      "https://hub.example.com/api/envs/opencode-env/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ harnessSettings: { model: "gpt-5.5" } }),
+      },
+      env as any,
+      createExecutionCtx() as any,
+    );
+
+    expect(response.status).toBe(400);
+    expect(lifecycleStub.beginStart).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("preserves a Sol dispatch failure and never retries with GPT-5.5", async () => {
+    const start = vi.fn().mockRejectedValue(new Error("Sol capacity unavailable for this account"));
+    const fixture = await createOpenCodeStartFixture({ start });
+    const executionCtx = createExecutionCtx();
+    const response = await fixture.app.request(
+      "https://hub.example.com/api/envs/opencode-env/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" } }),
+      },
+      fixture.env as any,
+      executionCtx as any,
+    );
+
+    expect(response.status).toBe(200);
+    await executionCtx.waitUntil.mock.calls[0][0];
+    expect(fixture.lifecycleStub.beginStart).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(start.mock.calls[0][1]).toMatchObject({
+      TILLER_OPENCODE_MODEL_ID: "gpt-5.6-sol",
+      TILLER_OPENCODE_REASONING_EFFORT: "xhigh",
+    });
+    expect(JSON.stringify(start.mock.calls)).not.toContain("gpt-5.5");
+    expect(fixture.lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
+      opId: "start-op-1",
+      stepId: "harness-launch",
+      message: "Sol capacity unavailable for this account",
+      runnerMayExist: true,
+    });
+    expect((await fixture.lifecycleStub.getMutableState()).harnessSettings).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+    });
+  });
+
+  it("retries an exact startup-failure acknowledgement when the first response is lost", async () => {
+    const start = vi.fn().mockRejectedValue(new Error("runner dispatch failed"));
+    const fixture = await createOpenCodeStartFixture({ start });
+    fixture.lifecycleStub.reportStartupFailure.mockRejectedValueOnce(new Error("acknowledgement lost"));
+    const executionCtx = createExecutionCtx();
+
+    const response = await fixture.app.request(
+      "https://hub.example.com/api/envs/opencode-env/start",
+      { method: "POST" },
+      fixture.env as any,
+      executionCtx as any,
+    );
+
+    expect(response.status).toBe(200);
+    await executionCtx.waitUntil.mock.calls[0][0];
+    expect(fixture.lifecycleStub.reportStartupFailure).toHaveBeenCalledTimes(2);
+    expect(fixture.lifecycleStub.reportStartupFailure).toHaveBeenLastCalledWith({
+      opId: "start-op-1",
+      stepId: "harness-launch",
+      message: "runner dispatch failed",
+      runnerMayExist: true,
+    });
   });
 });

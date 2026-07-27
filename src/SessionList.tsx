@@ -1,113 +1,163 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { KeyboardEvent, MouseEvent } from "react";
+import { PlusIcon, TrashIcon } from "@phosphor-icons/react";
+import { Badge } from "@cloudflare/kumo/components/badge";
+import { Button } from "@cloudflare/kumo/components/button";
+import { Popover } from "@cloudflare/kumo/components/popover";
+import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import type { StoredSession, EnvMeta, RepoMeta } from "../api/types";
-import { ApiActionError, deleteEnv, deleteRepo, mergeEnvIntoMain, resetEnvToRepo, stopEnv, updateEnvFromMain } from "./api";
+import { ApiActionError, cancelScheduledRun, deleteEnv, fetchRepoArtifacts, stopEnv } from "./api";
+import { planPath } from "./dashboard-paths";
 import { getDisplayEnvBranchStatus } from "./env-state";
-import type { RecoverEntitiesOptions } from "./live-sync-store";
 import {
-  getEnvAuthBadge,
   getHarnessBadgeClass,
   getHarnessBadgeLabel,
 } from "./env-harness";
-import { getBackendBadgeLabel, getEnvDisplayName } from "./env-display";
+import {
+  EXISTING_EXECUTION_UNAVAILABLE_MESSAGE,
+  getBackendBadgeLabel,
+  getEnvDisplayName,
+} from "./env-display";
 import { canStopEnvStatus, isEnvRunningStatus } from "./env-runtime";
 import { getRepoMainStatusDetail, getRepoMainStatusLabel, isRepoMainReady } from "./repo-status";
-import { pickPrimaryEnvSession } from "./session-attachment";
+import { listPlanArtifacts } from "./plan-artifacts";
 
 interface SessionListProps {
   repos: RepoMeta[];
   sessions: StoredSession[];
-  selectedId: string | null;
-  onSelect: (id: string) => void;
   envs?: EnvMeta[];
   hubUrl?: string;
   onRecoverEnv?: (slug: string, status?: string) => void;
   onEnvSelect?: (slug: string) => void;
-  selectedEnvSlug?: string | null;
-  onChangesSelect?: (slug: string) => void;
-  selectedChangesEnvSlug?: string | null;
-  onPlanSelect?: (repoId: string) => void;
+  activeEnvironmentSlug?: string | null;
+  onShipSelect?: (slug: string) => void;
+  onPlanSelect?: (repoId: string, planArtifactId?: string | null) => void;
   planRepoId?: string | null;
+  selectedRepoId?: string | null;
+  repoSettingsRepoId?: string | null;
   onStartRequest?: (slug: string) => void;
   onAddEnv?: (repoId: string) => void;
   onRetryRepoMain?: (repoId: string) => void;
-  onRecoverEntities?: (options?: RecoverEntitiesOptions) => void;
-  onRepoDeleted?: (repoId: string, deletedEnvSlugs: string[]) => void;
+  sidebarCollapsed?: boolean;
+  onRepoHomeSelect?: (repoId: string) => void;
 }
 
 export default function SessionList({
   repos,
   sessions,
-  selectedId,
-  onSelect,
   envs = [],
   hubUrl = "",
   onRecoverEnv,
   onEnvSelect,
-  selectedEnvSlug,
-  onChangesSelect,
-  selectedChangesEnvSlug,
+  activeEnvironmentSlug,
+  onShipSelect,
   onPlanSelect,
   planRepoId,
+  selectedRepoId,
+  repoSettingsRepoId,
   onStartRequest,
   onAddEnv,
   onRetryRepoMain,
-  onRecoverEntities,
-  onRepoDeleted,
+  sidebarCollapsed = false,
+  onRepoHomeSelect,
 }: SessionListProps) {
-  const envSessionMap = new Map<string, StoredSession>();
-  for (const env of envs) {
-    const session = pickPrimaryEnvSession(sessions, env.slug);
-    if (session) {
-      envSessionMap.set(env.slug, session);
-    }
-  }
+  const [planLabels, setPlanLabels] = useState<Record<string, string>>({});
+  const fetchedPlanRepoIdsRef = useRef<Set<string>>(new Set());
 
   const repoGroups = repos.map((repo) => ({
     repo,
     envs: envs.filter((env) => matchesRepo(repo, env)),
   }));
 
-  return (
-    <div className="flex-1 overflow-y-auto">
-      {repoGroups.map(({ repo, envs: repoEnvs }) => (
-        <div key={repo.repoId} className="border-b border-[#e1e4e8]">
-          <RepoGroupHeader
-            repo={repo}
-            planRepoId={planRepoId}
-            hubUrl={hubUrl}
-            envCount={repoEnvs.length}
-            onPlanSelect={onPlanSelect}
-            onAddEnv={onAddEnv}
-            onRetryRepoMain={onRetryRepoMain}
-            onRecoverEntities={onRecoverEntities}
-            onRepoDeleted={onRepoDeleted}
-          />
-          <div className="ml-3 border-l border-[#e1e4e8]">
-            {repoEnvs.length === 0 ? (
-              <p className="px-3 py-2 text-xs text-[#6e7781]">
-                {isRepoMainReady(repo) ? (
-                  <>
-                    No environments yet —{" "}
-                    <button
-                      onClick={() => onAddEnv?.(repo.repoId)}
-                      className="text-[#0969da] hover:underline"
-                    >
-                      add one
-                    </button>
-                  </>
-                ) : (
-                  getRepoMainStatusDetail(repo)
-                )}
-              </p>
-            ) : (
-              repoEnvs.map((env) => {
-                const session = envSessionMap.get(env.slug);
-                const isSelected =
-                  planRepoId === repo.repoId ||
-                  (session ? session.id === selectedId : selectedEnvSlug === env.slug);
-                const isChangesSelected = selectedChangesEnvSlug === env.slug;
+  useEffect(() => {
+    fetchedPlanRepoIdsRef.current = new Set();
+    setPlanLabels({});
+  }, [hubUrl]);
 
-                return (
+  useEffect(() => {
+    if (!hubUrl) return;
+    const repoIds = Array.from(new Set(
+      envs
+        .filter((env) => !!env.startupPlanId && !!env.repoId)
+        .map((env) => env.repoId),
+    ));
+    for (const repoId of repoIds) {
+      if (fetchedPlanRepoIdsRef.current.has(repoId)) continue;
+      fetchedPlanRepoIdsRef.current.add(repoId);
+      void fetchRepoArtifacts(hubUrl, repoId)
+        .then((state) => {
+          const labels: Record<string, string> = {};
+          for (const plan of listPlanArtifacts(state.artifacts)) {
+            labels[planLabelCacheKey(repoId, plan.id)] = plan.title || "Untitled plan";
+          }
+          setPlanLabels((current) => ({ ...current, ...labels }));
+        })
+        .catch(() => {
+          // Keep rendering the fallback label when plan artifacts are unavailable.
+        });
+    }
+  }, [envs, hubUrl]);
+
+  return (
+    <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+      {repoGroups.map(({ repo, envs: repoEnvs }) => (
+        <div key={repo.repoId} className="min-w-0 max-w-full overflow-x-hidden border-b border-kumo-line">
+          {!sidebarCollapsed && (
+            <RepoGroupHeader
+              repo={repo}
+              onPlanSelect={onPlanSelect}
+              onRetryRepoMain={onRetryRepoMain}
+              onRepoHomeSelect={onRepoHomeSelect}
+              planSelected={planRepoId === repo.repoId}
+            />
+          )}
+          <div>
+            {!sidebarCollapsed && (
+              <div className="flex items-center gap-3 border-b border-kumo-line bg-kumo-base px-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <h2 className="truncate text-xs font-semibold text-kumo-strong">Implementor Environments</h2>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="primary"
+                  icon={PlusIcon}
+                  onClick={() => onAddEnv?.(repo.repoId)}
+                  disabled={!isRepoMainReady(repo)}
+                  aria-label="Add implementor environment"
+                  className="shrink-0"
+                >
+                  Add
+                </Button>
+              </div>
+            )}
+            {repoEnvs.length === 0 ? (
+              !sidebarCollapsed && (
+                isRepoMainReady(repo) ? (
+                  <div className="min-w-0 p-2.5">
+                    <button
+                      type="button"
+                      onClick={() => onAddEnv?.(repo.repoId)}
+                      aria-label="Add the first implementor environment"
+                      className="flex min-w-0 w-full items-start gap-3 overflow-hidden rounded border border-dashed border-kumo-info/50 bg-kumo-info/5 px-3 py-3 text-left transition-colors hover:border-kumo-info hover:bg-kumo-info/10"
+                    >
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-kumo-info/15 text-lg font-medium text-kumo-info">+</span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block whitespace-normal break-words text-xs font-semibold leading-4 text-kumo-strong">Add an implementor environment</span>
+                        <span className="mt-0.5 block whitespace-normal break-words text-[11px] leading-4 text-kumo-subtle">Create the first environment where an agent can implement this plan.</span>
+                      </span>
+                    </button>
+                  </div>
+                ) : (
+                  <p className="tiller-sidebar-open-text px-3 pb-3 text-xs text-kumo-subtle whitespace-normal tiller-sidebar-wrap">
+                    {getRepoMainStatusDetail(repo)}
+                  </p>
+                )
+              )
+            ) : (
+              repoEnvs
+                .sort(compareSidebarOrder)
+                .map((env) => (
                   <EnvCard
                     key={env.slug}
                     env={env}
@@ -116,35 +166,36 @@ export default function SessionList({
                     onRecoverEnv={onRecoverEnv}
                     onSelect={(slug) => onEnvSelect?.(slug)}
                     onStartRequest={onStartRequest}
-                    onRecoverEntities={onRecoverEntities}
-                    selected={isSelected || isChangesSelected}
-                    onChangesSelect={onChangesSelect}
+                    selected={activeEnvironmentSlug === env.slug}
+                    onShipSelect={onShipSelect}
+                    onPlanSelect={onPlanSelect}
+                    planLabel={getEnvPlanLabel(env, repo, planLabels)}
+                    sidebarCollapsed={sidebarCollapsed}
                   />
-                );
-              })
+                ))
             )}
           </div>
         </div>
       ))}
 
-      {repos.length === 0 && sessions.length === 0 && (
-        <p className="p-3 text-sm text-[#57606a]">No repositories yet</p>
+      {!sidebarCollapsed && repos.length === 0 && sessions.length === 0 && (
+        <p className="tiller-sidebar-open-text p-3 text-sm text-kumo-subtle whitespace-normal tiller-sidebar-wrap">No repositories yet</p>
       )}
     </div>
   );
 }
 
 const STATUS_COLORS: Record<string, string> = {
-  running: "bg-green-500",
-  starting: "bg-yellow-400 animate-pulse",
-  saving: "bg-yellow-400 animate-pulse",
-  stopping: "bg-yellow-400 animate-pulse",
-  creating: "bg-blue-400 animate-pulse",
-  deleting: "bg-red-400 animate-pulse",
-  stopped: "bg-[#d0d7de]",
-  created: "bg-blue-400",
-  destroyed: "bg-red-400",
-  failed: "bg-red-500",
+  running: "bg-kumo-success",
+  starting: "bg-kumo-warning animate-pulse",
+  saving: "bg-kumo-warning animate-pulse",
+  stopping: "bg-kumo-warning animate-pulse",
+  creating: "bg-kumo-info animate-pulse",
+  deleting: "bg-kumo-danger animate-pulse",
+  stopped: "bg-kumo-line",
+  created: "bg-kumo-info",
+  destroyed: "bg-kumo-danger",
+  failed: "bg-kumo-danger",
 };
 
 function EnvCard({
@@ -154,9 +205,11 @@ function EnvCard({
   onRecoverEnv,
   onSelect,
   onStartRequest,
-  onRecoverEntities,
   selected,
-  onChangesSelect,
+  onShipSelect,
+  onPlanSelect,
+  planLabel,
+  sidebarCollapsed,
 }: {
   env: EnvMeta;
   repo: RepoMeta;
@@ -164,12 +217,17 @@ function EnvCard({
   onRecoverEnv?: (slug: string, status?: string) => void;
   onSelect?: (slug: string) => void;
   onStartRequest?: (slug: string) => void;
-  onRecoverEntities?: (options?: RecoverEntitiesOptions) => void;
   selected?: boolean;
-  onChangesSelect?: (slug: string) => void;
+  onShipSelect?: (slug: string) => void;
+  onPlanSelect?: (repoId: string, planArtifactId?: string | null) => void;
+  planLabel: string;
+  sidebarCollapsed: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<{ message: string; hint: string | null } | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const previewAnchorRef = useRef<HTMLDivElement | null>(null);
+  const previewCloseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const status = env.status || "unknown";
   const isCreating = status === "creating";
   const isStarting = status === "starting";
@@ -178,9 +236,19 @@ function EnvCard({
   const isStopping = status === "stopping";
   const isDeleting = status === "deleting";
   const isFailed = status === "failed";
-  const isScmPending = !!env.scmOperationType;
-  const canStart = (status === "stopped" || status === "unknown" || isFailed) && !isScmPending;
-  const canRepoAction = status === "stopped" && !isScmPending;
+  const isPublishPending = env.githubPublishStatus === "publishing" || !!env.githubPublishOperationId;
+  const scheduledRun = env.scheduledRun;
+  const scheduledRunActive = scheduledRun?.state === "running";
+  const scheduledRunFinalizing = scheduledRun?.stage === "saving";
+  const scheduledRunImplementing = scheduledRunActive && !scheduledRunFinalizing;
+  const scheduledRunScheduled = scheduledRun?.state === "scheduled" && !scheduledRunFinalizing;
+  const scheduledRunInterrupted = scheduledRun?.state === "interrupted";
+  const scheduledRunCleanupRequired = scheduledRun?.cleanupRequired === true;
+  const canStart = (status === "stopped" || status === "unknown" || isFailed)
+    && !isPublishPending
+    && !scheduledRunCleanupRequired
+    && !scheduledRunActive
+    && scheduledRun?.state !== "scheduled";
   const branchStatus = getDisplayEnvBranchStatus(env, repo);
 
   const showActionError = (err: unknown, fallback: string) => {
@@ -203,176 +271,364 @@ function EnvCard({
     }
   };
 
-  const dotColor = STATUS_COLORS[status] || "bg-[#d0d7de]";
+  const dotColor = scheduledRun?.state === "completed"
+    ? STATUS_COLORS.running
+    : scheduledRun?.state === "failed" || scheduledRun?.state === "interrupted"
+      ? STATUS_COLORS.failed
+      : scheduledRunActive || scheduledRunScheduled
+        ? STATUS_COLORS.starting
+        : STATUS_COLORS[status] || "bg-kumo-line";
 
   let label: string;
-  if (isDeleting) label = "Deleting...";
+  if (scheduledRunCleanupRequired) label = "Failed";
+  else if (scheduledRunFinalizing) label = "Saving and finalizing";
+  else if (scheduledRunScheduled) label = "Scheduled · 3:00 AM";
+  else if (scheduledRunImplementing) label = "Implementing plan";
+  else if (scheduledRun?.state === "completed") label = "Completed";
+  else if (scheduledRunInterrupted) label = "Interrupted";
+  else if (scheduledRun?.state === "failed") label = "Failed";
+  else if (isDeleting) label = "Deleting...";
   else if (isCreating) label = "Creating...";
   else if (isStarting) label = "Starting...";
   else if (isSaving) label = "Saving changes...";
   else if (isStopping) label = "Stopping...";
-  else if (isScmPending) label = formatScmOperationLabel(env.scmOperationType);
+  else if (isPublishPending) label = "Publishing draft PR...";
   else if (isFailed) label = "Failed";
   else if (canStart) label = "Stopped";
   else if (isEnvRunningStatus(status)) label = "Running";
   else label = status;
 
   const harness = env.harness;
-  const authBadge = getEnvAuthBadge(env);
   const displayName = getEnvDisplayName(env);
-  const changeStatus = formatChangeStatus(branchStatus);
+  const showShip = Boolean(onShipSelect && hasShipTarget(env, branchStatus));
+  const railLabel = env.sidebarSlot ? String(env.sidebarSlot) : "?";
+  const railLabelText = `${displayName} - Plan: ${planLabel} - ${getHarnessBadgeLabel(harness)} - ${label}`;
+  const attentionMessages = Array.from(new Set([
+    scheduledRun?.state === "failed" ? scheduledRun.error || "Scheduled run failed." : null,
+    scheduledRunInterrupted ? scheduledRun?.error || "Scheduled run interrupted." : null,
+    scheduledRunCleanupRequired
+      ? EXISTING_EXECUTION_UNAVAILABLE_MESSAGE
+      : null,
+    isFailed ? env.error?.trim() || "Environment failed." : null,
+    branchStatus === "needs-attention" ? "Needs attention" : null,
+    env.githubPublishStatus === "failed" ? env.githubPublishError?.trim() || "GitHub publish failed." : null,
+    actionError?.message ?? null,
+    actionError?.hint ?? null,
+  ].filter((message): message is string => Boolean(message))));
+  const handleSelect = () => {
+    setPreviewOpen(false);
+    onSelect?.(env.slug);
+  };
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    handleSelect();
+  };
+  const clearPreviewClose = () => {
+    if (!previewCloseTimeoutRef.current) return;
+    clearTimeout(previewCloseTimeoutRef.current);
+    previewCloseTimeoutRef.current = null;
+  };
+  const openPreview = () => {
+    if (!sidebarCollapsed) return;
+    clearPreviewClose();
+    setPreviewOpen(true);
+  };
+  const schedulePreviewClose = () => {
+    clearPreviewClose();
+    previewCloseTimeoutRef.current = setTimeout(() => {
+      setPreviewOpen(false);
+      previewCloseTimeoutRef.current = null;
+    }, 220);
+  };
+
+  useEffect(() => {
+    if (!sidebarCollapsed) setPreviewOpen(false);
+  }, [sidebarCollapsed]);
+
+  useEffect(() => () => {
+    if (previewCloseTimeoutRef.current) {
+      clearTimeout(previewCloseTimeoutRef.current);
+    }
+  }, []);
 
   return (
-    <div className={`px-3 py-2.5 border-b border-[#e1e4e8] hover:bg-white transition-colors cursor-pointer ${
-      selected ? "bg-white border-l-2 border-l-[#0969da]" : "border-l-2 border-l-transparent"
-    }`} onClick={() => onSelect?.(env.slug)}>
-      <div className="flex items-center gap-2">
-        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${dotColor}`} />
-        <span className="flex-shrink-0 rounded border border-[#d0d7de] bg-[#f6f8fa] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#57606a]">
-          {getBackendBadgeLabel(env.backend)}
+    <Popover
+      open={sidebarCollapsed && previewOpen}
+      onOpenChange={(open) => setPreviewOpen(sidebarCollapsed && open)}
+    >
+    <div
+      ref={previewAnchorRef}
+      data-testid={`env-card-${env.slug}`}
+      className={`max-w-full cursor-pointer overflow-x-hidden border-b border-l-2 border-kumo-line px-3 py-3 transition-colors last:border-b-0 group-data-[state=collapsed]/sidebar:flex group-data-[state=collapsed]/sidebar:h-11 group-data-[state=collapsed]/sidebar:items-center group-data-[state=collapsed]/sidebar:justify-center group-data-[state=collapsed]/sidebar:border-b-0 group-data-[state=collapsed]/sidebar:border-l-0 group-data-[state=collapsed]/sidebar:bg-transparent group-data-[state=collapsed]/sidebar:px-0 group-data-[state=collapsed]/sidebar:py-1 group-data-[state=collapsed]/sidebar:hover:bg-kumo-tint ${
+      selected
+        ? "border-l-kumo-info bg-kumo-info-tint hover:bg-kumo-info-tint"
+        : "border-l-transparent bg-kumo-base hover:bg-kumo-tint"
+    }`}
+      onClick={handleSelect}
+      onKeyDown={handleKeyDown}
+      onMouseEnter={openPreview}
+      onMouseLeave={schedulePreviewClose}
+      onFocus={openPreview}
+      onBlur={schedulePreviewClose}
+      role="button"
+      tabIndex={0}
+      aria-label={railLabelText}
+      aria-current={selected ? "page" : undefined}
+    >
+      <div className="flex min-w-0 max-w-full items-center gap-2 group-data-[state=collapsed]/sidebar:relative group-data-[state=collapsed]/sidebar:h-8 group-data-[state=collapsed]/sidebar:w-8 group-data-[state=collapsed]/sidebar:justify-center">
+        <Tooltip
+          content={label}
+          side="right"
+          delay={250}
+          render={(
+            <span
+              role="img"
+              aria-label={`Status: ${label}`}
+              className={`h-2 w-2 shrink-0 rounded-full group-data-[state=collapsed]/sidebar:absolute group-data-[state=collapsed]/sidebar:bottom-0 group-data-[state=collapsed]/sidebar:right-0 group-data-[state=collapsed]/sidebar:ring-2 group-data-[state=collapsed]/sidebar:ring-kumo-recessed ${dotColor}`}
+            />
+          )}
+        />
+        <span
+          title={displayName}
+          className="tiller-sidebar-open-text min-w-0 flex-1 truncate text-sm font-semibold text-kumo-strong group-data-[state=collapsed]/sidebar:hidden"
+        >
+          {displayName}
         </span>
-        <span className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getHarnessBadgeClass(harness)}`}>
+        <span className={`hidden h-7 w-7 items-center justify-center rounded border text-[11px] font-semibold tabular-nums group-data-[state=collapsed]/sidebar:flex ${
+          selected
+            ? "border-kumo-info bg-kumo-info-tint text-kumo-link"
+            : "border-kumo-line bg-kumo-base text-kumo-default"
+        }`}>
+          {railLabel}
+        </span>
+      </div>
+      <div className="tiller-sidebar-open-text mt-1 ml-4 flex min-w-0 items-start gap-1 text-xs leading-4 text-kumo-subtle group-data-[state=collapsed]/sidebar:hidden">
+        <span className="shrink-0">Plan:</span>
+        <PlanValueLink
+          repoId={repo.repoId}
+          planArtifactId={env.startupPlanId}
+          label={planLabel}
+          onPlanSelect={onPlanSelect}
+        />
+      </div>
+      <div className="tiller-sidebar-open-text mt-2.5 ml-4 flex min-w-0 items-center gap-1.5 group-data-[state=collapsed]/sidebar:hidden" onClick={(e) => e.stopPropagation()}>
+        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getHarnessBadgeClass(harness)}`}>
           {getHarnessBadgeLabel(harness)}
         </span>
-        {authBadge && (
-          <span className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${authBadge.className}`}>
-            {authBadge.label}
-          </span>
-        )}
-      </div>
-      <p className="text-xs text-[#57606a] mt-0.5 ml-4 truncate">
-        {label}
-      </p>
-
-      <p className="text-[11px] text-[#57606a] mt-0.5 ml-4">
-        {changeStatus}
-      </p>
-      {syncDetailText(env, repo) && (
-        <p className="text-[11px] text-[#6e7781] mt-0.5 ml-4">
-          {syncDetailText(env, repo)}
-        </p>
-      )}
-      {isScmPending && scmProgressText(env) && (
-        <p className="text-[11px] text-[#6e7781] mt-0.5 ml-4">
-          {scmProgressText(env)}
-        </p>
-      )}
-      {actionError && (
-        <p className="text-[11px] text-red-600 mt-0.5 ml-4">
-          {actionError.message}
-        </p>
-      )}
-      {actionError?.hint && (
-        <p className="text-[11px] text-red-500 mt-0.5 ml-4">
-          {actionError.hint}
-        </p>
-      )}
-      <div className="flex gap-1 mt-1.5 ml-4 flex-wrap" onClick={(e) => e.stopPropagation()}>
+        <span
+          data-testid={`env-backend-badge-${env.slug}`}
+          className="shrink-0 rounded border border-kumo-line bg-kumo-recessed px-1.5 py-0.5 text-[10px] font-medium text-kumo-default"
+        >
+          {getBackendBadgeLabel(env.backend)}
+        </span>
+        <span className="min-w-0 flex-1" />
         {canStart && (
-          <button
+          <Button
+            variant="secondary"
+            size="xs"
             onClick={() => onStartRequest?.(env.slug)}
             disabled={busy}
-            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
           >
             Start
-          </button>
+          </Button>
         )}
-        {isRunning && (
-          <button
+        {scheduledRunScheduled && (
+          <Button
+            variant="secondary"
+            size="xs"
+            onClick={() => run(async () => {
+              await cancelScheduledRun(hubUrl, env.slug);
+              onRecoverEnv?.(env.slug);
+            })}
+            disabled={busy}
+          >
+            Cancel
+          </Button>
+        )}
+        {(isRunning || scheduledRunActive || scheduledRunCleanupRequired) && (
+          <Button
+            variant="secondary"
+            size="xs"
             onClick={() => run(async () => {
               const res = await stopEnv(hubUrl, env.slug);
               onRecoverEnv?.(env.slug, res.status);
             })}
             disabled={busy}
-            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
           >
             Stop
-          </button>
+          </Button>
         )}
-        {canRepoAction && branchStatus === "ready-to-merge" && onChangesSelect && (
-          <button
-            onClick={() => onChangesSelect(env.slug)}
+        {showShip && (
+          <Button
+            variant="secondary"
+            size="xs"
+            onClick={() => onShipSelect?.(env.slug)}
             disabled={busy}
-            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
           >
-            Promote Preview
-          </button>
-        )}
-        {canRepoAction && branchStatus === "ready-to-merge" && (
-          <button
-            onClick={() => run(async () => {
-              const res = await mergeEnvIntoMain(hubUrl, env.slug);
-              if (res.pending) {
-                onRecoverEntities?.({ slug: env.slug, repoId: repo.repoId });
-                return;
-              }
-              onRecoverEnv?.(env.slug);
-              onRecoverEntities?.({ slug: env.slug, repoId: repo.repoId });
-            })}
-            disabled={busy}
-            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
-          >
-            Promote to Main
-          </button>
-        )}
-        {canRepoAction && branchStatus === "behind-main" && (
-          <button
-            onClick={() => run(async () => {
-              const res = await updateEnvFromMain(hubUrl, env.slug);
-              if (res.pending) {
-                onRecoverEntities?.({ slug: env.slug, repoId: repo.repoId });
-                return;
-              }
-              onRecoverEnv?.(env.slug);
-              onRecoverEntities?.({ slug: env.slug, repoId: repo.repoId });
-            })}
-            disabled={busy}
-            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
-          >
-            Update from Main
-          </button>
-        )}
-        {canRepoAction && (branchStatus === "ready-to-merge" || branchStatus === "needs-attention" || branchStatus === "behind-main") && (
-          <button
-            onClick={() => {
-              if (!confirm(`Reset "${displayName}" to main? This will discard unpromoted changes.`)) {
-                return;
-              }
-              void run(async () => {
-                await resetEnvToRepo(hubUrl, env.slug);
-                onRecoverEnv?.(env.slug);
-                onRecoverEntities?.({ slug: env.slug, repoId: repo.repoId });
-              });
-            }}
-            disabled={busy}
-            className="text-xs px-2 py-0.5 rounded border border-[#d0d7de] bg-white hover:bg-[#f6f8fa] text-[#57606a] disabled:opacity-40"
-          >
-            Reset to Main
-          </button>
+            Ship
+          </Button>
         )}
         {!isDeleting && (
-          <button
-            onClick={async () => {
-              if (confirm(`Delete environment "${displayName}"? This will destroy the container and wipe R2 storage.`)) {
-                setBusy(true);
-                setActionError(null);
-                try {
-                  await deleteEnv(hubUrl, env.slug);
-                  onRecoverEnv?.(env.slug, "deleting");
-                } catch (err) {
-                  showActionError(err, "Failed to delete environment.");
-                } finally {
-                  setBusy(false);
-                }
-              }
-            }}
-            disabled={busy || isScmPending || isSaving || isStopping}
-            className="text-xs px-2 py-0.5 rounded border border-red-200 bg-white hover:bg-red-50 text-red-600 disabled:opacity-40"
+          <Tooltip
+            content={`Delete ${displayName}`}
+            side="top"
+            delay={250}
+            render={(
+              <button
+                type="button"
+                className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-kumo-subtle transition-colors hover:bg-kumo-danger-tint hover:text-kumo-danger disabled:cursor-not-allowed disabled:opacity-40"
+                aria-label={`Delete ${displayName}`}
+                onClick={async () => {
+                  if (confirm(`Delete environment "${displayName}"? This will destroy the container and wipe R2 storage.`)) {
+                    setBusy(true);
+                    setActionError(null);
+                    try {
+                      await deleteEnv(hubUrl, env.slug);
+                      onRecoverEnv?.(env.slug, "deleting");
+                    } catch (err) {
+                      showActionError(err, "Failed to delete environment.");
+                    } finally {
+                      setBusy(false);
+                    }
+                  }
+                }}
+                disabled={busy || isPublishPending || isSaving || isStopping || scheduledRunFinalizing || scheduledRunActive || scheduledRunCleanupRequired}
+              />
+            )}
           >
-            Delete
-          </button>
+            <TrashIcon className="h-3.5 w-3.5" aria-hidden="true" />
+          </Tooltip>
         )}
       </div>
+      {attentionMessages.map((message) => (
+        <p
+          key={message}
+          className="tiller-sidebar-open-text mt-1 ml-4 w-[calc(100%-1rem)] whitespace-normal text-[11px] leading-4 text-kumo-danger tiller-sidebar-wrap group-data-[state=collapsed]/sidebar:hidden"
+        >
+          {message}
+        </p>
+      ))}
+    </div>
+      <Popover.Content
+        anchor={previewAnchorRef}
+        side="right"
+        align="center"
+        sideOffset={10}
+        positionMethod="fixed"
+        className="w-72 p-0"
+      >
+        <div
+          role="button"
+          tabIndex={0}
+          className="block w-full rounded-lg px-4 py-3 text-left transition-colors hover:bg-kumo-tint"
+          onClick={() => {
+            handleSelect();
+            setPreviewOpen(false);
+          }}
+          onKeyDown={handleKeyDown}
+          onMouseEnter={openPreview}
+          onMouseLeave={schedulePreviewClose}
+          onFocus={openPreview}
+          onBlur={schedulePreviewClose}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <span className={`h-2 w-2 flex-shrink-0 rounded-full ${dotColor}`} />
+            <span className="min-w-0 flex-1 truncate text-sm font-semibold text-kumo-strong">
+              {displayName}
+            </span>
+            <span className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getHarnessBadgeClass(harness)}`}>
+              {getHarnessBadgeLabel(harness)}
+            </span>
+          </div>
+          <div className="mt-2 grid gap-1 text-xs text-kumo-subtle">
+            <EnvPreviewRow label="Status" value={label} />
+            <EnvPreviewRow label="Backend" value={getBackendBadgeLabel(env.backend)} />
+            {env.sidebarSlot && <EnvPreviewRow label="Slot" value={`#${env.sidebarSlot}`} />}
+            <EnvPreviewPlanRow
+              repoId={repo.repoId}
+              planArtifactId={env.startupPlanId}
+              label={planLabel}
+              onPlanSelect={onPlanSelect}
+            />
+            {showShip && <EnvPreviewRow label="Ship" value={formatShipState(env, branchStatus)} />}
+            {attentionMessages.map((message) => (
+              <p key={message} className="mt-1 text-[11px] leading-4 text-kumo-danger">{message}</p>
+            ))}
+          </div>
+          <span className="mt-3 inline-flex text-xs font-medium text-kumo-link">
+            Open
+          </span>
+        </div>
+      </Popover.Content>
+    </Popover>
+  );
+}
+
+function PlanValueLink({
+  repoId,
+  planArtifactId,
+  label,
+  onPlanSelect,
+}: {
+  repoId: string;
+  planArtifactId: string | null;
+  label: string;
+  onPlanSelect?: (repoId: string, planArtifactId?: string | null) => void;
+}) {
+  if (!planArtifactId) {
+    return <span title={label} className="min-w-0 text-kumo-default">{label}</span>;
+  }
+  return (
+    <a
+      href={planPath(repoId, planArtifactId)}
+      title={label}
+      className="min-w-0 whitespace-normal break-words text-kumo-link hover:underline"
+      onClick={(event) => {
+        event.stopPropagation();
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        if (!onPlanSelect) return;
+        event.preventDefault();
+        onPlanSelect(repoId, planArtifactId);
+      }}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      {label}
+    </a>
+  );
+}
+
+function EnvPreviewPlanRow({
+  repoId,
+  planArtifactId,
+  label,
+  onPlanSelect,
+}: {
+  repoId: string;
+  planArtifactId: string | null;
+  label: string;
+  onPlanSelect?: (repoId: string, planArtifactId?: string | null) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span>Plan</span>
+      <span className="min-w-0 truncate text-kumo-default">
+        <PlanValueLink
+          repoId={repoId}
+          planArtifactId={planArtifactId}
+          label={label}
+          onPlanSelect={onPlanSelect}
+        />
+      </span>
+    </div>
+  );
+}
+
+function EnvPreviewRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span>{label}</span>
+      <span className="min-w-0 truncate text-kumo-default">{value}</span>
     </div>
   );
 }
@@ -381,110 +637,110 @@ function matchesRepo(repo: RepoMeta, env: EnvMeta): boolean {
   return env.repoId === repo.repoId;
 }
 
+function planLabelCacheKey(repoId: string, planArtifactId: string): string {
+  return `${repoId}:${planArtifactId}`;
+}
+
+function getEnvPlanLabel(env: EnvMeta, repo: RepoMeta, planLabels: Record<string, string>): string {
+  if (!env.startupPlanId) return "No plan";
+  return planLabels[planLabelCacheKey(repo.repoId, env.startupPlanId)] ?? "Selected plan";
+}
+
+function compareSidebarOrder(left: EnvMeta, right: EnvMeta): number {
+  const leftSlot = left.sidebarSlot ?? Number.MAX_SAFE_INTEGER;
+  const rightSlot = right.sidebarSlot ?? Number.MAX_SAFE_INTEGER;
+  return leftSlot - rightSlot
+    || left.createdAt.localeCompare(right.createdAt)
+    || left.slug.localeCompare(right.slug);
+}
+
 function RepoGroupHeader({
   repo,
-  planRepoId,
-  hubUrl,
-  envCount,
   onPlanSelect,
-  onAddEnv,
-  onRetryRepoMain,
-  onRecoverEntities,
-  onRepoDeleted,
+  onRepoHomeSelect,
+  planSelected,
 }: {
   repo: RepoMeta;
-  planRepoId?: string | null;
-  hubUrl: string;
-  envCount: number;
-  onPlanSelect?: (repoId: string) => void;
-  onAddEnv?: (repoId: string) => void;
+  onPlanSelect?: (repoId: string, planArtifactId?: string | null) => void;
   onRetryRepoMain?: (repoId: string) => void;
-  onRecoverEntities?: (options?: RecoverEntitiesOptions) => void;
-  onRepoDeleted?: (repoId: string, deletedEnvSlugs: string[]) => void;
+  onRepoHomeSelect?: (repoId: string) => void;
+  planSelected?: boolean;
 }) {
-  const [busy, setBusy] = useState(false);
   const repoMainReady = isRepoMainReady(repo);
   const repoMainStatusLabel = getRepoMainStatusLabel(repo);
   const repoMainStatusDetail = getRepoMainStatusDetail(repo);
+  const label = repoLabel(repo.repoUrl);
+  const selectRepo = () => onRepoHomeSelect?.(repo.repoId);
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    selectRepo();
+  };
+  const handlePlan = (event: MouseEvent<HTMLAnchorElement>) => {
+    event.stopPropagation();
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (!onPlanSelect) return;
+    event.preventDefault();
+    onPlanSelect?.(repo.repoId);
+  };
+  const statusBadge = !repoMainReady ? (
+    <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2 text-xs text-kumo-subtle">
+      <Badge variant={repo.gitStatus === "repair-required" ? "error" : "warning"}>
+        {repoMainStatusLabel}
+      </Badge>
+      {repoMainStatusDetail && (
+        <span className="tiller-sidebar-open-text min-w-0 whitespace-normal text-[11px] font-normal text-kumo-subtle tiller-sidebar-wrap">
+          {repoMainStatusDetail}
+        </span>
+      )}
+    </div>
+  ) : null;
 
   return (
-    <div className={`px-3 py-1.5 text-xs font-semibold text-[#57606a] ${planRepoId === repo.repoId ? "bg-white" : "bg-[#f6f8fa]"}`}>
-      <a
-        href={githubRepoHref(repo.repoUrl)}
-        target="_blank"
-        rel="noreferrer"
-        className="mb-1 block truncate text-[#0969da] hover:underline"
-      >
-        {repoLabel(repo.repoUrl)}
-      </a>
-      <div className="mb-1 flex items-center gap-2">
-        <span
-          className={`rounded border px-2 py-0.5 text-[10px] uppercase tracking-wide ${
-            repoMainReady
-              ? "border-emerald-200 bg-white text-emerald-700"
-              : repo.gitStatus === "repair-required"
-                ? "border-red-200 bg-white text-red-700"
-                : "border-amber-200 bg-white text-amber-800"
-          }`}
-        >
-          {repoMainStatusLabel}
-        </span>
-        {!repoMainReady && repoMainStatusDetail && (
-          <span className="text-[11px] font-normal text-[#6e7781]">
-            {repoMainStatusDetail}
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-2">
-        <button
-          onClick={() => onAddEnv?.(repo.repoId)}
-          disabled={!repoMainReady}
-          className="rounded border border-[#d0d7de] bg-white px-2 py-0.5 text-[10px] uppercase tracking-wide text-[#24292f] hover:bg-[#f6f8fa] disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          Add Env
-        </button>
-        {!repoMainReady && (
-          <button
-            onClick={() => onRetryRepoMain?.(repo.repoId)}
-            disabled={busy}
-            className="rounded border border-[#d0d7de] bg-white px-2 py-0.5 text-[10px] uppercase tracking-wide text-[#24292f] hover:bg-[#f6f8fa] disabled:cursor-not-allowed disabled:opacity-40"
+    <div
+      className="max-w-full overflow-x-hidden bg-kumo-base px-3 py-3 transition-colors hover:bg-kumo-tint"
+      role="button"
+      tabIndex={0}
+      onClick={selectRepo}
+      onKeyDown={handleKeyDown}
+    >
+      <div className="flex min-w-0 items-start">
+        <div className="min-w-0 max-w-full">
+          <a
+            href={githubRepoHref(repo.repoUrl)}
+            target="_blank"
+            rel="noreferrer"
+            className="tiller-sidebar-open-text whitespace-normal text-sm font-semibold text-kumo-strong hover:text-kumo-link hover:underline tiller-sidebar-wrap"
+            onClick={(event) => event.stopPropagation()}
           >
-            Retry Main
+            {label}
+          </a>
+          <p className="tiller-sidebar-open-text mt-0.5 whitespace-normal text-[11px] text-kumo-subtle tiller-sidebar-wrap">Repo actions dock below</p>
+        </div>
+      </div>
+      <div className="min-w-0">
+        {statusBadge}
+      </div>
+      <div className="mt-3 border border-kumo-line bg-kumo-base">
+        {repoMainReady ? (
+          <a
+            href={planPath(repo.repoId)}
+            aria-current={planSelected ? "page" : undefined}
+            className="flex min-h-10 w-full items-center justify-center gap-2 border-l-2 border-l-kumo-brand bg-kumo-base px-2 text-xs font-medium text-kumo-link transition-colors hover:bg-kumo-tint"
+            onClick={handlePlan}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            Plan
+          </a>
+        ) : (
+          <button
+            type="button"
+            className="flex min-h-10 w-full items-center justify-center gap-2 border-l-2 border-l-kumo-brand bg-kumo-base px-2 text-xs font-medium text-kumo-link transition-colors disabled:cursor-default disabled:text-kumo-subtle disabled:opacity-60"
+            disabled
+          >
+            Plan
           </button>
         )}
-        <button
-          onClick={() => onPlanSelect?.(repo.repoId)}
-          disabled={!repoMainReady}
-          className="rounded border border-[#d8b4fe] bg-white px-2 py-0.5 text-[10px] uppercase tracking-wide text-[#7c3aed] hover:bg-[#faf5ff] disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          Plan
-        </button>
-        <button
-          onClick={async () => {
-            const envWarning = envCount > 0
-              ? `\n\nThis will also destroy ${envCount} environment(s) and their containers.`
-              : "";
-            if (!confirm(`Delete repo "${repoLabel(repo.repoUrl)}"?${envWarning}`)) return;
-            setBusy(true);
-            try {
-              const result = await deleteRepo(hubUrl, repo.repoId);
-              if (onRepoDeleted) {
-                onRepoDeleted(result.repoId, result.deletedEnvSlugs);
-              } else {
-                onRecoverEntities?.({ repoId: result.repoId });
-              }
-            } catch (err) {
-              console.error("[tiller] repo delete failed:", err);
-              alert(err instanceof Error ? err.message : "Failed to delete repo.");
-            } finally {
-              setBusy(false);
-            }
-          }}
-          disabled={busy}
-          className="rounded border border-red-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wide text-red-600 hover:bg-red-50 disabled:opacity-40"
-        >
-          {busy ? "..." : "Delete"}
-        </button>
       </div>
     </div>
   );
@@ -501,46 +757,31 @@ function githubRepoHref(repoUrl: string): string {
       return `https://github.com${parsed.pathname.replace(/\.git$/, "").replace(/\/+$/, "")}`;
     }
   } catch {
-    // Fall through to the GitHub label-based URL below.
+    // Fall through to the label-based URL below.
   }
-  const label = repoLabel(repoUrl).replace(/^github\.com\//, "").replace(/\.git$/, "").replace(/\/+$/, "");
-  return `https://github.com/${label}`;
+  return `https://github.com/${repoLabel(repoUrl).replace(/\.git$/, "").replace(/\/+$/, "")}`;
 }
 
-function formatChangeStatus(status: string): string {
-  if (status === "behind-main") return "Behind main";
-  if (status === "ready-to-merge") return "Ready to promote";
-  if (status === "needs-attention") return "Needs attention";
-  return "No changes";
+function hasShipTarget(env: EnvMeta, branchStatus: NonNullable<EnvMeta["branchStatus"]>): boolean {
+  if (env.workspaceDirty) return true;
+  if (branchStatus === "ready-to-merge" || branchStatus === "needs-attention") return true;
+  if (env.githubPrUrl) return true;
+  if (env.githubPublishStatus === "publishing" || env.githubPublishStatus === "failed") return true;
+  return Boolean(
+    env.githubHeadCommitSha &&
+      env.githubPublishStatus === "published" &&
+      env.githubPrState !== "closed" &&
+      env.githubPrState !== "merged" &&
+      !env.githubMergedAt,
+  );
 }
 
-function formatScmOperationLabel(type?: string | null): string {
-  if (type === "merge-into-main") return "Promoting...";
-  if (type === "update-from-main") return "Updating from main...";
-  return "Working...";
-}
-
-function syncDetailText(env: EnvMeta, repo: RepoMeta): string | null {
-  const branchStatus = getDisplayEnvBranchStatus(env, repo);
-  if (branchStatus === "behind-main") {
-    return repo.lastCommittedFromEnvSlug
-      ? `Main advanced from ${repo.lastCommittedFromEnvSlug}. Update from Main before promoting, or reset this env to discard its work.`
-      : "Main has advanced. Update from Main before promoting, or reset this env to discard its work.";
-  }
-  if (branchStatus === "needs-attention") {
-    return "This env has conflicts or unsupported git state. Reset to Main to discard it.";
-  }
-  if (branchStatus === "ready-to-merge") {
-    return "This env has local work and can be promoted into main.";
-  }
-  return null;
-}
-
-function scmProgressText(env: EnvMeta): string | null {
-  if (!env.scmOperationType) return null;
-  const prefix = "Promote to Main";
-  if (env.scmOperationPhase) {
-    return `${prefix}: ${env.scmOperationPhase}`;
-  }
-  return `${prefix} in progress`;
+function formatShipState(env: EnvMeta, branchStatus: NonNullable<EnvMeta["branchStatus"]>): string {
+  if (branchStatus === "needs-attention") return "Needs attention";
+  if (env.githubPublishStatus === "publishing") return "Publishing PR";
+  if (env.githubPublishStatus === "failed") return "Publish failed";
+  if (env.githubPrState === "open" && env.workspaceDirty) return "Update PR";
+  if (env.githubPrUrl) return "Open PR";
+  if (env.workspaceDirty || branchStatus === "ready-to-merge") return "Create PR";
+  return "Review published branch";
 }

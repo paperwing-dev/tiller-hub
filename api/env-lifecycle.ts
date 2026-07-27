@@ -11,6 +11,19 @@ export type StopWorkspaceSyncedMetaPatch = Pick<
   | "baseMainCommit"
   | "lastKnownMainCommit"
   | "branchStatus"
+  | "githubBaseBranch"
+  | "githubBaseCommitSha"
+  | "githubHeadCommitSha"
+  | "githubPrNumber"
+  | "githubPrUrl"
+  | "githubPrState"
+  | "githubMergedAt"
+  | "githubPublishStatus"
+  | "githubPublishOperationId"
+  | "githubPublishError"
+  | "githubLastPublishedAt"
+  | "githubLastPublishedWorkspaceHash"
+  | "githubPendingPublish"
 >;
 
 export interface PendingStopWorkspaceSyncedMeta {
@@ -27,16 +40,49 @@ export function buildEnvScmMetaPatch(
     | "baseMainCommit"
     | "lastKnownMainCommit"
     | "branchStatus"
+    | "githubBaseBranch"
+    | "githubBaseCommitSha"
+    | "githubHeadCommitSha"
+    | "githubPrNumber"
+    | "githubPrUrl"
+    | "githubPrState"
+    | "githubMergedAt"
+    | "githubPublishStatus"
+    | "githubPublishOperationId"
+    | "githubPublishError"
+    | "githubLastPublishedAt"
+    | "githubLastPublishedWorkspaceHash"
+    | "githubPendingPublish"
   >,
   overrides?: Partial<StopWorkspaceSyncedMetaPatch>,
 ): StopWorkspaceSyncedMetaPatch {
+  const value = <K extends keyof StopWorkspaceSyncedMetaPatch>(
+    key: K,
+  ): StopWorkspaceSyncedMetaPatch[K] =>
+    overrides && Object.prototype.hasOwnProperty.call(overrides, key)
+      ? overrides[key] as StopWorkspaceSyncedMetaPatch[K]
+      : meta[key];
+
   return {
-    workspaceDirty: overrides?.workspaceDirty ?? meta.workspaceDirty,
-    workspaceNeedsAttention: overrides?.workspaceNeedsAttention ?? meta.workspaceNeedsAttention,
-    workspaceLastSyncedAt: overrides?.workspaceLastSyncedAt ?? meta.workspaceLastSyncedAt,
-    baseMainCommit: overrides?.baseMainCommit ?? meta.baseMainCommit,
-    lastKnownMainCommit: overrides?.lastKnownMainCommit ?? meta.lastKnownMainCommit,
-    branchStatus: overrides?.branchStatus ?? meta.branchStatus,
+    workspaceDirty: value("workspaceDirty"),
+    workspaceNeedsAttention: value("workspaceNeedsAttention"),
+    workspaceLastSyncedAt: value("workspaceLastSyncedAt"),
+    baseMainCommit: value("baseMainCommit"),
+    lastKnownMainCommit: value("lastKnownMainCommit"),
+    branchStatus: value("branchStatus"),
+    githubBaseBranch: value("githubBaseBranch"),
+    githubBaseCommitSha: value("githubBaseCommitSha"),
+    githubHeadCommitSha: value("githubHeadCommitSha"),
+    githubPrNumber: value("githubPrNumber"),
+    githubPrUrl: value("githubPrUrl"),
+    githubPrState: value("githubPrState"),
+    githubMergedAt: value("githubMergedAt"),
+    githubPublishStatus: value("githubPublishStatus"),
+    githubPublishOperationId: value("githubPublishOperationId"),
+    githubPublishError: value("githubPublishError"),
+    githubLastPublishedAt: value("githubLastPublishedAt"),
+    githubLastPublishedWorkspaceHash: value("githubLastPublishedWorkspaceHash"),
+    githubPendingPublish: value("githubPendingPublish"),
   };
 }
 

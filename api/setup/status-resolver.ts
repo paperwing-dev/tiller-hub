@@ -1,67 +1,55 @@
-import type { Env, EnvHarness } from "../types";
+import type { Env, EnvHarness, HostServiceRegistration } from "../types";
 import type { ChatGPTAuthStatus, CodexRouteStatus } from "../types";
 import { resolveEnabledHarnesses } from "../env/harness";
-import { resolveChatGPTAvailability } from "../chatgpt-availability";
-import { resolveManagedMachineHostStatus } from "../machine-hosts";
 import {
-  isQuickTunnelUrl,
   readRegisteredHostService,
   readRoutableHostService,
 } from "../service-registry";
 import {
   getCanonicalMainBootstrapDepth,
+  getBillingSelections,
   getIdleTimeoutMinutes,
   getSecret,
-  resolveDeploymentMode,
-  type DeploymentMode,
-  type RouteKind,
 } from "./config";
+import type { BillingMode } from "../../shared/billing";
 import {
-  getRouteKind,
   hasEnabledHarnessModelAuth,
   isLocalDevRequest,
   resolveModelAuthState,
   resolveProtectionState,
 } from "../protection";
 import {
-  expireSelfHostStateIfNeeded,
-  isSelfHostSetupInProgress,
-  selfHostSetupWorkersDevUrl,
-} from "../self-host/state";
-import { resolveWorkerServiceName } from "./cloudflare";
-import {
   getGitHubAppConfig,
   getGitHubAppInstallUrl,
   getGitHubAppManageUrl,
   isGitHubAppAllowedForRequest,
-  listGitHubAppRepositories,
+  isGitHubAppInstallationReady,
 } from "../github/app";
 import { requiresWorkersDevAccessProtection } from "./protect-hub";
 import { resolveHubUpdateRepoState } from "../update/hub-repo";
 import { getBuildDiagnostics } from "../update/metadata";
+import {
+  classifyHostRuntimeCompatibilityForExpectedRuntime,
+  resolveExpectedHostRuntime,
+} from "./runtime-compatibility";
 import type { HubUpdateRepoState, UpdateBuildDiagnostics } from "../update/types";
+import { resolveCodexBackendReadiness } from "../codex-execution";
+import {
+  hasAvailableHarnessModel,
+  listHarnessModelRequirementMessages,
+} from "../../shared/harness-catalog";
+import { readWorkersDevAccessLifecycle } from "../workers-dev-access/records";
+import { readExecutionStatus } from "../execution";
+import { CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES } from "../../shared/cloudflare-timeout";
 
 export interface SetupStatusPayload {
   needsSetup: boolean;
   setupPhase: "protect-hub" | "github-app" | "model-access" | "complete";
   isLocalDev: boolean;
-  currentOrigin: string;
-  hubUrl: string;
-  deploymentMode: DeploymentMode;
-  selfHostStatus: "not-enabled" | "setup-in-progress" | "enabled" | "offline" | "ready";
-  selfHostSetupAttemptId: string | null;
   workersDevHubUrl: string | null;
-  routeKind: RouteKind;
-  hostKind: "workers-dev" | "custom-domain";
-  workerServiceName: string | null;
   modelAuthConfigured: boolean;
-  modelAuthMode: "subscription" | "api" | "api-key" | null;
-  hostedInfrastructureReady: boolean;
-  hostedBlockingReasons: string[];
-  hostedModelReady: boolean;
-  hostedModelBlockingReasons: string[];
-  selfHostReady: boolean;
-  selfHostBlockingReasons: string[];
+  claudeBillingMode: BillingMode | null;
+  openaiBillingMode: BillingMode | null;
   workersAiConfigured: boolean;
   hasClaudeSubscription: boolean;
   hasAnthropicKey: boolean;
@@ -71,32 +59,15 @@ export interface SetupStatusPayload {
   codexRouteStatus: CodexRouteStatus;
   openaiPlannerConfigured: boolean;
   openaiPlannerAvailable: boolean;
-  openaiPlannerRoute: "api-key" | "subscription-gateway" | null;
+  openaiPlannerRoute: "api-key" | "subscription-app-server" | null;
   openaiPlannerReason: string | null;
+  codexBackendReadiness: { cf: CodexRouteStatus; host: CodexRouteStatus };
   hostRegistered: boolean;
-  hostRegisteredMode: "none" | "session";
-  hostGatewayAvailable: boolean;
-  hostGatewayConfigured: boolean;
-  hostGatewayMode: "none" | "quick" | "named";
   enabledHarnesses: EnvHarness[];
   protectionMode: "public" | "cf-access";
-  protectionCanAutomate: boolean;
-  serviceTokenConfigured: boolean;
-  gatewayHostname: string | null;
-  browserProtected: boolean;
-  gatewayProvisioned: boolean;
-  gatewayTunnelConfigured: boolean;
-  gatewaySupportAvailable: boolean;
-  gatewaySupportReason: string | null;
-  workersDevCutoverPending: boolean;
-  unsupportedProtectionConfig: boolean;
-  workersDevAliasDisabled: boolean;
-  protectionAppDomain: string | null;
-  accessConfigured: boolean;
-  accessIssuer: string | null;
-  accessJwksUrl: string | null;
+  tokenExpiresAt: string | null;
+  renewalRecommended: boolean;
   hostConnected: boolean;
-  hostConnectionMode: "none" | "session";
   idleTimeoutMinutes: number;
   canonicalMainBootstrapDepth: number;
   githubAppAvailable: boolean;
@@ -110,196 +81,181 @@ export interface SetupStatusPayload {
   selfUpdateRepo: HubUpdateRepoState;
 }
 
-async function resolveGitHubAppReady(options: {
+export function resolveWorkersDevAccessOnboardingStatus(
+  env: Env,
+  canonicalOrigin: string,
+): SetupStatusPayload {
+  return {
+    needsSetup: true,
+    setupPhase: "protect-hub",
+    isLocalDev: false,
+    workersDevHubUrl: canonicalOrigin,
+    modelAuthConfigured: false,
+    claudeBillingMode: null,
+    openaiBillingMode: null,
+    workersAiConfigured: false,
+    hasClaudeSubscription: false,
+    hasAnthropicKey: false,
+    hasChatGPTAuth: false,
+    chatgptAuthStatus: "missing",
+    hasOpenAIKey: false,
+    codexRouteStatus: "unavailable",
+    openaiPlannerConfigured: false,
+    openaiPlannerAvailable: false,
+    openaiPlannerRoute: null,
+    openaiPlannerReason: null,
+    codexBackendReadiness: { cf: "unavailable", host: "unavailable" },
+    hostRegistered: false,
+    enabledHarnesses: resolveEnabledHarnesses(env),
+    protectionMode: "public",
+    tokenExpiresAt: null,
+    renewalRecommended: false,
+    hostConnected: false,
+    idleTimeoutMinutes: CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES,
+    canonicalMainBootstrapDepth: 0,
+    githubAppAvailable: false,
+    githubAppConfigured: false,
+    githubAppReady: false,
+    githubAppSlug: null,
+    githubAppInstallUrl: null,
+    githubAppManageUrl: getGitHubAppManageUrl(),
+    githubAppPublicHubDisabled: true,
+    buildDiagnostics: getBuildDiagnostics(),
+    selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
+  };
+}
+
+type GitHubAppSetupReadiness = "ready" | "not_ready" | "unavailable";
+
+async function resolveGitHubAppReadiness(options: {
   allowed: boolean;
   configured: boolean;
   env: Env;
-}): Promise<boolean> {
-  if (!options.allowed || !options.configured) return false;
+}): Promise<GitHubAppSetupReadiness> {
+  if (!options.allowed || !options.configured) return "not_ready";
 
   try {
-    const result = await listGitHubAppRepositories(options.env);
-    return result.repositories.length > 0;
-  } catch {
-    return false;
+    return await isGitHubAppInstallationReady(options.env) ? "ready" : "not_ready";
+  } catch (error) {
+    console.warn("[setup] GitHub App installation readiness is temporarily unavailable:", error);
+    return "unavailable";
   }
 }
 
-function buildHostedInfrastructureBlockingReasons(options: {
-  isLocalDev: boolean;
-  protectionMode: "public" | "cf-access";
-}): string[] {
-  const reasons: string[] = [];
-  if (options.isLocalDev) {
-    reasons.push("Hosted Tiller requires a deployed Cloudflare Worker.");
-  }
-  if (options.protectionMode !== "cf-access") {
-    reasons.push("Protect this hub with Cloudflare Access.");
-  }
-  return reasons;
-}
-
-function buildHostedModelBlockingReasons(options: {
+function buildCloudflareModelBlockingReasons(options: {
   hasOpenAIKey: boolean;
   hasAnthropicKey: boolean;
   workersAiConfigured: boolean;
   enabledHarnesses: readonly EnvHarness[];
 }): string[] {
-  if (options.enabledHarnesses.includes("claude-code") && options.hasAnthropicKey) return [];
-  if (options.enabledHarnesses.includes("codex") && options.hasOpenAIKey) return [];
-  if (options.enabledHarnesses.includes("opencode") && options.workersAiConfigured) return [];
-  if (options.enabledHarnesses.length === 0 && (options.hasAnthropicKey || options.hasOpenAIKey || options.workersAiConfigured)) return [];
+  const credentialStatus = {
+    hasAnthropicKey: options.hasAnthropicKey,
+    hasOpenAIKey: options.hasOpenAIKey,
+    workersAiConfigured: options.workersAiConfigured,
+    // Cloudflare Containers onboarding remains credential-based in v1. Global billing is
+    // enforced by model pickers and launches after onboarding completes.
+    claudeBillingMode: "api" as const,
+    openaiBillingMode: "api" as const,
+  };
+  if (hasAvailableHarnessModel(options.enabledHarnesses, "cf", credentialStatus)) return [];
 
-  const expected = [
-    ...(options.enabledHarnesses.includes("claude-code") ? ["ANTHROPIC_API_KEY"] : []),
-    ...(options.enabledHarnesses.includes("codex") ? ["OPENAI_API_KEY"] : []),
-    ...(options.enabledHarnesses.includes("opencode") ? ["Workers AI credentials"] : []),
-  ];
-  return [`Configure ${expected.length > 0 ? expected.join(", or ") : "model credentials"} for Hosted Tiller models.`];
+  const expected = listHarnessModelRequirementMessages(
+    options.enabledHarnesses,
+    "cf",
+    credentialStatus,
+  ).map((message) => message.replace(/^Requires\s+/, "").replace(/\.$/, ""));
+  return [`Configure ${expected.length > 0 ? expected.join(", or ") : "model credentials"} for Cloudflare Containers.`];
 }
 
 function hasWorkersAiBinding(env: Env): boolean {
   return Boolean((env as Partial<Env>).AI);
 }
 
-function buildSelfHostBlockingReasons(options: {
-  deploymentMode: DeploymentMode;
-  routeKind: RouteKind;
-  protectionMode: "public" | "cf-access";
-  hostConnected: boolean;
-  gatewaySupportAvailable: boolean;
-  hostGatewayAvailable: boolean;
-}): string[] {
-  const reasons: string[] = [];
-  if (options.deploymentMode !== "self-host") {
-    reasons.push("Switch deployment mode to Tiller Self Host.");
-  }
-  if (options.routeKind !== "custom-domain") {
-    reasons.push("Tiller Self Host requires a custom domain.");
-  }
-  if (options.protectionMode !== "cf-access") {
-    reasons.push("Protect the hub with Cloudflare Access.");
-  }
-  if (!options.hostConnected) {
-    reasons.push("Connect a Tiller Self Host machine.");
-  }
-  if (!options.gatewaySupportAvailable) {
-    reasons.push("Provision the protected Subscription Gateway resources.");
-  }
-  if (!options.hostGatewayAvailable) {
-    reasons.push("Start a healthy, routable Subscription Gateway.");
-  }
-  return reasons;
-}
-
 function resolveOpenAIPlannerStatus(options: {
-  deploymentMode: DeploymentMode;
   hasOpenAIKey: boolean;
-  chatgptAvailability: Awaited<ReturnType<typeof resolveChatGPTAvailability>>;
+  chatgptAuthStatus: ChatGPTAuthStatus;
+  selectedMode: BillingMode | null;
+  codexRouteStatus: CodexRouteStatus;
 }): {
   configured: boolean;
   available: boolean;
-  route: "api-key" | "subscription-gateway" | null;
+  route: "api-key" | "subscription-app-server" | null;
   reason: string | null;
 } {
-  if (
-    options.hasOpenAIKey
-    && (
-      options.chatgptAvailability.route === "api-fallback"
-      || (options.deploymentMode === "self-host" && !options.chatgptAvailability.available)
-    )
-  ) {
+  if (!options.selectedMode) {
     return {
-      configured: true,
-      available: true,
-      route: "api-key",
-      reason: null,
-    };
-  }
-
-  if (
-    options.deploymentMode === "self-host"
-    && options.chatgptAvailability.route === "gateway-subscription"
-    && options.chatgptAvailability.available
-  ) {
-    return {
-      configured: true,
-      available: true,
-      route: "subscription-gateway",
-      reason: null,
-    };
-  }
-
-  if (options.deploymentMode === "hosted") {
-    return {
-      configured: options.hasOpenAIKey,
+      configured: options.hasOpenAIKey || options.chatgptAuthStatus !== "missing",
       available: false,
       route: null,
-      reason: options.hasOpenAIKey
-        ? "OpenAI planner API key route is not available right now."
-        : "Configure OPENAI_API_KEY to use the OpenAI planner in Hosted Tiller.",
+      reason: "Select an OpenAI billing mode in Global Settings.",
     };
+  }
+
+  if (options.selectedMode === "api") {
+    return {
+      configured: options.hasOpenAIKey,
+      available: options.hasOpenAIKey,
+      route: options.hasOpenAIKey ? "api-key" : null,
+      reason: options.hasOpenAIKey ? null : "Configure the active OpenAI API key in Global Settings.",
+    };
+  }
+
+  if (options.codexRouteStatus === "available") {
+    if (options.chatgptAuthStatus === "connected") {
+      return {
+        configured: true,
+        available: true,
+        route: "subscription-app-server",
+        reason: null,
+      };
+    }
+    if (options.hasOpenAIKey) {
+      return {
+        configured: true,
+        available: true,
+        route: "api-key",
+        reason: null,
+      };
+    }
   }
 
   return {
-    configured: options.chatgptAvailability.configured || options.hasOpenAIKey,
+    configured: options.hasOpenAIKey || options.chatgptAuthStatus !== "missing",
     available: false,
     route: null,
-    reason: options.chatgptAvailability.unavailableReason
-      ?? "Start a healthy Subscription Gateway or configure OPENAI_API_KEY.",
+    reason: options.codexRouteStatus === "runtime_update_required"
+      ? "The selected execution backend needs a compatible runtime update."
+      : options.codexRouteStatus === "backend_offline"
+        ? "The selected execution backend is offline."
+        : options.codexRouteStatus === "environment_not_connected"
+          ? "The selected machine is registered but not connected."
+          : options.codexRouteStatus === "authentication_unavailable"
+            ? "The selected OpenAI authentication route is unavailable."
+            : options.chatgptAuthStatus === "needs_reconnect"
+              ? "The active Codex subscription login needs re-import."
+              : options.chatgptAuthStatus === "refreshing" || options.chatgptAuthStatus === "temporarily_unavailable"
+                ? "The active Codex subscription login is temporarily unavailable."
+                : "Import a Codex subscription login or configure an OpenAI API key in Global Settings.",
   };
 }
 
-async function resolveHostExecutionStatus(
-  env: Env,
-): Promise<{
+function resolveHostExecutionStatus(
+  host: HostServiceRegistration | null,
+  connectedHost: HostServiceRegistration | null,
+): {
   registered: boolean;
-  registeredMode: "none" | "session";
   connected: boolean;
-  connectionMode: "none" | "session";
-}> {
-  const host = await readRegisteredHostService(env);
-  const connectedHost = host?.machineId?.trim()
-    ? await readRoutableHostService(env, host.machineId)
-    : null;
-
+} {
   if (!host?.machineId?.trim()) {
     return {
       registered: false,
-      registeredMode: "none",
       connected: false,
-      connectionMode: "none",
     };
   }
 
   return {
     registered: true,
-    registeredMode: "session",
     connected: Boolean(connectedHost),
-    connectionMode: connectedHost ? "session" : "none",
-  };
-}
-
-async function resolveGatewayExecutionStatus(
-  env: Env,
-): Promise<{
-  configured: boolean;
-  available: boolean;
-  mode: "none" | "quick" | "named";
-}> {
-  const registeredHost = await readRegisteredHostService(env);
-  const routableHost = await readRoutableHostService(env);
-  const configuredGatewayUrl = registeredHost?.gatewayUrl?.trim() ?? "";
-  const availableGatewayUrl = routableHost?.gatewayUrl?.trim() ?? "";
-
-  if (!configuredGatewayUrl) {
-    return { configured: false, available: false, mode: "none" };
-  }
-
-  return {
-    configured: true,
-    available: Boolean(availableGatewayUrl),
-    mode: isQuickTunnelUrl(configuredGatewayUrl) ? "quick" : "named",
   };
 }
 
@@ -307,95 +263,111 @@ export async function resolveSetupStatus(
   env: Env,
   request: Request,
 ): Promise<SetupStatusPayload> {
-  const selfHostSession = await expireSelfHostStateIfNeeded(env);
   const isLocalDev = isLocalDevRequest(env, request);
-  const modelAuth = await resolveModelAuthState(env);
+  const [modelAuth, billingSelections] = await Promise.all([
+    resolveModelAuthState(env),
+    getBillingSelections(env),
+  ]);
   const enabledHarnesses = resolveEnabledHarnesses(env);
+  const workersAiConfigured = hasWorkersAiBinding(env)
+    || Boolean(
+      (await getSecret(env, "TILLER_WORKERS_AI_ACCOUNT_ID", { fresh: true }))?.trim()
+        && (await getSecret(env, "TILLER_WORKERS_AI_API_TOKEN", { fresh: true }))?.trim(),
+    );
   const modelAuthConfigured = hasEnabledHarnessModelAuth(
-    modelAuth,
+    {
+      ...modelAuth,
+      workersAiConfigured,
+    },
     enabledHarnesses,
+    "host",
   );
   const protection = await resolveProtectionState(env, request.url);
-  const currentRouteKind = getRouteKind(request.url);
-  const managedMachineHosts = await resolveManagedMachineHostStatus(env, protection);
-  const hostExecution = await resolveHostExecutionStatus(env);
-  const gatewayExecution = await resolveGatewayExecutionStatus(env);
-  const deploymentMode = await resolveDeploymentMode(env, {
-    routeKind: protection.routeKind,
-    hostRegistered: hostExecution.registered,
-    hostGatewayConfigured: gatewayExecution.configured,
-    gatewayProvisioned: managedMachineHosts.gatewayProvisioned,
+  const workersDevAccess = await readWorkersDevAccessLifecycle(env);
+  const registeredHost = await readRegisteredHostService(env);
+  const routableHost = registeredHost?.machineId?.trim()
+    ? await readRoutableHostService(env, registeredHost.machineId)
+    : null;
+  const hostExecution = resolveHostExecutionStatus(registeredHost, routableHost);
+  const hostRuntime = classifyHostRuntimeCompatibilityForExpectedRuntime(
+    registeredHost,
+    resolveExpectedHostRuntime(),
+  );
+  const execution = protection.accessConfigured || isLocalDev
+    ? await readExecutionStatus(env)
+    : {
+        selected: { target: "cf" as const },
+        selectedHost: null,
+        candidate: { state: "not_connected" as const },
+        executionReady: Boolean(env.PLANNER_RUN),
+      };
+  const authenticationAvailable = billingSelections.openaiBillingMode === "api"
+    ? modelAuth.hasOpenAIKey
+    : billingSelections.openaiBillingMode === "subscription"
+      && (modelAuth.chatgptAuthStatus === "connected" || modelAuth.hasOpenAIKey);
+  const directApi = billingSelections.openaiBillingMode === "api";
+  const cfCodexReadiness = resolveCodexBackendReadiness({
+    backendConnected: Boolean(env.PLANNER_RUN),
+    authenticationAvailable,
+    directApi,
   });
-  const chatgptAvailability = await resolveChatGPTAvailability(env);
-  const workerServiceName = await resolveWorkerServiceName(env, request.url);
+  const hostCodexReadiness: CodexRouteStatus = resolveCodexBackendReadiness({
+      backendConnected: hostExecution.registered,
+      authenticationAvailable,
+      directApi,
+      runtimeCompatibilityRequired: hostExecution.connected,
+      runtimeImageCompatible: hostRuntime.compatible,
+      runtimeAuthProtocol: routableHost?.codexRuntimeAuthProtocol,
+      environmentConnected: hostExecution.connected,
+    });
+  const codexBackendReadiness = {
+    cf: cfCodexReadiness,
+    host: hostCodexReadiness,
+  } satisfies SetupStatusPayload["codexBackendReadiness"];
+  const isReadyCodexStatus = (status: CodexRouteStatus) => status === "available" || status === "direct_api";
+  const codexRouteStatus: CodexRouteStatus = execution.selected.target === "cf"
+    ? cfCodexReadiness
+    : hostCodexReadiness;
   const githubAppAllowed = await isGitHubAppAllowedForRequest(env, request);
   const githubAppConfig = githubAppAllowed ? await getGitHubAppConfig(env) : null;
   const githubAppConfigured = githubAppAllowed && Boolean(githubAppConfig);
   const buildDiagnostics = getBuildDiagnostics();
-  const githubAppReady = await resolveGitHubAppReady({
+  const githubAppReadiness = await resolveGitHubAppReadiness({
     allowed: githubAppAllowed,
     configured: githubAppConfigured,
     env,
   });
+  const githubAppReady = githubAppReadiness === "ready";
   const selfUpdateRepo = buildDiagnostics.channel === "development"
     ? { status: "not_checked" as const, lastDetectedAt: null }
     : await resolveHubUpdateRepoState(env, { autoDetect: githubAppConfigured });
-  const workersAiConfigured = hasWorkersAiBinding(env)
-    || Boolean(
-      (await getSecret(env, "TILLER_WORKERS_AI_ACCOUNT_ID"))?.trim()
-        && (await getSecret(env, "TILLER_WORKERS_AI_API_TOKEN"))?.trim(),
-    );
-  const hostedBlockingReasons = buildHostedInfrastructureBlockingReasons({
-    isLocalDev,
-    protectionMode: protection.protectionMode,
-  });
-  const hostedModelBlockingReasons = buildHostedModelBlockingReasons({
+  const cloudflareModelBlockingReasons = buildCloudflareModelBlockingReasons({
     hasOpenAIKey: modelAuth.hasOpenAIKey,
     hasAnthropicKey: modelAuth.hasAnthropicKey,
     workersAiConfigured,
     enabledHarnesses,
   });
-  const selfHostBlockingReasons = buildSelfHostBlockingReasons({
-    deploymentMode,
-    routeKind: protection.routeKind,
-    protectionMode: protection.protectionMode,
-    hostConnected: hostExecution.connected,
-    gatewaySupportAvailable: managedMachineHosts.gatewaySupportAvailable,
-    hostGatewayAvailable: gatewayExecution.available,
-  });
   const openaiPlanner = resolveOpenAIPlannerStatus({
-    deploymentMode,
     hasOpenAIKey: modelAuth.hasOpenAIKey,
-    chatgptAvailability,
+    chatgptAuthStatus: modelAuth.chatgptAuthStatus,
+    selectedMode: billingSelections.openaiBillingMode,
+    codexRouteStatus,
   });
-  const hostedInfrastructureReady = hostedBlockingReasons.length === 0;
-  const hostedModelReady = hostedModelBlockingReasons.length === 0;
-  const selfHostReady = selfHostBlockingReasons.length === 0;
-  const selfHostSetupInProgress = isSelfHostSetupInProgress(selfHostSession);
-  const selfHostStatus: SetupStatusPayload["selfHostStatus"] = selfHostSetupInProgress
-    ? "setup-in-progress"
-    : deploymentMode !== "self-host"
-      ? "not-enabled"
-      : selfHostReady
-        ? "ready"
-        : hostExecution.connected || gatewayExecution.configured
-          ? "offline"
-          : "enabled";
-  const workersDevHubUrl = selfHostSetupWorkersDevUrl(selfHostSession)
-    ?? (protection.routeKind === "workers-dev" ? protection.hubUrl : null);
-  const modelAccessReady = deploymentMode === "self-host"
-    ? modelAuthConfigured
-    : hostedModelReady;
+  const workersDevHubUrl = workersDevAccess.workersDevHostname
+    ? `https://${workersDevAccess.workersDevHostname}`
+    : isLocalDev
+      ? null
+      : protection.hubUrl;
+  const modelAccessReady = cloudflareModelBlockingReasons.length === 0;
   const githubAppRequired = !isLocalDev;
   const setupPhase: SetupStatusPayload["setupPhase"] = requiresWorkersDevAccessProtection({
     isLocalDev,
-    currentRouteKind,
     accessConfigured: protection.accessConfigured,
   })
     ? "protect-hub"
-    : githubAppRequired && !githubAppReady
+    : githubAppRequired && githubAppReadiness === "not_ready"
       ? "github-app"
-      : (modelAccessReady || workersAiConfigured)
+      : modelAccessReady
         ? "complete"
         : "model-access";
 
@@ -403,58 +375,28 @@ export async function resolveSetupStatus(
     needsSetup: setupPhase !== "complete",
     setupPhase,
     isLocalDev,
-    currentOrigin: protection.currentOrigin,
-    hubUrl: protection.hubUrl,
-    deploymentMode,
-    selfHostStatus,
-    selfHostSetupAttemptId: selfHostSetupInProgress ? selfHostSession?.attemptId ?? null : null,
     workersDevHubUrl,
-    routeKind: protection.routeKind,
-    hostKind: protection.routeKind,
-    workerServiceName,
     modelAuthConfigured,
-    modelAuthMode: modelAuth.mode,
-    hostedInfrastructureReady,
-    hostedBlockingReasons,
-    hostedModelReady,
-    hostedModelBlockingReasons,
-    selfHostReady,
-    selfHostBlockingReasons,
+    claudeBillingMode: billingSelections.claudeBillingMode,
+    openaiBillingMode: billingSelections.openaiBillingMode,
     workersAiConfigured,
     hasClaudeSubscription: modelAuth.hasClaudeSubscription,
     hasAnthropicKey: modelAuth.hasAnthropicKey,
     hasChatGPTAuth: modelAuth.hasChatGPTAuth,
     chatgptAuthStatus: modelAuth.chatgptAuthStatus,
     hasOpenAIKey: modelAuth.hasOpenAIKey,
-    codexRouteStatus: chatgptAvailability.codexRouteStatus,
+    codexRouteStatus,
     openaiPlannerConfigured: openaiPlanner.configured,
     openaiPlannerAvailable: openaiPlanner.available,
     openaiPlannerRoute: openaiPlanner.route,
     openaiPlannerReason: openaiPlanner.reason,
+    codexBackendReadiness,
     hostRegistered: hostExecution.registered,
-    hostRegisteredMode: hostExecution.registeredMode,
-    hostGatewayAvailable: gatewayExecution.available,
-    hostGatewayConfigured: gatewayExecution.configured,
-    hostGatewayMode: gatewayExecution.mode,
     enabledHarnesses,
     protectionMode: protection.protectionMode,
-    protectionCanAutomate: protection.protectionCanAutomate,
-    serviceTokenConfigured: protection.serviceTokenConfigured,
-    gatewayHostname: managedMachineHosts.gatewayHostname,
-    browserProtected: managedMachineHosts.browserProtected,
-    gatewayProvisioned: managedMachineHosts.gatewayProvisioned,
-    gatewayTunnelConfigured: managedMachineHosts.gatewayTunnelConfigured,
-    gatewaySupportAvailable: managedMachineHosts.gatewaySupportAvailable,
-    gatewaySupportReason: managedMachineHosts.gatewaySupportReason,
-    workersDevCutoverPending: managedMachineHosts.workersDevCutoverPending,
-    unsupportedProtectionConfig: protection.unsupportedProtectionConfig,
-    workersDevAliasDisabled: protection.workersDevAliasDisabled,
-    protectionAppDomain: protection.protectionAppDomain,
-    accessConfigured: protection.accessConfigured,
-    accessIssuer: protection.accessIssuer,
-    accessJwksUrl: protection.accessJwksUrl,
+    tokenExpiresAt: workersDevAccess.tokenExpiresAt,
+    renewalRecommended: workersDevAccess.renewalRecommended,
     hostConnected: hostExecution.connected,
-    hostConnectionMode: hostExecution.connectionMode,
     idleTimeoutMinutes: await getIdleTimeoutMinutes(env),
     canonicalMainBootstrapDepth: await getCanonicalMainBootstrapDepth(env),
     githubAppAvailable: githubAppConfigured,
