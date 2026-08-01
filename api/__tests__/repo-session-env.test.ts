@@ -154,15 +154,15 @@ describe("repo session env storage", () => {
     expect(() => normalizeSessionEnvPatch({ set: { USER_FLAG: "nul\0byte" } })).toThrow(SessionEnvValidationError);
   });
 
-  it("allows supported Tiller deploy inputs as session env names", () => {
+  it("reserves removed placement input while allowing workload Worker naming", () => {
+    expect(() => normalizeSessionEnvPatch({ set: { TILLER_REGION: "wnam" } }))
+      .toThrow(SessionEnvValidationError);
     expect(normalizeSessionEnvPatch({
       set: {
-        TILLER_REGION: "wnam",
         TILLER_WORKER_NAME: "tiller-hub",
       },
     })).toEqual({
       set: {
-        TILLER_REGION: "wnam",
         TILLER_WORKER_NAME: "tiller-hub",
       },
     });

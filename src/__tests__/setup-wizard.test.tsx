@@ -10,8 +10,9 @@ vi.mock("../Toast", () => ({
 function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
   return {
     needsSetup: true,
-    setupPhase: "protect-hub",
+    setupPhase: "github-app",
     isLocalDev: false,
+    installerManaged: false,
     workersDevHubUrl: "https://demo.preview.workers.dev",
     modelAuthConfigured: false,
     claudeBillingMode: null,
@@ -30,8 +31,8 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     codexBackendReadiness: { cf: "unavailable", host: "environment_not_connected" },
     hostRegistered: false,
     enabledHarnesses: ["claude-code"],
-    protectionMode: "public",
-    tokenExpiresAt: null,
+    protectionMode: "cf-access",
+    tokenExpiresAt: "2027-07-30T00:00:00.000Z",
     renewalRecommended: false,
     hostConnected: false,
     idleTimeoutMinutes: 10,
@@ -42,7 +43,7 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     githubAppSlug: null,
     githubAppInstallUrl: null,
     githubAppManageUrl: "https://github.com/settings/installations",
-    githubAppPublicHubDisabled: true,
+    githubAppPublicHubDisabled: false,
     buildDiagnostics: {
       channel: "release",
       version: "0.1.0",
@@ -50,11 +51,15 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
       workersCiBranch: null,
     },
     selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
+    dashboardOnboarding: {
+      dismissed: false,
+      executionReady: true,
+    },
     ...overrides,
   };
 }
 
-describe("SetupWizard protect-hub", () => {
+describe("SetupWizard", () => {
   const originalWindow = globalThis.window;
   const originalReact = (globalThis as typeof globalThis & { React?: typeof React }).React;
 
@@ -63,95 +68,63 @@ describe("SetupWizard protect-hub", () => {
       configurable: true,
       value: {
         location: { origin: "https://demo.preview.workers.dev" },
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
       },
     });
-    Object.defineProperty(globalThis, "React", {
-      configurable: true,
-      value: React,
-    });
+    Object.defineProperty(globalThis, "React", { configurable: true, value: React });
   });
 
   afterEach(() => {
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: originalWindow,
-    });
-    Object.defineProperty(globalThis, "React", {
-      configurable: true,
-      value: originalReact,
-    });
+    Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
+    Object.defineProperty(globalThis, "React", { configurable: true, value: originalReact });
     vi.resetModules();
   });
 
-  it("renders the current workers.dev route when the configured hub URL differs", async () => {
+  it("blocks dashboard entry on required GitHub App creation", async () => {
     const { default: SetupWizard } = await import("../SetupWizard");
     const html = renderToString(
       <SetupWizard status={baseStatus()} onRefresh={async () => undefined} />,
     );
 
-    expect(html).toContain("Connect Cloudflare and protect Tiller");
-    expect(html).toContain("Tiller uses Cloudflare OAuth");
-    expect(html).not.toContain("Paperwing uses Cloudflare OAuth");
-    expect(html).toContain("Step <!-- -->1<!-- --> of 2");
+    expect(html).toContain("Required setup");
     expect(html).toContain("Connect GitHub");
-    expect(html).toContain("demo.preview.workers.dev");
-    expect(html).toContain("Tiller callbacks");
-    expect(html).toContain("Tiller Hub");
-    expect(html).toContain("Owner sign-in");
-    expect(html).toContain("Tiller owner sign-in");
-    expect(html).toContain("attaches it only to Tiller Hub");
-    expect(html).toContain("Existing identity providers");
-    expect(html).toContain("/api/github/webhook");
-    expect(html).toContain("/api/setup/workers-dev-access/broker/proof");
-    expect(html).toContain("/api/setup/workers-dev-access/broker/complete");
-    expect(html).not.toContain("Open Domains");
-    expect(html).not.toContain("Reload now");
-    expect(html).not.toContain("Verify Access");
-    expect(html).not.toContain("Manage Cloudflare Access");
-    expect(html).not.toContain("Open Workers");
-    expect(html).not.toContain("Automatic setup");
-    expect(html).not.toContain("Cloudflare API token");
-    expect(html).not.toContain("Create token");
-    expect(html).not.toContain("tiller.example.com");
-    expect(html).not.toContain("Cloudflare steps");
-  });
-
-  it("renders GitHub setup as the second required step", async () => {
-    const { default: SetupWizard } = await import("../SetupWizard");
-    const html = renderToString(
-      <SetupWizard
-        status={baseStatus({
-          setupPhase: "github-app",
-          protectionMode: "cf-access",
-          githubAppPublicHubDisabled: false,
-        })}
-        onRefresh={async () => undefined}
-      />,
-    );
-
-    expect(html).toContain("Step <!-- -->2<!-- --> of 2");
-    expect(html).toContain("Connect GitHub");
-    expect(html).toContain("Tiller needs a GitHub App");
     expect(html).toContain("Create GitHub App");
     expect(html).toContain("/api/github/manifest/setup");
+    expect(html).toContain("install it on at least one repository");
+    expect(html).not.toContain("Cloudflare API token");
     expect(html).not.toContain("Add model keys");
   });
 
-  it("offers an OpenAI API key for OpenAI-backed OpenCode models", async () => {
+  it("requires a usable installed repository after App creation", async () => {
     const { default: SetupWizard } = await import("../SetupWizard");
     const html = renderToString(
       <SetupWizard
         status={baseStatus({
-          setupPhase: "model-access",
-          enabledHarnesses: ["opencode"],
-          protectionMode: "cf-access",
+          githubAppAvailable: true,
+          githubAppConfigured: true,
+          githubAppSlug: "tiller-test",
+          githubAppInstallUrl: "https://github.com/apps/tiller-test/installations/new",
         })}
         onRefresh={async () => undefined}
       />,
     );
 
-    expect(html).toContain("OpenAI API key");
-    expect(html).toContain("For Codex and OpenAI-backed OpenCode models.");
-    expect(html).toContain("Add a key for Claude, Codex, or OpenAI-backed OpenCode models.");
+    expect(html).toContain("GitHub App created");
+    expect(html).toContain("Install on repositories");
+    expect(html).toContain("Verify repository");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>(?:<[^>]+>)*Verify repository/);
+  });
+
+  it("renders nothing after required GitHub setup completes", async () => {
+    const { default: SetupWizard } = await import("../SetupWizard");
+    const html = renderToString(
+      <SetupWizard
+        status={baseStatus({ needsSetup: false, setupPhase: "complete", githubAppReady: true })}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toBe("");
   });
 });

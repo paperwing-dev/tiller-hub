@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { getLocationHintOptions } from "../helpers";
 import {
   parseSetExecutionBackendRequest,
   type LegacyCustomDomainCleanupManifestV1,
@@ -26,10 +25,7 @@ interface ExecutionSettingsStore {
 
 function getStore(env: Env): ExecutionSettingsStore {
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(
-    id,
-    getLocationHintOptions(env),
-  ) as unknown as ExecutionSettingsStore;
+  return env.HUB.get(id) as unknown as ExecutionSettingsStore;
 }
 
 function noStore(c: { header(name: string, value: string): void }): void {

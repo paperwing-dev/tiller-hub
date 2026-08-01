@@ -1,10 +1,9 @@
 import { Hono, type Context } from "hono";
 import type { HonoEnv, Env } from "../types";
-import { getLocationHintOptions } from "../helpers";
 import { parseCanonicalWorkersDevHostname } from "../canonical-workers-dev";
 import {
   clearWorkersDevAccessTrustCache,
-  readCanonicalWorkersDevAccessTrust,
+  readCanonicalLegacyWorkersDevAccessTrust,
 } from "./records";
 import type {
   PendingWorkersDevAccessJobV1,
@@ -68,7 +67,7 @@ type WorkersDevAccessHubStore = {
 
 function getHub(env: Env): WorkersDevAccessHubStore {
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as WorkersDevAccessHubStore;
+  return env.HUB.get(id) as unknown as WorkersDevAccessHubStore;
 }
 
 function setNoStore(c: Context<HonoEnv>): void {
@@ -310,6 +309,12 @@ async function startJob(
   operation: WorkersDevAccessOperation,
 ): Promise<Response> {
   setNoStore(c);
+  if (c.env.TILLER_INSTALLER_SCHEMA?.trim()) {
+    return c.json({
+      error: "Cloudflare Access maintenance is not available for installer-managed Hubs.",
+      code: "installer_managed",
+    }, 409);
+  }
   try {
     await assertBodylessSameOrigin(c.req.raw);
   } catch (error) {
@@ -325,7 +330,7 @@ async function startJob(
     if (operation === "bootstrap") {
       target = deriveWorkersDevTarget(c.req.url);
     } else {
-      renewal = await readCanonicalWorkersDevAccessTrust(c.env);
+      renewal = await readCanonicalLegacyWorkersDevAccessTrust(c.env);
       if (!renewal) throw new Error("workers.dev Access is not configured");
       target = deriveWorkersDevTarget(`https://${renewal.workersDevHostname}`);
     }
@@ -459,6 +464,9 @@ workersDevAccessRoutes.post("/api/settings/workers-dev-access/oauth/start", (c) 
 
 workersDevAccessRoutes.post("/api/setup/workers-dev-access/broker/proof", async (c) => {
   setNoStore(c);
+  if (c.env.TILLER_INSTALLER_SCHEMA?.trim()) {
+    return c.json({ error: "Not found" }, 404);
+  }
   try {
     const body = await readBoundedJson(c.req.raw);
     const authentication = readJobAuthentication(body);
@@ -481,6 +489,9 @@ workersDevAccessRoutes.post("/api/setup/workers-dev-access/broker/proof", async 
 
 workersDevAccessRoutes.post("/api/setup/workers-dev-access/broker/complete", async (c) => {
   setNoStore(c);
+  if (c.env.TILLER_INSTALLER_SCHEMA?.trim()) {
+    return c.json({ error: "Not found" }, 404);
+  }
   try {
     const body = await readBoundedJson(c.req.raw);
     const authentication = readJobAuthentication(body);

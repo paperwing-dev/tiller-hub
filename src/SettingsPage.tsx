@@ -8,18 +8,27 @@ import { LayerCard } from "@cloudflare/kumo/components/layer-card";
 import { Select } from "@cloudflare/kumo/components/select";
 import { useToast } from "./Toast";
 import { getStoredThemePreference, setThemePreference, type ThemePreference } from "./theme";
-import type { ExecutionStatus, HubUpdateRepoCandidate, SetupStatus, VerifyModelAuthResult } from "./api";
+import type {
+  ExecutionStatus,
+  HubUpdateRepoCandidate,
+  SeedOpenAIAuthInput,
+  SetupStatus,
+  UpdateCheckResult,
+  VerifyModelAuthResult,
+} from "./api";
 import {
   detectSelfUpdateRepo,
   fetchExecutionStatus,
   fetchSetupStatus,
   renewWorkersDevAccess,
   saveBillingMode,
+  seedOpenAIAuth,
   selectSelfUpdateRepo,
   setExecutionBackend,
   submitSetup,
   verifyModelAuth,
 } from "./api";
+import { installerMaintenanceAction } from "./installer-maintenance";
 import type { BillingMode } from "../shared/billing";
 import { useGitHubRepositories } from "./useGitHubRepositories";
 import { KIMI_K2_7_CODE } from "../shared/harness-catalog";
@@ -40,6 +49,8 @@ const HUB_URL = window.location.origin;
 
 interface SettingsPageProps {
   status: SetupStatus;
+  updateStatus?: UpdateCheckResult | null;
+  isCheckingUpdate?: boolean;
   onDone: () => void;
   onRefresh: () => Promise<void>;
 }
@@ -89,7 +100,15 @@ function AppearanceRow() {
   );
 }
 
-function WorkersDevAccessLifecycleCard({ status }: { status: SetupStatus }) {
+function WorkersDevAccessLifecycleCard({
+  status,
+  updateStatus,
+  isCheckingUpdate = false,
+}: {
+  status: SetupStatus;
+  updateStatus?: UpdateCheckResult | null;
+  isCheckingUpdate?: boolean;
+}) {
   const [renewing, setRenewing] = useState(false);
   const addToast = useToast();
   if (!status.tokenExpiresAt) return null;
@@ -97,10 +116,28 @@ function WorkersDevAccessLifecycleCard({ status }: { status: SetupStatus }) {
   const expiration = Number.isFinite(parsedExpiration)
     ? new Intl.DateTimeFormat(undefined, { dateStyle: "long" }).format(new Date(parsedExpiration))
     : status.tokenExpiresAt;
+  const installerUpdateStatus = updateStatus?.kind === "installer-maintenance"
+    ? updateStatus
+    : null;
+  // Setup status remains the safety signal for binding-based Access when the
+  // update check itself is temporarily unavailable.
+  const usesInstallerAccess = Boolean(installerUpdateStatus || status.installerManaged);
+  const maintenanceAction = usesInstallerAccess
+    ? installerMaintenanceAction({
+        updateAvailable: installerUpdateStatus?.updateAvailable ?? false,
+        latestVersion: installerUpdateStatus?.stableRelease?.version ?? "",
+        renewAccess: true,
+      })
+    : null;
 
   async function renew() {
     setRenewing(true);
     try {
+      if (usesInstallerAccess) {
+        if (!maintenanceAction) throw new Error("Cloudflare maintenance action is unavailable.");
+        window.location.assign(maintenanceAction.url);
+        return;
+      }
       const job = await renewWorkersDevAccess(HUB_URL);
       window.location.assign(job.connectUrl);
     } catch (error) {
@@ -130,16 +167,46 @@ function WorkersDevAccessLifecycleCard({ status }: { status: SetupStatus }) {
               : "Renewal keeps the existing client ID and secret; connected machines and processes do not restart."}
           </p>
         </div>
-        <Button variant="primary" size="sm" onClick={() => void renew()} disabled={renewing} loading={renewing}>
-          {renewing ? "Opening Cloudflare..." : "Renew with Cloudflare"}
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => void renew()}
+          disabled={renewing || (usesInstallerAccess && isCheckingUpdate)}
+          loading={renewing || (usesInstallerAccess && isCheckingUpdate)}
+        >
+          {renewing
+            ? "Opening Cloudflare..."
+            : usesInstallerAccess && isCheckingUpdate
+              ? "Checking for updates..."
+              : usesInstallerAccess
+                ? maintenanceAction?.label ?? "Renew Access"
+                : "Renew with Cloudflare"}
         </Button>
       </div>
     </Card>
   );
 }
 
-export function buildCodexImportCommand(hubUrl: string): string {
-  return `npx --yes @paperwing-dev/tiller@latest auth import codex --hub-url ${hubUrl}`;
+export function parseCodexAuthFile(value: unknown): SeedOpenAIAuthInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The selected file is not a Codex auth file.");
+  }
+  const auth = value as Record<string, unknown>;
+  if (auth.auth_mode !== "chatgpt" || !auth.tokens || typeof auth.tokens !== "object" || Array.isArray(auth.tokens)) {
+    throw new Error("Run codex login with a ChatGPT subscription, then select its auth.json file.");
+  }
+  const tokens = auth.tokens as Record<string, unknown>;
+  const accessToken = typeof tokens.access_token === "string" ? tokens.access_token.trim() : "";
+  const refreshToken = typeof tokens.refresh_token === "string" ? tokens.refresh_token.trim() : "";
+  const idToken = typeof tokens.id_token === "string" ? tokens.id_token.trim() : "";
+  if (!accessToken || !refreshToken) {
+    throw new Error("The selected Codex auth file is missing its access or refresh token.");
+  }
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    ...(idToken ? { id_token: idToken } : {}),
+  };
 }
 
 function codexSubscriptionStatus(status: SetupStatus): {
@@ -649,50 +716,24 @@ export function CodexImportDialog({
   onImported: () => Promise<void>;
   hubUrl?: string;
 }) {
-  const [copied, setCopied] = useState(false);
   const [importDetected, setImportDetected] = useState(false);
-  const command = buildCodexImportCommand(hubUrl);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (importDetected) return;
-    let disposed = false;
-    let checking = false;
-
-    async function checkForImport() {
-      if (checking || disposed) return;
-      checking = true;
-      try {
-        const latest = await fetchSetupStatus(hubUrl);
-        if (
-          !disposed
-          && latest.hasChatGPTAuth
-          && (latest.chatgptAuthStatus === "connected" || latest.chatgptAuthStatus === "refreshing")
-        ) {
-          setImportDetected(true);
-          await onImported();
-        }
-      } catch {
-        // The normal Settings status action remains available for actionable errors.
-      } finally {
-        checking = false;
-      }
+  async function importFile(file: File): Promise<void> {
+    setImporting(true);
+    setError(null);
+    try {
+      if (file.size > 1024 * 1024) throw new Error("The selected Codex auth file is too large.");
+      const input = parseCodexAuthFile(JSON.parse(await file.text()) as unknown);
+      await seedOpenAIAuth(hubUrl, input);
+      setImportDetected(true);
+      await onImported();
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : "Codex login import failed.");
+    } finally {
+      setImporting(false);
     }
-
-    const interval = window.setInterval(() => void checkForImport(), 2_000);
-    const onFocus = () => void checkForImport();
-    window.addEventListener("focus", onFocus);
-    void checkForImport();
-    return () => {
-      disposed = true;
-      window.clearInterval(interval);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [hubUrl, importDetected, onImported]);
-
-  async function copy() {
-    await navigator.clipboard.writeText(command);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1800);
   }
 
   return (
@@ -706,36 +747,41 @@ export function CodexImportDialog({
         <div className="border-b border-kumo-line px-5 py-4">
           <Dialog.Title className="text-base font-semibold text-kumo-strong">Import Codex Login</Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-kumo-subtle">
-            Run this on the computer where Codex already works with your subscription.
+            Choose the auth file from a computer where Codex already works with your subscription.
           </Dialog.Description>
         </div>
 
         <div className="grid gap-3 overflow-y-auto px-5 py-4">
           <p className="text-sm text-kumo-subtle">
-            Run this exact command on the computer where Codex is already logged in. It downloads the latest Tiller CLI
-            if needed and imports the login into <code>{new URL(hubUrl).hostname}</code>.
+            Select <code>~/.codex/auth.json</code>. Your browser sends it only to this owner-authenticated Hub, where the
+            login is refresh-validated before it is stored.
           </p>
-          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3">
-            <code className="min-w-0 flex-1 break-all text-xs text-kumo-default">{command}</code>
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => void copy()}
-            >
-              {copied ? "Copied" : "Copy command"}
-            </Button>
-          </div>
+          <label className="grid gap-2 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3 text-sm text-kumo-default">
+            <span className="font-medium">Codex auth file</span>
+            <input
+              aria-label="Codex auth file"
+              type="file"
+              accept=".json,application/json"
+              disabled={importing || importDetected}
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) void importFile(file);
+                event.currentTarget.value = "";
+              }}
+              className="block w-full text-xs text-kumo-subtle file:mr-3 file:rounded file:border-0 file:bg-kumo-brand file:px-3 file:py-2 file:font-medium file:text-white"
+            />
+          </label>
           <p className="text-xs text-kumo-subtle">
-            The command reconnects Tiller if it was previously pointed at another Hub, then reports both the destination
-            Hub URL and Codex account. Run <code>codex login</code> first if the local login has expired.
+            Hidden files may require showing hidden items in the file picker. Run <code>codex login</code> first if the local login has expired.
           </p>
+          {error && <p role="alert" className="text-xs text-kumo-danger">{error}</p>}
           <p
             aria-live="polite"
             className={`text-xs ${importDetected ? "font-medium text-kumo-success" : "text-kumo-subtle"}`}
           >
             {importDetected
               ? `Codex subscription imported into ${new URL(hubUrl).hostname}. Settings is up to date.`
-              : "Waiting for the import to complete. This page will update automatically."}
+              : importing ? "Validating and importing the Codex login…" : "Choose the auth file to continue."}
           </p>
         </div>
 
@@ -1833,7 +1879,13 @@ function ExecutionBackendCard({ canonicalHubUrl }: { canonicalHubUrl: string }) 
 
 // ── Settings page ────────────────────────────────────────────────
 
-export default function SettingsPage({ status, onDone, onRefresh }: SettingsPageProps) {
+export default function SettingsPage({
+  status,
+  updateStatus,
+  isCheckingUpdate = false,
+  onDone,
+  onRefresh,
+}: SettingsPageProps) {
   const [testResults, setTestResults] = useState<Map<string, VerifyModelAuthResult>>(new Map());
   const [codexImportOpen, setCodexImportOpen] = useState(false);
   const [codexStatusRefreshing, setCodexStatusRefreshing] = useState(false);
@@ -1999,7 +2051,11 @@ export default function SettingsPage({ status, onDone, onRefresh }: SettingsPage
           <AppearanceRow />
         </Card>
 
-        <WorkersDevAccessLifecycleCard status={status} />
+        <WorkersDevAccessLifecycleCard
+          status={status}
+          updateStatus={updateStatus}
+          isCheckingUpdate={isCheckingUpdate}
+        />
 
         <Card
           title="Execution backend"

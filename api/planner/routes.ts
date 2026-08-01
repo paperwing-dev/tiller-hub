@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { HonoEnv } from "../types";
-import { getArtifactStoreStub, getLocationHintOptions, getThreadStub } from "../helpers";
+import { getArtifactStoreStub, getThreadStub } from "../helpers";
 import { loadTrackedRepoForRequest } from "../repo/access";
 import {
   listPlannerProviders,
@@ -76,7 +76,7 @@ function isEditablePlanStatus(status: unknown): boolean {
 async function broadcastWriterStateHint(c: any, repoId: string, planArtifactId: string): Promise<void> {
   try {
     const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId, getLocationHintOptions(c.env)) as unknown as {
+    const hub = c.env.HUB.get(hubId) as unknown as {
       broadcastPlanWriterState(repoId: string, planArtifactId: string): void | Promise<void>;
     };
     await hub.broadcastPlanWriterState(repoId, planArtifactId);
@@ -88,7 +88,7 @@ async function broadcastWriterStateHint(c: any, repoId: string, planArtifactId: 
 async function broadcastPlanArtifactHint(c: any, repoId: string, planArtifactId: string): Promise<void> {
   try {
     const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId, getLocationHintOptions(c.env)) as unknown as {
+    const hub = c.env.HUB.get(hubId) as unknown as {
       broadcastPlanArtifactUpdated(repoId: string, planArtifactId: string): void | Promise<void>;
     };
     await hub.broadcastPlanArtifactUpdated(repoId, planArtifactId);
@@ -971,7 +971,7 @@ plannerRoutes.post("/api/repos/:repoId/plans/:planArtifactId/live-writer/stop", 
   const writer = fenced.writer!;
   try {
     const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId, getLocationHintOptions(c.env)) as unknown as {
+    const hub = c.env.HUB.get(hubId) as unknown as {
       revokePlanWriterTerminal(sessionId: string, repoId: string, planArtifactId: string, generation: number): void | Promise<void>;
     };
     await hub.revokePlanWriterTerminal(

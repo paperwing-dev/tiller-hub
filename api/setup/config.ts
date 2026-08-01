@@ -1,4 +1,3 @@
-import { getLocationHintOptions } from "../helpers";
 import type { Env } from "../types";
 import { normalizeCloudflareIdleTimeoutMinutes } from "../../shared/cloudflare-timeout";
 import {
@@ -28,7 +27,7 @@ function getHubConfigStore(env: Env): HubConfigStore {
     throw new Error("The HubDO binding is required to read Tiller settings.");
   }
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as HubConfigStore;
+  return env.HUB.get(id) as unknown as HubConfigStore;
 }
 
 function getEnvSecretValue(env: Env, key: string): string | undefined {

@@ -122,6 +122,15 @@ function createEnv(
   const store = createHubStore(storeOverrides);
   return {
     PLANNER_RUN: {},
+    TILLER_INSTALLER_SCHEMA: "1",
+    TILLER_RELEASE_ID: "a".repeat(40),
+    TILLER_WORKERS_DEV_HOSTNAME: "tiller.demo.workers.dev",
+    CF_ACCESS_ISSUER: "https://demo-tiller.cloudflareaccess.com",
+    CF_ACCESS_AUDIENCE: "audience",
+    CF_ACCESS_SERVICE_CLIENT_ID: "service-client-id",
+    CF_ACCESS_TOKEN_EXPIRES_AT: "2027-07-17T00:00:00.000Z",
+    TILLER_OWNER_EMAIL: "owner@example.com",
+    CF_ACCESS_SERVICE_CLIENT_SECRET: "service-secret",
     ...extra,
     HUB: {
       idFromName: vi.fn(() => "hub-id"),
@@ -218,6 +227,18 @@ describe("POST /api/setup", () => {
     );
     expect(response.status).toBe(404);
   });
+
+  it("persists only the optional onboarding dismissal", async () => {
+    const setConfig = vi.fn();
+    const response = await createApp().request(
+      "https://demo.preview.workers.dev/api/setup/onboarding/dismiss",
+      { method: "POST" },
+      createEnv({}, { setConfig }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(setConfig).toHaveBeenCalledWith("DASHBOARD_ONBOARDING_DISMISSED_V1", "1");
+  });
 });
 
 describe("GET /api/setup/status", () => {
@@ -231,12 +252,32 @@ describe("GET /api/setup/status", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
-    expect(body.workersDevHubUrl).toBe("https://demo.preview.workers.dev");
+    expect(body.workersDevHubUrl).toBe("https://tiller.demo.workers.dev");
+    expect(body.installerManaged).toBe(true);
+    expect(body.tokenExpiresAt).toBe("2027-07-17T00:00:00.000Z");
+    expect(body.renewalRecommended).toBe(false);
     expect(body).not.toHaveProperty("deploymentMode");
     expect(body).not.toHaveProperty("environmentBackendPolicy");
     expect(body).not.toHaveProperty("selfHostStatus");
     expect(body).not.toHaveProperty("routeKind");
     expect(body).not.toHaveProperty("workerServiceName");
+  });
+
+  it("exposes binding-based Access renewal readiness to installer-managed owners", async () => {
+    const tokenExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString();
+    const response = await createApp().request(
+      "https://demo.preview.workers.dev/api/setup/status",
+      { method: "GET" },
+      createEnv({ CF_ACCESS_TOKEN_EXPIRES_AT: tokenExpiresAt }),
+    );
+    const body = await response.json<Record<string, unknown>>();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      installerManaged: true,
+      tokenExpiresAt,
+      renewalRecommended: true,
+    });
   });
 
   it("marks localhost as contributor development", async () => {
@@ -249,30 +290,21 @@ describe("GET /api/setup/status", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       isLocalDev: true,
-      setupPhase: "model-access",
+      setupPhase: "complete",
       canonicalMainBootstrapDepth: 0,
     });
   });
 
-  it("returns the normal workers.dev Access onboarding status without canonical trust", async () => {
+  it("fails closed into Access repair with malformed installer bindings", async () => {
     const response = await createApp().request(
       "https://fresh.preview.workers.dev/api/setup/status",
       { method: "GET" },
-      createEnv({}, {
-        getWorkersDevAccessLifecycle: vi.fn(async () => ({
-          configured: false,
-          workersDevHostname: null,
-          tokenExpiresAt: null,
-          renewalRecommended: false,
-        })),
-      }),
+      createEnv({ TILLER_INSTALLER_SCHEMA: "2" }),
     );
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
-      needsSetup: true,
-      setupPhase: "protect-hub",
-      workersDevHubUrl: "https://fresh.preview.workers.dev",
+      code: "access_repair_required",
     });
   });
 

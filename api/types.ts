@@ -24,12 +24,26 @@ export interface Env {
   ASSETS: Fetcher;
   BUCKET: R2Bucket;
   ENVS_KV: KVNamespace;
-  CF_ACCESS_AUD: string;
   LOCAL_DEV_ONLY_BACKEND?: string;
   TILLER_UPDATE_SERVICE_DISABLED?: string;
-  CF_ACCESS_CONFIGURED?: string;
-  CF_ACCESS_TEAM_DOMAIN?: string;
-  CF_ACCESS_JWKS_URL?: string;
+  /** Temporary endpoint override for the legacy Access broker fallback. */
+  WORKERS_DEV_ACCESS_BROKER_URL?: string;
+  /** Present together only on Hubs created by the fresh OAuth installer. */
+  TILLER_INSTALLER_SCHEMA?: string;
+  TILLER_INSTALLATION_ID?: string;
+  TILLER_RELEASE_ID?: string;
+  TILLER_WORKERS_DEV_HOSTNAME?: string;
+  CF_ACCESS_ISSUER?: string;
+  CF_ACCESS_AUDIENCE?: string;
+  CF_ACCESS_IDENTITY_PROVIDER_ID?: string;
+  CF_ACCESS_APPLICATION_ID?: string;
+  CF_ACCESS_OWNER_POLICY_ID?: string;
+  CF_ACCESS_SERVICE_POLICY_ID?: string;
+  CF_ACCESS_PUBLIC_APPLICATION_ID?: string;
+  CF_ACCESS_PUBLIC_POLICY_ID?: string;
+  CF_ACCESS_SERVICE_TOKEN_ID?: string;
+  CF_ACCESS_SERVICE_CLIENT_ID?: string;
+  CF_ACCESS_TOKEN_EXPIRES_AT?: string;
   ANTHROPIC_API_KEY: string;
   OPENAI_API_KEY?: string;
   OPENAI_MODEL?: string;
@@ -44,10 +58,8 @@ export interface Env {
   TILLER_WORKERS_AI_API_TOKEN?: string;
   TILLER_OPENCODE_PROXY_TOKEN?: string;
   ENABLED_ENV_HARNESSES?: string;
-  CF_ACCESS_CLIENT_ID: string;
-  CF_ACCESS_CLIENT_SECRET: string;
-  WORKERS_DEV_ACCESS_BROKER_URL?: string;
-  DO_LOCATION_HINT?: string; // Optional HubDO locationHint, usually derived at deploy time or set manually.
+  TILLER_OWNER_EMAIL?: string;
+  CF_ACCESS_SERVICE_CLIENT_SECRET?: string;
 }
 
 export type ResolvedClaudeAuthMode = "subscription" | "api";

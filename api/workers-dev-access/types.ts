@@ -5,23 +5,31 @@ export type AccessPrincipal =
   | { kind: "service" }
   | { kind: "local-dev" };
 
-export interface WorkersDevAccessTrustV1 {
-  version: 1;
+/** Minimal Access identity used by an installed Hub at request time. */
+export interface WorkersDevAccessRuntimeTrust {
   ownerEmail: string;
-  accountId: string;
-  workerName: string;
   workersDevHostname: string;
   issuer: string;
   audience: string;
-  serviceTokenId: string;
   serviceClientId: string;
+}
+
+export interface WorkersDevAccessTrustV1 extends WorkersDevAccessRuntimeTrust {
+  version: 1;
+  accountId: string;
+  workerName: string;
+  serviceTokenId: string;
   configuredAt: string;
 }
 
-export interface WorkersDevAccessCredentialV1 {
-  version: 1;
+/** Minimal outbound Access credential used by an installed Hub at request time. */
+export interface WorkersDevAccessRuntimeCredential {
   currentSecret: string;
   tokenExpiresAt: string;
+}
+
+export interface WorkersDevAccessCredentialV1 extends WorkersDevAccessRuntimeCredential {
+  version: 1;
   updatedAt: string;
 }
 

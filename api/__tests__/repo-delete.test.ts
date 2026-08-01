@@ -33,7 +33,6 @@ vi.mock("../helpers", () => ({
   getArtifactStoreStub: mocks.getArtifactStoreStub,
   getEnvLifecycleStub: mocks.getEnvLifecycleStub,
   getEnvReviewStub: mocks.getEnvReviewStub,
-  getLocationHintOptions: vi.fn(),
 }));
 
 vi.mock("../github/app", async () => {

@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { HonoEnv, RepoMeta } from "../types";
 import { createInitialRepoScmState } from "../scm/model";
+import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
 const mocks = vi.hoisted(() => ({
   broadcastRepoUpsert: vi.fn(),
@@ -23,7 +24,6 @@ const mocks = vi.hoisted(() => ({
   readEnvDefinition: vi.fn(),
   getArtifactStoreStub: vi.fn(),
   getEnvLifecycleStub: vi.fn(),
-  getLocationHintOptions: vi.fn(() => undefined),
   destroyEnv: vi.fn(),
   loadRepoArtifacts: vi.fn(),
   buildCloudflareMcpRedirectUri: vi.fn(),
@@ -58,7 +58,6 @@ vi.mock("../repo/refresh", () => ({
 vi.mock("../helpers", () => ({
   getArtifactStoreStub: mocks.getArtifactStoreStub,
   getEnvLifecycleStub: mocks.getEnvLifecycleStub,
-  getLocationHintOptions: mocks.getLocationHintOptions,
 }));
 
 vi.mock("../env/service", () => ({
@@ -144,9 +143,9 @@ describe("repo routes", () => {
     const trust = {
       version: 1,
       ownerEmail: "owner@example.com",
-      accountId: "account-1",
-      workerName: "demo",
-      workersDevHostname: "demo.preview.workers.dev",
+      accountId: "",
+      workerName: "tiller",
+      workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
       issuer: "https://team.cloudflareaccess.com",
       audience: "audience-1",
       serviceTokenId: "token-1",
@@ -165,6 +164,13 @@ describe("repo routes", () => {
       getWorkersDevAccessTrust: vi.fn().mockResolvedValue(trust),
     };
     const env = {
+      ...installedAccessBindings({
+        hostname: trust.workersDevHostname,
+        issuer: trust.issuer,
+        audience: trust.audience,
+        serviceClientId: trust.serviceClientId,
+        ownerEmail: trust.ownerEmail,
+      }),
       HUB: {
         idFromName: vi.fn(() => "hub-id"),
         get: vi.fn(() => hub),
@@ -179,8 +185,8 @@ describe("repo routes", () => {
 
     expect(response.status).toBe(200);
     expect(startRepoCloudflareMcpOAuth).toHaveBeenCalledWith("123", {
-      redirectUri: "https://demo.preview.workers.dev/api/repos/123/cloudflare-mcp/callback",
-      hubOrigin: "https://demo.preview.workers.dev",
+      redirectUri: "https://tiller.preview.workers.dev/api/repos/123/cloudflare-mcp/callback",
+      hubOrigin: "https://tiller.preview.workers.dev",
       requestIdentity: { email: "owner@example.com" },
     });
 
@@ -193,7 +199,7 @@ describe("repo routes", () => {
     expect(completeRepoCloudflareMcpOAuth).toHaveBeenCalledWith("123", {
       state: "state-1",
       code: "code-1",
-      redirectUri: "https://demo.preview.workers.dev/api/repos/123/cloudflare-mcp/callback",
+      redirectUri: "https://tiller.preview.workers.dev/api/repos/123/cloudflare-mcp/callback",
       requestIdentity: { email: "owner@example.com" },
     });
   });

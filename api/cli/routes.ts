@@ -107,7 +107,6 @@ function renderCliBootstrapPage(): string {
       code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-word; }
       .code-shell { display: grid; gap: .75rem; } .code-value { display: block; overflow-wrap: anywhere; white-space: pre-wrap; }
       button { width: fit-content; border: 1px solid #0969da; border-radius: 999px; background: #0969da; color: #fff; padding: .5rem 1rem; font: inherit; font-weight: 650; cursor: pointer; }
-      button[hidden] { display: none; } button[disabled] { opacity: .65; cursor: wait; }
     </style>
   </head>
   <body>
@@ -124,7 +123,6 @@ function renderCliBootstrapPage(): string {
             <span class="meta-label">Connection code</span>
             <div class="code-shell"><code id="connection-code" class="code-value"></code><button id="copy-code" type="button">Copy code</button></div>
           </div>
-          <button id="connect-cloudflare" type="button" hidden>Connect Cloudflare and protect Tiller</button>
         </div>
       </div>
     </main>
@@ -140,7 +138,6 @@ function renderCliBootstrapPage(): string {
       const codeRowEl = document.getElementById("code-row");
       const connectionCodeEl = document.getElementById("connection-code");
       const copyCodeEl = document.getElementById("copy-code");
-      const connectCloudflareEl = document.getElementById("connect-cloudflare");
 
       function setState(kind, title, detail) {
         statusEl.textContent = title;
@@ -244,24 +241,6 @@ function renderCliBootstrapPage(): string {
         }
       }
 
-      function offerCloudflareConnection() {
-        setState("", "Protect this Tiller Hub", "Cloudflare will authenticate the owner, create the two exact Access applications Tiller needs, and add a restricted Tiller owner sign-in only if this account does not already have one.");
-        connectCloudflareEl.hidden = false;
-        connectCloudflareEl.onclick = async () => {
-          connectCloudflareEl.disabled = true;
-          setState("", "Opening Cloudflare…", "Keep this tab open until Paperwing finishes provisioning.");
-          try {
-            const response = await fetch("/api/setup/workers-dev-access/oauth/start", { method: "POST", credentials: "include", headers: { Accept: "application/json" } });
-            const value = await response.json();
-            if (!response.ok || !value.connectUrl) throw new Error();
-            location.assign(value.connectUrl);
-          } catch {
-            connectCloudflareEl.disabled = false;
-            setState("error", "Cloudflare connection could not start", "Try again from this tab.");
-          }
-        };
-      }
-
       async function run() {
         const request = readConnectionRequest();
         if (!request) {
@@ -278,7 +257,11 @@ function renderCliBootstrapPage(): string {
             return;
           }
           if (value.code === "setup_protection_required") {
-            offerCloudflareConnection();
+            setState(
+              "error",
+              "This Hub needs Access repair",
+              "Use the documented maintainer Access repair procedure, then retry this command.",
+            );
             return;
           }
           if (response.status !== 410 || value.code !== "generic_secret_bootstrap_disabled") {

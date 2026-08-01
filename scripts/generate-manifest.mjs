@@ -6,6 +6,7 @@ const packageRoot = path.resolve(import.meta.dirname, "..");
 const wranglerOutputPath = path.join(packageRoot, "dist", "tiller", "wrangler.json");
 const packageJsonPath = path.join(packageRoot, "package.json");
 const manifestPath = path.join(packageRoot, "manifest.json");
+const legacyMigrationsPath = path.join(packageRoot, "scripts", "legacy-migrations.json");
 const CONTAINER_IMAGE_TAG_ENV = "CONTAINER_IMAGE_TAG";
 const GITHUB_JOB_IMAGE_TAG_ENV = "GITHUB_JOB_IMAGE_TAG";
 const REQUIRE_PINNED_IMAGES_ENV = "TILLER_MANIFEST_REQUIRE_PINNED_IMAGES";
@@ -205,10 +206,18 @@ export function buildManifestContainers(config) {
   });
 }
 
+export function resolveLegacyMigrations(config, frozenMigrations) {
+  const migrations = hasItems(config.migrations) ? config.migrations : frozenMigrations;
+  assert(Array.isArray(migrations) && migrations.length > 0,
+    "Legacy updater migrations are unavailable");
+  return migrations;
+}
+
 async function main() {
-  const [wranglerText, packageText] = await Promise.all([
+  const [wranglerText, packageText, legacyMigrationsText] = await Promise.all([
     readFile(wranglerOutputPath, "utf8"),
     readFile(packageJsonPath, "utf8"),
+    readFile(legacyMigrationsPath, "utf8"),
   ]);
   const config = JSON.parse(wranglerText);
   const packageJson = JSON.parse(packageText);
@@ -228,7 +237,9 @@ async function main() {
     version: process.env.TILLER_BUILD_VERSION || packageJson.version,
     compatibility_date: config.compatibility_date,
     compatibility_flags: config.compatibility_flags ?? [],
-    migrations: config.migrations ?? [],
+    // Temporary compatibility for the legacy updater. Fresh installation uses
+    // only the declarative exports map in the release descriptor.
+    migrations: resolveLegacyMigrations(config, JSON.parse(legacyMigrationsText)),
     bindings,
     containers: buildManifestContainers(config),
   };

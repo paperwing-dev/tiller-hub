@@ -127,6 +127,42 @@ describe("workers.dev Access OAuth job routes", () => {
     expect(store.beginWorkersDevAccessJob).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "/api/setup/workers-dev-access/oauth/start",
+    "/api/settings/workers-dev-access/oauth/start",
+  ])("does not expose the legacy broker at %s to installer-managed Hubs", async (path) => {
+    const { env, store } = createEnv();
+    env.TILLER_INSTALLER_SCHEMA = "1";
+
+    const response = await createApp().request(
+      `${job.origin}${path}`,
+      { method: "POST", headers: sameOriginHeaders(job.origin) },
+      env,
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ code: "installer_managed" });
+    expect(store.beginWorkersDevAccessJob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "/api/setup/workers-dev-access/broker/proof",
+    "/api/setup/workers-dev-access/broker/complete",
+  ])("does not expose the legacy broker callback at %s to installer-managed Hubs", async (path) => {
+    const { env, store } = createEnv();
+    env.TILLER_INSTALLER_SCHEMA = "1";
+
+    const response = await createApp().request(
+      `${job.origin}${path}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+      env,
+    );
+
+    expect(response.status).toBe(404);
+    expect(store.verifyWorkersDevAccessJobProof).not.toHaveBeenCalled();
+    expect(store.completeWorkersDevAccessJob).not.toHaveBeenCalled();
+  });
+
   it("rejects a streamed body on an otherwise valid OAuth-start request", async () => {
     const { env, store } = createEnv();
     const response = await createApp().request(

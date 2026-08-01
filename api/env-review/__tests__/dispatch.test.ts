@@ -42,7 +42,6 @@ vi.mock("../runtime-token", () => ({
 }));
 
 vi.mock("../../helpers", () => ({
-  getLocationHintOptions: vi.fn(),
   getPlannerRunStub: vi.fn(() => ({
     startPlannerJob: mocks.startPlannerJob,
   })),

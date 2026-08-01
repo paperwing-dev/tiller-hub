@@ -13,19 +13,7 @@ export {
 
 const ACCESS_ONBOARDING_PATHS = new Set([
   "/health",
-  "/cli/bootstrap",
-  "/api/setup/status",
-  "/api/setup/workers-dev-access/oauth/start",
-  "/api/setup/workers-dev-access/broker/proof",
-  "/api/setup/workers-dev-access/broker/complete",
 ]);
-
-function isAccessOnboardingUiPath(pathname: string): boolean {
-  return !pathname.startsWith("/api/")
-    && !pathname.startsWith("/agents/")
-    && !pathname.startsWith("/parties/")
-    && !pathname.startsWith("/cli/");
-}
 
 export function workersDevOrigin(hostname: string): string {
   try {
@@ -65,10 +53,7 @@ export async function canonicalIngressResponse(
     }
     if (
       workersDevRoute
-      && (
-        ACCESS_ONBOARDING_PATHS.has(url.pathname)
-        || isAccessOnboardingUiPath(url.pathname)
-      )
+      && ACCESS_ONBOARDING_PATHS.has(url.pathname)
     ) {
       return null;
     }

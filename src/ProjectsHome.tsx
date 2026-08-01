@@ -11,6 +11,14 @@ interface ProjectsHomeProps {
   envs: EnvMeta[];
   hubUrl: string;
   toolbar?: ReactNode;
+  onboarding: {
+    dismissed: boolean;
+    modelReady: boolean;
+    executionReady: boolean;
+    machineReady: boolean;
+  } | null;
+  onDismissOnboarding: () => Promise<void>;
+  onOpenSettings: () => void;
   onAddProject: () => void;
   onOpenProject: (repoId: string) => void;
   onProjectDeleted: (repoId: string, deletedEnvSlugs: string[]) => void;
@@ -21,6 +29,9 @@ export default function ProjectsHome({
   envs,
   hubUrl,
   toolbar,
+  onboarding,
+  onDismissOnboarding,
+  onOpenSettings,
   onAddProject,
   onOpenProject,
   onProjectDeleted,
@@ -37,6 +48,15 @@ export default function ProjectsHome({
       </div>
 
       <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-3 px-5 py-5">
+        {onboarding && !onboarding.dismissed && (
+          !onboarding.modelReady || !onboarding.executionReady || !onboarding.machineReady
+        ) && (
+          <OptionalOnboarding
+            onboarding={onboarding}
+            onDismiss={onDismissOnboarding}
+            onOpenSettings={onOpenSettings}
+          />
+        )}
         <div className="flex justify-end">
           <Button type="button" variant="primary" size="sm" onClick={onAddProject}>
             Add Repo
@@ -68,6 +88,51 @@ export default function ProjectsHome({
         )}
       </div>
     </main>
+  );
+}
+
+function OptionalOnboarding({
+  onboarding,
+  onDismiss,
+  onOpenSettings,
+}: {
+  onboarding: NonNullable<ProjectsHomeProps["onboarding"]>;
+  onDismiss: () => Promise<void>;
+  onOpenSettings: () => void;
+}) {
+  const [dismissing, setDismissing] = useState(false);
+  const dismiss = async () => {
+    setDismissing(true);
+    try {
+      await onDismiss();
+    } finally {
+      setDismissing(false);
+    }
+  };
+  return (
+    <section className="border border-kumo-line bg-kumo-elevated p-4" aria-label="Optional onboarding">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-kumo-strong">Finish setting up Tiller</h2>
+          <p className="mt-1 text-xs text-kumo-subtle">
+            These choices are optional. Tiller will prompt again when a feature needs one.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button type="button" variant="secondary" size="sm" onClick={() => void dismiss()} disabled={dismissing}>
+            {dismissing ? "Dismissing…" : "Dismiss"}
+          </Button>
+          <Button type="button" variant="primary" size="sm" onClick={onOpenSettings}>
+            Open settings
+          </Button>
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2 text-xs text-kumo-subtle">
+        <span>Model access: {onboarding.modelReady ? "ready" : "optional"}</span>
+        <span>Execution: {onboarding.executionReady ? "ready" : "optional"}</span>
+        <span>Machine: {onboarding.machineReady ? "connected" : "optional"}</span>
+      </div>
+    </section>
   );
 }
 

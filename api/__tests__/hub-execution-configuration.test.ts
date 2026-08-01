@@ -31,6 +31,7 @@ vi.mock("../predeploy-clean-slate", () => ({
 }));
 
 import { HubDO } from "../hub";
+import { installedAccessBindings } from "./access-binding-fixture";
 import {
   EXECUTION_MIGRATION_KEY,
   EXECUTION_SELECTION_KEY,
@@ -208,7 +209,7 @@ describe("Hub execution configuration migration", () => {
   });
 
   it("retains canonical workers.dev Access records", async () => {
-    const { subject, storage } = createSubject({});
+    const { subject, storage } = createSubject(installedAccessBindings());
     await storage.put(WORKERS_DEV_ACCESS_TRUST_KEY, {
       version: 1,
       workersDevHostname: "demo.preview.workers.dev",
@@ -227,6 +228,23 @@ describe("Hub execution configuration migration", () => {
     await expect(storage.get(WORKERS_DEV_ACCESS_CREDENTIAL_KEY)).resolves.toMatchObject({
       clientId: "canonical-client",
     });
+    storage.close();
+  });
+
+  it("reads legacy Access trust locally instead of recursively RPCing HubDO", async () => {
+    const getHubStub = vi.fn(() => {
+      throw new Error("HubDO must not call its own stub");
+    });
+    const { subject, storage } = createSubject({
+      HUB: { idFromName: vi.fn(() => "hub-id"), get: getHubStub },
+    });
+    await storage.put(WORKERS_DEV_ACCESS_TRUST_KEY, {
+      version: 1,
+      workersDevHostname: "tiller.preview.workers.dev",
+    });
+
+    await expect(subject.ensureExecutionConfiguration()).resolves.toEqual({ target: "cf" });
+    expect(getHubStub).not.toHaveBeenCalled();
     storage.close();
   });
 
@@ -287,11 +305,7 @@ describe("Hub execution configuration migration", () => {
   });
 
   it("does not overwrite a concurrent machine selection after the clean-slate scan", async () => {
-    const { subject, storage } = createSubject({});
-    await storage.put(WORKERS_DEV_ACCESS_TRUST_KEY, {
-      version: 1,
-      workersDevHostname: "demo.preview.workers.dev",
-    });
+    const { subject, storage } = createSubject(installedAccessBindings());
     const service = {
       machineId: "machine-1",
       displayName: "Build Mac",

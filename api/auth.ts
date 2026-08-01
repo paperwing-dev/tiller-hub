@@ -12,7 +12,7 @@ import {
   readCanonicalWorkersDevAccessTrust,
   readWorkersDevAccessTrust,
 } from "./workers-dev-access/records";
-import type { AccessPrincipal, WorkersDevAccessTrustV1 } from "./workers-dev-access/types";
+import type { AccessPrincipal, WorkersDevAccessRuntimeTrust } from "./workers-dev-access/types";
 
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
@@ -119,7 +119,7 @@ export async function verifyCfAccessJwt(request: Request, env: Env): Promise<JWT
 
 function classifyWorkersDevPrincipal(
   payload: JWTPayload,
-  trust: WorkersDevAccessTrustV1,
+  trust: WorkersDevAccessRuntimeTrust,
 ): AccessPrincipal {
   const rawEmail = typeof payload.email === "string" ? payload.email : "";
   const email = normalizeOwnerEmail(rawEmail);
@@ -191,24 +191,22 @@ export async function resolveAuthGuardState(
 type RouteAuthMode =
   | "normal"
   | "public"
-  | "owner";
+  | "owner"
+  | "service";
 
 interface RouteAuthPolicy {
   path: string;
   method?: string;
   mode: RouteAuthMode;
   protectHubAllowlisted?: boolean;
-  canonicalAccessBootstrap?: boolean;
 }
 
 const ROUTE_AUTH_POLICIES: RouteAuthPolicy[] = [
   { path: "/health", mode: "public", protectHubAllowlisted: true },
-  { path: "/api/setup/status", method: "GET", mode: "normal", protectHubAllowlisted: true, canonicalAccessBootstrap: true },
-  { path: "/api/setup/workers-dev-access/oauth/start", method: "POST", mode: "normal", protectHubAllowlisted: true },
-  { path: "/api/setup/workers-dev-access/broker/proof", method: "POST", mode: "public" },
-  { path: "/api/setup/workers-dev-access/broker/complete", method: "POST", mode: "public" },
-  { path: "/api/settings/workers-dev-access/oauth/start", method: "POST", mode: "owner" },
+  { path: "/api/setup/status", method: "GET", mode: "normal" },
   { path: "/api/execution/status", method: "GET", mode: "owner" },
+  { path: "/api/auth/openai/seed", method: "POST", mode: "owner" },
+  { path: "/api/auth/openai/status", method: "GET", mode: "owner" },
   { path: "/api/cli/connect-package", method: "POST", mode: "owner" },
   { path: "/api/github/app-config", method: "POST", mode: "owner" },
   { path: "/api/github/manifest/setup", method: "GET", mode: "owner" },
@@ -216,23 +214,52 @@ const ROUTE_AUTH_POLICIES: RouteAuthPolicy[] = [
   { path: "/api/github/install", method: "GET", mode: "owner" },
   { path: "/api/github/install/callback", method: "GET", mode: "owner" },
   { path: "/api/github/manage", method: "GET", mode: "owner" },
+  { path: "/api/setup/workers-dev-access/oauth/start", method: "POST", mode: "owner" },
+  { path: "/api/settings/workers-dev-access/oauth/start", method: "POST", mode: "owner" },
+  // The legacy broker authenticates these callbacks with its one-time job
+  // secret. They must remain externally reachable while the fallback exists.
+  { path: "/api/setup/workers-dev-access/broker/proof", method: "POST", mode: "public" },
+  { path: "/api/setup/workers-dev-access/broker/complete", method: "POST", mode: "public" },
   { path: "/api/update/hub-repo/detect", method: "POST", mode: "owner" },
   { path: "/api/update/hub-repo/select", method: "POST", mode: "owner" },
   { path: "/api/update/apply", method: "POST", mode: "owner" },
   { path: "/api/update/repair/cloudflare-redeploy", method: "POST", mode: "owner" },
-  { path: "/cli/bootstrap", method: "GET", mode: "public" },
+  { path: "/api/installer/probe", method: "GET", mode: "service" },
   { path: "/api/github/webhook", method: "POST", mode: "public" },
-  { path: "/api/mcp/cloudflare", method: "GET", mode: "public" },
-  { path: "/api/mcp/cloudflare", method: "POST", mode: "public" },
-  { path: "/api/mcp/cloudflare", method: "DELETE", mode: "public" },
+  // Runtime containers authenticate with the Access service principal, then
+  // prove a separately scoped and short-lived GitHub bridge capability in the
+  // route handler before a repository token can be minted.
+  { path: "/api/github/token", method: "GET", mode: "normal" },
 ];
 
+function repositoryRoutePolicy(path: string, method: string): RouteAuthPolicy | null {
+  if (path === "/api/repos") {
+    return { path, method, mode: method === "GET" ? "normal" : "owner" };
+  }
+  if (!path.startsWith("/api/repos/")) return null;
+
+  const segments = path.slice("/api/repos/".length).split("/").filter(Boolean);
+  if (segments.length === 1) {
+    return { path, method, mode: method === "GET" ? "normal" : "owner" };
+  }
+
+  // The CLI and runtime surfaces need repository projections and artifact/plan
+  // operations. Every other repository family is owner-only by default so a
+  // new settings or administration route cannot silently inherit the shared
+  // Access service principal.
+  const family = segments[1];
+  if (family === "artifacts" || family === "plans") {
+    return { path, method, mode: "normal" };
+  }
+  if (family === "planner-providers" && method === "GET") {
+    return { path, method, mode: "normal" };
+  }
+  return { path, method, mode: "owner" };
+}
+
 function resolveRouteAuthPolicy(path: string, method: string): RouteAuthPolicy {
-  if (
-    method === "POST" &&
-    /^\/api\/envs\/[^/]+\/github\/publish-draft-pr\/[^/]+\/result$/.test(path)
-  ) {
-    return { path, method, mode: "public" };
+  if (method === "POST" && /^\/api\/sessions\/[^/]+\/permissions\/[^/]+$/.test(path)) {
+    return { path, method, mode: "owner" };
   }
   const explicit = ROUTE_AUTH_POLICIES.find((policy) => {
     return policy.path === path && (!policy.method || policy.method === method);
@@ -244,30 +271,12 @@ function resolveRouteAuthPolicy(path: string, method: string): RouteAuthPolicy {
   if (path === "/api/settings" || path.startsWith("/api/settings/")) {
     return { path, method, mode: "owner" };
   }
-  return { path, method, mode: "normal" };
-}
-
-async function verifyCanonicalAccessBootstrap(request: Request, env: Env): Promise<void> {
-  const hostname = new URL(request.url).hostname;
-  const trust = await readWorkersDevAccessTrust(env, hostname);
-  if (!trust) throw new Error("Canonical workers.dev Access trust is not available");
-  const token = request.headers.get("Cf-Access-Jwt-Assertion")?.trim() ?? "";
-  if (!token) throw new Error("Missing Cf-Access-Jwt-Assertion");
-  const payload = await verifyCloudflareAccessToken(token, {
-    audience: trust.audience,
-    issuer: trust.issuer,
-    jwksUrl: accessCertsUrl(trust.issuer),
-  });
-  classifyWorkersDevPrincipal(payload, trust);
-}
-
-async function tryVerifyCanonicalAccessBootstrap(request: Request, env: Env): Promise<boolean> {
-  try {
-    await verifyCanonicalAccessBootstrap(request, env);
-    return true;
-  } catch {
-    return false;
+  if (path === "/api/github" || path.startsWith("/api/github/")) {
+    return { path, method, mode: "owner" };
   }
+  const repoPolicy = repositoryRoutePolicy(path, method);
+  if (repoPolicy) return repoPolicy;
+  return { path, method, mode: "normal" };
 }
 
 function setupProtectionRequiredResponse(): Response {
@@ -280,11 +289,6 @@ function setupProtectionRequiredResponse(): Response {
 
 function unauthorizedResponse(): Response {
   return Response.json({ error: "Unauthorized" }, { status: 401 });
-}
-
-function isPublicSetupApiAllowed(path: string, method: string): boolean {
-  return (path === "/api/setup/status" && method === "GET")
-    || (path === "/api/setup/workers-dev-access/oauth/start" && method === "POST");
 }
 
 export async function hubAuthGuardResponse(
@@ -304,6 +308,17 @@ export async function hubAuthGuardResponse(
     return setupProtectionRequiredResponse();
   }
 
+  if (policy.mode === "service") {
+    try {
+      const principal = await authenticateAccessRequest(request, env);
+      return principal.kind === "service"
+        ? null
+        : Response.json({ error: "Service principal required" }, { status: 403 });
+    } catch {
+      return unauthorizedResponse();
+    }
+  }
+
   if (state.isLocalDev) return null;
 
   if (policy.mode === "owner") {
@@ -315,21 +330,11 @@ export async function hubAuthGuardResponse(
     }
   }
 
-  if (
-    policy.canonicalAccessBootstrap
-    && await tryVerifyCanonicalAccessBootstrap(request, env)
-  ) {
-    return null;
-  }
-
   if (options.skipNormalAuthForWebSocket && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
     return null;
   }
 
   if (state.protection.protectionMode !== "cf-access") {
-    if (path.startsWith("/api/setup") && !isPublicSetupApiAllowed(path, request.method)) {
-      return unauthorizedResponse();
-    }
     return null;
   }
 
@@ -345,9 +350,9 @@ export const dynamicEntrypointAuthResponse = hubAuthGuardResponse;
 
 /**
  * Hono middleware — verifies CF Access JWT.
- * Skips /health and WebSocket upgrades (WS auth happens in onConnect).
- * Public hubs skip auth here. Protected hubs require a valid Access JWT or the
- * stored Access service token at the Worker boundary.
+ * Allows only the exact public routes selected above and skips WebSocket
+ * upgrades (WS auth happens in onConnect). Protected hubs require a valid
+ * Access JWT at the Worker boundary, with owner-only routes classified above.
  */
 export const authMiddleware = createMiddleware<HonoEnv>(async (c, next) => {
   const blocked = await hubAuthGuardResponse(c.req.raw, c.env, {

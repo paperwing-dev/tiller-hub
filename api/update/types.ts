@@ -1,13 +1,33 @@
-export interface UpdateCheckResult {
+interface UpdateCheckResultBase {
   updateAvailable: boolean;
   currentUpdate: TillerUpdateMetadata;
-  latestUpdate: TillerUpdateMetadata;
   buildDiagnostics: UpdateBuildDiagnostics;
-  hubRepo: HubUpdateRepoState;
-  updateMethod: "github_repo" | "connect_hub_repo" | "advanced_repair";
   issue?: UpdateIssue;
+}
+
+export interface StableReleaseSummary {
+  releaseId: string;
+  version: string;
   releaseNotesUrl: string;
 }
+
+export interface InstallerMaintenanceUpdateCheckResult extends UpdateCheckResultBase {
+  kind: "installer-maintenance";
+  installedReleaseId: string;
+  stableRelease: StableReleaseSummary | null;
+}
+
+export interface LegacyUpdateCheckResult extends UpdateCheckResultBase {
+  kind: "legacy";
+  latestUpdate: TillerUpdateMetadata;
+  hubRepo: HubUpdateRepoState;
+  updateMethod: "github_repo" | "connect_hub_repo" | "advanced_repair";
+  releaseNotesUrl: string;
+}
+
+export type UpdateCheckResult =
+  | InstallerMaintenanceUpdateCheckResult
+  | LegacyUpdateCheckResult;
 
 export interface TillerUpdateMetadata {
   schemaVersion: 1;

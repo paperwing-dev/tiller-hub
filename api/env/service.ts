@@ -1,7 +1,6 @@
 import {
   getEnvLifecycleStub,
   getEnvReviewStub,
-  getLocationHintOptions,
   getWorkspaceStub,
 } from "../helpers";
 import type { HubDO } from "../hub";
@@ -38,7 +37,7 @@ export function getHub(
   | "revokeCloudflareMcpProxyTokensForStart"
 > {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as Pick<
+  return env.HUB.get(hubId) as unknown as Pick<
     HubDO,
     | "broadcastEnvUpsert"
     | "broadcastEnvRemove"

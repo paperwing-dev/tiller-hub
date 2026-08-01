@@ -23,7 +23,6 @@ vi.mock("../../env/view", () => ({
 }));
 
 vi.mock("../../helpers", () => ({
-  getLocationHintOptions: vi.fn(() => undefined),
   getWorkspaceStub: mocks.getWorkspaceStub,
   getThreadStub: vi.fn(),
 }));

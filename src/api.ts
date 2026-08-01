@@ -58,6 +58,9 @@ import type {
 import type {
   HubUpdateRepoCandidate,
   HubUpdateRepoState,
+  InstallerMaintenanceUpdateCheckResult,
+  LegacyUpdateCheckResult,
+  StableReleaseSummary,
   TillerUpdateMetadata,
   UpdateApplyResult,
   UpdateBuildDiagnostics,
@@ -913,6 +916,14 @@ function normalizeUpdateMetadata(payload: unknown): TillerUpdateMetadata | null 
   const label = readString(payload.label);
   const managedFiles = normalizeStringArray(payload.managedFiles);
   if (!sourceId || !version || !label || managedFiles.length === 0) return null;
+  const selfHostRuntime = isRecord(payload.selfHostRuntime)
+    && typeof payload.selfHostRuntime.imageSourceId === "string"
+    && typeof payload.selfHostRuntime.sandboxImage === "string"
+    ? {
+        imageSourceId: payload.selfHostRuntime.imageSourceId,
+        sandboxImage: payload.selfHostRuntime.sandboxImage,
+      }
+    : null;
   return {
     schemaVersion: 1,
     channel: "deploy-button",
@@ -922,6 +933,7 @@ function normalizeUpdateMetadata(payload: unknown): TillerUpdateMetadata | null 
     version,
     label,
     managedFiles,
+    ...(selfHostRuntime ? { selfHostRuntime } : {}),
   };
 }
 
@@ -1018,32 +1030,58 @@ function normalizeBuildDiagnostics(payload: unknown): UpdateBuildDiagnostics {
 function normalizeUpdateCheckResult(payload: unknown): UpdateCheckResult | null {
   if (!isRecord(payload)) return null;
   const currentUpdate = normalizeUpdateMetadata(payload.currentUpdate);
-  const latestUpdate = normalizeUpdateMetadata(payload.latestUpdate);
-  const releaseNotesUrl = readString(payload.releaseNotesUrl) ?? "https://github.com/paperwing-dev/tiller-hub";
-  if (typeof payload.updateAvailable !== "boolean" || !currentUpdate || !latestUpdate || !releaseNotesUrl) {
+  if (typeof payload.updateAvailable !== "boolean" || !currentUpdate) {
     return null;
   }
 
-  return {
+  const issue = isRecord(payload.issue) && readString(payload.issue.code) && readString(payload.issue.message)
+    ? {
+        code: readString(payload.issue.code) as NonNullable<UpdateCheckResult["issue"]>["code"],
+        message: readString(payload.issue.message) ?? "",
+        retryable: readBooleanOr(payload.issue.retryable, false),
+      }
+    : null;
+  const common = {
     updateAvailable: payload.updateAvailable,
     currentUpdate,
-    latestUpdate,
     buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
+    ...(issue ? { issue } : {}),
+  };
+
+  if (payload.kind === "installer-maintenance") {
+    const installedReleaseId = readString(payload.installedReleaseId);
+    let stableRelease: StableReleaseSummary | null = null;
+    if (payload.stableRelease !== null) {
+      if (!isRecord(payload.stableRelease)) return null;
+      const releaseId = readString(payload.stableRelease.releaseId);
+      const version = readString(payload.stableRelease.version);
+      const releaseNotesUrl = readString(payload.stableRelease.releaseNotesUrl);
+      if (!releaseId || !version || !releaseNotesUrl) return null;
+      stableRelease = { releaseId, version, releaseNotesUrl };
+    }
+    if (!installedReleaseId) return null;
+    return {
+      kind: "installer-maintenance",
+      ...common,
+      installedReleaseId,
+      stableRelease,
+    } satisfies InstallerMaintenanceUpdateCheckResult;
+  }
+
+  if (payload.kind !== "legacy") return null;
+  const latestUpdate = normalizeUpdateMetadata(payload.latestUpdate);
+  const releaseNotesUrl = readString(payload.releaseNotesUrl);
+  if (!latestUpdate || !releaseNotesUrl) return null;
+  return {
+    kind: "legacy",
+    ...common,
+    latestUpdate,
     hubRepo: normalizeHubUpdateRepoState(payload.hubRepo),
     updateMethod: payload.updateMethod === "github_repo" || payload.updateMethod === "connect_hub_repo" || payload.updateMethod === "advanced_repair"
       ? payload.updateMethod
       : "advanced_repair",
-    ...(isRecord(payload.issue) && readString(payload.issue.code) && readString(payload.issue.message)
-      ? {
-          issue: {
-            code: readString(payload.issue.code) as NonNullable<UpdateCheckResult["issue"]>["code"],
-            message: readString(payload.issue.message) ?? "",
-            retryable: readBooleanOr(payload.issue.retryable, false),
-          },
-        }
-      : {}),
     releaseNotesUrl,
-  };
+  } satisfies LegacyUpdateCheckResult;
 }
 
 export class ApiActionError extends Error {
@@ -1063,6 +1101,9 @@ export class ApiActionError extends Error {
 export type {
   HubUpdateRepoCandidate,
   HubUpdateRepoState,
+  InstallerMaintenanceUpdateCheckResult,
+  LegacyUpdateCheckResult,
+  StableReleaseSummary,
   TillerUpdateMetadata,
   UpdateApplyResult,
   UpdateBuildDiagnostics,
@@ -1113,6 +1154,7 @@ function normalizeRepoArtifactState(
 const SETUP_BOOLEAN_FIELDS = [
   "needsSetup",
   "isLocalDev",
+  "installerManaged",
   "modelAuthConfigured",
   "workersAiConfigured",
   "hasClaudeSubscription",
@@ -1151,6 +1193,7 @@ const SETUP_STATUS_KEYS = [
   "githubAppManageUrl",
   "buildDiagnostics",
   "selfUpdateRepo",
+  "dashboardOnboarding",
 ] as const;
 
 function isNullableSetupString(value: unknown): boolean {
@@ -1168,13 +1211,10 @@ function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void
   }
   if (
     (
-      payload.setupPhase !== "protect-hub"
-      && payload.setupPhase !== "github-app"
-      && payload.setupPhase !== "model-access"
+      payload.setupPhase !== "github-app"
       && payload.setupPhase !== "complete"
     )
     || payload.needsSetup !== (payload.setupPhase !== "complete")
-    || (payload.setupPhase === "protect-hub" && typeof payload.workersDevHubUrl !== "string")
     || (payload.protectionMode !== "public" && payload.protectionMode !== "cf-access")
     || !Array.isArray(payload.enabledHarnesses)
     || payload.enabledHarnesses.length === 0
@@ -1192,6 +1232,9 @@ function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void
     || !isCodexRouteStatus(payload.codexBackendReadiness.host)
     || !isRecord(payload.buildDiagnostics)
     || !isRecord(payload.selfUpdateRepo)
+    || !isRecord(payload.dashboardOnboarding)
+    || typeof payload.dashboardOnboarding.dismissed !== "boolean"
+    || typeof payload.dashboardOnboarding.executionReady !== "boolean"
   ) {
     throw new Error("Malformed setup status: current setup schema is required.");
   }
@@ -1243,6 +1286,10 @@ function normalizeSetupStatus(payload: unknown): SetupStatus {
     codexBackendReadiness: { ...current.codexBackendReadiness },
     buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
     selfUpdateRepo: normalizeHubUpdateRepoState(payload.selfUpdateRepo),
+    dashboardOnboarding: {
+      dismissed: current.dashboardOnboarding.dismissed,
+      executionReady: current.dashboardOnboarding.executionReady,
+    },
   };
 }
 
@@ -3149,8 +3196,9 @@ export async function disconnectRepoCloudflareMcp(
 
 export interface SetupStatus {
   needsSetup: boolean;
-  setupPhase: "protect-hub" | "github-app" | "model-access" | "complete";
+  setupPhase: "github-app" | "complete";
   isLocalDev: boolean;
+  installerManaged: boolean;
   workersDevHubUrl: string | null;
   modelAuthConfigured: boolean;
   claudeBillingMode: BillingMode | null;
@@ -3184,6 +3232,10 @@ export interface SetupStatus {
   githubAppPublicHubDisabled: boolean;
   buildDiagnostics: UpdateBuildDiagnostics;
   selfUpdateRepo: HubUpdateRepoState;
+  dashboardOnboarding: {
+    dismissed: boolean;
+    executionReady: boolean;
+  };
 }
 
 export type ExecutionSelection =
@@ -3307,6 +3359,15 @@ export async function fetchSetupStatus(hubUrl: string): Promise<SetupStatus> {
   });
   if (!res.ok) throw new Error(`Failed to fetch setup status: ${res.status}`);
   return normalizeSetupStatus(await res.json().catch(() => null));
+}
+
+export async function dismissDashboardOnboarding(hubUrl: string): Promise<void> {
+  const response = await fetch(`${hubUrl}/api/setup/onboarding/dismiss`, {
+    method: "POST",
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!response.ok) throw await parseApiError(response, "Failed to dismiss dashboard onboarding.");
 }
 
 export interface SeedOpenAIAuthInput {

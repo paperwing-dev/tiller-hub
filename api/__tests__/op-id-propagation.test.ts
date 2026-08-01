@@ -18,7 +18,6 @@ vi.mock("../helpers", () => ({
     destroySandbox: vi.fn(),
     fetch: vi.fn(),
   })),
-  getLocationHintOptions: vi.fn(() => undefined),
 }));
 
 vi.mock("../setup/config", () => ({

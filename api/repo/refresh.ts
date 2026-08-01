@@ -1,4 +1,3 @@
-import { getLocationHintOptions } from "../helpers";
 import type { HubDO } from "../hub";
 import {
   patchRepoDefaultHeadIfCurrent,
@@ -27,7 +26,7 @@ type RepoRefreshHub = Pick<HubDO, "broadcastRepoUpsert" | "broadcastRepoMainChan
 
 function getHub(env: Env): RepoRefreshHub {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as RepoRefreshHub;
+  return env.HUB.get(hubId) as unknown as RepoRefreshHub;
 }
 
 function successResult(args: {

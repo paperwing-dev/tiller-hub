@@ -1,14 +1,13 @@
 import { Hono } from "hono";
 import type { HonoEnv, Env } from "../types";
-import { getLocationHintOptions, getSandboxStub } from "../helpers";
+import { getSandboxStub } from "../helpers";
 import { listEnvViews } from "../env/view";
 import { getIdleTimeoutMinutes, getSecret, invalidateConfigCache } from "./config";
 import {
+  DASHBOARD_ONBOARDING_DISMISSED_KEY,
   resolveSetupStatus,
-  resolveWorkersDevAccessOnboardingStatus,
 } from "./status-resolver";
 import { isLocalDevRequest } from "../protection";
-import { parseCanonicalWorkersDevHostname } from "../canonical-workers-dev";
 import { readWorkersDevAccessLifecycle } from "../workers-dev-access/records";
 import {
   CLOUDFLARE_IDLE_TIMEOUT_MAX_MINUTES,
@@ -32,7 +31,7 @@ type ConfigurableKey = typeof CONFIGURABLE_KEYS extends Set<infer T> ? T : never
 
 function getHub(env: Env) {
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as {
+  return env.HUB.get(id) as unknown as {
     setConfig(key: string, value: string): void;
   };
 }
@@ -46,9 +45,10 @@ setupRoutes.get("/api/setup/status", async (c) => {
   if (!isLocalDevRequest(c.env, c.req.raw)) {
     const lifecycle = await readWorkersDevAccessLifecycle(c.env);
     if (!lifecycle.configured) {
-      const origin = new URL(c.req.url).origin;
-      parseCanonicalWorkersDevHostname(new URL(c.req.url).hostname);
-      return c.json(resolveWorkersDevAccessOnboardingStatus(c.env, origin));
+      return c.json({
+        error: "Installer-managed Cloudflare Access bindings are missing or invalid.",
+        code: "access_repair_required",
+      }, 503);
     }
   }
   return c.json(await resolveSetupStatus(c.env, c.req.raw));
@@ -134,6 +134,12 @@ setupRoutes.post("/api/setup", async (c) => {
   }
 
   return c.json({ ok: true, saved: [...entries, ...settingEntries].map(([k]) => k) });
+});
+
+setupRoutes.post("/api/setup/onboarding/dismiss", async (c) => {
+  await getHub(c.env).setConfig(DASHBOARD_ONBOARDING_DISMISSED_KEY, "1");
+  invalidateConfigCache();
+  return c.json({ ok: true });
 });
 
 setupRoutes.post("/api/setup/verify-model-auth", async (c) => {

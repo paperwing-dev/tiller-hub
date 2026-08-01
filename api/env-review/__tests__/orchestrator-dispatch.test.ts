@@ -28,7 +28,6 @@ vi.mock("../dispatch", () => ({
   destroyEnvReviewRuntimeJob: mocks.destroyEnvReviewRuntimeJob,
 }));
 vi.mock("../../helpers", () => ({
-  getLocationHintOptions: vi.fn(),
   getThreadStub: vi.fn(() => ({ listMessages: vi.fn(async () => []) })),
   getWorkspaceStub: vi.fn(),
 }));

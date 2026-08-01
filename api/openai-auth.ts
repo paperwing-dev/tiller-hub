@@ -1,4 +1,3 @@
-import { getLocationHintOptions } from "./helpers";
 import type { Env } from "./types";
 import {
   OpenAIAuthBroker,
@@ -36,7 +35,7 @@ function hasHub(env: Env): boolean {
 
 function hub(env: Env): OpenAIAuthHub {
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as OpenAIAuthHub;
+  return env.HUB.get(id) as unknown as OpenAIAuthHub;
 }
 
 function fallbackBroker(env: Env): OpenAIAuthBroker {

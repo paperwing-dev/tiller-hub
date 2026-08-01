@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { HonoEnv } from "../types";
-import { getArtifactStoreStub, getLocationHintOptions, getThreadStub } from "../helpers";
+import { getArtifactStoreStub, getThreadStub } from "../helpers";
 import { renderArtifactBodyMarkdown, type PlannerRun } from "../coordination";
 import {
   isCurrentLaunchProvenance,
@@ -113,7 +113,7 @@ async function loadAuthorizedPlanWriter(c: any, runtimeAuth = false) {
 async function broadcastPlanWriterHints(c: any, repoId: string, planArtifactId: string, artifactUpdated: boolean) {
   try {
     const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId, getLocationHintOptions(c.env)) as unknown as {
+    const hub = c.env.HUB.get(hubId) as unknown as {
       broadcastPlanWriterState(repoId: string, planArtifactId: string): void | Promise<void>;
       broadcastPlanArtifactUpdated(repoId: string, planArtifactId: string): void | Promise<void>;
     };
@@ -459,7 +459,7 @@ plannerRuntimeRoutes.post(
     const terminalId = planWriterTerminalId(loaded.repoId, loaded.planArtifactId, loaded.generation);
     try {
       const hubId = c.env.HUB.idFromName("hub");
-      const hub = c.env.HUB.get(hubId, getLocationHintOptions(c.env)) as unknown as {
+      const hub = c.env.HUB.get(hubId) as unknown as {
         revokePlanWriterTerminal(id: string, repoId: string, planArtifactId: string, generation: number): void | Promise<void>;
       };
       await hub.revokePlanWriterTerminal(terminalId, loaded.repoId, loaded.planArtifactId, loaded.generation);

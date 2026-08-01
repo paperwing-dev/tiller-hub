@@ -9,7 +9,6 @@ import {
   parseMachineServiceState,
 } from "./machine-service-state";
 import { readOptionalConfigValue } from "./config-row";
-import { getLocationHintOptions } from "./helpers";
 import { readTerminalScopeFromStoredSession } from "./session-attachment";
 import { classifyHostRuntimeCompatibility } from "./setup/runtime-compatibility";
 import { isLocalOnlyRunnerBackendMode } from "./env/runner-backend";
@@ -35,6 +34,7 @@ import {
   WORKERS_DEV_ACCESS_TRUST_KEY,
   isRenewalRecommended,
   normalizeWorkersDevHostname,
+  readCanonicalWorkersDevAccessTrust,
 } from "./workers-dev-access/records";
 import {
   EXECUTION_MIGRATION_KEY,
@@ -1760,7 +1760,7 @@ export class HubDO extends Server<Env> {
   private getSessionThreadStub(sessionId: string): ThreadDO | null {
     if (!this.env.THREAD) return null;
     const id = this.env.THREAD.idFromName(this.getSessionThreadId(sessionId));
-    return this.env.THREAD.get(id, getLocationHintOptions(this.env)) as unknown as ThreadDO;
+    return this.env.THREAD.get(id) as unknown as ThreadDO;
   }
 
   private threadMessageToStoredMessage(sessionId: string, message: ThreadMessage): StoredMessage {
@@ -2448,11 +2448,14 @@ export class HubDO extends Server<Env> {
    * One-way clean-slate configuration migration. It records the identifiers
    * an operator may need for later manual cleanup before clearing the legacy
    * custom-domain and deployment-mode state. It never calls Cloudflare.
-   */
+  */
   async ensureExecutionConfiguration(): Promise<ExecutionSelection> {
-    const trust = await this.ctx.storage.get<WorkersDevAccessTrustV1>(
-      WORKERS_DEV_ACCESS_TRUST_KEY,
-    );
+    // The binding-backed branch is safe for fresh Hubs. A legacy Hub must read
+    // its own storage directly; RPCing env.HUB from inside HubDO would call the
+    // currently executing object recursively.
+    const trust = this.env.TILLER_INSTALLER_SCHEMA?.trim()
+      ? await readCanonicalWorkersDevAccessTrust(this.env)
+      : await this.ctx.storage.get<WorkersDevAccessTrustV1>(WORKERS_DEV_ACCESS_TRUST_KEY);
     const localOnly = isLocalOnlyRunnerBackendMode(this.env);
     if (
       !localOnly

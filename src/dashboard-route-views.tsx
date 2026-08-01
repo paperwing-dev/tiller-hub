@@ -1,7 +1,7 @@
 import { Navigate, useNavigate, useParams } from 'react-router-dom';
 import { Button } from '@cloudflare/kumo/components/button';
 import type { EnvMeta, RepoMeta } from '../api/types';
-import { useDashboardData } from './DashboardDataProvider';
+import { getUpdateDismissalSourceId, useDashboardData } from './DashboardDataProvider';
 import SessionView from './SessionView';
 import EnvWaitingView from './EnvWaitingView';
 import PlanView from './PlanView';
@@ -28,6 +28,14 @@ import {
 export function ProjectsHomeRoute() {
   const data = useDashboardData();
   const navigate = useNavigate();
+  const setupStatus = data.setupStatus;
+  const onboarding = setupStatus
+    ? {
+        ...setupStatus.dashboardOnboarding,
+        modelReady: setupStatus.modelAuthConfigured,
+        machineReady: setupStatus.hostConnected,
+      }
+    : null;
   return (
     <div className="relative min-h-screen bg-kumo-base">
       <ProjectsHome
@@ -35,6 +43,9 @@ export function ProjectsHomeRoute() {
         envs={data.envs}
         hubUrl={data.hubUrl}
         toolbar={<StatusActions />}
+        onboarding={onboarding}
+        onDismissOnboarding={data.dismissDashboardOnboarding}
+        onOpenSettings={() => navigate('/settings')}
         onAddProject={() => data.setShowNewRepo(true)}
         onOpenProject={(repoId) => navigate(projectPath(repoId))}
         onProjectDeleted={data.handleDashboardRepoDeleted}
@@ -53,6 +64,8 @@ export function SettingsRoute() {
     <HomeSettingsFrame>
       <SettingsPage
         status={data.setupStatus}
+        updateStatus={data.updateStatus}
+        isCheckingUpdate={data.isCheckingUpdate}
         onRefresh={data.refreshSetupStatus}
         onDone={() => navigate('/', { replace: true })}
       />
@@ -81,9 +94,10 @@ export function UpdateRoute() {
         issueCode={data.updateIssueCode}
         isChecking={data.isCheckingUpdate}
         hasExecutionMachine={Boolean(data.setupStatus?.hostRegistered)}
+        renewalRecommended={data.setupStatus?.renewalRecommended ?? false}
         onDismiss={() => {
           if (data.updateStatus) {
-            dismissUpdate(data.updateStatus.latestUpdate.sourceId);
+            dismissUpdate(getUpdateDismissalSourceId(data.updateStatus));
           }
           navigate('/', { replace: true });
         }}
@@ -165,6 +179,8 @@ export function WorkspaceSettingsRoute() {
   return (
     <SettingsPage
       status={data.setupStatus}
+      updateStatus={data.updateStatus}
+      isCheckingUpdate={data.isCheckingUpdate}
       onRefresh={data.refreshSetupStatus}
       onDone={() => navigate(projectPath(repoId), { replace: true })}
     />

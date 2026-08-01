@@ -18,10 +18,9 @@
 			"binding": "LOADER"
 		}
 	],
-		"vars": {
-			"DO_LOCATION_HINT": "wnam",
-			"LOCAL_DEV_ONLY_BACKEND": "true"
-		},
+	"vars": {
+		"LOCAL_DEV_ONLY_BACKEND": "true"
+	},
 	"durable_objects": {
 		"bindings": [
 			{
@@ -64,163 +63,20 @@
 				"name": "REVIEWER_CHAT",
 				"class_name": "ReviewerChatAgent"
 			}
-		]
+			]
+		},
+	"exports": {
+		"ScheduledRunCapacityDO": { "type": "durable-object", "storage": "sqlite" },
+		"EnvLifecycleDO": { "type": "durable-object", "storage": "sqlite" },
+		"ArtifactStoreDO": { "type": "durable-object", "storage": "sqlite" },
+		"HubDO": { "type": "durable-object", "storage": "sqlite" },
+		"SandboxDO": { "type": "durable-object", "storage": "sqlite" },
+		"TillerVoice": { "type": "durable-object", "storage": "sqlite" },
+		"GitHubJobDO": { "type": "durable-object", "storage": "sqlite" },
+		"ThreadDO": { "type": "durable-object", "storage": "sqlite" },
+		"WorkspaceDO": { "type": "durable-object", "storage": "sqlite" },
+		"ReviewerChatAgent": { "type": "durable-object", "storage": "sqlite" }
 	},
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": [
-				"HubDO"
-			]
-		},
-		{
-			"tag": "v2",
-			"new_classes": [
-				"VoiceDO"
-			]
-		},
-		{
-			"tag": "v3",
-			"deleted_classes": [
-				"VoiceDO"
-			],
-			"new_sqlite_classes": [
-				"HapiVoice"
-			]
-		},
-		{
-			"tag": "v4",
-			"renamed_classes": [
-				{
-					"from": "HapiVoice",
-					"to": "HelmVoice"
-				}
-			]
-		},
-		{
-			"tag": "v5",
-			"new_sqlite_classes": [
-				"SandboxDO"
-			]
-		},
-		{
-			"tag": "v6",
-			"new_sqlite_classes": [
-				"WorkspaceDO"
-			]
-		},
-		{
-			"tag": "v7",
-			"new_sqlite_classes": [
-				"ResearchChatAgent"
-			]
-		},
-		{
-			"tag": "v8",
-			"new_sqlite_classes": [
-				"ReviewerChatAgent"
-			]
-		},
-		{
-			"tag": "v9",
-			"new_sqlite_classes": [
-				"PlannerChatAgent"
-			]
-		},
-		{
-			"tag": "v10",
-			"new_sqlite_classes": [
-				"CartographerChatAgent"
-			]
-		},
-		{
-			"tag": "v11",
-			"new_sqlite_classes": [
-				"PlanChatAgent"
-			]
-		},
-		{
-			"tag": "v12",
-			"renamed_classes": [
-				{
-					"from": "HelmVoice",
-					"to": "TillerVoice"
-				}
-			]
-		},
-		{
-			"tag": "v13",
-			"new_sqlite_classes": [
-				"RepoMergeLockDO"
-			]
-		},
-		{
-			"tag": "v14",
-			"new_sqlite_classes": [
-				"ScmBootstrapDO"
-			]
-		},
-		{
-			"tag": "v15",
-			"new_sqlite_classes": [
-				"EnvLifecycleDO"
-			]
-		},
-		{
-			"tag": "v16",
-			"new_sqlite_classes": [
-				"ArtifactStoreDO"
-			]
-		},
-		{
-			"tag": "v17",
-			"new_sqlite_classes": [
-				"ScmOperationDO"
-			]
-		},
-		{
-			"tag": "v18",
-			"deleted_classes": [
-				"PlannerChatAgent"
-			]
-		},
-		{
-			"tag": "v19",
-			"deleted_classes": [
-				"ResearchChatAgent",
-				"CartographerChatAgent"
-			]
-		},
-		{
-			"tag": "v20",
-			"new_sqlite_classes": [
-				"ThreadDO"
-			]
-		},
-		{
-			"tag": "v21",
-			"deleted_classes": [
-				"PlanChatAgent"
-			]
-		},
-		{
-			"tag": "v22",
-			"new_sqlite_classes": [
-				"GitHubJobDO"
-			],
-			"deleted_classes": [
-				"RepoMergeLockDO",
-				"ScmOperationDO",
-				"ScmBootstrapDO"
-			]
-		},
-		{
-			"tag": "v23",
-			"new_sqlite_classes": [
-				"ScheduledRunCapacityDO"
-			]
-		}
-	],
 	"r2_buckets": [
 		{
 			"binding": "BUCKET"

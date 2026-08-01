@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { describeUpdateButtonState } from "../UpdateBadge";
-import type { TillerUpdateMetadata, UpdateCheckResult } from "../api";
+import type {
+  InstallerMaintenanceUpdateCheckResult,
+  LegacyUpdateCheckResult,
+  TillerUpdateMetadata,
+} from "../api";
 
 function updateMarker(sourceId: string, version: string): TillerUpdateMetadata {
   return {
@@ -15,10 +19,11 @@ function updateMarker(sourceId: string, version: string): TillerUpdateMetadata {
   };
 }
 
-function updateStatus(overrides: Partial<UpdateCheckResult> = {}): UpdateCheckResult {
+function updateStatus(overrides: Partial<LegacyUpdateCheckResult> = {}): LegacyUpdateCheckResult {
   const currentUpdate = updateMarker("current-source", "0.1.0");
   const latestUpdate = updateMarker("latest-source", "0.2.0");
   return {
+    kind: "legacy",
     updateAvailable: true,
     currentUpdate,
     latestUpdate,
@@ -35,6 +40,30 @@ function updateStatus(overrides: Partial<UpdateCheckResult> = {}): UpdateCheckRe
   };
 }
 
+function installerUpdateStatus(
+  overrides: Partial<InstallerMaintenanceUpdateCheckResult> = {},
+): InstallerMaintenanceUpdateCheckResult {
+  const currentUpdate = updateMarker("current-source", "0.1.0");
+  return {
+    kind: "installer-maintenance",
+    updateAvailable: true,
+    installedReleaseId: "a".repeat(40),
+    stableRelease: {
+      releaseId: "b".repeat(40),
+      version: "0.2.0",
+      releaseNotesUrl: "https://example.com/release",
+    },
+    currentUpdate,
+    buildDiagnostics: {
+      channel: "release",
+      version: "0.1.0",
+      workersCiCommitSha: null,
+      workersCiBranch: null,
+    },
+    ...overrides,
+  };
+}
+
 describe("describeUpdateButtonState", () => {
   it("disables the button when the self-update check fails", () => {
     expect(describeUpdateButtonState({
@@ -46,6 +75,7 @@ describe("describeUpdateButtonState", () => {
       title: "Update unavailable: Latest tiller-hub release is not accessible.",
       tooltip: "Update unavailable: Latest tiller-hub release is not accessible.",
       enabled: false,
+      label: "Update",
     });
   });
 
@@ -59,6 +89,7 @@ describe("describeUpdateButtonState", () => {
       title: "Update available: v0.1.0 -> v0.2.0",
       tooltip: "Update available",
       enabled: true,
+      label: "Update",
     });
   });
 
@@ -72,6 +103,7 @@ describe("describeUpdateButtonState", () => {
       title: "No update available",
       tooltip: "No update available",
       enabled: false,
+      label: "Update",
     });
 
     expect(describeUpdateButtonState({
@@ -83,6 +115,7 @@ describe("describeUpdateButtonState", () => {
       title: "Update dismissed",
       tooltip: "Update dismissed",
       enabled: false,
+      label: "Update",
     });
   });
 
@@ -96,6 +129,7 @@ describe("describeUpdateButtonState", () => {
       title: "Checking for updates",
       tooltip: "Checking for updates",
       enabled: false,
+      label: "Update",
     });
 
     expect(describeUpdateButtonState({
@@ -114,6 +148,43 @@ describe("describeUpdateButtonState", () => {
       title: "Development build",
       tooltip: "Development build",
       enabled: false,
+      label: "Update",
     });
+  });
+
+  it("uses installer maintenance labels for updates and renewal", () => {
+    expect(describeUpdateButtonState({
+      status: installerUpdateStatus(),
+      issue: null,
+      dismissed: false,
+      isChecking: false,
+      renewalRecommended: false,
+    })).toEqual({
+      title: "Update to v0.2.0",
+      tooltip: "Update to v0.2.0",
+      enabled: true,
+      label: "Update to v0.2.0",
+    });
+
+    expect(describeUpdateButtonState({
+      status: installerUpdateStatus({ updateAvailable: false }),
+      issue: null,
+      dismissed: true,
+      isChecking: false,
+      renewalRecommended: true,
+    })).toEqual({
+      title: "Renew Access",
+      tooltip: "Renew Access",
+      enabled: true,
+      label: "Renew Access",
+    });
+
+    expect(describeUpdateButtonState({
+      status: installerUpdateStatus(),
+      issue: null,
+      dismissed: false,
+      isChecking: false,
+      renewalRecommended: true,
+    }).label).toBe("Renew and update to v0.2.0");
   });
 });

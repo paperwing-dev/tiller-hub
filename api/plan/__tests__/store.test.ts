@@ -133,6 +133,11 @@ describe("repo store env metadata helpers", () => {
       2,
       "123456:generation:generation-1",
     );
+    expect(env.ARTIFACT_STORE.get).toHaveBeenNthCalledWith(1, "123456");
+    expect(env.ARTIFACT_STORE.get).toHaveBeenNthCalledWith(
+      2,
+      "123456:generation:generation-1",
+    );
   });
 
   it("persists canonical main commit updates to repo metadata", async () => {

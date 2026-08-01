@@ -10,6 +10,7 @@ import {
   replaceSelfHostRuntimeMetadata,
   resolveSelfHostRuntimeChannel,
   resolveSelfHostRuntimeBuildInput,
+  validateManagedSelfHostRuntime,
 } from "./scripts/self-host-runtime-build.mjs";
 
 const require = createRequire(import.meta.url);
@@ -39,11 +40,22 @@ function readUpdateMetadata(command: "build" | "serve"): unknown {
 
   const sourceId = process.env.TILLER_UPDATE_SOURCE_ID?.trim();
   const buildChannel = resolveBuildChannel();
+  const releaseImageSourceId = process.env.TILLER_RELEASE_SELF_HOST_RUNTIME_IMAGE_SOURCE_ID?.trim() ?? "";
+  const releaseSandboxImage = process.env.TILLER_RELEASE_SELF_HOST_RUNTIME_SANDBOX_IMAGE?.trim() ?? "";
+  const releaseRuntime = releaseImageSourceId || releaseSandboxImage
+    ? validateManagedSelfHostRuntime({
+        imageSourceId: releaseImageSourceId,
+        sandboxImage: releaseSandboxImage,
+      }, "release machine runtime metadata")
+    : null;
+  if (releaseRuntime && (command === "serve" || buildChannel === "development")) {
+    throw new Error("TILLER_RELEASE_SELF_HOST_RUNTIME_* is supported only for release builds.");
+  }
   const selfHostRuntime = resolveSelfHostRuntimeBuildInput({
     env: process.env,
     buildChannel: resolveSelfHostRuntimeChannel(command, buildChannel),
     developmentRuntime: readDevelopmentDeployRuntime(),
-    embeddedRuntime: "selfHostRuntime" in metadata ? metadata.selfHostRuntime : null,
+    embeddedRuntime: releaseRuntime ?? ("selfHostRuntime" in metadata ? metadata.selfHostRuntime : null),
     required: process.env.TILLER_REQUIRE_SELF_HOST_RUNTIME === "1",
   });
   const resolvedMetadata = replaceSelfHostRuntimeMetadata(metadata, selfHostRuntime);

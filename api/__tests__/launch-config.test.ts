@@ -3,6 +3,7 @@ import {
   buildContainerLaunchConfig,
 } from "../env/launch-config";
 import { HARNESS_MODEL_CATALOG } from "../../shared/harness-catalog";
+import { installedAccessBindings } from "./access-binding-fixture";
 
 const mocks = vi.hoisted(() => ({
   isGitHubAppAllowedForRequest: vi.fn(),
@@ -58,12 +59,12 @@ function createEnv() {
     getOpenAIAuthStatus: vi.fn(async () => ({ authenticated: true, status: "connected" })),
     getWorkersDevAccessLifecycle: vi.fn(async () => ({
       configured: true,
-      workersDevHostname: "demo.preview.workers.dev",
+      workersDevHostname: "tiller.preview.workers.dev",
       tokenExpiresAt: "2027-07-17T00:00:00.000Z",
       renewalRecommended: false,
     })),
     getWorkersDevAccessTrust: vi.fn(async (hostname: string) => (
-      hostname === "demo.preview.workers.dev"
+      hostname === "tiller.preview.workers.dev"
         ? {
             version: 1,
             ownerEmail: "owner@example.com",
@@ -80,6 +81,10 @@ function createEnv() {
     )),
   };
   return {
+    ...installedAccessBindings({
+      audience: "audience-1",
+      serviceClientId: "client.access",
+    }),
     OPENAI_API_KEY: "openai-key",
     HUB: {
       idFromName: vi.fn(() => "hub-id"),
@@ -276,7 +281,7 @@ describe("container launch config", () => {
     expect(config.envVars).toMatchObject({
       TILLER_CODEX_AUTH_MODE: "subscription",
       TILLER_CODEX_RUNTIME_MODE: "app-server",
-      TILLER_CODEX_RUNTIME_AUTH_URL: "https://demo.preview.workers.dev/api/envs/demo-env/codex/runtime-auth",
+      TILLER_CODEX_RUNTIME_AUTH_URL: "https://tiller.preview.workers.dev/api/envs/demo-env/codex/runtime-auth",
       TILLER_CODEX_MODEL: "gpt-5.6-sol",
       TILLER_CODEX_REASONING_EFFORT: "xhigh",
     });
@@ -536,7 +541,7 @@ describe("container launch config", () => {
           expect(config.envVars.TILLER_OPENCODE_AUTH_TOKEN).toBeUndefined();
         } else {
           expect(config.envVars, `${entry.harness}/${entry.id}/${effort}`).toMatchObject({
-            TILLER_OPENCODE_BASE_URL: entry.binding.baseUrl ?? "https://demo.preview.workers.dev/api/opencode/v1",
+            TILLER_OPENCODE_BASE_URL: entry.binding.baseUrl ?? "https://tiller.preview.workers.dev/api/opencode/v1",
             TILLER_OPENCODE_AUTH_TOKEN: entry.binding.provider === "openai" ? "openai-token" : "workers-token",
             TILLER_OPENCODE_MODEL_ID: entry.binding.model,
             TILLER_OPENCODE_MODEL_ALIAS: entry.binding.modelAlias,

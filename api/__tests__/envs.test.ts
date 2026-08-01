@@ -5,6 +5,7 @@ import { createInitialEnvScmState, createInitialRepoScmState } from "../scm/mode
 import { projectEnvSummary } from "../sync/projectors";
 import { applyLifecycleProjectionToMeta } from "../env-lifecycle";
 import { makeEnvDefinition } from "./fixtures/env";
+import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
 const mocks = vi.hoisted(() => ({
   getEnvLifecycleStub: vi.fn(),
@@ -1910,10 +1911,14 @@ describe("resolveHubPublicUrl", () => {
   it("uses the canonical workers.dev origin even when a competing URL is configured", async () => {
     expect(
       await resolveHubPublicUrl(
-        { HUB_PUBLIC_URL: "https://tiller.example.com/", HUB: createHubBinding() } as any,
+        {
+          ...installedAccessBindings(),
+          HUB_PUBLIC_URL: "https://tiller.example.com/",
+          HUB: createHubBinding(),
+        } as any,
         "https://ignored.example.net/api/envs",
       ),
-    ).toBe("https://demo.preview.workers.dev");
+    ).toBe(`https://${TEST_WORKERS_DEV_HOSTNAME}`);
   });
 
   it("fails closed instead of trusting a deployed request origin", async () => {

@@ -1,6 +1,5 @@
 import { Hono } from "hono";
 import { authenticateAccessRequest } from "../auth";
-import { getLocationHintOptions } from "../helpers";
 import type { HonoEnv } from "../types";
 
 // Authenticated voice WebSocket route.
@@ -26,7 +25,7 @@ voiceApp.get("/api/voice/session", async (c) => {
   }
 
   const id = c.env.TILLER_VOICE.idFromName(sessionId);
-  const stub = c.env.TILLER_VOICE.get(id, getLocationHintOptions(c.env));
+  const stub = c.env.TILLER_VOICE.get(id);
   return stub.fetch(new Request(c.req.url, c.req.raw));
 });
 

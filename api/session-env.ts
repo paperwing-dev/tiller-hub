@@ -27,7 +27,6 @@ const RESERVED_PREFIXES = [
 ] as const;
 
 const ALLOWED_TILLER_SESSION_ENV_NAMES = new Set([
-  "TILLER_REGION",
   "TILLER_WORKER_NAME",
 ]);
 

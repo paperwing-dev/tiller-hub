@@ -1,6 +1,6 @@
 import { isLifecycleStopInProgress } from "../env-lifecycle";
 import { loadEnvView } from "../env/view";
-import { getLocationHintOptions, getThreadStub, getWorkspaceStub } from "../helpers";
+import { getThreadStub, getWorkspaceStub } from "../helpers";
 import type { HubDO } from "../hub";
 import { appendThreadMessage } from "../planner/runtime";
 import type { PlannerRunRuntimeProvenance } from "../coordination";
@@ -55,7 +55,7 @@ interface HubEnvReviewSnapshotSender {
 
 function getHub(env: Env): HubEnvReviewSnapshotSender {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as HubDO & HubEnvReviewSnapshotSender;
+  return env.HUB.get(hubId) as unknown as HubDO & HubEnvReviewSnapshotSender;
 }
 
 function nowIso(): string {

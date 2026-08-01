@@ -18,7 +18,6 @@ vi.mock("../../planner/runtime", () => ({ appendThreadMessage: mocks.appendThrea
 vi.mock("../../helpers", () => ({
   getArtifactStoreStub: mocks.getArtifactStoreStub,
   getEnvReviewStub: mocks.getEnvReviewStub,
-  getLocationHintOptions: vi.fn(() => undefined),
   getThreadStub: mocks.getThreadStub,
 }));
 vi.mock("../../planner/providers", () => ({

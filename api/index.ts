@@ -1,17 +1,16 @@
 import { Hono } from "hono";
 import { routeAgentRequest } from "agents";
-import { partyserverMiddleware } from "hono-party";
+import { partyserverMiddleware } from "./partyserver-middleware";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { HonoEnv, Env, StoredSession } from "./types";
 import type { HubDO } from "./hub";
 import { parseRpcError } from "./errors";
-import { getArtifactStoreStub, getLocationHintOptions } from "./helpers";
+import { getArtifactStoreStub } from "./helpers";
 import { authMiddleware, dynamicEntrypointAuthResponse } from "./auth";
 import { DEFAULT_OPENAI_MODEL, listHostedAgentMetadata } from "./agent-core";
 import { getStatus as getOpenAIStatus, validateAndSeedTokens } from "./openai-auth";
 import setupRoutes from "./setup/routes";
 import cliRoutes from "./cli/routes";
-import workersDevAccessRoutes from "./workers-dev-access/routes";
 import executionRoutes from "./execution/routes";
 import opencodeRoutes from "./opencode/routes";
 import voiceRoutes from "./voice/routes";
@@ -24,6 +23,7 @@ import plannerRuntimeRoutes from "./planner/runtime-routes";
 import githubRoutes from "./github/routes";
 import workspaceRoutes from "./workspace/routes";
 import updateRoutes from "./update/routes";
+import workersDevAccessRoutes from "./workers-dev-access/routes";
 import cloudflareMcpRoutes from "./cloudflare-mcp-routes";
 import { envExists } from "./env/view";
 import {
@@ -77,7 +77,7 @@ type HubStub = Pick<
 
 function getHub(env: Env): HubStub {
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as HubStub;
+  return env.HUB.get(id) as unknown as HubStub;
 }
 
 // ── Hono app ────────────────────────────────────────────────────────
@@ -90,22 +90,28 @@ app.onError((err, c) => {
   return c.json({ error: message }, status as ContentfulStatusCode);
 });
 
-// Auth middleware (skips /health, /api/setup/status, and WebSocket upgrades)
+// Auth middleware (classifies public, owner-only, service-capable, and WebSocket routes)
 app.use("/api/*", authMiddleware);
 
-// Setup routes (auth skips these when unconfigured — see auth.ts)
+// Setup routes remain owner-only even while protection is incomplete — see auth.ts.
 app.route("/", setupRoutes);
 app.route("/", cliRoutes);
-app.route("/", workersDevAccessRoutes);
 app.route("/", executionRoutes);
 app.route("/", githubRoutes);
 app.route("/", opencodeRoutes);
 app.route("/", cloudflareMcpRoutes);
 app.route("/", updateRoutes);
+app.route("/", workersDevAccessRoutes);
 
 // ── Health ──────────────────────────────────────────────────────────
 
 app.get("/health", (c) => c.json({ ok: true }));
+
+app.get("/api/installer/probe", (c) => {
+  const releaseId = c.env.TILLER_RELEASE_ID?.trim() ?? "";
+  if (!/^[0-9a-f]{40}$/.test(releaseId)) return c.json({ error: "Release marker unavailable" }, 503);
+  return c.json({ ok: true, releaseId });
+});
 
 // ── Sessions ────────────────────────────────────────────────────────
 
@@ -625,9 +631,7 @@ app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 app.use("/parties/*", (c, next) => {
   return dynamicEntrypointAuthResponse(c.req.raw, c.env).then((blocked) => {
     if (blocked) return blocked;
-    const middleware = partyserverMiddleware({
-      options: getLocationHintOptions(c.env),
-    });
+    const middleware = partyserverMiddleware();
     return middleware(c as never, next as never);
   });
 });

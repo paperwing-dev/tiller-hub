@@ -29,8 +29,9 @@ describe("wrangler planner container config", () => {
     expect(block).toMatch(/"instance_type":\s*"standard-1"/);
   });
 
-  it("declares the PLANNER_RUN durable object binding and migration", () => {
+  it("declares the PLANNER_RUN binding and authoritative SQLite export", () => {
     expect(WRANGLER_SOURCE).toMatch(/"name":\s*"PLANNER_RUN",\s*"class_name":\s*"PlannerRunDO"/s);
-    expect(WRANGLER_SOURCE).toMatch(/"new_sqlite_classes":\s*\[\s*"PlannerRunDO"\s*\]/s);
+    expect(WRANGLER_SOURCE).toMatch(/"PlannerRunDO":\s*\{\s*"type":\s*"durable-object",\s*"storage":\s*"sqlite"\s*\}/s);
+    expect(WRANGLER_SOURCE).not.toContain('"migrations"');
   });
 });

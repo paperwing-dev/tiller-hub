@@ -4,7 +4,7 @@ import {
   type ArtifactStoreDO,
   type PlanArtifact,
 } from "../coordination";
-import { getLocationHintOptions, getWorkspaceStub } from "../helpers";
+import { getWorkspaceStub } from "../helpers";
 import type { HubDO } from "../hub";
 import type {
   CodexAuthPreference,
@@ -114,7 +114,7 @@ interface LaunchMcpServer {
 
 function getHub(env: Env): RepoLaunchSettingsHub {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as RepoLaunchSettingsHub;
+  return env.HUB.get(hubId) as unknown as RepoLaunchSettingsHub;
 }
 
 async function resolveRepoSessionEnvVars(

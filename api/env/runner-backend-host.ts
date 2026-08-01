@@ -6,7 +6,6 @@ import {
   type RunnerStartOptions,
   type RunnerStopOptions,
 } from "./runner-backend";
-import { getLocationHintOptions } from "../helpers";
 import type {
   Env,
   EnvMeta,
@@ -43,7 +42,7 @@ interface HubRunnerControl {
 
 function getHub(env: Env): HubRunnerControl {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as HubRunnerControl;
+  return env.HUB.get(hubId) as unknown as HubRunnerControl;
 }
 
 function parseHostRunnerStatus(value: unknown): HostRunnerStatus {

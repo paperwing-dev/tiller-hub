@@ -15,7 +15,6 @@ const mocks = vi.hoisted(() => ({
   loadTrackedRepoForRequest: vi.fn(),
   getArtifactStoreStub: vi.fn(),
   getThreadStub: vi.fn(),
-  getLocationHintOptions: vi.fn(),
   getOpenAIStatus: vi.fn(),
   getSecret: vi.fn(),
   getOrCreateSecret: vi.fn(),
@@ -48,7 +47,6 @@ vi.mock("../../repo/access", () => ({
 vi.mock("../../helpers", () => ({
   getArtifactStoreStub: mocks.getArtifactStoreStub,
   getThreadStub: mocks.getThreadStub,
-  getLocationHintOptions: mocks.getLocationHintOptions,
   getPlannerRunStub: mocks.getPlannerRunStub,
 }));
 

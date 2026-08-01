@@ -22,6 +22,7 @@ import {
   createEnv,
   createRepo,
   checkForUpdate,
+  dismissDashboardOnboarding as dismissDashboardOnboardingRequest,
   ApiActionError,
   type CreateEnvOptions,
 } from './api';
@@ -74,6 +75,7 @@ export interface DashboardData {
   refreshRepos: () => Promise<boolean>;
   refreshEnvs: () => Promise<boolean>;
   refreshSetupStatus: () => Promise<void>;
+  dismissDashboardOnboarding: () => Promise<void>;
   setupStatus: SetupStatus | null;
   updateStatus: UpdateCheckResult | null;
   updateIssue: string | null;
@@ -146,6 +148,12 @@ export function refreshDashboardStateAfterHubConnect(actions: {
 
 export function getTopLevelUpdateIssue(result: UpdateCheckResult): string | null {
   return result.issue?.code === 'update_check_failed' ? result.issue.message : null;
+}
+
+export function getUpdateDismissalSourceId(result: UpdateCheckResult): string {
+  return result.kind === 'installer-maintenance'
+    ? result.stableRelease?.releaseId ?? result.installedReleaseId
+    : result.latestUpdate.sourceId;
 }
 
 export function getUpdateCheckFailure(error: unknown): { message: string; code: string | null } {
@@ -275,7 +283,7 @@ export default function DashboardDataProvider() {
         status: result,
         issue,
         issueCode: issue ? result.issue?.code ?? null : null,
-        dismissed: isUpdateDismissed(result.latestUpdate.sourceId),
+        dismissed: isUpdateDismissed(getUpdateDismissalSourceId(result)),
       };
     } catch (error) {
       const failure = getUpdateCheckFailure(error);
@@ -308,6 +316,11 @@ export default function DashboardDataProvider() {
       setSetupLoadError('Setup status could not be loaded.');
     }
   }, []);
+
+  const dismissDashboardOnboarding = useCallback(async () => {
+    await dismissDashboardOnboardingRequest(HUB_URL);
+    await refreshSetupStatus();
+  }, [refreshSetupStatus]);
 
   const refreshSessions = useCallback(async (): Promise<boolean> => {
     setSessionsLoadState('loading');
@@ -674,6 +687,7 @@ export default function DashboardDataProvider() {
     refreshRepos,
     refreshEnvs,
     refreshSetupStatus,
+    dismissDashboardOnboarding,
     setupStatus,
     updateStatus,
     updateIssue,
@@ -716,6 +730,7 @@ export default function DashboardDataProvider() {
     refreshRepos,
     refreshEnvs,
     refreshSetupStatus,
+    dismissDashboardOnboarding,
     setupStatus,
     updateStatus,
     updateIssue,

@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { buildManifestContainers, buildPlainTextBindings } from "./generate-manifest.mjs";
+import {
+  buildManifestContainers,
+  buildPlainTextBindings,
+  resolveLegacyMigrations,
+} from "./generate-manifest.mjs";
 
 const envKeys = [
   "CONTAINER_IMAGE_TAG",
@@ -101,5 +105,12 @@ describe("generate-manifest plain text bindings", () => {
         TILLER_REGION: "wnam",
       },
     })).toEqual([]);
+  });
+
+  it("uses the frozen migration history when the fresh config has only exports", () => {
+    const frozen = [{ tag: "v1", new_sqlite_classes: ["HubDO"] }];
+    expect(resolveLegacyMigrations({ exports: { HubDO: {} } }, frozen)).toEqual(frozen);
+    expect(resolveLegacyMigrations({ migrations: [], exports: { HubDO: {} } }, frozen)).toEqual(frozen);
+    expect(() => resolveLegacyMigrations({ exports: { HubDO: {} } }, [])).toThrow(/unavailable/);
   });
 });

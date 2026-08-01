@@ -206,6 +206,7 @@ function updateStatus(): UpdateCheckResult {
     managedFiles: ["package.json"],
   } as const;
   return {
+    kind: "legacy",
     updateAvailable: false,
     currentUpdate,
     latestUpdate: currentUpdate,

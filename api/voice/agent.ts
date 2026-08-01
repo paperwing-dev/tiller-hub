@@ -6,7 +6,6 @@ import {
   type VoiceTurnContext,
 } from "@cloudflare/voice";
 import type { HubDO } from "../hub";
-import { getLocationHintOptions } from "../helpers";
 import type { Env } from "../types";
 import { KIMI_K2_7_CODE } from "../../shared/harness-catalog";
 
@@ -372,7 +371,7 @@ export class TillerVoice extends VoiceAgent<Env> {
 
   #getHub(): HubStub {
     const id = this.env.HUB.idFromName("hub");
-    return this.env.HUB.get(id, getLocationHintOptions(this.env)) as unknown as HubStub;
+    return this.env.HUB.get(id) as unknown as HubStub;
   }
 
   #extractToolCall(result: unknown): ToolCall | null {

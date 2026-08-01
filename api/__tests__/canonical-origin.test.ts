@@ -38,20 +38,18 @@ describe("canonical workers.dev origin", () => {
     expect(alias?.status).toBe(404);
   });
 
-  it("fails closed without trust except for Access onboarding", async () => {
+  it("fails closed without installer trust except for the DO-free health check", async () => {
     mocks.readCanonicalWorkersDevAccessTrust.mockResolvedValue(null);
     await expect(canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/api/setup/status"),
+      new Request("https://demo.preview.workers.dev/health"),
       env,
     )).resolves.toBeNull();
-    await expect(canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/"),
-      env,
-    )).resolves.toBeNull();
-    await expect(canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/assets/index.js"),
-      env,
-    )).resolves.toBeNull();
+    for (const path of ["/api/setup/status", "/", "/assets/index.js"]) {
+      await expect(canonicalIngressResponse(
+        new Request(`https://demo.preview.workers.dev${path}`),
+        env,
+      )).resolves.toMatchObject({ status: 503 });
+    }
     const blocked = await canonicalIngressResponse(
       new Request("https://demo.preview.workers.dev/api/envs"),
       env,

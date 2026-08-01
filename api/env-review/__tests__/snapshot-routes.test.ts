@@ -14,7 +14,6 @@ vi.mock("../../env/view", () => ({
 
 vi.mock("../../helpers", () => ({
   getEnvReviewStub: mocks.getEnvReviewStub,
-  getLocationHintOptions: vi.fn(() => undefined),
   getThreadStub: vi.fn(),
 }));
 

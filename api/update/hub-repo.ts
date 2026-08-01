@@ -1,4 +1,3 @@
-import { getLocationHintOptions } from "../helpers";
 import type { Env } from "../types";
 import {
   listGitHubAppRepositories,
@@ -46,7 +45,7 @@ interface GitHubContentResponse {
 
 function getConfigStore(env: Env): ConfigStore {
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as ConfigStore;
+  return env.HUB.get(id) as unknown as ConfigStore;
 }
 
 function nowIso(): string {

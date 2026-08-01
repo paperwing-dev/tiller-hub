@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { compactDecrypt, exportJWK, generateKeyPair } from "jose";
 import { describe, expect, it, vi } from "vitest";
 import type { HonoEnv } from "../types";
+import { installedAccessBindings } from "./access-binding-fixture";
 
 vi.mock("../setup/config", () => ({
   getSecret: async (env: Record<string, unknown>, key: string) => env[key] || undefined,
@@ -19,7 +20,7 @@ describe("GET /api/cli/bootstrap-config", () => {
   it("returns public bootstrap config for workers.dev hubs", async () => {
     const app = createApp();
     const res = await app.request(
-      "https://demo.preview.workers.dev/api/cli/bootstrap-config",
+      "https://tiller.preview.workers.dev/api/cli/bootstrap-config",
       {},
       {} as any,
     );
@@ -27,7 +28,7 @@ describe("GET /api/cli/bootstrap-config", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
     await expect(res.json()).resolves.toEqual({
-      hubUrl: "https://demo.preview.workers.dev",
+      hubUrl: "https://tiller.preview.workers.dev",
       protectionMode: "public",
     });
   });
@@ -38,7 +39,7 @@ describe("GET /cli/bootstrap", () => {
   it("renders neutral connection copy for tiller commands", async () => {
     const app = createApp();
     const res = await app.request(
-      "https://demo.preview.workers.dev/cli/bootstrap?port=8788&state=test",
+      "https://tiller.preview.workers.dev/cli/bootstrap?port=8788&state=test",
       {},
       {} as any,
     );
@@ -50,7 +51,10 @@ describe("GET /cli/bootstrap", () => {
     expect(html).toContain("Connection code");
     expect(html).toContain("Copy code");
     expect(html).toContain("hideConnectionCode();");
-    expect(html).toContain("restricted Tiller owner sign-in");
+    expect(html).toContain("This Hub needs Access repair");
+    expect(html).toContain("documented maintainer Access repair procedure");
+    expect(html).not.toContain("/api/setup/workers-dev-access/oauth/start");
+    expect(html).not.toContain("install.paperwing.dev/maintenance");
     expect(html).toContain("CONNECTION_REQUEST_TTL_MS");
     expect(html).toContain("createdAt: Date.now()");
     expect(html).not.toContain("Complete local bootstrap");
@@ -66,9 +70,9 @@ describe("POST /api/cli/connect-package", () => {
     const trust = {
       version: 1,
       ownerEmail: "owner@example.com",
-      accountId: "account-1",
-      workerName: "demo",
-      workersDevHostname: "demo.preview.workers.dev",
+      accountId: "",
+      workerName: "tiller",
+      workersDevHostname: "tiller.preview.workers.dev",
       issuer: "https://team.cloudflareaccess.com",
       audience: "audience-1",
       serviceTokenId: "token-1",
@@ -82,22 +86,18 @@ describe("POST /api/cli/connect-package", () => {
       updatedAt: "2026-07-16T00:00:00.000Z",
     };
     const env = {
-      HUB: {
-        idFromName: () => "hub-id",
-        get: () => ({
-          getWorkersDevAccessLifecycle: async () => ({
-            configured: true,
-            workersDevHostname: trust.workersDevHostname,
-            tokenExpiresAt: credential.tokenExpiresAt,
-            renewalRecommended: false,
-          }),
-          getWorkersDevAccessTrust: async () => trust,
-          getWorkersDevAccessCredential: async () => credential,
-        }),
-      },
+      ...installedAccessBindings({
+        hostname: trust.workersDevHostname,
+        issuer: trust.issuer,
+        audience: trust.audience,
+        serviceClientId: trust.serviceClientId,
+        serviceClientSecret: credential.currentSecret,
+        ownerEmail: trust.ownerEmail,
+        tokenExpiresAt: credential.tokenExpiresAt,
+      }),
     } as any;
     const res = await app.request(
-      "https://demo.preview.workers.dev/api/cli/connect-package",
+      "https://tiller.preview.workers.dev/api/cli/connect-package",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -116,7 +116,7 @@ describe("POST /api/cli/connect-package", () => {
       typ: "tiller-connect+jwe",
     });
     expect(JSON.parse(new TextDecoder().decode(decrypted.plaintext))).toMatchObject({
-      hubUrl: "https://demo.preview.workers.dev",
+      hubUrl: "https://tiller.preview.workers.dev",
       clientId: "client-id.access",
       clientSecret: "client-secret",
       tokenExpiresAt: "2027-07-16T00:00:00.000Z",
@@ -127,7 +127,7 @@ describe("POST /api/cli/connect-package", () => {
   it("rejects an oversized streamed package request before reading credentials", async () => {
     const get = vi.fn();
     const res = await createApp().request(
-      "https://demo.preview.workers.dev/api/cli/connect-package",
+      "https://tiller.preview.workers.dev/api/cli/connect-package",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },

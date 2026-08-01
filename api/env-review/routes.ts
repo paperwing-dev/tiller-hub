@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { HonoEnv, Env, EnvMeta } from "../types";
-import { getArtifactStoreStub, getEnvReviewStub, getLocationHintOptions, getThreadStub } from "../helpers";
+import { getArtifactStoreStub, getEnvReviewStub, getThreadStub } from "../helpers";
 import type { HubDO } from "../hub";
 import { loadEnvView } from "../env/view";
 import { loadRepoForRequest, type RepoWorkspace } from "../repo/access";
@@ -59,7 +59,7 @@ interface HubSessionLookup {
 
 function getHub(env: Env): HubSessionLookup {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as HubDO & HubSessionLookup;
+  return env.HUB.get(hubId) as unknown as HubDO & HubSessionLookup;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { hash as blake3Hash } from "blake3-wasm/esm/browser/index.js";
+import { blake3 } from "@noble/hashes/blake3.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type { Env } from "../types";
 import { CloudflareApiError } from "../cloudflare-errors";
 import { resolveWorkerServiceName } from "../setup/cloudflare";
@@ -664,6 +665,7 @@ export async function createContainerApplication(
         },
         instances: 0,
         max_instances: container.max_instances,
+        scheduling_policy: "default",
         durable_objects: {
           namespace_id: namespaceId,
         },
@@ -696,9 +698,11 @@ function hashBytes(content: Uint8Array): string {
 }
 
 function hashAssetContent(filePath: string, content: Uint8Array): string {
-  const extension = filePath.split(".").pop() ?? "";
+  const filename = filePath.split("/").pop() ?? "";
+  const lastDot = filename.lastIndexOf(".");
+  const extension = lastDot > 0 ? filename.slice(lastDot + 1) : "";
   const base64Contents = Buffer.from(content).toString("base64");
-  return blake3Hash(base64Contents + extension).toString("hex").slice(0, 32);
+  return bytesToHex(blake3(new TextEncoder().encode(base64Contents + extension))).slice(0, 32);
 }
 
 function buildAssetManifest(files: AssetFile[]): Record<string, { hash: string; size: number }> {

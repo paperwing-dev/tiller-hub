@@ -8,6 +8,8 @@ import {
 } from "../auth";
 import {
   clearWorkersDevAccessTrustCache,
+  readWorkersDevAccessCredential,
+  readWorkersDevAccessLifecycle,
   readWorkersDevAccessTrust,
 } from "../workers-dev-access/records";
 import type { Env } from "../types";
@@ -16,25 +18,34 @@ import type {
   WorkersDevAccessCredentialV1,
   WorkersDevAccessTrustV1,
 } from "../workers-dev-access/types";
+import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
 const trust: WorkersDevAccessTrustV1 = {
   version: 1,
   ownerEmail: "owner@example.com",
-  accountId: "account-1",
-  workerName: "demo",
-  workersDevHostname: "demo.preview.workers.dev",
+  accountId: "",
+  workerName: "tiller",
+  workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
   issuer: "https://team.cloudflareaccess.com",
   audience: "audience-1",
   serviceTokenId: "token-1",
   serviceClientId: "service-client.access",
-  configuredAt: "2026-07-16T00:00:00.000Z",
+  configuredAt: "1970-01-01T00:00:00.000Z",
 };
 
 const credential: WorkersDevAccessCredentialV1 = {
   version: 1,
   currentSecret: "secret",
   tokenExpiresAt: "2027-07-16T00:00:00.000Z",
-  updatedAt: "2026-07-16T00:00:00.000Z",
+  updatedAt: "1970-01-01T00:00:00.000Z",
+};
+
+const bindingTrust = {
+  ownerEmail: trust.ownerEmail,
+  workersDevHostname: trust.workersDevHostname,
+  issuer: trust.issuer,
+  audience: trust.audience,
+  serviceClientId: trust.serviceClientId,
 };
 
 let privateKey: CryptoKey;
@@ -43,20 +54,19 @@ let publicJwk: Record<string, unknown>;
 
 function envFor(canonical: WorkersDevAccessTrustV1 | null = trust): Env {
   return {
+    ...(canonical ? installedAccessBindings({
+      hostname: canonical.workersDevHostname,
+      issuer: canonical.issuer,
+      audience: canonical.audience,
+      serviceClientId: canonical.serviceClientId,
+      serviceClientSecret: credential.currentSecret,
+      ownerEmail: canonical.ownerEmail,
+      tokenExpiresAt: credential.tokenExpiresAt,
+    }) : {}),
     HUB: {
       idFromName: vi.fn(() => "hub-id"),
       get: vi.fn(() => ({
         getAllConfig: vi.fn(async () => ({})),
-        getWorkersDevAccessTrust: vi.fn(async (hostname: string) => (
-          canonical?.workersDevHostname === hostname ? canonical : null
-        )),
-        getWorkersDevAccessCredential: vi.fn(async () => credential),
-        getWorkersDevAccessLifecycle: vi.fn(async () => ({
-          configured: Boolean(canonical),
-          workersDevHostname: canonical?.workersDevHostname ?? null,
-          tokenExpiresAt: canonical ? credential.tokenExpiresAt : null,
-          renewalRecommended: false,
-        })),
       })),
     },
   } as unknown as Env;
@@ -91,7 +101,7 @@ async function token(
 }
 
 function request(assertion: string): Request {
-  return new Request("https://demo.preview.workers.dev/api/sessions", {
+  return new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}/api/sessions`, {
     headers: { "Cf-Access-Jwt-Assertion": assertion },
   });
 }
@@ -122,14 +132,38 @@ function authPolicyApp(): Hono<HonoEnv> {
   app.post("/api/setup", (c) => c.json({ ok: true }));
   app.get("/api/setup/status", (c) => c.json({ ok: true }));
   app.get("/api/execution/status", (c) => c.json({ ok: true }));
+  app.post("/api/auth/openai/seed", (c) => c.json({ ok: true }));
+  app.get("/api/auth/openai/status", (c) => c.json({ ok: true }));
+  app.post("/api/setup/workers-dev-access/oauth/start", (c) => c.json({ ok: true }));
+  app.post("/api/settings/workers-dev-access/oauth/start", (c) => c.json({ ok: true }));
+  app.post("/api/setup/workers-dev-access/broker/proof", (c) => c.json({ ok: true }));
+  app.post("/api/setup/workers-dev-access/broker/complete", (c) => c.json({ ok: true }));
+  app.post("/api/update/hub-repo/detect", (c) => c.json({ ok: true }));
+  app.post("/api/update/hub-repo/select", (c) => c.json({ ok: true }));
+  app.post("/api/update/apply", (c) => c.json({ ok: true }));
+  app.post("/api/update/repair/cloudflare-redeploy", (c) => c.json({ ok: true }));
   app.put("/api/settings/execution-backend", (c) => c.json({ ok: true }));
   app.get("/api/settings/legacy-custom-domain-cleanup", (c) => c.json({ ok: true }));
   app.post("/api/envs/demo/boot-progress", (c) => c.json({ ok: true }));
-  for (const path of [
-    "/api/github/webhook",
-    "/api/setup/workers-dev-access/broker/proof",
-    "/api/setup/workers-dev-access/broker/complete",
-  ]) {
+  app.post("/api/sessions/:id/permissions/:permId", (c) => c.json({ ok: true }));
+  app.get("/api/github/status", (c) => c.json({ ok: true }));
+  app.post("/api/github/test-access", (c) => c.json({ ok: true }));
+  app.get("/api/github/repositories", (c) => c.json({ ok: true }));
+  app.get("/api/github/token", (c) => c.json({ ok: true }));
+  app.get("/api/repos", (c) => c.json({ ok: true }));
+  app.post("/api/repos", (c) => c.json({ ok: true }));
+  app.get("/api/repos/:repoId", (c) => c.json({ ok: true }));
+  app.delete("/api/repos/:repoId", (c) => c.json({ ok: true }));
+  app.get("/api/repos/:repoId/artifacts", (c) => c.json({ ok: true }));
+  app.get("/api/repos/:repoId/planner-providers", (c) => c.json({ ok: true }));
+  app.get("/api/repos/:repoId/session-env", (c) => c.json({ ok: true }));
+  app.patch("/api/repos/:repoId/session-env", (c) => c.json({ ok: true }));
+  app.get("/api/repos/:repoId/mcp-servers", (c) => c.json({ ok: true }));
+  app.put("/api/repos/:repoId/mcp-servers", (c) => c.json({ ok: true }));
+  app.post("/api/repos/:repoId/cloudflare-mcp/connect", (c) => c.json({ ok: true }));
+  app.post("/api/repos/:repoId/skills", (c) => c.json({ ok: true }));
+  app.put("/api/repos/:repoId/plan-writer-settings", (c) => c.json({ ok: true }));
+  for (const path of ["/api/github/webhook"]) {
     app.post(path, (c) => c.json({ ok: true }));
     app.post(`${path}/extra`, (c) => c.json({ ok: true }));
   }
@@ -261,20 +295,16 @@ describe("canonical workers.dev signed principals", () => {
 describe("owner-only Settings policy", () => {
   it("keeps callback destination descendants closed at the Worker boundary", async () => {
     const app = authPolicyApp();
-    const paths = [
-      "/api/github/webhook",
-      "/api/setup/workers-dev-access/broker/proof",
-      "/api/setup/workers-dev-access/broker/complete",
-    ];
+    const paths = ["/api/github/webhook"];
 
     for (const path of paths) {
       const exact = await app.request(
-        `https://demo.preview.workers.dev${path}`,
+        `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
         { method: "POST" },
         envFor() as HonoEnv["Bindings"],
       );
       const descendant = await app.request(
-        `https://demo.preview.workers.dev${path}/extra`,
+        `https://${TEST_WORKERS_DEV_HOSTNAME}${path}/extra`,
         { method: "POST" },
         envFor() as HonoEnv["Bindings"],
       );
@@ -299,7 +329,7 @@ describe("owner-only Settings policy", () => {
 
   it("allows the exact signed owner to mutate Settings", async () => {
     const response = await authPolicyApp().request(
-      "https://demo.preview.workers.dev/api/setup",
+      `https://${TEST_WORKERS_DEV_HOSTNAME}/api/setup`,
       {
         method: "POST",
         headers: { "Cf-Access-Jwt-Assertion": await token({ email: trust.ownerEmail, sub: "user" }) },
@@ -312,7 +342,7 @@ describe("owner-only Settings policy", () => {
 
   it("rejects a valid signed service principal from Settings mutations", async () => {
     const response = await authPolicyApp().request(
-      "https://demo.preview.workers.dev/api/setup",
+      `https://${TEST_WORKERS_DEV_HOSTNAME}/api/setup`,
       {
         method: "POST",
         headers: {
@@ -327,12 +357,20 @@ describe("owner-only Settings policy", () => {
 
   it.each([
     ["GET", "/api/execution/status"],
+    ["POST", "/api/auth/openai/seed"],
+    ["GET", "/api/auth/openai/status"],
     ["PUT", "/api/settings/execution-backend"],
     ["GET", "/api/settings/legacy-custom-domain-cleanup"],
-  ])("keeps execution Settings owner-only for %s %s", async (method, path) => {
+    ["POST", "/api/setup/workers-dev-access/oauth/start"],
+    ["POST", "/api/settings/workers-dev-access/oauth/start"],
+    ["POST", "/api/update/hub-repo/detect"],
+    ["POST", "/api/update/hub-repo/select"],
+    ["POST", "/api/update/apply"],
+    ["POST", "/api/update/repair/cloudflare-redeploy"],
+  ])("keeps credential and execution Settings owner-only for %s %s", async (method, path) => {
     const app = authPolicyApp();
     const service = await app.request(
-      `https://demo.preview.workers.dev${path}`,
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
       {
         method,
         headers: {
@@ -347,7 +385,7 @@ describe("owner-only Settings policy", () => {
     expect(service.status).toBe(401);
 
     const owner = await app.request(
-      `https://demo.preview.workers.dev${path}`,
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
       {
         method,
         headers: { "Cf-Access-Jwt-Assertion": await ownerAssertion() },
@@ -357,17 +395,17 @@ describe("owner-only Settings policy", () => {
     expect(owner.status).toBe(200);
   });
 
-  it("keeps redacted setup status and runtime callbacks available to the service principal", async () => {
+  it("allows service-authenticated setup status and runtime callbacks", async () => {
     const assertion = await token({ common_name: trust.serviceClientId, sub: "" });
     const app = authPolicyApp();
     const [statusResponse, runtimeResponse] = await Promise.all([
       app.request(
-        "https://demo.preview.workers.dev/api/setup/status",
+        `https://${TEST_WORKERS_DEV_HOSTNAME}/api/setup/status`,
         { headers: { "Cf-Access-Jwt-Assertion": assertion } },
         envFor() as HonoEnv["Bindings"],
       ),
       app.request(
-        "https://demo.preview.workers.dev/api/envs/demo/boot-progress",
+        `https://${TEST_WORKERS_DEV_HOSTNAME}/api/envs/demo/boot-progress`,
         { method: "POST", headers: { "Cf-Access-Jwt-Assertion": assertion } },
         envFor() as HonoEnv["Bindings"],
       ),
@@ -376,17 +414,187 @@ describe("owner-only Settings policy", () => {
     expect(statusResponse.status).toBe(200);
     expect(runtimeResponse.status).toBe(200);
   });
+
+  it("keeps permission decisions owner-only while runtimes use the service principal", async () => {
+    const app = authPolicyApp();
+    const path = "/api/sessions/session-1/permissions/permission-1";
+    const service = await app.request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      {
+        method: "POST",
+        headers: {
+          "Cf-Access-Jwt-Assertion": await token({ common_name: trust.serviceClientId, sub: "" }),
+        },
+      },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(service.status).toBe(401);
+
+    const owner = await app.request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      {
+        method: "POST",
+        headers: { "Cf-Access-Jwt-Assertion": await ownerAssertion() },
+      },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(owner.status).toBe(200);
+  });
+
+  it.each([
+    "/api/setup/workers-dev-access/broker/proof",
+    "/api/setup/workers-dev-access/broker/complete",
+  ])("keeps the job-secret-authenticated legacy broker callback reachable at %s", async (path) => {
+    const response = await authPolicyApp().request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      { method: "POST" },
+      envFor() as HonoEnv["Bindings"],
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  it("keeps GitHub administration owner-only while preserving capability-gated runtime token access", async () => {
+    const app = authPolicyApp();
+    const serviceAssertion = await token({ common_name: trust.serviceClientId, sub: "" });
+    const owner = await ownerAssertion();
+
+    for (const [method, path] of [
+      ["GET", "/api/github/status"],
+      ["POST", "/api/github/test-access"],
+      ["GET", "/api/github/repositories"],
+    ] as const) {
+      const service = await app.request(
+        `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+        { method, headers: { "Cf-Access-Jwt-Assertion": serviceAssertion } },
+        envFor() as HonoEnv["Bindings"],
+      );
+      expect(service.status).toBe(401);
+
+      const ownerResponse = await app.request(
+        `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+        { method, headers: { "Cf-Access-Jwt-Assertion": owner } },
+        envFor() as HonoEnv["Bindings"],
+      );
+      expect(ownerResponse.status).toBe(200);
+    }
+
+    const tokenResponse = await app.request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}/api/github/token`,
+      { headers: { "Cf-Access-Jwt-Assertion": serviceAssertion } },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(tokenResponse.status).toBe(200);
+  });
+
+  it.each([
+    ["POST", "/api/repos"],
+    ["DELETE", "/api/repos/repo-1"],
+    ["GET", "/api/repos/repo-1/session-env"],
+    ["PATCH", "/api/repos/repo-1/session-env"],
+    ["GET", "/api/repos/repo-1/mcp-servers"],
+    ["PUT", "/api/repos/repo-1/mcp-servers"],
+    ["POST", "/api/repos/repo-1/cloudflare-mcp/connect"],
+    ["POST", "/api/repos/repo-1/skills"],
+    ["PUT", "/api/repos/repo-1/plan-writer-settings"],
+  ])("keeps repository administration owner-only for %s %s", async (method, path) => {
+    const app = authPolicyApp();
+    const service = await app.request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      {
+        method,
+        headers: {
+          "Cf-Access-Jwt-Assertion": await token({
+            common_name: trust.serviceClientId,
+            sub: "",
+          }),
+        },
+      },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(service.status).toBe(401);
+
+    const owner = await app.request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      {
+        method,
+        headers: { "Cf-Access-Jwt-Assertion": await ownerAssertion() },
+      },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(owner.status).toBe(200);
+  });
+
+  it.each([
+    ["GET", "/api/repos"],
+    ["GET", "/api/repos/repo-1"],
+    ["GET", "/api/repos/repo-1/artifacts"],
+    ["GET", "/api/repos/repo-1/planner-providers"],
+  ])("preserves explicit repository runtime access for %s %s", async (method, path) => {
+    const response = await authPolicyApp().request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      {
+        method,
+        headers: {
+          "Cf-Access-Jwt-Assertion": await token({
+            common_name: trust.serviceClientId,
+            sub: "",
+          }),
+        },
+      },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(response.status).toBe(200);
+  });
 });
 
 describe("canonical workers.dev trust cache", () => {
   it("does not negatively cache an unconfigured hostname", async () => {
     await expect(readWorkersDevAccessTrust(envFor(null), trust.workersDevHostname)).resolves.toBeNull();
-    await expect(readWorkersDevAccessTrust(envFor(trust), trust.workersDevHostname)).resolves.toEqual(trust);
+    await expect(readWorkersDevAccessTrust(envFor(trust), trust.workersDevHostname)).resolves.toEqual(bindingTrust);
   });
 
   it("keys positive trust by the exact hostname", async () => {
-    await expect(readWorkersDevAccessTrust(envFor(trust), trust.workersDevHostname)).resolves.toEqual(trust);
+    await expect(readWorkersDevAccessTrust(envFor(trust), trust.workersDevHostname)).resolves.toEqual(bindingTrust);
     await expect(readWorkersDevAccessTrust(envFor(trust), "other.preview.workers.dev")).resolves.toBeNull();
     await expect(readWorkersDevAccessTrust(envFor(trust), "tiller.example.com")).resolves.toBeNull();
+  });
+
+  it("falls back to legacy HubDO Access records only when installer bindings are absent", async () => {
+    const legacyStore = {
+      getWorkersDevAccessTrust: vi.fn(async () => trust),
+      getWorkersDevAccessCredential: vi.fn(async () => credential),
+      getWorkersDevAccessLifecycle: vi.fn(async () => ({
+        configured: true,
+        workersDevHostname: trust.workersDevHostname,
+        tokenExpiresAt: credential.tokenExpiresAt,
+        renewalRecommended: false,
+      })),
+    };
+    const legacyEnv = {
+      HUB: {
+        idFromName: vi.fn(() => "hub-id"),
+        get: vi.fn(() => legacyStore),
+      },
+    } as unknown as Env;
+
+    await expect(readWorkersDevAccessTrust(legacyEnv, trust.workersDevHostname)).resolves.toEqual(trust);
+    await expect(readWorkersDevAccessCredential(legacyEnv)).resolves.toEqual(credential);
+    await expect(readWorkersDevAccessLifecycle(legacyEnv)).resolves.toMatchObject({ configured: true });
+  });
+
+  it("fails closed instead of using legacy records when installer bindings are malformed", async () => {
+    const getWorkersDevAccessTrust = vi.fn(async () => trust);
+    const env = {
+      ...installedAccessBindings(),
+      TILLER_RELEASE_ID: "invalid",
+      HUB: {
+        idFromName: vi.fn(() => "hub-id"),
+        get: vi.fn(() => ({ getWorkersDevAccessTrust })),
+      },
+    } as unknown as Env;
+
+    await expect(readWorkersDevAccessTrust(env, trust.workersDevHostname)).resolves.toBeNull();
+    expect(getWorkersDevAccessTrust).not.toHaveBeenCalled();
   });
 });

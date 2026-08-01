@@ -8,7 +8,66 @@ import {
   UPDATE_CACHE_TTL_SECONDS,
   UPDATE_CHECK_CACHE_KEY,
 } from "./metadata";
-import type { HubUpdateRepoState, TillerUpdateMetadata, UpdateCheckResult } from "./types";
+import type {
+  HubUpdateRepoState,
+  LegacyUpdateCheckResult,
+  StableReleaseSummary,
+  TillerUpdateMetadata,
+  UpdateCheckResult,
+  UpdateIssue,
+} from "./types";
+
+export const INSTALLER_STABLE_URL = "https://install.paperwing.dev/stable";
+export const INSTALLER_STABLE_CACHE_KEY = "tiller:installer-stable:v1";
+const INSTALLER_STABLE_TIMEOUT_MS = 1_500;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function parseStableReleaseSummary(value: unknown): StableReleaseSummary | null {
+  if (!isRecord(value)) return null;
+  const releaseId = typeof value.releaseId === "string" ? value.releaseId.trim() : "";
+  const version = typeof value.version === "string" ? value.version.trim() : "";
+  const releaseNotesUrl = typeof value.releaseNotesUrl === "string" ? value.releaseNotesUrl.trim() : "";
+  if (!/^[0-9a-f]{40}$/.test(releaseId) || /^0{40}$/.test(releaseId) || !version) return null;
+  try {
+    const parsedUrl = new URL(releaseNotesUrl);
+    if (parsedUrl.protocol !== "https:" || parsedUrl.href !== releaseNotesUrl) return null;
+  } catch {
+    return null;
+  }
+  return { releaseId, version, releaseNotesUrl };
+}
+
+async function readInstallerStableRelease(env: Env): Promise<StableReleaseSummary> {
+  const cached = parseStableReleaseSummary(
+    await env.ENVS_KV.get(INSTALLER_STABLE_CACHE_KEY, "json"),
+  );
+  if (cached) return cached;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INSTALLER_STABLE_TIMEOUT_MS);
+  try {
+    const response = await fetch(INSTALLER_STABLE_URL, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      throw new Error(`Installer stable release lookup failed: HTTP ${response.status}`);
+    }
+    const summary = parseStableReleaseSummary(await response.json());
+    if (!summary) throw new Error("Installer stable release summary is invalid.");
+    await env.ENVS_KV.put(
+      INSTALLER_STABLE_CACHE_KEY,
+      JSON.stringify(summary),
+      { expirationTtl: UPDATE_CACHE_TTL_SECONDS },
+    );
+    return summary;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 function normalizeVersionTag(tagName: string): string {
   return tagName.trim().replace(/^tiller-hub-v/i, "").replace(/^v/i, "");
@@ -42,7 +101,7 @@ function isHubRepoConfigured(state: HubUpdateRepoState): boolean {
   return state.status === "detected";
 }
 
-function updateMethodForState(hubRepo: HubUpdateRepoState): UpdateCheckResult["updateMethod"] {
+function updateMethodForState(hubRepo: HubUpdateRepoState): LegacyUpdateCheckResult["updateMethod"] {
   if (isHubRepoConfigured(hubRepo)) return "github_repo";
   return "connect_hub_repo";
 }
@@ -50,7 +109,7 @@ function updateMethodForState(hubRepo: HubUpdateRepoState): UpdateCheckResult["u
 function issueForState(
   updateAvailable: boolean,
   hubRepo: HubUpdateRepoState,
-): UpdateCheckResult["issue"] {
+): UpdateIssue | undefined {
   if (!updateAvailable || hubRepo.status === "detected") return undefined;
   if (hubRepo.status === "ambiguous") {
     return {
@@ -69,9 +128,10 @@ function buildUpdateCheckResult(
   latestUpdate: TillerUpdateMetadata,
   hubRepo: HubUpdateRepoState,
   releaseNotesUrl: string,
-): UpdateCheckResult {
+): LegacyUpdateCheckResult {
   const updateAvailable = currentUpdate.sourceId !== latestUpdate.sourceId;
   return {
+    kind: "legacy",
     updateAvailable,
     currentUpdate,
     latestUpdate,
@@ -83,10 +143,11 @@ function buildUpdateCheckResult(
   };
 }
 
-function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMetadata): value is UpdateCheckResult {
+function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMetadata): value is LegacyUpdateCheckResult {
   if (!value || typeof value !== "object") return false;
-  const result = value as Partial<UpdateCheckResult>;
-  return typeof result.updateAvailable === "boolean" &&
+  const result = value as Partial<LegacyUpdateCheckResult>;
+  return result.kind === "legacy" &&
+    typeof result.updateAvailable === "boolean" &&
     result.currentUpdate?.sourceId === currentUpdate.sourceId &&
     result.buildDiagnostics?.channel === getBuildChannel() &&
     typeof result.currentUpdate.version === "string" &&
@@ -98,8 +159,22 @@ function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMeta
 export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
   try {
     const currentUpdate = getCurrentUpdateMetadata();
+    if (env.TILLER_INSTALLER_SCHEMA?.trim()) {
+      const stableRelease = await readInstallerStableRelease(env);
+      const installedReleaseId = env.TILLER_RELEASE_ID?.trim() || currentUpdate.sourceId;
+      return {
+        kind: "installer-maintenance",
+        updateAvailable: installedReleaseId !== stableRelease.releaseId,
+        installedReleaseId,
+        stableRelease,
+        currentUpdate,
+        buildDiagnostics: getBuildDiagnostics(),
+      };
+    }
+
     if (getBuildChannel() === "development") {
       return {
+        kind: "legacy",
         updateAvailable: false,
         currentUpdate,
         latestUpdate: currentUpdate,
@@ -150,12 +225,28 @@ export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     const currentUpdate = getCurrentUpdateMetadata();
+    const installerManaged = Boolean(env.TILLER_INSTALLER_SCHEMA?.trim());
+    if (installerManaged) {
+      return {
+        kind: "installer-maintenance",
+        updateAvailable: false,
+        installedReleaseId: env.TILLER_RELEASE_ID?.trim() || currentUpdate.sourceId,
+        stableRelease: null,
+        currentUpdate,
+        buildDiagnostics: getBuildDiagnostics(),
+        issue: {
+          code: "update_check_failed",
+          message: `Self-update check failed: ${message}`,
+        },
+      };
+    }
     const latestUpdate = currentUpdate;
     const hubRepo = await readHubUpdateRepoState(env).catch((): HubUpdateRepoState => ({
       status: "not_checked",
       lastDetectedAt: null,
     }));
     return {
+      kind: "legacy",
       updateAvailable: false,
       currentUpdate,
       latestUpdate,

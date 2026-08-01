@@ -1,4 +1,4 @@
-import { getLocationHintOptions, getPlannerRunStub } from "../helpers";
+import { getPlannerRunStub } from "../helpers";
 import { isLocalOnlyRunnerBackendMode } from "../env/runner-backend";
 import { resolveContainerHubUrl } from "../env/hub-url";
 import { redactEnvValues } from "../redaction";
@@ -92,7 +92,7 @@ function runtimeStatus(value: unknown): string | null {
 
 function getHub(env: Env): HubRunnerControl {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as HubRunnerControl;
+  return env.HUB.get(hubId) as unknown as HubRunnerControl;
 }
 
 export function plannerJobSlug(runId: string): string {

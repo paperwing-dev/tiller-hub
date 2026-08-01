@@ -788,11 +788,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     if (!shouldBroadcast) return meta;
 
     const hubId = this.env.HUB.idFromName("hub");
-    const locationHint = this.env.DO_LOCATION_HINT as DurableObjectLocationHint | undefined;
-    const hub = this.env.HUB.get(
-      hubId,
-      locationHint ? { locationHint } : undefined,
-    ) as unknown as {
+    const hub = this.env.HUB.get(hubId) as unknown as {
       broadcastEnvUpsert: (env: EnvMeta) => Promise<void> | void;
     };
     await hub.broadcastEnvUpsert(projectEnvSummary(meta));

@@ -10,6 +10,7 @@ import {
   getBillingSelections,
   getIdleTimeoutMinutes,
   getSecret,
+  loadConfig,
 } from "./config";
 import type { BillingMode } from "../../shared/billing";
 import {
@@ -25,8 +26,6 @@ import {
   isGitHubAppAllowedForRequest,
   isGitHubAppInstallationReady,
 } from "../github/app";
-import { requiresWorkersDevAccessProtection } from "./protect-hub";
-import { resolveHubUpdateRepoState } from "../update/hub-repo";
 import { getBuildDiagnostics } from "../update/metadata";
 import {
   classifyHostRuntimeCompatibilityForExpectedRuntime,
@@ -34,18 +33,15 @@ import {
 } from "./runtime-compatibility";
 import type { HubUpdateRepoState, UpdateBuildDiagnostics } from "../update/types";
 import { resolveCodexBackendReadiness } from "../codex-execution";
-import {
-  hasAvailableHarnessModel,
-  listHarnessModelRequirementMessages,
-} from "../../shared/harness-catalog";
 import { readWorkersDevAccessLifecycle } from "../workers-dev-access/records";
 import { readExecutionStatus } from "../execution";
 import { CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES } from "../../shared/cloudflare-timeout";
 
 export interface SetupStatusPayload {
   needsSetup: boolean;
-  setupPhase: "protect-hub" | "github-app" | "model-access" | "complete";
+  setupPhase: "github-app" | "complete";
   isLocalDev: boolean;
+  installerManaged: boolean;
   workersDevHubUrl: string | null;
   modelAuthConfigured: boolean;
   claudeBillingMode: BillingMode | null;
@@ -79,51 +75,13 @@ export interface SetupStatusPayload {
   githubAppPublicHubDisabled: boolean;
   buildDiagnostics: UpdateBuildDiagnostics;
   selfUpdateRepo: HubUpdateRepoState;
-}
-
-export function resolveWorkersDevAccessOnboardingStatus(
-  env: Env,
-  canonicalOrigin: string,
-): SetupStatusPayload {
-  return {
-    needsSetup: true,
-    setupPhase: "protect-hub",
-    isLocalDev: false,
-    workersDevHubUrl: canonicalOrigin,
-    modelAuthConfigured: false,
-    claudeBillingMode: null,
-    openaiBillingMode: null,
-    workersAiConfigured: false,
-    hasClaudeSubscription: false,
-    hasAnthropicKey: false,
-    hasChatGPTAuth: false,
-    chatgptAuthStatus: "missing",
-    hasOpenAIKey: false,
-    codexRouteStatus: "unavailable",
-    openaiPlannerConfigured: false,
-    openaiPlannerAvailable: false,
-    openaiPlannerRoute: null,
-    openaiPlannerReason: null,
-    codexBackendReadiness: { cf: "unavailable", host: "unavailable" },
-    hostRegistered: false,
-    enabledHarnesses: resolveEnabledHarnesses(env),
-    protectionMode: "public",
-    tokenExpiresAt: null,
-    renewalRecommended: false,
-    hostConnected: false,
-    idleTimeoutMinutes: CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES,
-    canonicalMainBootstrapDepth: 0,
-    githubAppAvailable: false,
-    githubAppConfigured: false,
-    githubAppReady: false,
-    githubAppSlug: null,
-    githubAppInstallUrl: null,
-    githubAppManageUrl: getGitHubAppManageUrl(),
-    githubAppPublicHubDisabled: true,
-    buildDiagnostics: getBuildDiagnostics(),
-    selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
+  dashboardOnboarding: {
+    dismissed: boolean;
+    executionReady: boolean;
   };
 }
+
+export const DASHBOARD_ONBOARDING_DISMISSED_KEY = "DASHBOARD_ONBOARDING_DISMISSED_V1";
 
 type GitHubAppSetupReadiness = "ready" | "not_ready" | "unavailable";
 
@@ -140,31 +98,6 @@ async function resolveGitHubAppReadiness(options: {
     console.warn("[setup] GitHub App installation readiness is temporarily unavailable:", error);
     return "unavailable";
   }
-}
-
-function buildCloudflareModelBlockingReasons(options: {
-  hasOpenAIKey: boolean;
-  hasAnthropicKey: boolean;
-  workersAiConfigured: boolean;
-  enabledHarnesses: readonly EnvHarness[];
-}): string[] {
-  const credentialStatus = {
-    hasAnthropicKey: options.hasAnthropicKey,
-    hasOpenAIKey: options.hasOpenAIKey,
-    workersAiConfigured: options.workersAiConfigured,
-    // Cloudflare Containers onboarding remains credential-based in v1. Global billing is
-    // enforced by model pickers and launches after onboarding completes.
-    claudeBillingMode: "api" as const,
-    openaiBillingMode: "api" as const,
-  };
-  if (hasAvailableHarnessModel(options.enabledHarnesses, "cf", credentialStatus)) return [];
-
-  const expected = listHarnessModelRequirementMessages(
-    options.enabledHarnesses,
-    "cf",
-    credentialStatus,
-  ).map((message) => message.replace(/^Requires\s+/, "").replace(/\.$/, ""));
-  return [`Configure ${expected.length > 0 ? expected.join(", or ") : "model credentials"} for Cloudflare Containers.`];
 }
 
 function hasWorkersAiBinding(env: Env): boolean {
@@ -338,15 +271,9 @@ export async function resolveSetupStatus(
     env,
   });
   const githubAppReady = githubAppReadiness === "ready";
-  const selfUpdateRepo = buildDiagnostics.channel === "development"
-    ? { status: "not_checked" as const, lastDetectedAt: null }
-    : await resolveHubUpdateRepoState(env, { autoDetect: githubAppConfigured });
-  const cloudflareModelBlockingReasons = buildCloudflareModelBlockingReasons({
-    hasOpenAIKey: modelAuth.hasOpenAIKey,
-    hasAnthropicKey: modelAuth.hasAnthropicKey,
-    workersAiConfigured,
-    enabledHarnesses,
-  });
+  // Kept in the response for one compatibility window. Generated deployment
+  // repositories are no longer part of setup or lifecycle updates.
+  const selfUpdateRepo: HubUpdateRepoState = { status: "not_checked", lastDetectedAt: null };
   const openaiPlanner = resolveOpenAIPlannerStatus({
     hasOpenAIKey: modelAuth.hasOpenAIKey,
     chatgptAuthStatus: modelAuth.chatgptAuthStatus,
@@ -358,23 +285,19 @@ export async function resolveSetupStatus(
     : isLocalDev
       ? null
       : protection.hubUrl;
-  const modelAccessReady = cloudflareModelBlockingReasons.length === 0;
   const githubAppRequired = !isLocalDev;
-  const setupPhase: SetupStatusPayload["setupPhase"] = requiresWorkersDevAccessProtection({
-    isLocalDev,
-    accessConfigured: protection.accessConfigured,
-  })
-    ? "protect-hub"
-    : githubAppRequired && githubAppReadiness === "not_ready"
-      ? "github-app"
-      : modelAccessReady
-        ? "complete"
-        : "model-access";
+  // Model, execution, and machine configuration are dashboard onboarding. Only
+  // a usable GitHub App installation blocks first entry to the dashboard.
+  // Temporary GitHub API failures fail closed instead of bypassing required setup.
+  const setupPhase: SetupStatusPayload["setupPhase"] = githubAppRequired && githubAppReadiness !== "ready"
+    ? "github-app"
+    : "complete";
 
   return {
     needsSetup: setupPhase !== "complete",
     setupPhase,
     isLocalDev,
+    installerManaged: Boolean(env.TILLER_INSTALLER_SCHEMA?.trim()),
     workersDevHubUrl,
     modelAuthConfigured,
     claudeBillingMode: billingSelections.claudeBillingMode,
@@ -408,5 +331,9 @@ export async function resolveSetupStatus(
     githubAppPublicHubDisabled: !githubAppAllowed,
     buildDiagnostics,
     selfUpdateRepo,
+    dashboardOnboarding: {
+      dismissed: (await loadConfig(env))[DASHBOARD_ONBOARDING_DISMISSED_KEY] === "1",
+      executionReady: execution.executionReady,
+    },
   };
 }

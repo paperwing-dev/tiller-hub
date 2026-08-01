@@ -1,4 +1,4 @@
-import { getLocationHintOptions, getPlannerRunStub } from "../helpers";
+import { getPlannerRunStub } from "../helpers";
 import type { HubDO } from "../hub";
 import type { Env, ExecutionPlacement, RunnerCommandClaim, RunnerControlAction } from "../types";
 import type {
@@ -33,7 +33,7 @@ interface HubRunnerControl {
 
 function getHub(env: Env): HubRunnerControl {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as HubDO & HubRunnerControl;
+  return env.HUB.get(hubId) as unknown as HubDO & HubRunnerControl;
 }
 
 export function envReviewJobSlug(runId: string): string {

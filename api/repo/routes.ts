@@ -19,7 +19,7 @@ import {
   type RepoWorkspace,
 } from "./access";
 import { refreshGitHubDefaultBranchHead } from "./refresh";
-import { getArtifactStoreStub, getEnvLifecycleStub, getEnvReviewStub, getLocationHintOptions } from "../helpers";
+import { getArtifactStoreStub, getEnvLifecycleStub, getEnvReviewStub } from "../helpers";
 import { cleanupPlanWriterRuntime } from "../planner/dispatch";
 import { planWriterTerminalId } from "../planner/plan-writer-contract";
 import { projectRepoSummary } from "../sync/projectors";
@@ -71,7 +71,7 @@ async function broadcastRepoSummary(
   repo: RepoMeta,
 ): Promise<void> {
   const hubId = env.HUB.idFromName("hub");
-  const hub = env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as Pick<HubDO, "broadcastRepoUpsert">;
+  const hub = env.HUB.get(hubId) as unknown as Pick<HubDO, "broadcastRepoUpsert">;
   await hub.broadcastRepoUpsert(projectRepoSummary(repo));
 }
 
@@ -364,7 +364,7 @@ repoRoutes.post("/api/repos/:repoId/artifacts", async (c) => {
 
 function getHub(env: Env): RepoHub {
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as RepoHub;
+  return env.HUB.get(hubId) as unknown as RepoHub;
 }
 
 function sessionEnvJson(body: unknown, status = 200): Response {

@@ -1,4 +1,3 @@
-import { getLocationHintOptions } from "./helpers";
 import type {
   Env,
   HostServiceRegistration,
@@ -13,7 +12,7 @@ type HubServiceRegistry = {
 function getHub(env: Env): HubServiceRegistry | null {
   if (!env.HUB) return null;
   const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId, getLocationHintOptions(env)) as unknown as HubServiceRegistry;
+  return env.HUB.get(hubId) as unknown as HubServiceRegistry;
 }
 
 function normalizeHostService(service: HostServiceRegistration | null | undefined): HostServiceRegistration | null {

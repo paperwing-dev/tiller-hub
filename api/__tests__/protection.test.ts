@@ -9,6 +9,7 @@ import type {
   WorkersDevAccessCredentialV1,
   WorkersDevAccessTrustV1,
 } from "../workers-dev-access/types";
+import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
 const { getOpenAIAuthStatus } = vi.hoisted(() => ({
   getOpenAIAuthStatus: vi.fn(async () => ({ authenticated: false, status: "missing" })),
@@ -26,21 +27,21 @@ vi.mock("../openai-auth", () => ({
 const canonicalTrust: WorkersDevAccessTrustV1 = {
   version: 1,
   ownerEmail: "owner@example.com",
-  accountId: "account-1",
-  workerName: "demo",
-  workersDevHostname: "demo.preview.workers.dev",
+  accountId: "",
+  workerName: "tiller",
+  workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
   issuer: "https://team.cloudflareaccess.com",
   audience: "aud",
   serviceTokenId: "token-1",
   serviceClientId: "client-id.access",
-  configuredAt: "2026-07-16T00:00:00.000Z",
+  configuredAt: "1970-01-01T00:00:00.000Z",
 };
 
 const canonicalCredential: WorkersDevAccessCredentialV1 = {
   version: 1,
   currentSecret: "client-secret",
   tokenExpiresAt: "2027-07-16T00:00:00.000Z",
-  updatedAt: "2026-07-16T00:00:00.000Z",
+  updatedAt: "1970-01-01T00:00:00.000Z",
 };
 
 function mockEnv(
@@ -51,20 +52,19 @@ function mockEnv(
   const trust = access.trust ?? null;
   const credential = access.credential ?? null;
   return {
+    ...(trust && credential ? installedAccessBindings({
+      hostname: trust.workersDevHostname,
+      issuer: trust.issuer,
+      audience: trust.audience,
+      serviceClientId: trust.serviceClientId,
+      serviceClientSecret: credential.currentSecret,
+      ownerEmail: trust.ownerEmail,
+      tokenExpiresAt: credential.tokenExpiresAt,
+    }) : {}),
     HUB: {
       idFromName: vi.fn(() => "hub-id"),
       get: vi.fn(() => ({
         getConfig: vi.fn(async () => undefined),
-        getWorkersDevAccessTrust: vi.fn(async (hostname: string) => (
-          trust?.workersDevHostname === hostname ? trust : null
-        )),
-        getWorkersDevAccessCredential: vi.fn(async () => credential),
-        getWorkersDevAccessLifecycle: vi.fn(async () => ({
-          configured: Boolean(trust && credential),
-          workersDevHostname: trust?.workersDevHostname ?? null,
-          tokenExpiresAt: credential?.tokenExpiresAt ?? null,
-          renewalRecommended: false,
-        })),
       })),
     },
     TILLER_VOICE: {
@@ -223,14 +223,14 @@ describe("hasEnabledHarnessModelAuth", () => {
 describe("resolveProtectionState", () => {
   it("keeps workers.dev public until Access is explicitly configured", async () => {
     const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
+      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
       CF_ACCESS_AUD: "aud",
       CF_ACCESS_CLIENT_ID: "client-id",
       CF_ACCESS_CLIENT_SECRET: "client-secret",
     });
 
     await expect(
-      resolveProtectionState(env, "https://demo.preview.workers.dev/api/setup/status"),
+      resolveProtectionState(env, "https://tiller.preview.workers.dev/api/setup/status"),
     ).resolves.toMatchObject({
       protectionMode: "public",
       serviceTokenConfigured: false,
@@ -242,7 +242,7 @@ describe("resolveProtectionState", () => {
     const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     await expect(
-      resolveProtectionState(env, "https://demo.preview.workers.dev/api/setup/status"),
+      resolveProtectionState(env, "https://tiller.preview.workers.dev/api/setup/status"),
     ).resolves.toMatchObject({
       protectionMode: "cf-access",
       serviceTokenConfigured: true,
@@ -286,10 +286,10 @@ describe("authenticateAccessRequest", () => {
 
   it("fails closed when canonical workers.dev trust is missing", async () => {
     const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
+      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
       CF_ACCESS_AUD: "aud",
     });
-    const request = new Request("https://demo.preview.workers.dev/api/sessions", {
+    const request = new Request("https://tiller.preview.workers.dev/api/sessions", {
       headers: { "Cf-Access-Jwt-Assertion": "not-a-jwt" },
     });
 
@@ -300,7 +300,7 @@ describe("authenticateAccessRequest", () => {
 
   it("validates workers.dev Access JWTs when Access is configured", async () => {
     const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
-    const request = new Request("https://demo.preview.workers.dev/api/sessions", {
+    const request = new Request("https://tiller.preview.workers.dev/api/sessions", {
       headers: { "Cf-Access-Jwt-Assertion": "not-a-jwt" },
     });
 
@@ -322,10 +322,10 @@ describe("authMiddleware protect-hub guard", () => {
   it("blocks non-allowlisted APIs on fresh deployed workers.dev hubs", async () => {
     const app = createProtectedApp();
     const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
+      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
     });
 
-    const blocked = await app.request("https://demo.preview.workers.dev/api/envs", {}, env as any);
+    const blocked = await app.request("https://tiller.preview.workers.dev/api/envs", {}, env as any);
     expect(blocked.status).toBe(403);
     await expect(blocked.json()).resolves.toMatchObject({
       code: "setup_protection_required",
@@ -333,7 +333,7 @@ describe("authMiddleware protect-hub guard", () => {
     });
 
     const setupWrite = await app.request(
-      "https://demo.preview.workers.dev/api/setup",
+      "https://tiller.preview.workers.dev/api/setup",
       { method: "POST" },
       env as any,
     );
@@ -347,7 +347,7 @@ describe("authMiddleware protect-hub guard", () => {
     });
 
     const blocked = await app.request(
-      "https://demo.preview.workers.dev/api/envs",
+      "https://tiller.preview.workers.dev/api/envs",
       {},
       env as any,
     );
@@ -358,22 +358,22 @@ describe("authMiddleware protect-hub guard", () => {
     });
   });
 
-  it("allows only setup status and workers.dev OAuth start during protect-hub", async () => {
+  it("does not expose the retired in-Hub Access bootstrap before installer trust exists", async () => {
     const app = createProtectedApp();
     const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
+      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
     });
 
     await expect(
-      app.request("https://demo.preview.workers.dev/api/setup/status", {}, env as any),
-    ).resolves.toMatchObject({ status: 200 });
+      app.request("https://tiller.preview.workers.dev/api/setup/status", {}, env as any),
+    ).resolves.toMatchObject({ status: 403 });
     await expect(
       app.request(
-        "https://demo.preview.workers.dev/api/setup/workers-dev-access/oauth/start",
+        "https://tiller.preview.workers.dev/api/setup/workers-dev-access/oauth/start",
         { method: "POST" },
         env as any,
       ),
-    ).resolves.toMatchObject({ status: 200 });
+    ).resolves.toMatchObject({ status: 403 });
   });
 
   it("keeps localhost setup writes relaxed", async () => {
@@ -417,17 +417,17 @@ describe("authMiddleware protect-hub guard", () => {
 
   it("blocks non-API dynamic entrypoints during protect-hub", async () => {
     const env = mockEnv({
-      HUB_PUBLIC_URL: "https://demo.preview.workers.dev",
+      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
     });
 
     const agentsBlocked = await dynamicEntrypointAuthResponse(
-      new Request("https://demo.preview.workers.dev/agents/reviewer-chat/default"),
+      new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default"),
       env,
     );
     expect(agentsBlocked?.status).toBe(403);
 
     const partiesBlocked = await dynamicEntrypointAuthResponse(
-      new Request("https://demo.preview.workers.dev/parties/hub/hub", {
+      new Request("https://tiller.preview.workers.dev/parties/hub/hub", {
         headers: { Upgrade: "websocket" },
       }),
       env,
@@ -439,13 +439,13 @@ describe("authMiddleware protect-hub guard", () => {
     const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     const missing = await dynamicEntrypointAuthResponse(
-      new Request("https://demo.preview.workers.dev/agents/reviewer-chat/default"),
+      new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default"),
       env,
     );
     expect(missing?.status).toBe(401);
 
     const authed = await dynamicEntrypointAuthResponse(
-      new Request("https://demo.preview.workers.dev/agents/reviewer-chat/default", {
+      new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default", {
         headers: {
           "CF-Access-Client-Id": "client-id.access",
           "CF-Access-Client-Secret": "client-secret",
@@ -461,14 +461,14 @@ describe("authMiddleware protect-hub guard", () => {
     const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     const missing = await app.request(
-      "https://demo.preview.workers.dev/api/setup",
+      "https://tiller.preview.workers.dev/api/setup",
       { method: "POST" },
       env as any,
     );
     expect(missing.status).toBe(401);
 
     const authed = await app.request(
-      "https://demo.preview.workers.dev/api/setup",
+      "https://tiller.preview.workers.dev/api/setup",
       {
         method: "POST",
         headers: {
@@ -486,14 +486,14 @@ describe("authMiddleware protect-hub guard", () => {
     const env = mockEnv({}, { trust: canonicalTrust, credential: canonicalCredential });
 
     const missing = await app.request(
-      "https://demo.preview.workers.dev/api/setup/status",
+      "https://tiller.preview.workers.dev/api/setup/status",
       { method: "GET" },
       env as any,
     );
     expect(missing.status).toBe(401);
 
     const authed = await app.request(
-      "https://demo.preview.workers.dev/api/setup/status",
+      "https://tiller.preview.workers.dev/api/setup/status",
       {
         method: "GET",
         headers: {
@@ -556,7 +556,7 @@ describe("voice access auth", () => {
 
   it("fails closed for workers.dev voice requests without Access config", async () => {
     const res = await voiceRoutes.request(
-      "https://demo.preview.workers.dev/api/voice/session?sessionId=session-1",
+      "https://tiller.preview.workers.dev/api/voice/session?sessionId=session-1",
       {
         headers: {
           upgrade: "websocket",

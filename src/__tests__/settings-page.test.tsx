@@ -12,6 +12,7 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     needsSetup: false,
     setupPhase: "complete",
     isLocalDev: false,
+    installerManaged: false,
     workersDevHubUrl: "https://demo.preview.workers.dev",
     modelAuthConfigured: true,
     claudeBillingMode: "subscription",
@@ -154,12 +155,28 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).not.toContain("Import or replace");
   });
 
-  it("builds a Codex import command that targets the exact current Hub", async () => {
-    const { buildCodexImportCommand } = await import("../SettingsPage");
+  it("parses only the tokens needed for a Codex subscription import", async () => {
+    const { parseCodexAuthFile } = await import("../SettingsPage");
 
-    expect(buildCodexImportCommand("https://fresh.preview.workers.dev")).toBe(
-      "npx --yes @paperwing-dev/tiller@latest auth import codex --hub-url https://fresh.preview.workers.dev",
-    );
+    expect(parseCodexAuthFile({
+      auth_mode: "chatgpt",
+      tokens: {
+        access_token: " access-token ",
+        refresh_token: " refresh-token ",
+        id_token: " id-token ",
+        account_id: "must-not-be-uploaded",
+      },
+      unknown: "must-not-be-uploaded",
+    })).toEqual({
+      access_token: "access-token",
+      refresh_token: "refresh-token",
+      id_token: "id-token",
+    });
+
+    expect(() => parseCodexAuthFile({
+      auth_mode: "apikey",
+      tokens: { access_token: "access-token", refresh_token: "refresh-token" },
+    })).toThrow("Run codex login with a ChatGPT subscription");
   });
 
   it("shows independent unselected modes and configured inactive credentials", async () => {
@@ -399,5 +416,45 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).toContain("Renew within 30 days");
     expect(html.match(/Renew with Cloudflare/g)).toHaveLength(1);
     expect(html).toContain("existing CLI, machine, and workload connections");
+  });
+
+  it("uses installer maintenance for binding-based Access renewal", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const update = {
+      schemaVersion: 1 as const,
+      channel: "deploy-button" as const,
+      updateMode: "full-source" as const,
+      sourceRepo: "paperwing-dev/tiller-hub" as const,
+      sourceId: "a".repeat(40),
+      version: "0.3.0",
+      label: "Tiller Hub v0.3.0",
+      managedFiles: ["package.json"],
+    };
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus({
+          installerManaged: true,
+          tokenExpiresAt: "2026-08-01T00:00:00.000Z",
+          renewalRecommended: true,
+        })}
+        updateStatus={{
+          kind: "installer-maintenance",
+          updateAvailable: true,
+          installedReleaseId: "b".repeat(40),
+          currentUpdate: { ...update, sourceId: "b".repeat(40), version: "0.2.0" },
+          stableRelease: {
+            releaseId: update.sourceId,
+            version: update.version,
+            releaseNotesUrl: "https://example.com/release",
+          },
+          buildDiagnostics: baseStatus().buildDiagnostics,
+        }}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain("Renew and update to v0.3.0");
+    expect(html).not.toContain("Renew with Cloudflare");
   });
 });

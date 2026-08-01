@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Button } from '@cloudflare/kumo/components/button';
 import { applyUpdate, checkForUpdate, detectSelfUpdateRepo, selectSelfUpdateRepo } from './api';
-import type { HubUpdateRepoCandidate, UpdateCheckResult } from './api';
+import type { HubUpdateRepoCandidate, LegacyUpdateCheckResult, UpdateCheckResult } from './api';
 import { useToast } from './Toast';
-import { formatUpdateName } from './update-display';
+import { formatUpdateName, formatUpdateVersion } from './update-display';
+import { installerMaintenanceAction } from './installer-maintenance';
 
 const PROGRESS_STAGES = [
   'resolving-account',
@@ -29,6 +30,7 @@ interface UpdateDialogProps {
   issueCode?: string | null;
   isChecking: boolean;
   hasExecutionMachine: boolean;
+  renewalRecommended?: boolean;
   onDismiss: () => void;
   onOpenSettings: () => void;
   onRetryCheck: () => void;
@@ -60,7 +62,7 @@ function formatStage(stage: ProgressStage): string {
   }
 }
 
-function visibleGitHubOwnersForUpdateRepo(status: UpdateCheckResult['hubRepo']): string[] {
+function visibleGitHubOwnersForUpdateRepo(status: LegacyUpdateCheckResult['hubRepo']): string[] {
   return status.status === 'missing' ? status.visibleGitHubOwners : [];
 }
 
@@ -70,6 +72,13 @@ function formatVisibleGitHubOwners(owners: string[]): string {
   return owners.join(', ');
 }
 
+function updateResultIdentity(status: UpdateCheckResult | null): string | null {
+  if (!status) return null;
+  return status.kind === 'installer-maintenance'
+    ? status.stableRelease?.releaseId ?? status.installedReleaseId
+    : status.latestUpdate.sourceId;
+}
+
 export default function UpdateDialog({
   hubUrl,
   status,
@@ -77,6 +86,7 @@ export default function UpdateDialog({
   issueCode,
   isChecking,
   hasExecutionMachine,
+  renewalRecommended = false,
   onDismiss,
   onOpenSettings,
   onRetryCheck,
@@ -121,7 +131,7 @@ export default function UpdateDialog({
     setAutoReloadScheduled(false);
     clearProgressTimer();
     clearReloadTimer();
-  }, [status?.latestUpdate.sourceId]);
+  }, [updateResultIdentity(status)]);
 
   useEffect(() => () => {
     clearProgressTimer();
@@ -191,7 +201,7 @@ export default function UpdateDialog({
   }
 
   async function handleGitHubRepoUpdate() {
-    if (!status) {
+    if (!status || status.kind !== 'legacy') {
       return;
     }
 
@@ -339,11 +349,97 @@ export default function UpdateDialog({
   }
 
   const currentUpdateName = formatUpdateName(status.currentUpdate);
+  const isDevelopmentBuild = status.buildDiagnostics.channel === 'development';
+  if (status.kind === 'installer-maintenance') {
+    const stableUpdateName = status.stableRelease
+      ? formatUpdateVersion(status.stableRelease.version)
+      : null;
+    const action = isDevelopmentBuild ? null : installerMaintenanceAction({
+      updateAvailable: status.updateAvailable,
+      latestVersion: status.stableRelease?.version ?? '',
+      renewAccess: renewalRecommended,
+    });
+    return (
+      <div className="flex-1 overflow-auto bg-kumo-recessed">
+        <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
+          <section className="rounded-2xl border border-kumo-line bg-kumo-base p-6 shadow-sm">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
+              Tiller maintenance
+            </p>
+            <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">
+              {isDevelopmentBuild
+                ? 'Development build'
+                : action?.label ?? (status.stableRelease ? 'Tiller is up to date' : 'Stable release check unavailable')}
+            </h1>
+            <p className="mt-2 text-sm text-kumo-subtle">
+              {isDevelopmentBuild
+                ? <>This Hub is running a development build from <strong>{currentUpdateName}</strong>.</>
+                : status.updateAvailable && stableUpdateName
+                  ? <>This Hub is running <strong>{currentUpdateName}</strong>. The stable release is <strong>{stableUpdateName}</strong>.</>
+                  : status.stableRelease
+                    ? <>This Hub is running the current stable release, <strong>{currentUpdateName}</strong>.</>
+                    : <>Tiller could not load the current stable release. The deployed Hub remains on <strong>{currentUpdateName}</strong>.</>}
+            </p>
+
+            {renewalRecommended && (
+              <div className="mt-5 rounded-xl border border-kumo-warning/30 bg-kumo-warning-tint px-4 py-3">
+                <p className="text-sm font-semibold text-kumo-default">Access renewal recommended</p>
+                <p className="mt-1 text-sm text-kumo-subtle">
+                  Renew Access to keep CLI, execution-machine, and workload connections active.
+                </p>
+              </div>
+            )}
+
+            {issue && (
+              <div className="mt-5 rounded-xl border border-kumo-warning/30 bg-kumo-warning-tint px-4 py-3">
+                <p className="text-sm font-semibold text-kumo-default">Stable release check unavailable</p>
+                <p className="mt-1 text-sm text-kumo-subtle">{issue}</p>
+              </div>
+            )}
+
+            {hasExecutionMachine && status.updateAvailable && (
+              <div className="mt-5 rounded-xl border border-kumo-warning/30 bg-kumo-warning-tint px-4 py-3">
+                <p className="text-sm font-semibold text-kumo-default">Execution machine</p>
+                <p className="mt-1 text-sm leading-5 text-kumo-subtle">
+                  After the Hub update, run tiller host update if you also want to refresh the execution-machine runtime.
+                </p>
+              </div>
+            )}
+
+            <div className="mt-6 flex flex-wrap items-center gap-3">
+              {action && (
+                <Button
+                  type="button"
+                  variant="primary"
+                  onClick={() => window.location.assign(action.url)}
+                >
+                  {action.label}
+                </Button>
+              )}
+              {status.stableRelease && (
+                <a
+                  href={status.stableRelease.releaseNotesUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint"
+                >
+                  Release notes
+                </a>
+              )}
+              <Button type="button" variant="secondary" onClick={onDismiss}>
+                {action ? 'Dismiss' : 'Close'}
+              </Button>
+            </div>
+          </section>
+        </div>
+      </div>
+    );
+  }
+
   const latestUpdateName = formatUpdateName(status.latestUpdate);
   const visibleUpdateRepoOwners = visibleGitHubOwnersForUpdateRepo(status.hubRepo);
   const showProgress = stage !== 'idle';
   const sameUpdateName = currentUpdateName === latestUpdateName;
-  const isDevelopmentBuild = status.buildDiagnostics.channel === 'development';
   return (
     <div className="flex-1 overflow-auto bg-kumo-recessed">
       <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">

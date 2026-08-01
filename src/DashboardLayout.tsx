@@ -142,6 +142,7 @@ export function WorkspaceLayout() {
                 issue={data.updateIssue}
                 dismissed={data.updateDismissed}
                 isChecking={data.isCheckingUpdate}
+                renewalRecommended={data.setupStatus?.renewalRecommended ?? false}
                 onOpen={() => navigate('/update')}
               />
             </div>

@@ -169,6 +169,7 @@ describe("Dashboard", () => {
   it("surfaces update-check failures returned as typed update issues", async () => {
     const { getTopLevelUpdateIssue } = await import("../App");
     expect(getTopLevelUpdateIssue({
+      kind: "legacy",
       updateAvailable: false,
       currentUpdate: {
         schemaVersion: 1,

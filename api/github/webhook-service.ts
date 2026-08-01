@@ -1,4 +1,4 @@
-import { getEnvLifecycleStub, getLocationHintOptions } from "../helpers";
+import { getEnvLifecycleStub } from "../helpers";
 import type { Env, EnvMeta, RepoMeta } from "../types";
 import type { HubDO } from "../hub";
 import { buildEnvScmMetaPatch } from "../env-lifecycle";
@@ -26,7 +26,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function getHubConfigStore(env: Env): HubWebhookConfigStore {
   const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id, getLocationHintOptions(env)) as unknown as HubWebhookConfigStore;
+  return env.HUB.get(id) as unknown as HubWebhookConfigStore;
 }
 
 function nowIso(): string {

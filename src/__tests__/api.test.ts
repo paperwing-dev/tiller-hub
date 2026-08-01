@@ -790,8 +790,9 @@ describe("single-object api helpers", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({
         needsSetup: true,
-        setupPhase: "protect-hub",
+        setupPhase: "github-app",
         isLocalDev: false,
+        installerManaged: true,
         workersDevHubUrl: "https://demo.preview.workers.dev",
         modelAuthConfigured: false,
         claudeBillingMode: null,
@@ -810,7 +811,7 @@ describe("single-object api helpers", () => {
         codexBackendReadiness: { cf: "unavailable", host: "unavailable" },
         hostRegistered: false,
         enabledHarnesses: ["claude-code", "codex", "opencode"],
-        protectionMode: "public",
+        protectionMode: "cf-access",
         tokenExpiresAt: null,
         renewalRecommended: false,
         hostConnected: false,
@@ -830,12 +831,17 @@ describe("single-object api helpers", () => {
           workersCiBranch: null,
         },
         selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
+        dashboardOnboarding: {
+          dismissed: false,
+          executionReady: true,
+        },
       }), { status: 200 }),
     );
 
     await expect(fetchSetupStatus("https://demo.preview.workers.dev"))
       .resolves.toMatchObject({
-        setupPhase: "protect-hub",
+        setupPhase: "github-app",
+        installerManaged: true,
         workersDevHubUrl: "https://demo.preview.workers.dev",
         enabledHarnesses: ["claude-code", "codex", "opencode"],
       });
@@ -925,6 +931,52 @@ describe("single-object api helpers", () => {
     );
 
     await expect(checkForUpdate("https://example.com")).rejects.toThrow("Malformed update check response");
+  });
+
+  it("normalizes installer maintenance results without synthesizing legacy update metadata", async () => {
+    const runtimeSha = "0123456789abcdef0123456789abcdef01234567";
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        kind: "installer-maintenance",
+        updateAvailable: true,
+        installedReleaseId: "a".repeat(40),
+        stableRelease: {
+          releaseId: "b".repeat(40),
+          version: "0.3.0",
+          releaseNotesUrl: "https://example.com/release",
+        },
+        currentUpdate: {
+          schemaVersion: 1,
+          channel: "deploy-button",
+          updateMode: "full-source",
+          sourceRepo: "paperwing-dev/tiller-hub",
+          sourceId: "a".repeat(40),
+          version: "0.2.0",
+          label: "Tiller Hub v0.2.0",
+          managedFiles: ["package.json"],
+          selfHostRuntime: {
+            imageSourceId: runtimeSha,
+            sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${runtimeSha}`,
+          },
+        },
+        buildDiagnostics: {
+          channel: "release",
+          version: "0.2.0",
+          workersCiCommitSha: null,
+          workersCiBranch: null,
+        },
+      }), { status: 200 }),
+    );
+
+    const result = await checkForUpdate("https://example.com");
+
+    expect(result.kind).toBe("installer-maintenance");
+    expect(result.currentUpdate.selfHostRuntime).toEqual({
+      imageSourceId: runtimeSha,
+      sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${runtimeSha}`,
+    });
+    expect(result).not.toHaveProperty("latestUpdate");
+    expect(result).not.toHaveProperty("hubRepo");
   });
 });
 

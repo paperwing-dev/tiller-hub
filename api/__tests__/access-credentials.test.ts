@@ -6,6 +6,7 @@ import type {
   WorkersDevAccessCredentialV1,
   WorkersDevAccessTrustV1,
 } from "../workers-dev-access/types";
+import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
 vi.mock("../setup/config", () => ({
   getSecret: async (env: Record<string, unknown>, key: string) => env[key] || undefined,
@@ -14,9 +15,9 @@ vi.mock("../setup/config", () => ({
 const trust: WorkersDevAccessTrustV1 = {
   version: 1,
   ownerEmail: "owner@example.com",
-  accountId: "account-1",
-  workerName: "demo",
-  workersDevHostname: "demo.preview.workers.dev",
+  accountId: "",
+  workerName: "tiller",
+  workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
   issuer: "https://team.cloudflareaccess.com",
   audience: "audience-1",
   serviceTokenId: "token-1",
@@ -33,21 +34,15 @@ const credential: WorkersDevAccessCredentialV1 = {
 
 function canonicalEnv(): Env {
   return {
-    HUB: {
-      idFromName: vi.fn(() => "hub-id"),
-      get: vi.fn(() => ({
-        getWorkersDevAccessLifecycle: vi.fn(async () => ({
-          configured: true,
-          workersDevHostname: trust.workersDevHostname,
-          tokenExpiresAt: credential.tokenExpiresAt,
-          renewalRecommended: false,
-        })),
-        getWorkersDevAccessTrust: vi.fn(async (hostname: string) => (
-          hostname === trust.workersDevHostname ? trust : null
-        )),
-        getWorkersDevAccessCredential: vi.fn(async () => credential),
-      })),
-    },
+    ...installedAccessBindings({
+      hostname: trust.workersDevHostname,
+      issuer: trust.issuer,
+      audience: trust.audience,
+      serviceClientId: trust.serviceClientId,
+      serviceClientSecret: credential.currentSecret,
+      ownerEmail: trust.ownerEmail,
+      tokenExpiresAt: credential.tokenExpiresAt,
+    }),
   } as unknown as Env;
 }
 
@@ -57,7 +52,7 @@ describe("outbound Cloudflare Access credentials", () => {
   it("reads the canonical workers.dev credential fresh without stripping headers", async () => {
     await expect(readAccessServiceCredential(
       canonicalEnv(),
-      "https://demo.preview.workers.dev",
+      `https://${TEST_WORKERS_DEV_HOSTNAME}`,
     )).resolves.toEqual({
       clientId: "service-client.access",
       clientSecret: "service-secret",
