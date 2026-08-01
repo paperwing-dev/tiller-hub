@@ -1,6 +1,6 @@
 {
   "name": "tiller-hub",
-  "version": "0.2.40",
+  "version": "0.2.41",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "type": "module",
