@@ -155,6 +155,18 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).not.toContain("Import Codex Login");
   });
 
+  it("leads Claude subscription setup with the Tiller CLI and keeps manual entry as a fallback", async () => {
+    const { default: SettingsPage } = await import("../SettingsPage");
+    const html = renderToString(
+      <SettingsPage status={baseStatus()} onDone={() => undefined} onRefresh={async () => undefined} />,
+    );
+
+    expect(html).toContain("tiller auth connect claude");
+    expect(html).toContain("requests one hidden token paste");
+    expect(html).toContain("Manual fallback:");
+    expect(html).toContain("claude setup-token");
+  });
+
   it("shows independent unselected modes and configured inactive credentials", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
     const html = renderToString(
@@ -247,9 +259,9 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).not.toContain("Import Codex Login");
   });
 
-  it("distinguishes a disconnected execution machine from unavailable authentication", async () => {
+  it("keeps Hub-wide Codex authentication separate from execution-backend readiness", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
-    const disconnected = renderToString(
+    const html = renderToString(
       <SettingsPage
         status={baseStatus({
           hasChatGPTAuth: true,
@@ -261,25 +273,12 @@ describe("SettingsPage GitHub App wizard", () => {
         onRefresh={async () => undefined}
       />,
     );
-    expect(disconnected).toContain("The selected execution machine is registered but not connected.");
-
-    const unavailable = renderToString(
-      <SettingsPage
-        status={baseStatus({
-          hasChatGPTAuth: true,
-          chatgptAuthStatus: "connected",
-          codexRouteStatus: "authentication_unavailable",
-          openaiPlannerReason: "The selected OpenAI authentication route is unavailable.",
-        })}
-        onDone={() => undefined}
-        onRefresh={async () => undefined}
-      />,
-    );
-    expect(unavailable).toContain("Authentication unavailable");
-    expect(unavailable).toContain("The selected OpenAI authentication route is unavailable.");
+    expect(html).toContain("Subscription active");
+    expect(html).toContain("Connected to this Hub for Codex workloads and OpenAI planner runs on either execution backend.");
+    expect(html).not.toContain("The selected execution machine is registered but not connected.");
   });
 
-  it("shows backend readiness independently when Cloudflare is ready but the machine is disconnected", async () => {
+  it("shows backend choices only in the execution settings card", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
     const html = renderToString(
       <SettingsPage
@@ -295,10 +294,9 @@ describe("SettingsPage GitHub App wizard", () => {
         onRefresh={async () => undefined}
       />,
     );
-    expect(html).toContain("Cloudflare Containers");
-    expect(html).toContain("Ready");
-    expect(html).toContain("Your machine");
-    expect(html).toContain("Environment not connected");
+    expect(html.match(/Cloudflare Containers/g)).toHaveLength(1);
+    expect(html.match(/Your machine/g)).toHaveLength(1);
+    expect(html).not.toContain("Environment not connected");
   });
 
   it("warns when the self-update repo is not visible to the GitHub App", async () => {

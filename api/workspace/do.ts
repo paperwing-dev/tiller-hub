@@ -100,9 +100,17 @@ function identitiesEqual(left: RepoDefaultHeadIdentity, right: RepoDefaultHeadId
 function repoMetaFromStored(meta: Record<string, unknown>): RepoMeta | null {
   const githubDefaultBranch = meta.githubDefaultBranch ?? null;
   const githubDefaultBranchHeadSha = meta.githubDefaultBranchHeadSha ?? null;
+  const artifactStoreGeneration = meta.artifactStoreGeneration ?? null;
   const bootstrappedFromRef = meta.bootstrappedFromRef;
   if (
     typeof meta.repoId !== "string" ||
+    !(
+      artifactStoreGeneration === null ||
+      (
+        typeof artifactStoreGeneration === "string" &&
+        Boolean(artifactStoreGeneration.trim())
+      )
+    ) ||
     typeof meta.githubInstallationId !== "number" ||
     typeof meta.githubFullName !== "string" ||
     !isNullableString(githubDefaultBranch) ||
@@ -116,6 +124,9 @@ function repoMetaFromStored(meta: Record<string, unknown>): RepoMeta | null {
 
   return {
     repoId: meta.repoId,
+    artifactStoreGeneration: typeof artifactStoreGeneration === "string"
+      ? artifactStoreGeneration.trim()
+      : null,
     repoUrl: githubRepoUrlFromFullName(meta.githubFullName),
     scmModel: "github",
     githubInstallationId: meta.githubInstallationId,

@@ -215,48 +215,19 @@ function codexSubscriptionStatus(status: SetupStatus): {
     };
   }
 
-  if (status.openaiPlannerAvailable && status.openaiPlannerRoute === "subscription-app-server") {
+  if (status.chatgptAuthStatus === "refreshing") {
     return {
-      title: "Subscription active",
-      detail: "New Codex launch profiles use the connected subscription through the app-server runtime.",
-      tone: "success",
+      title: "Subscription refreshing",
+      detail: "Tiller is refreshing this Hub's Codex subscription connection.",
+      tone: "warning",
     };
   }
 
-  if (status.hasChatGPTAuth || status.chatgptAuthStatus === "refreshing") {
-    if (status.codexRouteStatus === "runtime_update_required") {
-      return {
-        title: "Subscription connected",
-        detail: "The selected execution backend needs a compatible runtime update.",
-        tone: "warning",
-      };
-    }
-    if (status.codexRouteStatus === "backend_offline") {
-      return {
-        title: "Subscription connected",
-        detail: "The selected execution backend is offline.",
-        tone: "warning",
-      };
-    }
-    if (status.codexRouteStatus === "environment_not_connected") {
-      return {
-        title: "Subscription connected",
-        detail: "The selected execution machine is registered but not connected.",
-        tone: "warning",
-      };
-    }
-    if (status.codexRouteStatus === "authentication_unavailable") {
-      return {
-        title: "Authentication unavailable",
-        detail: status.openaiPlannerReason || "The selected OpenAI authentication route is unavailable.",
-        tone: "warning",
-      };
-    }
-
+  if (status.hasChatGPTAuth || status.chatgptAuthStatus === "connected") {
     return {
-      title: "Subscription connected",
-      detail: status.openaiPlannerReason || "The selected Codex runtime is not ready for a new launch.",
-      tone: "warning",
+      title: "Subscription active",
+      detail: "Connected to this Hub for Codex workloads and OpenAI planner runs on either execution backend.",
+      tone: "success",
     };
   }
 
@@ -273,18 +244,6 @@ function codexSubscriptionStatus(status: SetupStatus): {
     detail: "Run the Tiller CLI connection command to enable subscription-backed Codex launches.",
     tone: "neutral",
   };
-}
-
-function codexBackendReadinessLabel(status: SetupStatus["codexRouteStatus"]): string {
-  switch (status) {
-    case "available": return "Ready";
-    case "direct_api": return "API key ready";
-    case "backend_offline": return "Backend offline";
-    case "runtime_update_required": return "Runtime update required";
-    case "environment_not_connected": return "Environment not connected";
-    case "authentication_unavailable": return "Authentication unavailable";
-    case "unavailable": return "Unavailable";
-  }
 }
 
 function visibleGitHubOwnersForUpdateRepo(status: SetupStatus["selfUpdateRepo"]): string[] {
@@ -539,16 +498,15 @@ function CredentialRow({
 function ClaudeSubscriptionSetupHint() {
   return (
     <div className="mt-3 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2">
-      <ol className="list-decimal space-y-1 pl-4 text-xs text-kumo-subtle">
-        <li>
-          On a trusted machine where you can log in to Claude Code, run{" "}
-          <code>claude setup-token</code>.
-        </li>
-        <li>
-          Complete the browser login with your Claude Pro, Max, Team, or Enterprise account, then paste the printed
-          token here.
-        </li>
-      </ol>
+      <p className="text-xs font-medium text-kumo-default">Recommended</p>
+      <p className="mt-1 text-xs text-kumo-subtle">
+        Run <code>tiller auth connect claude</code> from a terminal. Tiller guides you through Claude&apos;s login,
+        requests one hidden token paste, and activates subscription billing.
+      </p>
+      <p className="mt-2 text-xs text-kumo-subtle">
+        <span className="font-medium text-kumo-default">Manual fallback:</span>{" "}
+        run <code>claude setup-token</code>, then add the printed token here.
+      </p>
     </div>
   );
 }
@@ -628,23 +586,6 @@ function CodexSubscriptionRow({
       </p>
       <p className="mt-1 text-xs text-kumo-subtle">{codexStatus.detail}</p>
 
-      {status.openaiBillingMode === "subscription" && (
-        <dl className="mt-3 grid gap-1 text-xs">
-          <div className="flex items-center justify-between gap-3">
-            <dt className="text-kumo-subtle">Cloudflare Containers</dt>
-            <dd className="font-medium text-kumo-default">
-              {codexBackendReadinessLabel(status.codexBackendReadiness.cf)}
-            </dd>
-          </div>
-          <div className="flex items-center justify-between gap-3">
-            <dt className="text-kumo-subtle">Your machine</dt>
-            <dd className="font-medium text-kumo-default">
-              {codexBackendReadinessLabel(status.codexBackendReadiness.host)}
-            </dd>
-          </div>
-        </dl>
-      )}
-
       <div className="mt-3 flex flex-wrap gap-2">
         <Button
           variant="secondary"
@@ -661,12 +602,6 @@ function CodexSubscriptionRow({
           : "Connect from a terminal with "}
         <code>tiller auth connect codex</code>.
       </p>
-      {status.hostRegistered && !status.hostConnected && (
-        <p className="mt-2 text-xs text-kumo-warning">
-          Keep <code>tiller host</code> running when you want Codex workloads or the OpenAI planner on Your machine
-          to use this subscription route.
-        </p>
-      )}
     </div>
   );
 }
@@ -1769,7 +1704,7 @@ export default function SettingsPage({
   const subscriptionCredentials: CredentialDef[] = [
     {
       label: "Claude subscription token",
-      description: "Use a Claude Code OAuth token from your subscription.",
+      description: "Connect your Claude subscription with the Tiller CLI. Manual token entry remains available as a fallback.",
       secretKey: "CLAUDE_CODE_OAUTH_TOKEN",
       configured: status.hasClaudeSubscription,
       active: status.claudeBillingMode === "subscription",
