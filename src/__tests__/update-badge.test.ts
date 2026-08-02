@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { describeUpdateButtonState } from "../UpdateBadge";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import UpdateButton, { describeUpdateButtonState } from "../UpdateBadge";
 import type {
   InstallerMaintenanceUpdateCheckResult,
   LegacyUpdateCheckResult,
@@ -65,6 +67,21 @@ function installerUpdateStatus(
 }
 
 describe("describeUpdateButtonState", () => {
+  it("keeps one fixed button label and does not add a native tooltip", () => {
+    const html = renderToStaticMarkup(React.createElement(UpdateButton, {
+      status: installerUpdateStatus(),
+      issue: null,
+      dismissed: false,
+      isChecking: false,
+      renewalRecommended: false,
+      onOpen: () => undefined,
+    }));
+
+    expect(html).toContain(">Update</button>");
+    expect(html).toContain('aria-label="Update to v0.2.0"');
+    expect(html).not.toContain("title=");
+  });
+
   it("disables the button when the self-update check fails", () => {
     expect(describeUpdateButtonState({
       status: null,
@@ -72,10 +89,8 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: false,
     })).toEqual({
-      title: "Update unavailable: Latest tiller-hub release is not accessible.",
-      tooltip: "Update unavailable: Latest tiller-hub release is not accessible.",
+      description: "Update unavailable: Latest tiller-hub release is not accessible.",
       enabled: false,
-      label: "Update",
     });
   });
 
@@ -86,10 +101,8 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: false,
     })).toEqual({
-      title: "Update available: v0.1.0 -> v0.2.0",
-      tooltip: "Update available",
+      description: "Update available: v0.1.0 -> v0.2.0",
       enabled: true,
-      label: "Update",
     });
   });
 
@@ -100,10 +113,8 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: false,
     })).toEqual({
-      title: "No update available",
-      tooltip: "No update available",
+      description: "No update available",
       enabled: false,
-      label: "Update",
     });
 
     expect(describeUpdateButtonState({
@@ -112,10 +123,8 @@ describe("describeUpdateButtonState", () => {
       dismissed: true,
       isChecking: false,
     })).toEqual({
-      title: "Update dismissed",
-      tooltip: "Update dismissed",
+      description: "Update dismissed",
       enabled: false,
-      label: "Update",
     });
   });
 
@@ -126,10 +135,8 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: true,
     })).toEqual({
-      title: "Checking for updates",
-      tooltip: "Checking for updates",
+      description: "Checking for updates",
       enabled: false,
-      label: "Update",
     });
 
     expect(describeUpdateButtonState({
@@ -145,10 +152,8 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: false,
     })).toEqual({
-      title: "Development build",
-      tooltip: "Development build",
+      description: "Development build",
       enabled: false,
-      label: "Update",
     });
   });
 
@@ -160,10 +165,8 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
       renewalRecommended: false,
     })).toEqual({
-      title: "Update to v0.2.0",
-      tooltip: "Update to v0.2.0",
+      description: "Update to v0.2.0",
       enabled: true,
-      label: "Update to v0.2.0",
     });
 
     expect(describeUpdateButtonState({
@@ -173,10 +176,8 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
       renewalRecommended: true,
     })).toEqual({
-      title: "Renew Access",
-      tooltip: "Renew Access",
+      description: "Renew Access",
       enabled: true,
-      label: "Renew Access",
     });
 
     expect(describeUpdateButtonState({
@@ -185,6 +186,6 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: false,
       renewalRecommended: true,
-    }).label).toBe("Renew and update to v0.2.0");
+    }).description).toBe("Renew and update to v0.2.0");
   });
 });

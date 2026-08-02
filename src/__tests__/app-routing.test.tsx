@@ -20,6 +20,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchRepos: vi.fn(),
   fetchEnv: vi.fn(),
   fetchRepo: vi.fn(),
+  updateButtonOnOpen: null as (() => void) | null,
   wsHandlers: null as null | {
     onEnvRemove?: (slug: string) => void;
   },
@@ -71,7 +72,10 @@ vi.mock("../SetupWizard", () => ({
 }));
 
 vi.mock("../UpdateBadge", () => ({
-  default: () => <button data-testid="update-button" type="button" />,
+  default: ({ onOpen }: { onOpen: () => void }) => {
+    apiMocks.updateButtonOnOpen = onOpen;
+    return <button data-testid="update-button" type="button">Update</button>;
+  },
 }));
 
 vi.mock("../UpdateDialog", () => ({
@@ -252,6 +256,7 @@ describe("dashboard route guards", () => {
       })),
     });
     apiMocks.fetchSessions.mockResolvedValue([sessionFixture()]);
+    apiMocks.updateButtonOnOpen = null;
     apiMocks.fetchMessages.mockResolvedValue([]);
     apiMocks.fetchPendingPermissions.mockResolvedValue([]);
     apiMocks.wsHandlers = null;
@@ -397,6 +402,27 @@ describe("dashboard route guards", () => {
       expect(screen.getAllByTestId("update-button")).toHaveLength(1);
     });
     expect(router.state.location.pathname).toBe("/projects/repo-1/global-settings");
+  });
+
+  it("opens update maintenance as a modal without leaving the workspace route", async () => {
+    const router = await renderDashboardAt("/projects/repo-1");
+
+    await screen.findByTestId("update-button");
+    act(() => {
+      apiMocks.updateButtonOnOpen?.();
+    });
+
+    expect(await screen.findByTestId("update-dialog")).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/projects/repo-1");
+    expect(screen.getByTestId("session-list")).toBeInTheDocument();
+  });
+
+  it("keeps the direct update URL as a modal compatibility route", async () => {
+    const router = await renderDashboardAt("/update");
+
+    expect(await screen.findByTestId("update-dialog")).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/update");
+    expect(screen.queryByTestId("session-list")).not.toBeInTheDocument();
   });
 
   it("returns to the repo workspace when the selected environment is deleted", async () => {

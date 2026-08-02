@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import type { UpdateCheckResult } from './api';
 import { formatUpdateName } from './update-display';
 import { installerMaintenanceAction } from './installer-maintenance';
@@ -25,17 +25,13 @@ export function describeUpdateButtonState({
   isChecking: boolean;
   renewalRecommended?: boolean;
 }): {
-  title: string;
-  tooltip: string;
+  description: string;
   enabled: boolean;
-  label: string;
 } {
   if (isChecking) {
     return {
-      title: 'Checking for updates',
-      tooltip: 'Checking for updates',
+      description: 'Checking for updates',
       enabled: false,
-      label: 'Update',
     };
   }
 
@@ -49,72 +45,56 @@ export function describeUpdateButtonState({
 
   if (issue && !maintenanceAction) {
     return {
-      title: `Update unavailable: ${issue}`,
-      tooltip: `Update unavailable: ${issue}`,
+      description: `Update unavailable: ${issue}`,
       enabled: false,
-      label: 'Update',
     };
   }
 
   if (!status) {
     return {
-      title: 'No update available',
-      tooltip: 'No update available',
+      description: 'No update available',
       enabled: false,
-      label: 'Update',
     };
   }
 
   if (status.buildDiagnostics.channel === 'development') {
     return {
-      title: 'Development build',
-      tooltip: 'Development build',
+      description: 'Development build',
       enabled: false,
-      label: 'Update',
     };
   }
 
   if (dismissed && maintenanceAction?.intent !== 'renew') {
     return {
-      title: 'Update dismissed',
-      tooltip: 'Update dismissed',
+      description: 'Update dismissed',
       enabled: false,
-      label: 'Update',
     };
   }
 
   if (maintenanceAction) {
     return {
-      title: maintenanceAction.label,
-      tooltip: maintenanceAction.label,
+      description: maintenanceAction.label,
       enabled: true,
-      label: maintenanceAction.label,
     };
   }
 
   if (!status.updateAvailable) {
     return {
-      title: 'No update available',
-      tooltip: 'No update available',
+      description: 'No update available',
       enabled: false,
-      label: 'Update',
     };
   }
 
   if (status.kind === 'installer-maintenance') {
     return {
-      title: 'Update unavailable',
-      tooltip: 'Update unavailable',
+      description: 'Update unavailable',
       enabled: false,
-      label: 'Update',
     };
   }
 
   return {
-    title: `Update available: ${formatUpdateName(status.currentUpdate)} -> ${formatUpdateName(status.latestUpdate)}`,
-    tooltip: 'Update available',
+    description: `Update available: ${formatUpdateName(status.currentUpdate)} -> ${formatUpdateName(status.latestUpdate)}`,
     enabled: true,
-    label: 'Update',
   };
 }
 
@@ -147,19 +127,18 @@ export default function UpdateButton({
         type="button"
         onClick={state.enabled ? onOpen : undefined}
         disabled={!state.enabled}
-        title={state.title}
-        aria-label={state.title}
+        aria-label={state.description}
         className={`h-6 rounded border px-2 text-[10px] font-medium uppercase tracking-wide transition-colors ${
           state.enabled
             ? 'border-kumo-focus bg-kumo-info-tint text-kumo-link hover:bg-kumo-tint'
             : 'border-kumo-line bg-kumo-base text-kumo-subtle disabled:cursor-default disabled:opacity-60'
         }`}
       >
-        {state.label}
+        Update
       </button>
       {open && (
         <span className="pointer-events-none absolute right-0 top-full z-[1001] mt-1 w-max max-w-72 rounded-md border border-kumo-line bg-kumo-elevated px-2 py-1 text-xs font-medium normal-case tracking-normal text-kumo-default shadow-lg">
-          {state.tooltip}
+          {state.description}
         </span>
       )}
     </span>

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Button } from '@cloudflare/kumo/components/button';
+import { Dialog } from '@cloudflare/kumo/components/dialog';
 import { applyUpdate, checkForUpdate, detectSelfUpdateRepo, selectSelfUpdateRepo } from './api';
 import type { HubUpdateRepoCandidate, LegacyUpdateCheckResult, UpdateCheckResult } from './api';
 import { useToast } from './Toast';
@@ -35,6 +36,38 @@ interface UpdateDialogProps {
   onOpenSettings: () => void;
   onRetryCheck: () => void;
   onUpdated: () => void;
+}
+
+function UpdateModal({
+  title,
+  description,
+  onClose,
+  children,
+}: {
+  title: string;
+  description: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <Dialog.Root
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <Dialog
+        size="lg"
+        className="flex max-h-[calc(100vh-2rem)] w-full max-w-3xl flex-col overflow-hidden p-0"
+      >
+        <Dialog.Title className="sr-only">{title}</Dialog.Title>
+        <Dialog.Description className="sr-only">{description}</Dialog.Description>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {children}
+        </div>
+      </Dialog>
+    </Dialog.Root>
+  );
 }
 
 function formatStage(stage: ProgressStage): string {
@@ -284,19 +317,45 @@ export default function UpdateDialog({
     }
   }
 
+  if (!status && isChecking && !issue) {
+    return (
+      <UpdateModal
+        title="Checking for updates"
+        description="Tiller Hub is checking for a stable release."
+        onClose={onDismiss}
+      >
+        <section className="p-6">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
+            Tiller maintenance
+          </p>
+          <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">
+            Checking for updates
+          </h1>
+          <p className="mt-2 text-sm text-kumo-subtle">
+            Tiller Hub is checking the current deployment against the latest stable release.
+          </p>
+        </section>
+      </UpdateModal>
+    );
+  }
+
   if (!status) {
     const accessRequired = issueCode === 'setup_protection_required';
+    const heading = accessRequired ? 'Access verification required' : 'Update check unavailable';
     return (
-      <div className="flex-1 overflow-auto bg-kumo-recessed">
-        <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
-          <section className="rounded-2xl border border-kumo-line bg-kumo-base p-6 shadow-sm">
+      <UpdateModal
+        title={heading}
+        description={issue ?? 'Tiller could not check for updates.'}
+        onClose={onDismiss}
+      >
+          <section className="p-6">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
                   Self-Update
                 </p>
                 <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">
-                  {accessRequired ? 'Access verification required' : 'Update check unavailable'}
+                  {heading}
                 </h1>
                 <p className="mt-2 text-sm text-kumo-subtle">
                   {accessRequired
@@ -343,8 +402,7 @@ export default function UpdateDialog({
               </Button>
             </div>
           </section>
-        </div>
-      </div>
+      </UpdateModal>
     );
   }
 
@@ -359,17 +417,21 @@ export default function UpdateDialog({
       latestVersion: status.stableRelease?.version ?? '',
       renewAccess: renewalRecommended,
     });
+    const heading = isDevelopmentBuild
+      ? 'Development build'
+      : action?.label ?? (status.stableRelease ? 'Tiller is up to date' : 'Stable release check unavailable');
     return (
-      <div className="flex-1 overflow-auto bg-kumo-recessed">
-        <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
-          <section className="rounded-2xl border border-kumo-line bg-kumo-base p-6 shadow-sm">
+      <UpdateModal
+        title={heading}
+        description="Review and start Tiller maintenance."
+        onClose={onDismiss}
+      >
+          <section className="p-6">
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
               Tiller maintenance
             </p>
             <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">
-              {isDevelopmentBuild
-                ? 'Development build'
-                : action?.label ?? (status.stableRelease ? 'Tiller is up to date' : 'Stable release check unavailable')}
+              {heading}
             </h1>
             <p className="mt-2 text-sm text-kumo-subtle">
               {isDevelopmentBuild
@@ -431,8 +493,7 @@ export default function UpdateDialog({
               </Button>
             </div>
           </section>
-        </div>
-      </div>
+      </UpdateModal>
     );
   }
 
@@ -441,9 +502,12 @@ export default function UpdateDialog({
   const showProgress = stage !== 'idle';
   const sameUpdateName = currentUpdateName === latestUpdateName;
   return (
-    <div className="flex-1 overflow-auto bg-kumo-recessed">
-      <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
-        <section className="rounded-2xl border border-kumo-line bg-kumo-base p-6 shadow-sm">
+    <UpdateModal
+      title="Upgrade Tiller Hub"
+      description="Review and start the available Tiller Hub update."
+      onClose={onDismiss}
+    >
+        <section className="p-6">
           <div className="flex items-start justify-between gap-4">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
@@ -605,7 +669,6 @@ export default function UpdateDialog({
             </Button>
           </div>
         </section>
-      </div>
-    </div>
+    </UpdateModal>
   );
 }

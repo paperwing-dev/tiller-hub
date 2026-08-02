@@ -3,10 +3,6 @@ import { renderToString } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SetupStatus } from "../api";
 
-vi.mock("../Toast", () => ({
-  useToast: () => vi.fn(),
-}));
-
 function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
   return {
     needsSetup: true,
@@ -68,8 +64,6 @@ describe("SetupWizard", () => {
       configurable: true,
       value: {
         location: { origin: "https://demo.preview.workers.dev" },
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
       },
     });
     Object.defineProperty(globalThis, "React", { configurable: true, value: React });
@@ -89,14 +83,15 @@ describe("SetupWizard", () => {
 
     expect(html).toContain("Required setup");
     expect(html).toContain("Connect GitHub");
-    expect(html).toContain("Create GitHub App");
+    expect(html).toContain("One guided connection");
     expect(html).toContain("/api/github/manifest/setup");
-    expect(html).toContain("install it on at least one repository");
+    expect(html).not.toContain('target="_blank"');
+    expect(html).not.toContain("Check again");
     expect(html).not.toContain("Cloudflare API token");
     expect(html).not.toContain("Add model keys");
   });
 
-  it("requires a usable installed repository after App creation", async () => {
+  it("offers simple recovery when the App exists without a usable installation", async () => {
     const { default: SetupWizard } = await import("../SetupWizard");
     const html = renderToString(
       <SetupWizard
@@ -110,10 +105,15 @@ describe("SetupWizard", () => {
       />,
     );
 
+    expect(html).toContain("Finish connecting GitHub");
     expect(html).toContain("GitHub App created");
-    expect(html).toContain("Install on repositories");
-    expect(html).toContain("Verify repository");
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>(?:<[^>]+>)*Verify repository/);
+    expect(html).toContain("tiller-test");
+    expect(html).toContain("https://github.com/apps/tiller-test/installations/new");
+    expect(html).toContain("Continue on GitHub");
+    expect(html).toContain("Check again");
+    expect(html).not.toContain('target="_blank"');
+    expect(html).not.toContain("Verify repository");
+    expect(html).not.toContain("Select repository");
   });
 
   it("renders nothing after required GitHub setup completes", async () => {

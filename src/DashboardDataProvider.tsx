@@ -37,7 +37,8 @@ import { useToast } from './Toast';
 import { NewRepoDialog, NewEnvDialog } from './NewEnvDialog';
 import StartPlanDialog from './StartPlanDialog';
 import SetupWizard from './SetupWizard';
-import { isUpdateDismissed } from './update-storage';
+import UpdateDialog from './UpdateDialog';
+import { dismissUpdate, isUpdateDismissed } from './update-storage';
 import { isRepoMainReady } from './repo-status';
 import { getBackendBadgeLabel, getEnvDisplayName } from './env-display';
 import { getHarnessBadgeLabel } from './env-harness';
@@ -107,6 +108,7 @@ export interface DashboardData {
   recoverEnv: (slug: string, status?: string) => void;
   recoverEntities: (options?: RecoverEntitiesOptions) => void;
   setShowNewRepo: (show: boolean) => void;
+  setShowUpdate: (show: boolean) => void;
   setNewEnvTarget: Dispatch<SetStateAction<NewEnvTarget | null>>;
   setStartDialogSlug: Dispatch<SetStateAction<string | null>>;
   handleCreateRepo: (selection: GitHubRepositorySelection) => Promise<void>;
@@ -178,6 +180,7 @@ export default function DashboardDataProvider() {
   const [reconnectExhausted, setReconnectExhausted] = useState(false);
   const [permissions, setPermissions] = useState<Map<string, StoredPermission[]>>(new Map());
   const [showNewRepo, setShowNewRepo] = useState(false);
+  const [showUpdate, setShowUpdate] = useState(false);
   const [newEnvTarget, setNewEnvTarget] = useState<NewEnvTarget | null>(null);
   const [startDialogSlug, setStartDialogSlug] = useState<string | null>(null);
   const [lastRepoMainEvent, setLastRepoMainEvent] = useState<{
@@ -710,6 +713,7 @@ export default function DashboardDataProvider() {
     recoverEnv,
     recoverEntities,
     setShowNewRepo,
+    setShowUpdate,
     setNewEnvTarget,
     setStartDialogSlug,
     handleCreateRepo,
@@ -789,6 +793,7 @@ export default function DashboardDataProvider() {
       <Outlet />
       <DashboardDialogs
         showNewRepo={showNewRepo}
+        showUpdate={showUpdate || location.pathname === '/update'}
         newEnvTarget={newEnvTarget}
         startDialogSlug={startDialogSlug}
       />
@@ -798,14 +803,18 @@ export default function DashboardDataProvider() {
 
 function DashboardDialogs({
   showNewRepo,
+  showUpdate,
   newEnvTarget,
   startDialogSlug,
 }: {
   showNewRepo: boolean;
+  showUpdate: boolean;
   newEnvTarget: NewEnvTarget | null;
   startDialogSlug: string | null;
 }) {
   const data = useDashboardData();
+  const location = useLocation();
+  const navigate = useNavigate();
   const newEnvRepo = newEnvTarget
     ? data.repos.find((repo) => repo.repoId === newEnvTarget.repoId) ?? null
     : null;
@@ -815,6 +824,10 @@ function DashboardDialogs({
   const startDialogRepo = startDialogEnv?.repoId
     ? data.repos.find((repo) => repo.repoId === startDialogEnv.repoId) ?? null
     : null;
+  const closeUpdate = () => {
+    data.setShowUpdate(false);
+    if (location.pathname === '/update') navigate('/', { replace: true });
+  };
   return (
     <>
       {showNewRepo && (
@@ -859,6 +872,36 @@ function DashboardDialogs({
           chatgptAuthStatus={data.setupStatus?.chatgptAuthStatus ?? 'missing'}
           claudeBillingMode={data.setupStatus?.claudeBillingMode ?? null}
           openaiBillingMode={data.setupStatus?.openaiBillingMode ?? null}
+        />
+      )}
+      {showUpdate && (
+        <UpdateDialog
+          hubUrl={data.hubUrl}
+          status={data.updateStatus}
+          issue={data.updateIssue}
+          issueCode={data.updateIssueCode}
+          isChecking={data.isCheckingUpdate}
+          hasExecutionMachine={Boolean(data.setupStatus?.hostRegistered)}
+          renewalRecommended={data.setupStatus?.renewalRecommended ?? false}
+          onDismiss={() => {
+            if (data.updateStatus) {
+              dismissUpdate(getUpdateDismissalSourceId(data.updateStatus));
+              data.refreshUpdateStatus().catch(() => undefined);
+            }
+            closeUpdate();
+          }}
+          onOpenSettings={() => {
+            data.setShowUpdate(false);
+            navigate('/settings');
+          }}
+          onRetryCheck={() => {
+            void data.refreshUpdateStatus().then((next) => {
+              if (next.status && !next.issue && !next.status.updateAvailable) closeUpdate();
+            });
+          }}
+          onUpdated={() => {
+            data.refreshUpdateStatus().catch(() => undefined);
+          }}
         />
       )}
     </>

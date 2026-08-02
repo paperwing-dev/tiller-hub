@@ -19,7 +19,6 @@ import { handleGitHubWebhook } from "./webhook-service";
 import { resolveCanonicalRequestOrigin } from "../canonical-origin";
 
 const githubRoutes = new Hono<HonoEnv>();
-const GITHUB_APP_NAME_MAX_LENGTH = 32;
 export const MAX_GITHUB_WEBHOOK_BODY_BYTES = 25_000_000;
 
 class GitHubWebhookBodyTooLargeError extends Error {}
@@ -156,7 +155,7 @@ async function buildManifest(env: Env, request: Request) {
   const origin = await resolveCanonicalRequestOrigin(env, request);
   const url = new URL(origin);
   return {
-    name: buildGitHubAppName(url.hostname),
+    name: buildGitHubAppName(),
     url: url.origin,
     redirect_url: `${url.origin}/api/github/manifest/callback`,
     setup_url: `${url.origin}/api/github/install/callback`,
@@ -176,30 +175,11 @@ async function buildManifest(env: Env, request: Request) {
   };
 }
 
-function sanitizeGitHubAppNamePart(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function stableShortHash(value: string): string {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36).padStart(6, "0").slice(0, 6);
-}
-
-function buildGitHubAppName(hostname: string): string {
-  const normalizedHost = hostname.trim().toLowerCase();
-  const firstLabel = sanitizeGitHubAppNamePart(normalizedHost.split(".")[0] || "hub") || "hub";
-  const suffix = `-${stableShortHash(normalizedHost || firstLabel)}`;
-  const maxBaseLength = GITHUB_APP_NAME_MAX_LENGTH - suffix.length;
-  const base = firstLabel.slice(0, maxBaseLength).replace(/-+$/g, "") || "hub";
-  return `${base}${suffix}`;
+function buildGitHubAppName(): string {
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  const suffix = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `tiller-${suffix}`;
 }
 
 function escapeHtml(value: string): string {
@@ -433,7 +413,7 @@ githubRoutes.get("/api/github/manifest/callback", async (c) => {
     if (c.req.header("Accept")?.includes("application/json")) {
       return c.json({ ok: true, status: await statusPayload(c.env, c.req.raw) });
     }
-    return c.redirect(`${await resolveCanonicalRequestOrigin(c.env, c.req.raw)}/`, 303);
+    return c.redirect(getGitHubAppInstallUrl(converted.slug), 303);
   } catch (error) {
     const normalized = jsonError(error);
     return c.json(normalized.body, normalized.status as any);

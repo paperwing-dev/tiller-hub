@@ -1,7 +1,7 @@
 import { Navigate, useNavigate, useParams } from 'react-router-dom';
 import { Button } from '@cloudflare/kumo/components/button';
 import type { EnvMeta, RepoMeta } from '../api/types';
-import { getUpdateDismissalSourceId, useDashboardData } from './DashboardDataProvider';
+import { useDashboardData } from './DashboardDataProvider';
 import SessionView from './SessionView';
 import EnvWaitingView from './EnvWaitingView';
 import PlanView from './PlanView';
@@ -9,15 +9,12 @@ import ShipView from './ShipView';
 import ProjectsHome from './ProjectsHome';
 import SettingsPage from './SettingsPage';
 import RepoSettingsPage from './RepoSettingsPage';
-import UpdateDialog from './UpdateDialog';
-import { dismissUpdate } from './update-storage';
 import { isRepoMainReady } from './repo-status';
 import { getSessionEnvSlug } from './dashboard-route-scope';
 import { RouteLoading } from './dashboard-route-state';
 import {
   HomeSettingsFrame,
   StatusActions,
-  TopLevelPage,
 } from './DashboardLayout';
 import {
   planPath,
@@ -74,47 +71,7 @@ export function SettingsRoute() {
 }
 
 export function UpdateRoute() {
-  const data = useDashboardData();
-  const navigate = useNavigate();
-
-  if (data.isCheckingUpdate && !data.updateStatus && !data.updateIssue) {
-    return (
-      <TopLevelPage>
-        <UpdateCheckingView />
-      </TopLevelPage>
-    );
-  }
-
-  return (
-    <TopLevelPage>
-      <UpdateDialog
-        hubUrl={data.hubUrl}
-        status={data.updateStatus}
-        issue={data.updateIssue}
-        issueCode={data.updateIssueCode}
-        isChecking={data.isCheckingUpdate}
-        hasExecutionMachine={Boolean(data.setupStatus?.hostRegistered)}
-        renewalRecommended={data.setupStatus?.renewalRecommended ?? false}
-        onDismiss={() => {
-          if (data.updateStatus) {
-            dismissUpdate(getUpdateDismissalSourceId(data.updateStatus));
-          }
-          navigate('/', { replace: true });
-        }}
-        onOpenSettings={() => navigate('/settings')}
-        onRetryCheck={() => {
-          void data.refreshUpdateStatus().then((next) => {
-            if (next.status && !next.issue && !next.status.updateAvailable) {
-              navigate('/', { replace: true });
-            }
-          });
-        }}
-        onUpdated={() => {
-          data.refreshUpdateStatus().catch(() => undefined);
-        }}
-      />
-    </TopLevelPage>
-  );
+  return <ProjectsHomeRoute />;
 }
 
 export function ProjectWorkspaceHomeRoute() {
@@ -248,26 +205,6 @@ export function SessionRoute() {
       onPermissionResolved={data.handlePermissionResolved}
       onRecoverEnv={data.recoverEnv}
     />
-  );
-}
-
-export function UpdateCheckingView() {
-  return (
-    <div className="flex-1 overflow-auto bg-kumo-recessed">
-      <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
-        <section className="rounded-2xl border border-kumo-line bg-kumo-base p-6 shadow-sm">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-kumo-subtle">
-            Self-Update
-          </p>
-          <h1 className="mt-2 text-2xl font-semibold text-kumo-strong">
-            Checking for updates
-          </h1>
-          <p className="mt-2 text-sm text-kumo-subtle">
-            Tiller Hub is checking the current deployment against the latest available build.
-          </p>
-        </section>
-      </div>
-    </div>
   );
 }
 
