@@ -20,6 +20,12 @@ import type {
 export const INSTALLER_STABLE_URL = "https://install.paperwing.dev/stable";
 export const INSTALLER_STABLE_CACHE_KEY = "tiller:installer-stable:v1";
 const INSTALLER_STABLE_TIMEOUT_MS = 1_500;
+const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+interface ParsedVersion {
+  core: [string, string, string];
+  prerelease: string[];
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -30,7 +36,7 @@ export function parseStableReleaseSummary(value: unknown): StableReleaseSummary 
   const releaseId = typeof value.releaseId === "string" ? value.releaseId.trim() : "";
   const version = typeof value.version === "string" ? value.version.trim() : "";
   const releaseNotesUrl = typeof value.releaseNotesUrl === "string" ? value.releaseNotesUrl.trim() : "";
-  if (!/^[0-9a-f]{40}$/.test(releaseId) || /^0{40}$/.test(releaseId) || !version) return null;
+  if (!/^[0-9a-f]{40}$/.test(releaseId) || /^0{40}$/.test(releaseId) || !parseVersion(version)) return null;
   try {
     const parsedUrl = new URL(releaseNotesUrl);
     if (parsedUrl.protocol !== "https:" || parsedUrl.href !== releaseNotesUrl) return null;
@@ -40,9 +46,13 @@ export function parseStableReleaseSummary(value: unknown): StableReleaseSummary 
   return { releaseId, version, releaseNotesUrl };
 }
 
-async function readInstallerStableRelease(env: Env): Promise<StableReleaseSummary> {
+async function readInstallerStableRelease(
+  env: Env,
+  installedReleaseId: string,
+): Promise<StableReleaseSummary> {
+  const cacheKey = `${INSTALLER_STABLE_CACHE_KEY}:${installedReleaseId}`;
   const cached = parseStableReleaseSummary(
-    await env.ENVS_KV.get(INSTALLER_STABLE_CACHE_KEY, "json"),
+    await env.ENVS_KV.get(cacheKey, "json"),
   );
   if (cached) return cached;
 
@@ -59,7 +69,7 @@ async function readInstallerStableRelease(env: Env): Promise<StableReleaseSummar
     const summary = parseStableReleaseSummary(await response.json());
     if (!summary) throw new Error("Installer stable release summary is invalid.");
     await env.ENVS_KV.put(
-      INSTALLER_STABLE_CACHE_KEY,
+      cacheKey,
       JSON.stringify(summary),
       { expirationTtl: UPDATE_CACHE_TTL_SECONDS },
     );
@@ -73,27 +83,55 @@ function normalizeVersionTag(tagName: string): string {
   return tagName.trim().replace(/^tiller-hub-v/i, "").replace(/^v/i, "");
 }
 
-function toNumericParts(version: string): number[] {
-  const normalized = normalizeVersionTag(version).split("-")[0] ?? "";
-  return normalized.split(".").map((part) => {
-    const parsed = Number.parseInt(part, 10);
-    return Number.isFinite(parsed) ? parsed : 0;
-  });
+function parseVersion(version: string): ParsedVersion | null {
+  const match = SEMVER_PATTERN.exec(normalizeVersionTag(version));
+  if (!match) return null;
+  const prerelease = match[4]?.split(".") ?? [];
+  if (prerelease.some((part) => /^\d+$/.test(part) && part.length > 1 && part.startsWith("0"))) {
+    return null;
+  }
+  return {
+    core: [match[1]!, match[2]!, match[3]!],
+    prerelease,
+  };
+}
+
+function compareNumericIdentifiers(left: string, right: string): number {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  return left === right ? 0 : left < right ? -1 : 1;
 }
 
 export function compareVersions(left: string, right: string): number {
-  const leftParts = toNumericParts(left);
-  const rightParts = toNumericParts(right);
-  const length = Math.max(leftParts.length, rightParts.length);
-
-  for (let index = 0; index < length; index += 1) {
-    const leftValue = leftParts[index] ?? 0;
-    const rightValue = rightParts[index] ?? 0;
-    if (leftValue !== rightValue) {
-      return leftValue < rightValue ? -1 : 1;
-    }
+  const leftVersion = parseVersion(left);
+  const rightVersion = parseVersion(right);
+  if (!leftVersion || !rightVersion) {
+    throw new Error(`Cannot compare invalid release versions: ${left} and ${right}.`);
   }
 
+  for (let index = 0; index < leftVersion.core.length; index += 1) {
+    const result = compareNumericIdentifiers(leftVersion.core[index]!, rightVersion.core[index]!);
+    if (result !== 0) return result;
+  }
+
+  if (leftVersion.prerelease.length === 0 || rightVersion.prerelease.length === 0) {
+    if (leftVersion.prerelease.length === rightVersion.prerelease.length) return 0;
+    return leftVersion.prerelease.length === 0 ? 1 : -1;
+  }
+
+  const length = Math.max(leftVersion.prerelease.length, rightVersion.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftVersion.prerelease[index];
+    const rightPart = rightVersion.prerelease[index];
+    if (leftPart === undefined || rightPart === undefined) {
+      return leftPart === undefined ? -1 : 1;
+    }
+    if (leftPart === rightPart) continue;
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) return compareNumericIdentifiers(leftPart, rightPart);
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftPart < rightPart ? -1 : 1;
+  }
   return 0;
 }
 
@@ -160,11 +198,13 @@ export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
   try {
     const currentUpdate = getCurrentUpdateMetadata();
     if (env.TILLER_INSTALLER_SCHEMA?.trim()) {
-      const stableRelease = await readInstallerStableRelease(env);
       const installedReleaseId = env.TILLER_RELEASE_ID?.trim() || currentUpdate.sourceId;
+      const stableRelease = await readInstallerStableRelease(env, installedReleaseId);
+      const versionDirection = compareVersions(currentUpdate.version, stableRelease.version);
       return {
         kind: "installer-maintenance",
-        updateAvailable: installedReleaseId !== stableRelease.releaseId,
+        updateAvailable: versionDirection < 0 ||
+          (versionDirection === 0 && installedReleaseId !== stableRelease.releaseId),
         installedReleaseId,
         stableRelease,
         currentUpdate,

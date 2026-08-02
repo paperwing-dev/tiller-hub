@@ -10,11 +10,13 @@ import {
 import { GearSixIcon } from '@phosphor-icons/react';
 import { Button } from '@cloudflare/kumo/components/button';
 import { Sidebar, useSidebar } from '@cloudflare/kumo/components/sidebar';
+import { Tooltip } from '@cloudflare/kumo/components/tooltip';
 import type { EnvMeta, RepoMeta } from '../api/types';
 import { useDashboardData } from './DashboardDataProvider';
 import SessionList from './SessionList';
 import ConnectionsBadge from './ConnectionsBadge';
 import UpdateButton from './UpdateBadge';
+import { INSTALLER_MAINTENANCE_URL } from './installer-maintenance';
 import { getEnvDisplayName } from './env-display';
 import { getEnvAuthBadge, getEnvModelLabel } from './env-harness';
 import {
@@ -45,7 +47,10 @@ export function TopLevelPage({ children }: { children: ReactNode }) {
           <div className="min-w-0">
             <h1 className="text-sm font-semibold text-kumo-strong">Tiller</h1>
           </div>
-          <StatusActions />
+          <div className="flex items-center gap-2">
+            <AccessRenewalAction />
+            <StatusActions />
+          </div>
         </div>
       </div>
       {children}
@@ -61,7 +66,10 @@ export function HomeSettingsFrame({ children }: { children: ReactNode }) {
           <div className="min-w-0">
             <h1 className="text-sm font-semibold text-kumo-strong">Tiller</h1>
           </div>
-          <StatusActions />
+          <div className="flex items-center gap-2">
+            <AccessRenewalAction />
+            <StatusActions />
+          </div>
         </div>
       </div>
       <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-5 py-5">
@@ -136,15 +144,15 @@ export function WorkspaceLayout() {
                 <span className="tiller-sidebar-open-text group-data-[state=collapsed]/sidebar:hidden">Tiller</span>
               </button>
             </div>
-            <div className="tiller-sidebar-open-text shrink-0 group-data-[state=collapsed]/sidebar:hidden">
+            <div className="tiller-sidebar-open-text flex shrink-0 items-center gap-2 group-data-[state=collapsed]/sidebar:hidden">
               <UpdateButton
                 status={data.updateStatus}
                 issue={data.updateIssue}
                 dismissed={data.updateDismissed}
                 isChecking={data.isCheckingUpdate}
-                renewalRecommended={data.setupStatus?.renewalRecommended ?? false}
                 onOpen={() => data.setShowUpdate(true)}
               />
+              <AccessRenewalAction />
             </div>
           </div>
         </Sidebar.Header>
@@ -287,6 +295,34 @@ export function StatusActions({ settingsPath = '/settings' }: { settingsPath?: s
         )}
       </span>
     </div>
+  );
+}
+
+export function AccessRenewalAction() {
+  const data = useDashboardData();
+  if (!data.setupStatus?.renewalRecommended) return null;
+
+  const accessExpiration = data.setupStatus.tokenExpiresAt ?? 'an unknown date';
+  const parsedAccessExpiration = Date.parse(accessExpiration);
+  const formattedAccessExpiration = Number.isFinite(parsedAccessExpiration)
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: 'long' }).format(new Date(parsedAccessExpiration))
+    : accessExpiration;
+
+  return (
+    <Tooltip
+      content={`Cloudflare Access expires ${formattedAccessExpiration}. Renew to keep existing CLI, machine, and workload connections active. Updating Tiller also renews Access.`}
+      side="bottom"
+      align="end"
+      delay={250}
+      render={(
+        <a
+          href={`${INSTALLER_MAINTENANCE_URL}?intent=renew`}
+          className="inline-flex h-6 items-center rounded border border-kumo-warning/40 bg-kumo-warning-tint px-2 text-[10px] font-medium uppercase tracking-wide text-kumo-warning transition-colors hover:bg-kumo-tint"
+        />
+      )}
+    >
+      Renew access
+    </Tooltip>
   );
 }
 

@@ -38,10 +38,6 @@ import {
   LEGACY_CUSTOM_DOMAIN_CLEANUP_KEY,
   NEW_EXECUTION_UNAVAILABLE_MESSAGE,
 } from "../execution";
-import {
-  WORKERS_DEV_ACCESS_CREDENTIAL_KEY,
-  WORKERS_DEV_ACCESS_TRUST_KEY,
-} from "../workers-dev-access/records";
 
 type SqlRow = Record<string, unknown>;
 
@@ -77,27 +73,9 @@ class FakeSqlStorage {
 
 class FakeStorage {
   readonly sql = new FakeSqlStorage();
-  private readonly values = new Map<string, unknown>();
-
-  get<T>(key: string): Promise<T | undefined> {
-    return Promise.resolve(this.values.get(key) as T | undefined);
-  }
-
-  put(key: string, value: unknown): Promise<void> {
-    this.values.set(key, value);
-    return Promise.resolve();
-  }
 
   transactionSync<T>(callback: () => T): T {
     return callback();
-  }
-
-  getAlarm(): Promise<number | null> {
-    return Promise.resolve(null);
-  }
-
-  setAlarm(): Promise<void> {
-    return Promise.resolve();
   }
 
   close(): void {
@@ -208,42 +186,17 @@ describe("Hub execution configuration migration", () => {
     storage.close();
   });
 
-  it("retains canonical workers.dev Access records", async () => {
-    const { subject, storage } = createSubject(installedAccessBindings());
-    await storage.put(WORKERS_DEV_ACCESS_TRUST_KEY, {
-      version: 1,
-      workersDevHostname: "demo.preview.workers.dev",
-    });
-    await storage.put(WORKERS_DEV_ACCESS_CREDENTIAL_KEY, {
-      version: 1,
-      clientId: "canonical-client",
-      clientSecret: "canonical-secret",
-    });
-
-    await subject.ensureExecutionConfiguration();
-
-    await expect(storage.get(WORKERS_DEV_ACCESS_TRUST_KEY)).resolves.toMatchObject({
-      workersDevHostname: "demo.preview.workers.dev",
-    });
-    await expect(storage.get(WORKERS_DEV_ACCESS_CREDENTIAL_KEY)).resolves.toMatchObject({
-      clientId: "canonical-client",
-    });
-    storage.close();
-  });
-
-  it("reads legacy Access trust locally instead of recursively RPCing HubDO", async () => {
+  it("requires binding-backed Access trust without RPCing HubDO", async () => {
     const getHubStub = vi.fn(() => {
       throw new Error("HubDO must not call its own stub");
     });
     const { subject, storage } = createSubject({
       HUB: { idFromName: vi.fn(() => "hub-id"), get: getHubStub },
     });
-    await storage.put(WORKERS_DEV_ACCESS_TRUST_KEY, {
-      version: 1,
-      workersDevHostname: "tiller.preview.workers.dev",
-    });
 
-    await expect(subject.ensureExecutionConfiguration()).resolves.toEqual({ target: "cf" });
+    await expect(subject.ensureExecutionConfiguration()).rejects.toThrow(
+      "Canonical workers.dev Access trust is required",
+    );
     expect(getHubStub).not.toHaveBeenCalled();
     storage.close();
   });

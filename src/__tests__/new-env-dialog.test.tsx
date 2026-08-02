@@ -224,6 +224,54 @@ describe("NewRepoDialog", () => {
     });
   });
 
+  it("links to fixed GitHub access management in a new tab and closes the dialog", async () => {
+    const onClose = vi.fn();
+    act(() => {
+      root?.render(
+        <NewRepoDialog
+          onClose={onClose}
+          hubUrl="http://localhost:5173"
+          repos={[]}
+          githubAppConfigured
+          onCreate={vi.fn(async () => undefined)}
+        />,
+      );
+    });
+
+    const link = Array.from(document.body.querySelectorAll<HTMLAnchorElement>("a"))
+      .find((candidate) => candidate.textContent === "Manage GitHub access");
+    expect(link).toBeInstanceOf(HTMLAnchorElement);
+    expect(link).toHaveAttribute("href", "/api/github/manage");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noreferrer");
+
+    await act(async () => {
+      await userEvent.setup({ pointerEventsCheck: 0 }).click(link!);
+    });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("links an unconfigured Hub to GitHub App setup", () => {
+    act(() => {
+      root?.render(
+        <NewRepoDialog
+          onClose={vi.fn()}
+          hubUrl="http://localhost:5173"
+          repos={[]}
+          githubAppConfigured={false}
+          onCreate={vi.fn(async () => undefined)}
+        />,
+      );
+    });
+
+    const link = Array.from(document.body.querySelectorAll<HTMLAnchorElement>("a"))
+      .find((candidate) => candidate.textContent === "Set up GitHub access");
+    expect(link).toBeInstanceOf(HTMLAnchorElement);
+    expect(link).toHaveAttribute("href", "/api/github/manifest/setup");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noreferrer");
+  });
+
   it("renders only the first page of selected repositories with pagination controls", () => {
     useGitHubRepositoriesMock.mockReturnValue({
       repositories: Array.from({ length: REPOSITORY_PAGE_SIZE + 1 }, (_, index) => makeGitHubRepository(index + 1)),
@@ -239,6 +287,7 @@ describe("NewRepoDialog", () => {
           onClose={vi.fn()}
           hubUrl="https://hub.example.com"
           repos={[]}
+          githubAppConfigured
           onCreate={vi.fn(async () => undefined)}
         />,
       );
@@ -269,6 +318,7 @@ describe("NewRepoDialog", () => {
           onClose={vi.fn()}
           hubUrl="https://hub.example.com"
           repos={[]}
+          githubAppConfigured
           onCreate={vi.fn(async () => undefined)}
         />,
       );

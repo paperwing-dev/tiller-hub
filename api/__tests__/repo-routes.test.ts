@@ -77,7 +77,6 @@ vi.mock("../cloudflare-mcp", () => ({
 }));
 
 const { default: repoRoutes } = await import("../repo/routes");
-const { clearWorkersDevAccessTrustCache } = await import("../workers-dev-access/records");
 
 function createApp() {
   const app = new Hono<HonoEnv>();
@@ -120,7 +119,6 @@ function makeRepoMeta(overrides: Partial<RepoMeta> = {}): RepoMeta {
 describe("repo routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    clearWorkersDevAccessTrustCache();
     mocks.isGitHubAppAllowedForRequest.mockResolvedValue(true);
   });
 
@@ -141,27 +139,15 @@ describe("repo routes", () => {
       state: "connected",
     });
     const trust = {
-      version: 1,
       ownerEmail: "owner@example.com",
-      accountId: "",
-      workerName: "tiller",
       workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
       issuer: "https://team.cloudflareaccess.com",
       audience: "audience-1",
-      serviceTokenId: "token-1",
       serviceClientId: "client-id.access",
-      configuredAt: "2026-07-16T00:00:00.000Z",
     };
     const hub = {
       startRepoCloudflareMcpOAuth,
       completeRepoCloudflareMcpOAuth,
-      getWorkersDevAccessLifecycle: vi.fn().mockResolvedValue({
-        configured: true,
-        workersDevHostname: trust.workersDevHostname,
-        tokenExpiresAt: "2027-07-16T00:00:00.000Z",
-        renewalRecommended: false,
-      }),
-      getWorkersDevAccessTrust: vi.fn().mockResolvedValue(trust),
     };
     const env = {
       ...installedAccessBindings({

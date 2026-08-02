@@ -1,34 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const mocks = vi.hoisted(() => ({
-  readCanonicalWorkersDevAccessTrust: vi.fn(),
-}));
-
-vi.mock("../workers-dev-access/records", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../workers-dev-access/records")>()),
-  readCanonicalWorkersDevAccessTrust: mocks.readCanonicalWorkersDevAccessTrust,
-}));
+import { describe, expect, it } from "vitest";
 
 import {
   canonicalIngressResponse,
   parseCanonicalWorkersDevHostname,
   workersDevOrigin,
 } from "../canonical-origin";
+import { installedAccessBindings } from "./access-binding-fixture";
 import type { Env } from "../types";
 
-const env = {} as Env;
+const env = installedAccessBindings({
+  hostname: "tiller.preview.workers.dev",
+}) as Env;
 
 describe("canonical workers.dev origin", () => {
-  beforeEach(() => {
-    mocks.readCanonicalWorkersDevAccessTrust.mockReset();
-    mocks.readCanonicalWorkersDevAccessTrust.mockResolvedValue({
-      workersDevHostname: "demo.preview.workers.dev",
-    });
-  });
-
   it("accepts only the exact canonical production origin", async () => {
     await expect(canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/api/execution/status"),
+      new Request("https://tiller.preview.workers.dev/api/execution/status"),
       env,
     )).resolves.toBeNull();
     const alias = await canonicalIngressResponse(
@@ -39,30 +26,30 @@ describe("canonical workers.dev origin", () => {
   });
 
   it("fails closed without installer trust except for the DO-free health check", async () => {
-    mocks.readCanonicalWorkersDevAccessTrust.mockResolvedValue(null);
+    const unconfigured = {} as Env;
     await expect(canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/health"),
-      env,
+      new Request("https://tiller.preview.workers.dev/health"),
+      unconfigured,
     )).resolves.toBeNull();
     for (const path of ["/api/setup/status", "/", "/assets/index.js"]) {
       await expect(canonicalIngressResponse(
-        new Request(`https://demo.preview.workers.dev${path}`),
-        env,
+        new Request(`https://tiller.preview.workers.dev${path}`),
+        unconfigured,
       )).resolves.toMatchObject({ status: 503 });
     }
     const blocked = await canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/api/envs"),
-      env,
+      new Request("https://tiller.preview.workers.dev/api/envs"),
+      unconfigured,
     );
     expect(blocked?.status).toBe(503);
     expect(blocked?.headers.get("Cache-Control")).toBe("no-store");
     await expect(canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/agents/reviewer-chat/default"),
-      env,
+      new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default"),
+      unconfigured,
     )).resolves.toMatchObject({ status: 503 });
     await expect(canonicalIngressResponse(
-      new Request("https://demo.preview.workers.dev/parties/hub/hub"),
-      env,
+      new Request("https://tiller.preview.workers.dev/parties/hub/hub"),
+      unconfigured,
     )).resolves.toMatchObject({ status: 503 });
   });
 
@@ -73,11 +60,11 @@ describe("canonical workers.dev origin", () => {
     )).resolves.toBeNull();
     await expect(canonicalIngressResponse(
       new Request("https://alias.example.com/api/envs"),
-      { LOCAL_DEV_ONLY_BACKEND: "1" } as Env,
+      { ...env, LOCAL_DEV_ONLY_BACKEND: "1" } as Env,
     )).resolves.toMatchObject({ status: 404 });
     await expect(canonicalIngressResponse(
       new Request("http://localhost:5173/api/envs"),
-      {} as Env,
+      env,
     )).resolves.toMatchObject({ status: 404 });
     expect(() => workersDevOrigin("workers.dev")).toThrow();
     expect(() => workersDevOrigin("example.com")).toThrow();

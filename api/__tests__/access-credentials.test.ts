@@ -1,10 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readAccessServiceCredential } from "../access/credentials";
 import type { Env } from "../types";
-import { clearWorkersDevAccessTrustCache } from "../workers-dev-access/records";
 import type {
-  WorkersDevAccessCredentialV1,
-  WorkersDevAccessTrustV1,
+  WorkersDevAccessRuntimeCredential,
+  WorkersDevAccessRuntimeTrust,
 } from "../workers-dev-access/types";
 import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
@@ -12,24 +11,17 @@ vi.mock("../setup/config", () => ({
   getSecret: async (env: Record<string, unknown>, key: string) => env[key] || undefined,
 }));
 
-const trust: WorkersDevAccessTrustV1 = {
-  version: 1,
+const trust: WorkersDevAccessRuntimeTrust = {
   ownerEmail: "owner@example.com",
-  accountId: "",
-  workerName: "tiller",
   workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
   issuer: "https://team.cloudflareaccess.com",
   audience: "audience-1",
-  serviceTokenId: "token-1",
   serviceClientId: "service-client.access",
-  configuredAt: "2026-07-16T00:00:00.000Z",
 };
 
-const credential: WorkersDevAccessCredentialV1 = {
-  version: 1,
+const credential: WorkersDevAccessRuntimeCredential = {
   currentSecret: "service-secret",
   tokenExpiresAt: "2027-07-16T00:00:00.000Z",
-  updatedAt: "2026-07-16T00:00:00.000Z",
 };
 
 function canonicalEnv(): Env {
@@ -45,8 +37,6 @@ function canonicalEnv(): Env {
     }),
   } as unknown as Env;
 }
-
-beforeEach(() => clearWorkersDevAccessTrustCache());
 
 describe("outbound Cloudflare Access credentials", () => {
   it("reads the canonical workers.dev credential fresh without stripping headers", async () => {

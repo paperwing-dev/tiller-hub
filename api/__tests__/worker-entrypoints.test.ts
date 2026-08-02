@@ -1,10 +1,9 @@
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../types";
-import { clearWorkersDevAccessTrustCache } from "../workers-dev-access/records";
 import type {
-  WorkersDevAccessCredentialV1,
-  WorkersDevAccessTrustV1,
+  WorkersDevAccessRuntimeCredential,
+  WorkersDevAccessRuntimeTrust,
 } from "../workers-dev-access/types";
 import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
@@ -58,24 +57,17 @@ vi.mock("../voice/agent", () => ({
 
 import worker from "../index";
 
-const canonicalTrust: WorkersDevAccessTrustV1 = {
-  version: 1,
+const canonicalTrust: WorkersDevAccessRuntimeTrust = {
   ownerEmail: "owner@example.com",
-  accountId: "",
-  workerName: "tiller",
   workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
   issuer: "https://entrypoint.cloudflareaccess.com",
   audience: "entrypoint-audience",
-  serviceTokenId: "service-token-1",
   serviceClientId: "service-client.access",
-  configuredAt: "1970-01-01T00:00:00.000Z",
 };
 
-const canonicalCredential: WorkersDevAccessCredentialV1 = {
-  version: 1,
+const canonicalCredential: WorkersDevAccessRuntimeCredential = {
   currentSecret: "service-secret",
   tokenExpiresAt: "2027-07-16T00:00:00.000Z",
-  updatedAt: "1970-01-01T00:00:00.000Z",
 };
 
 let accessPrivateKey: CryptoKey;
@@ -111,7 +103,7 @@ async function ownerAssertion(): Promise<string> {
 
 function mockEnv(
   config: Record<string, string> = {},
-  trust: WorkersDevAccessTrustV1 | null = null,
+  trust: WorkersDevAccessRuntimeTrust | null = null,
   hubOverrides: Record<string, unknown> = {},
 ): Env {
   return {
@@ -150,7 +142,6 @@ beforeAll(async () => {
 
 describe("Worker dynamic entrypoints", () => {
   beforeEach(() => {
-    clearWorkersDevAccessTrustCache();
     partyMiddleware.mockClear();
     partyserverMiddleware.mockClear();
     partyserverMiddleware.mockReturnValue(partyMiddleware);
@@ -194,6 +185,31 @@ describe("Worker dynamic entrypoints", () => {
       );
       expect(response.status, `${method} ${path}`).toBe(404);
     }
+  });
+
+  it.each([
+    ["POST", "/api/setup/workers-dev-access/oauth/start"],
+    ["POST", "/api/settings/workers-dev-access/oauth/start"],
+    ["POST", "/api/setup/workers-dev-access/broker/proof"],
+    ["POST", "/api/setup/workers-dev-access/broker/complete"],
+  ] as const)("authenticates retired Access routes before returning 404 for %s %s", async (method, path) => {
+    const env = mockEnv({}, canonicalTrust);
+    const unauthenticated = await worker.fetch(
+      new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, { method }),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(unauthenticated.status).toBe(401);
+
+    const authenticated = await worker.fetch(
+      new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, {
+        method,
+        headers: { "Cf-Access-Jwt-Assertion": await ownerAssertion() },
+      }),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(authenticated.status).toBe(404);
   });
 
   it("fails closed on /agents before canonical trust exists", async () => {

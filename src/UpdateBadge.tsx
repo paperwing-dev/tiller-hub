@@ -8,7 +8,6 @@ interface UpdateBadgeProps {
   issue: string | null;
   dismissed: boolean;
   isChecking: boolean;
-  renewalRecommended: boolean;
   onOpen: () => void;
 }
 
@@ -17,13 +16,11 @@ export function describeUpdateButtonState({
   issue,
   dismissed,
   isChecking,
-  renewalRecommended = false,
 }: {
   status: UpdateCheckResult | null;
   issue: string | null;
   dismissed: boolean;
   isChecking: boolean;
-  renewalRecommended?: boolean;
 }): {
   description: string;
   enabled: boolean;
@@ -39,7 +36,6 @@ export function describeUpdateButtonState({
     ? installerMaintenanceAction({
         updateAvailable: status.updateAvailable,
         latestVersion: status.stableRelease?.version ?? '',
-        renewAccess: renewalRecommended,
       })
     : null;
 
@@ -64,7 +60,7 @@ export function describeUpdateButtonState({
     };
   }
 
-  if (dismissed && maintenanceAction?.intent !== 'renew') {
+  if (dismissed) {
     return {
       description: 'Update dismissed',
       enabled: false,
@@ -103,7 +99,6 @@ export default function UpdateButton({
   issue,
   dismissed,
   isChecking,
-  renewalRecommended,
   onOpen,
 }: UpdateBadgeProps) {
   const state = describeUpdateButtonState({
@@ -111,7 +106,6 @@ export default function UpdateButton({
     issue,
     dismissed,
     isChecking,
-    renewalRecommended,
   });
   const [open, setOpen] = useState(false);
 

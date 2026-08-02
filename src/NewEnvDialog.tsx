@@ -67,10 +67,17 @@ interface NewRepoDialogProps {
   onClose: () => void;
   hubUrl: string;
   repos: RepoMeta[];
+  githubAppConfigured: boolean;
   onCreate: (selection: GitHubRepositorySelection) => Promise<void>;
 }
 
-export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialogProps) {
+export function NewRepoDialog({
+  onClose,
+  hubUrl,
+  repos,
+  githubAppConfigured,
+  onCreate,
+}: NewRepoDialogProps) {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [selectedKey, setSelectedKey] = useState("");
@@ -230,25 +237,36 @@ export function NewRepoDialog({ onClose, hubUrl, repos, onCreate }: NewRepoDialo
           {error && (
             <p className="mt-2 text-xs text-kumo-danger">{error}</p>
           )}
-          <div className="flex justify-end gap-2 mt-4">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
+          <div className="mt-4 flex items-center justify-between gap-3">
+            <a
+              href={githubAppConfigured ? "/api/github/manage" : "/api/github/manifest/setup"}
+              target="_blank"
+              rel="noreferrer"
               onClick={onClose}
-              disabled={loading}
+              className="text-xs font-medium text-kumo-link hover:underline"
             >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              variant="primary"
-              size="sm"
-              loading={loading}
-              disabled={loading || loadingRepositories || !selected || existingRepoIds.has(String(selected.repositoryId))}
-            >
-              {loading ? "Adding..." : "Add"}
-            </Button>
+              {githubAppConfigured ? "Manage GitHub access" : "Set up GitHub access"}
+            </a>
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={onClose}
+                disabled={loading}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="primary"
+                size="sm"
+                loading={loading}
+                disabled={loading || loadingRepositories || !selected || existingRepoIds.has(String(selected.repositoryId))}
+              >
+                {loading ? "Adding..." : "Add"}
+              </Button>
+            </div>
           </div>
         </form>
       </Dialog>

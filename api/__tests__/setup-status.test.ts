@@ -5,6 +5,7 @@ import {
   CLOUDFLARE_IDLE_TIMEOUT_MAX_MINUTES,
   CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES,
 } from "../../shared/cloudflare-timeout";
+import { maintainerDevAccessBindings } from "./access-binding-fixture";
 
 const mocks = vi.hoisted(() => ({
   readRegisteredHostService: vi.fn(),
@@ -47,7 +48,6 @@ vi.mock("../setup/config", async (importOriginal) => {
     getSecret: async (env: Record<string, unknown>, key: string) => env[key] || undefined,
     invalidateConfigCache: vi.fn(),
     getIdleTimeoutMinutes: vi.fn(async () => 10),
-    getCanonicalMainBootstrapDepth: vi.fn(async () => 0),
     getBillingSelections: mocks.getBillingSelections,
   };
 });
@@ -99,13 +99,6 @@ function createHubStore(overrides: Record<string, unknown> = {}) {
     setConfig: vi.fn(),
     getConfig: vi.fn(async () => undefined),
     getAllConfig: vi.fn(async () => ({})),
-    getWorkersDevAccessLifecycle: vi.fn(async () => ({
-      configured: true,
-      workersDevHostname: "demo.preview.workers.dev",
-      tokenExpiresAt: "2027-07-17T00:00:00.000Z",
-      renewalRecommended: false,
-    })),
-    getWorkersDevAccessTrust: vi.fn(async () => null),
     getExecutionStatus: vi.fn(async () => ({
       selected: { target: "cf" },
       selectedHost: null,
@@ -224,6 +217,23 @@ describe("POST /api/setup", () => {
     expect(setConfig).toHaveBeenCalledWith("openaiBillingMode", "subscription");
   });
 
+  it("rejects the retired canonical main history-depth setting", async () => {
+    const response = await createApp().request(
+      "https://demo.preview.workers.dev/api/setup",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ secrets: { CANONICAL_MAIN_BOOTSTRAP_DEPTH: "25" } }),
+      },
+      createEnv(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "Invalid keys: CANONICAL_MAIN_BOOTSTRAP_DEPTH",
+    });
+  });
+
   it("does not expose a custom-domain setup endpoint", async () => {
     const response = await createApp().request(
       "https://demo.preview.workers.dev/api/setup/custom-domain",
@@ -315,6 +325,25 @@ describe("GET /api/setup/status", () => {
     });
   });
 
+  it("does not route maintainer dev Access renewal through the customer installer", async () => {
+    const tokenExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString();
+    const response = await createApp().request(
+      "https://tiller-dev.personal-infrastructure.workers.dev/api/setup/status",
+      { method: "GET" },
+      createEnv({
+        TILLER_INSTALLER_SCHEMA: undefined,
+        ...maintainerDevAccessBindings({ tokenExpiresAt }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      installerManaged: false,
+      tokenExpiresAt,
+      renewalRecommended: false,
+    });
+  });
+
   it("marks localhost as contributor development", async () => {
     const response = await createApp().request(
       "http://localhost:5173/api/setup/status",
@@ -326,7 +355,6 @@ describe("GET /api/setup/status", () => {
     await expect(response.json()).resolves.toMatchObject({
       isLocalDev: true,
       setupPhase: "complete",
-      canonicalMainBootstrapDepth: 0,
     });
   });
 

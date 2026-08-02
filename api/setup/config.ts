@@ -105,18 +105,3 @@ export async function getIdleTimeoutMinutes(env: Env): Promise<number> {
   const config = await loadConfig(env);
   return normalizeCloudflareIdleTimeoutMinutes(config["IDLE_TIMEOUT_MINUTES"]);
 }
-
-/**
- * Read the canonical main bootstrap depth for repo git initialization.
- * Returns 0 by default, meaning "full history" (no `--depth` flag).
- * Positive values configure a shallow clone and are clamped to 1..200.
- * Zero or negative values are normalized to 0 (full history).
- */
-export async function getCanonicalMainBootstrapDepth(env: Env): Promise<number> {
-  const config = await loadConfig(env);
-  const raw = config["CANONICAL_MAIN_BOOTSTRAP_DEPTH"];
-  if (!raw) return 0;
-  const parsed = parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.min(200, parsed);
-}

@@ -345,28 +345,6 @@ function createHubBinding(
         claudeBillingMode: "api",
         openaiBillingMode: "api",
       }),
-      getWorkersDevAccessLifecycle: vi.fn().mockResolvedValue({
-        configured: true,
-        workersDevHostname: "demo.preview.workers.dev",
-        tokenExpiresAt: "2027-07-17T00:00:00.000Z",
-        renewalRecommended: false,
-      }),
-      getWorkersDevAccessTrust: vi.fn().mockImplementation(async (hostname: string) => (
-        hostname === "demo.preview.workers.dev"
-          ? {
-              version: 1,
-              ownerEmail: "owner@example.com",
-              accountId: "account-1",
-              workerName: "demo",
-              workersDevHostname: hostname,
-              issuer: "https://team.cloudflareaccess.com",
-              audience: "audience-1",
-              serviceTokenId: "token-1",
-              serviceClientId: "client.access",
-              configuredAt: "2026-07-17T00:00:00.000Z",
-            }
-          : null
-      )),
       resolveNewExecutionPlacement: options.executionAvailable === false
         ? vi.fn().mockRejectedValue(new Error("selected backend unavailable"))
         : vi.fn().mockResolvedValue(placement),

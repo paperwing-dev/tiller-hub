@@ -835,6 +835,7 @@ function DashboardDialogs({
           onClose={() => data.setShowNewRepo(false)}
           hubUrl={data.hubUrl}
           repos={data.repos}
+          githubAppConfigured={data.setupStatus?.githubAppConfigured ?? false}
           onCreate={data.handleCreateRepo}
         />
       )}
@@ -882,7 +883,6 @@ function DashboardDialogs({
           issueCode={data.updateIssueCode}
           isChecking={data.isCheckingUpdate}
           hasExecutionMachine={Boolean(data.setupStatus?.hostRegistered)}
-          renewalRecommended={data.setupStatus?.renewalRecommended ?? false}
           onDismiss={() => {
             if (data.updateStatus) {
               dismissUpdate(getUpdateDismissalSourceId(data.updateStatus));

@@ -32,7 +32,6 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     renewalRecommended: false,
     hostConnected: false,
     idleTimeoutMinutes: 10,
-    canonicalMainBootstrapDepth: 0,
     githubAppAvailable: false,
     githubAppConfigured: false,
     githubAppReady: false,

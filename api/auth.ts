@@ -214,12 +214,6 @@ const ROUTE_AUTH_POLICIES: RouteAuthPolicy[] = [
   { path: "/api/github/install", method: "GET", mode: "owner" },
   { path: "/api/github/install/callback", method: "GET", mode: "owner" },
   { path: "/api/github/manage", method: "GET", mode: "owner" },
-  { path: "/api/setup/workers-dev-access/oauth/start", method: "POST", mode: "owner" },
-  { path: "/api/settings/workers-dev-access/oauth/start", method: "POST", mode: "owner" },
-  // The legacy broker authenticates these callbacks with its one-time job
-  // secret. They must remain externally reachable while the fallback exists.
-  { path: "/api/setup/workers-dev-access/broker/proof", method: "POST", mode: "public" },
-  { path: "/api/setup/workers-dev-access/broker/complete", method: "POST", mode: "public" },
   { path: "/api/update/hub-repo/detect", method: "POST", mode: "owner" },
   { path: "/api/update/hub-repo/select", method: "POST", mode: "owner" },
   { path: "/api/update/apply", method: "POST", mode: "owner" },

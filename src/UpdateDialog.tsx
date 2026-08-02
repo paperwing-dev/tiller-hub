@@ -31,7 +31,6 @@ interface UpdateDialogProps {
   issueCode?: string | null;
   isChecking: boolean;
   hasExecutionMachine: boolean;
-  renewalRecommended?: boolean;
   onDismiss: () => void;
   onOpenSettings: () => void;
   onRetryCheck: () => void;
@@ -119,7 +118,6 @@ export default function UpdateDialog({
   issueCode,
   isChecking,
   hasExecutionMachine,
-  renewalRecommended = false,
   onDismiss,
   onOpenSettings,
   onRetryCheck,
@@ -415,7 +413,6 @@ export default function UpdateDialog({
     const action = isDevelopmentBuild ? null : installerMaintenanceAction({
       updateAvailable: status.updateAvailable,
       latestVersion: status.stableRelease?.version ?? '',
-      renewAccess: renewalRecommended,
     });
     const heading = isDevelopmentBuild
       ? 'Development build'
@@ -439,18 +436,9 @@ export default function UpdateDialog({
                 : status.updateAvailable && stableUpdateName
                   ? <>This Hub is running <strong>{currentUpdateName}</strong>. The stable release is <strong>{stableUpdateName}</strong>.</>
                   : status.stableRelease
-                    ? <>This Hub is running the current stable release, <strong>{currentUpdateName}</strong>.</>
+                    ? <>No newer stable release is available. This Hub is running <strong>{currentUpdateName}</strong>.</>
                     : <>Tiller could not load the current stable release. The deployed Hub remains on <strong>{currentUpdateName}</strong>.</>}
             </p>
-
-            {renewalRecommended && (
-              <div className="mt-5 rounded-xl border border-kumo-warning/30 bg-kumo-warning-tint px-4 py-3">
-                <p className="text-sm font-semibold text-kumo-default">Access renewal recommended</p>
-                <p className="mt-1 text-sm text-kumo-subtle">
-                  Renew Access to keep CLI, execution-machine, and workload connections active.
-                </p>
-              </div>
-            )}
 
             {issue && (
               <div className="mt-5 rounded-xl border border-kumo-warning/30 bg-kumo-warning-tint px-4 py-3">

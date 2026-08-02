@@ -24,7 +24,6 @@ import plannerRuntimeRoutes from "./planner/runtime-routes";
 import githubRoutes from "./github/routes";
 import workspaceRoutes from "./workspace/routes";
 import updateRoutes from "./update/routes";
-import workersDevAccessRoutes from "./workers-dev-access/routes";
 import cloudflareMcpRoutes from "./cloudflare-mcp-routes";
 import { envExists } from "./env/view";
 import {
@@ -104,7 +103,6 @@ app.route("/", githubRoutes);
 app.route("/", opencodeRoutes);
 app.route("/", cloudflareMcpRoutes);
 app.route("/", updateRoutes);
-app.route("/", workersDevAccessRoutes);
 
 // ── Health ──────────────────────────────────────────────────────────
 

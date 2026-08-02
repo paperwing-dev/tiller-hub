@@ -816,7 +816,6 @@ describe("single-object api helpers", () => {
         renewalRecommended: false,
         hostConnected: false,
         idleTimeoutMinutes: 15,
-        canonicalMainBootstrapDepth: 0,
         githubAppAvailable: false,
         githubAppConfigured: false,
         githubAppReady: false,

@@ -1187,7 +1187,6 @@ const SETUP_STATUS_KEYS = [
   "protectionMode",
   "tokenExpiresAt",
   "idleTimeoutMinutes",
-  "canonicalMainBootstrapDepth",
   "githubAppSlug",
   "githubAppInstallUrl",
   "githubAppManageUrl",
@@ -1222,9 +1221,6 @@ function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void
       value !== "claude-code" && value !== "codex" && value !== "opencode"
     )
     || !isCloudflareIdleTimeoutMinutes(payload.idleTimeoutMinutes)
-    || typeof payload.canonicalMainBootstrapDepth !== "number"
-    || !Number.isInteger(payload.canonicalMainBootstrapDepth)
-    || payload.canonicalMainBootstrapDepth < 0
     || typeof payload.githubAppManageUrl !== "string"
     || !isRecord(payload.codexBackendReadiness)
     || !isCodexRouteStatus(payload.codexRouteStatus)
@@ -3222,7 +3218,6 @@ export interface SetupStatus {
   renewalRecommended: boolean;
   hostConnected: boolean;
   idleTimeoutMinutes: number;
-  canonicalMainBootstrapDepth: number;
   githubAppAvailable: boolean;
   githubAppConfigured: boolean;
   githubAppReady: boolean;
@@ -3514,40 +3509,6 @@ export async function testGitHubAppAccess(hubUrl: string, selection: GitHubRepos
     installUrl: readNullableString(body.installUrl),
     manageUrl: readNullableString(body.manageUrl),
   };
-}
-
-export interface WorkersDevAccessOAuthStart {
-  jobId: string;
-  connectUrl: string;
-  expiresAt: string;
-}
-
-async function startWorkersDevAccessOAuthAt(
-  hubUrl: string,
-  path: string,
-): Promise<WorkersDevAccessOAuthStart> {
-  const res = await fetch(`${hubUrl}${path}`, {
-    method: "POST",
-    credentials: "include",
-  });
-  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw buildApiActionError(body, `Cloudflare connection failed: ${res.status}`);
-  if (!isRecord(body)) throw new Error("Malformed Cloudflare connection response");
-  const jobId = readString(body.jobId);
-  const connectUrl = readString(body.connectUrl);
-  const expiresAt = readString(body.expiresAt);
-  if (!jobId || !connectUrl || !expiresAt) {
-    throw new Error("Malformed Cloudflare connection response");
-  }
-  return { jobId, connectUrl, expiresAt };
-}
-
-export function startWorkersDevAccessOAuth(hubUrl: string): Promise<WorkersDevAccessOAuthStart> {
-  return startWorkersDevAccessOAuthAt(hubUrl, "/api/setup/workers-dev-access/oauth/start");
-}
-
-export function renewWorkersDevAccess(hubUrl: string): Promise<WorkersDevAccessOAuthStart> {
-  return startWorkersDevAccessOAuthAt(hubUrl, "/api/settings/workers-dev-access/oauth/start");
 }
 
 export async function checkForUpdate(hubUrl: string): Promise<UpdateCheckResult> {

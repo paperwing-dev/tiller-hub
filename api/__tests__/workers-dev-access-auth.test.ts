@@ -1,13 +1,12 @@
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { Hono } from "hono";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import {
   authenticateAccessRequest,
   authenticateCanonicalOwner,
   authMiddleware,
 } from "../auth";
 import {
-  clearWorkersDevAccessTrustCache,
   readWorkersDevAccessCredential,
   readWorkersDevAccessLifecycle,
   readWorkersDevAccessTrust,
@@ -15,29 +14,27 @@ import {
 import type { Env } from "../types";
 import type { HonoEnv } from "../types";
 import type {
-  WorkersDevAccessCredentialV1,
-  WorkersDevAccessTrustV1,
+  WorkersDevAccessRuntimeCredential,
+  WorkersDevAccessRuntimeTrust,
 } from "../workers-dev-access/types";
-import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
+import {
+  installedAccessBindings,
+  maintainerDevAccessBindings,
+  TEST_MAINTAINER_DEV_HOSTNAME,
+  TEST_WORKERS_DEV_HOSTNAME,
+} from "./access-binding-fixture";
 
-const trust: WorkersDevAccessTrustV1 = {
-  version: 1,
+const trust: WorkersDevAccessRuntimeTrust = {
   ownerEmail: "owner@example.com",
-  accountId: "",
-  workerName: "tiller",
   workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
   issuer: "https://team.cloudflareaccess.com",
   audience: "audience-1",
-  serviceTokenId: "token-1",
   serviceClientId: "service-client.access",
-  configuredAt: "1970-01-01T00:00:00.000Z",
 };
 
-const credential: WorkersDevAccessCredentialV1 = {
-  version: 1,
+const credential: WorkersDevAccessRuntimeCredential = {
   currentSecret: "secret",
   tokenExpiresAt: "2027-07-16T00:00:00.000Z",
-  updatedAt: "1970-01-01T00:00:00.000Z",
 };
 
 const bindingTrust = {
@@ -52,7 +49,7 @@ let privateKey: CryptoKey;
 let unrelatedPrivateKey: CryptoKey;
 let publicJwk: Record<string, unknown>;
 
-function envFor(canonical: WorkersDevAccessTrustV1 | null = trust): Env {
+function envFor(canonical: WorkersDevAccessRuntimeTrust | null = trust): Env {
   return {
     ...(canonical ? installedAccessBindings({
       hostname: canonical.workersDevHostname,
@@ -117,7 +114,7 @@ function customDomainRequest(assertion: string, path = "/api/setup"): Request {
   });
 }
 
-function customDomainEnv(canonical: WorkersDevAccessTrustV1 | null = trust): Env {
+function customDomainEnv(canonical: WorkersDevAccessRuntimeTrust | null = trust): Env {
   return {
     ...envFor(canonical),
     HUB_PUBLIC_URL: "https://tiller.example.com",
@@ -136,10 +133,6 @@ function authPolicyApp(): Hono<HonoEnv> {
   app.post("/api/cli/auth-connect-package", (c) => c.json({ ok: true }));
   app.post("/api/auth/subscriptions/codex/connect", (c) => c.json({ ok: true }));
   app.post("/api/auth/subscriptions/claude/connect", (c) => c.json({ ok: true }));
-  app.post("/api/setup/workers-dev-access/oauth/start", (c) => c.json({ ok: true }));
-  app.post("/api/settings/workers-dev-access/oauth/start", (c) => c.json({ ok: true }));
-  app.post("/api/setup/workers-dev-access/broker/proof", (c) => c.json({ ok: true }));
-  app.post("/api/setup/workers-dev-access/broker/complete", (c) => c.json({ ok: true }));
   app.post("/api/update/hub-repo/detect", (c) => c.json({ ok: true }));
   app.post("/api/update/hub-repo/select", (c) => c.json({ ok: true }));
   app.post("/api/update/apply", (c) => c.json({ ok: true }));
@@ -180,8 +173,6 @@ beforeAll(async () => {
   publicJwk = { ...await exportJWK(keys.publicKey), kid: "test-key", alg: "RS256", use: "sig" };
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ keys: [publicJwk] })));
 });
-
-beforeEach(() => clearWorkersDevAccessTrustCache());
 
 describe("canonical workers.dev signed principals", () => {
   it("classifies only the exact signed owner email", async () => {
@@ -363,8 +354,6 @@ describe("owner-only Settings policy", () => {
     ["POST", "/api/cli/auth-connect-package"],
     ["PUT", "/api/settings/execution-backend"],
     ["GET", "/api/settings/legacy-custom-domain-cleanup"],
-    ["POST", "/api/setup/workers-dev-access/oauth/start"],
-    ["POST", "/api/settings/workers-dev-access/oauth/start"],
     ["POST", "/api/update/hub-repo/detect"],
     ["POST", "/api/update/hub-repo/select"],
     ["POST", "/api/update/apply"],
@@ -461,16 +450,28 @@ describe("owner-only Settings policy", () => {
   });
 
   it.each([
+    "/api/setup/workers-dev-access/oauth/start",
+    "/api/settings/workers-dev-access/oauth/start",
     "/api/setup/workers-dev-access/broker/proof",
     "/api/setup/workers-dev-access/broker/complete",
-  ])("keeps the job-secret-authenticated legacy broker callback reachable at %s", async (path) => {
-    const response = await authPolicyApp().request(
+  ])("authenticates removed Access routes before falling through to not found at %s", async (path) => {
+    const app = authPolicyApp();
+    const unauthenticated = await app.request(
       `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
       { method: "POST" },
       envFor() as HonoEnv["Bindings"],
     );
+    expect(unauthenticated.status).toBe(401);
 
-    expect(response.status).toBe(200);
+    const authenticated = await app.request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      {
+        method: "POST",
+        headers: { "Cf-Access-Jwt-Assertion": await ownerAssertion() },
+      },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(authenticated.status).toBe(404);
   });
 
   it("keeps GitHub administration owner-only while preserving capability-gated runtime token access", async () => {
@@ -567,42 +568,44 @@ describe("owner-only Settings policy", () => {
   });
 });
 
-describe("canonical workers.dev trust cache", () => {
-  it("does not negatively cache an unconfigured hostname", async () => {
+describe("installer binding-backed workers.dev trust", () => {
+  it("reads a newly configured binding after an unconfigured environment", async () => {
     await expect(readWorkersDevAccessTrust(envFor(null), trust.workersDevHostname)).resolves.toBeNull();
     await expect(readWorkersDevAccessTrust(envFor(trust), trust.workersDevHostname)).resolves.toEqual(bindingTrust);
   });
 
-  it("keys positive trust by the exact hostname", async () => {
+  it("matches trust by the exact hostname", async () => {
     await expect(readWorkersDevAccessTrust(envFor(trust), trust.workersDevHostname)).resolves.toEqual(bindingTrust);
     await expect(readWorkersDevAccessTrust(envFor(trust), "other.preview.workers.dev")).resolves.toBeNull();
     await expect(readWorkersDevAccessTrust(envFor(trust), "tiller.example.com")).resolves.toBeNull();
   });
 
-  it("falls back to legacy HubDO Access records only when installer bindings are absent", async () => {
-    const legacyStore = {
-      getWorkersDevAccessTrust: vi.fn(async () => trust),
-      getWorkersDevAccessCredential: vi.fn(async () => credential),
-      getWorkersDevAccessLifecycle: vi.fn(async () => ({
-        configured: true,
-        workersDevHostname: trust.workersDevHostname,
-        tokenExpiresAt: credential.tokenExpiresAt,
-        renewalRecommended: false,
-      })),
-    };
-    const legacyEnv = {
+  it("returns unconfigured without reading Hub storage when installer bindings are absent", async () => {
+    const get = vi.fn(() => {
+      throw new Error("legacy storage must not be read");
+    });
+    const unconfiguredEnv = {
       HUB: {
         idFromName: vi.fn(() => "hub-id"),
-        get: vi.fn(() => legacyStore),
+        get,
       },
     } as unknown as Env;
 
-    await expect(readWorkersDevAccessTrust(legacyEnv, trust.workersDevHostname)).resolves.toEqual(trust);
-    await expect(readWorkersDevAccessCredential(legacyEnv)).resolves.toEqual(credential);
-    await expect(readWorkersDevAccessLifecycle(legacyEnv)).resolves.toMatchObject({ configured: true });
+    await expect(readWorkersDevAccessTrust(
+      unconfiguredEnv,
+      trust.workersDevHostname,
+    )).resolves.toBeNull();
+    await expect(readWorkersDevAccessCredential(unconfiguredEnv)).resolves.toBeNull();
+    await expect(readWorkersDevAccessLifecycle(unconfiguredEnv)).resolves.toEqual({
+      configured: false,
+      workersDevHostname: null,
+      tokenExpiresAt: null,
+      renewalRecommended: false,
+    });
+    expect(get).not.toHaveBeenCalled();
   });
 
-  it("fails closed instead of using legacy records when installer bindings are malformed", async () => {
+  it("fails closed without reading Hub storage when installer bindings are malformed", async () => {
     const getWorkersDevAccessTrust = vi.fn(async () => trust);
     const env = {
       ...installedAccessBindings(),
@@ -615,6 +618,36 @@ describe("canonical workers.dev trust cache", () => {
 
     await expect(readWorkersDevAccessTrust(env, trust.workersDevHostname)).resolves.toBeNull();
     expect(getWorkersDevAccessTrust).not.toHaveBeenCalled();
+  });
+
+  it("accepts the separate fixed maintainer dev schema", async () => {
+    const env = maintainerDevAccessBindings() as unknown as Env;
+    await expect(readWorkersDevAccessTrust(env, TEST_MAINTAINER_DEV_HOSTNAME)).resolves.toEqual({
+      ownerEmail: "owner@example.com",
+      workersDevHostname: TEST_MAINTAINER_DEV_HOSTNAME,
+      issuer: "https://team.cloudflareaccess.com",
+      audience: "audience-1",
+      serviceClientId: "service-client.access",
+    });
+    await expect(readWorkersDevAccessCredential(env)).resolves.toEqual({
+      currentSecret: "service-secret",
+      tokenExpiresAt: "2027-07-16T00:00:00.000Z",
+    });
+  });
+
+  it("fails closed for mixed schemas or any other dev hostname", async () => {
+    const mixed = {
+      ...maintainerDevAccessBindings(),
+      TILLER_INSTALLER_SCHEMA: "1",
+    } as unknown as Env;
+    const otherHostname = maintainerDevAccessBindings({
+      hostname: "tiller-dev.other-account.workers.dev",
+    }) as unknown as Env;
+    await expect(readWorkersDevAccessTrust(mixed, TEST_MAINTAINER_DEV_HOSTNAME)).resolves.toBeNull();
+    await expect(readWorkersDevAccessTrust(
+      otherHostname,
+      "tiller-dev.other-account.workers.dev",
+    )).resolves.toBeNull();
   });
 
 });

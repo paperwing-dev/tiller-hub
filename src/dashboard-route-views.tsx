@@ -61,8 +61,6 @@ export function SettingsRoute() {
     <HomeSettingsFrame>
       <SettingsPage
         status={data.setupStatus}
-        updateStatus={data.updateStatus}
-        isCheckingUpdate={data.isCheckingUpdate}
         onRefresh={data.refreshSetupStatus}
         onDone={() => navigate('/', { replace: true })}
       />
@@ -136,8 +134,6 @@ export function WorkspaceSettingsRoute() {
   return (
     <SettingsPage
       status={data.setupStatus}
-      updateStatus={data.updateStatus}
-      isCheckingUpdate={data.isCheckingUpdate}
       onRefresh={data.refreshSetupStatus}
       onDone={() => navigate(projectPath(repoId), { replace: true })}
     />

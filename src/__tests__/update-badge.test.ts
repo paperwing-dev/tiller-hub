@@ -73,7 +73,6 @@ describe("describeUpdateButtonState", () => {
       issue: null,
       dismissed: false,
       isChecking: false,
-      renewalRecommended: false,
       onOpen: () => undefined,
     }));
 
@@ -157,13 +156,12 @@ describe("describeUpdateButtonState", () => {
     });
   });
 
-  it("uses installer maintenance labels for updates and renewal", () => {
+  it("keeps installer maintenance state version-only", () => {
     expect(describeUpdateButtonState({
       status: installerUpdateStatus(),
       issue: null,
       dismissed: false,
       isChecking: false,
-      renewalRecommended: false,
     })).toEqual({
       description: "Update to v0.2.0",
       enabled: true,
@@ -174,29 +172,19 @@ describe("describeUpdateButtonState", () => {
       issue: null,
       dismissed: false,
       isChecking: false,
-      renewalRecommended: false,
     })).toEqual({
       description: "No update available\nCurrent version: v0.1.0",
       enabled: false,
     });
 
     expect(describeUpdateButtonState({
-      status: installerUpdateStatus({ updateAvailable: false }),
+      status: installerUpdateStatus(),
       issue: null,
       dismissed: true,
       isChecking: false,
-      renewalRecommended: true,
     })).toEqual({
-      description: "Renew Access",
-      enabled: true,
+      description: "Update dismissed",
+      enabled: false,
     });
-
-    expect(describeUpdateButtonState({
-      status: installerUpdateStatus(),
-      issue: null,
-      dismissed: false,
-      isChecking: false,
-      renewalRecommended: true,
-    }).description).toBe("Renew and update to v0.2.0");
   });
 });

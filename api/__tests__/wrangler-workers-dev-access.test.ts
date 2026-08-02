@@ -8,7 +8,7 @@ const WRANGLER_SOURCE = readFileSync(
 );
 
 describe("workers.dev Access deployment config", () => {
-  it("routes Hub-to-broker fetches through Cloudflare's public front door", () => {
+  it("keeps strict public global-fetch semantics", () => {
     const flags = WRANGLER_SOURCE.match(/"compatibility_flags":\s*\[([^\]]*)\]/s)?.[1];
 
     expect(flags, "compatibility_flags missing from wrangler.jsonc").toBeDefined();

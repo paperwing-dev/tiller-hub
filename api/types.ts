@@ -27,10 +27,10 @@ export interface Env {
   CODEX_AUTH: DurableObjectNamespace;
   LOCAL_DEV_ONLY_BACKEND?: string;
   TILLER_UPDATE_SERVICE_DISABLED?: string;
-  /** Temporary endpoint override for the legacy Access broker fallback. */
-  WORKERS_DEV_ACCESS_BROKER_URL?: string;
   /** Present together only on Hubs created by the fresh OAuth installer. */
   TILLER_INSTALLER_SCHEMA?: string;
+  /** Present only on the fixed maintainer-owned tiller-dev deployment. */
+  TILLER_MAINTAINER_DEV_SCHEMA?: string;
   TILLER_INSTALLATION_ID?: string;
   TILLER_RELEASE_ID?: string;
   TILLER_WORKERS_DEV_HOSTNAME?: string;

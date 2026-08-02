@@ -4,10 +4,9 @@ import { authenticateAccessRequest, authMiddleware, dynamicEntrypointAuthRespons
 import { hasEnabledHarnessModelAuth, resolveModelAuthState, resolveProtectionState } from "../protection";
 import voiceRoutes from "../voice/routes";
 import type { Env, HonoEnv } from "../types";
-import { clearWorkersDevAccessTrustCache } from "../workers-dev-access/records";
 import type {
-  WorkersDevAccessCredentialV1,
-  WorkersDevAccessTrustV1,
+  WorkersDevAccessRuntimeCredential,
+  WorkersDevAccessRuntimeTrust,
 } from "../workers-dev-access/types";
 import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
@@ -24,29 +23,25 @@ vi.mock("../openai-auth", () => ({
   getStatus: getOpenAIAuthStatus,
 }));
 
-const canonicalTrust: WorkersDevAccessTrustV1 = {
-  version: 1,
+const canonicalTrust: WorkersDevAccessRuntimeTrust = {
   ownerEmail: "owner@example.com",
-  accountId: "",
-  workerName: "tiller",
   workersDevHostname: TEST_WORKERS_DEV_HOSTNAME,
   issuer: "https://team.cloudflareaccess.com",
   audience: "aud",
-  serviceTokenId: "token-1",
   serviceClientId: "client-id.access",
-  configuredAt: "1970-01-01T00:00:00.000Z",
 };
 
-const canonicalCredential: WorkersDevAccessCredentialV1 = {
-  version: 1,
+const canonicalCredential: WorkersDevAccessRuntimeCredential = {
   currentSecret: "client-secret",
   tokenExpiresAt: "2027-07-16T00:00:00.000Z",
-  updatedAt: "1970-01-01T00:00:00.000Z",
 };
 
 function mockEnv(
   overrides: Record<string, unknown> = {},
-  access: { trust?: WorkersDevAccessTrustV1 | null; credential?: WorkersDevAccessCredentialV1 | null } = {},
+  access: {
+    trust?: WorkersDevAccessRuntimeTrust | null;
+    credential?: WorkersDevAccessRuntimeCredential | null;
+  } = {},
 ): Env {
   const fetchSpy = vi.fn(async () => new Response("ok", { status: 200 }));
   const trust = access.trust ?? null;
@@ -74,8 +69,6 @@ function mockEnv(
     ...overrides,
   } as unknown as Env;
 }
-
-beforeEach(() => clearWorkersDevAccessTrustCache());
 
 describe("resolveModelAuthState", () => {
   beforeEach(() => {
@@ -541,19 +534,6 @@ describe("voice access auth", () => {
   beforeEach(() => {
     stubFetch = vi.fn(async () => new Response("ok", { status: 200 }));
     env = {
-      HUB: {
-        idFromName: vi.fn(() => "hub-id"),
-        get: vi.fn(() => ({
-          getWorkersDevAccessTrust: vi.fn(async () => null),
-          getWorkersDevAccessCredential: vi.fn(async () => null),
-          getWorkersDevAccessLifecycle: vi.fn(async () => ({
-            configured: false,
-            workersDevHostname: null,
-            tokenExpiresAt: null,
-            renewalRecommended: false,
-          })),
-        })),
-      },
       TILLER_VOICE: {
         idFromName: vi.fn(() => "voice-id"),
         get: vi.fn(() => ({ fetch: stubFetch })),

@@ -27,13 +27,6 @@ import {
   VALID_ACTIVITIES,
 } from "./types";
 import {
-  WORKERS_DEV_ACCESS_COMPLETED_JOB_PREFIX,
-  WORKERS_DEV_ACCESS_CREDENTIAL_KEY,
-  WORKERS_DEV_ACCESS_PENDING_JOB_KEY,
-  WORKERS_DEV_ACCESS_RESULT_DIGEST_KEY,
-  WORKERS_DEV_ACCESS_TRUST_KEY,
-  isRenewalRecommended,
-  normalizeWorkersDevHostname,
   readCanonicalWorkersDevAccessTrust,
 } from "./workers-dev-access/records";
 import {
@@ -50,22 +43,7 @@ import {
   selectionToPlacement,
   type LegacyCustomDomainCleanupManifestV1,
 } from "./execution";
-import {
-  normalizeBootstrapCompletion,
-  normalizeRenewCompletion,
-  stableJson,
-} from "./workers-dev-access/validation";
 import { inspectPredeployCleanSlate } from "./predeploy-clean-slate";
-import type {
-  CompletedWorkersDevAccessJobV1,
-  PendingWorkersDevAccessJobV1,
-  WorkersDevAccessCompletionResult,
-  WorkersDevAccessCredentialV1,
-  WorkersDevAccessJobAuthentication,
-  WorkersDevAccessLifecycle,
-  WorkersDevAccessOperation,
-  WorkersDevAccessTrustV1,
-} from "./workers-dev-access/types";
 import {
   applySessionEnvPatch,
   normalizeSessionEnvPatch,
@@ -143,10 +121,6 @@ const TERMINAL_OWNER_GRACE_MS = 750;
 const SESSION_THREAD_PREFIX = "session:";
 const REPO_SESSION_ENV_DATA_KEY = "__private:repo_session_env:data_key:v1";
 const REPO_CLOUDFLARE_MCP_DATA_KEY = "__private:repo_cloudflare_mcp:data_key:v1";
-const WORKERS_DEV_ACCESS_COMPLETION_TTL_MS = 80 * 60 * 1_000;
-const WORKERS_DEV_ACCESS_MUTATION_WINDOW_MS = 20 * 60 * 1_000;
-const WORKERS_DEV_ACCESS_REGISTRATION_WINDOW_MS = 2 * 60 * 1_000;
-const WORKERS_DEV_ACCESS_TOMBSTONE_GRACE_MS = 60 * 60 * 1_000;
 
 interface PendingRunnerRequest {
   connectionId: string;
@@ -189,19 +163,6 @@ function createDataKey(): string {
   return bytesToBase64(bytes);
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
-  return bytesToBase64(bytes)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
-function createAccessJobSecret(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return bytesToBase64Url(bytes);
-}
-
 function legacyCleanupManifest(
   rawState: string | undefined,
 ): LegacyCustomDomainCleanupManifestV1 | null {
@@ -223,16 +184,6 @@ function legacyCleanupManifest(
       access.serviceTokenPolicyId,
     ].filter((value, index, values) => Boolean(value) && values.indexOf(value) === index),
   };
-}
-
-async function sha256Base64Url(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return bytesToBase64Url(new Uint8Array(digest));
-}
-
-function accessMutationDeadline(job: PendingWorkersDevAccessJobV1): number {
-  return Date.parse(job.completionDeadline)
-    - (WORKERS_DEV_ACCESS_COMPLETION_TTL_MS - WORKERS_DEV_ACCESS_MUTATION_WINDOW_MS);
 }
 
 async function importAesKey(rawKeyBase64: string): Promise<CryptoKey> {
@@ -1992,422 +1943,6 @@ export class HubDO extends Server<Env> {
     });
   }
 
-  // ── Canonical workers.dev Access records ──────────────────────
-
-  async getWorkersDevAccessTrust(hostnameInput: string): Promise<WorkersDevAccessTrustV1 | null> {
-    const hostname = normalizeWorkersDevHostname(hostnameInput);
-    const trust = await this.ctx.storage.get<WorkersDevAccessTrustV1>(WORKERS_DEV_ACCESS_TRUST_KEY);
-    if (!trust || normalizeWorkersDevHostname(trust.workersDevHostname) !== hostname) return null;
-    return trust;
-  }
-
-  async getWorkersDevAccessCredential(): Promise<WorkersDevAccessCredentialV1 | null> {
-    return (await this.ctx.storage.get<WorkersDevAccessCredentialV1>(
-      WORKERS_DEV_ACCESS_CREDENTIAL_KEY,
-    )) ?? null;
-  }
-
-  async getWorkersDevAccessLifecycle(): Promise<WorkersDevAccessLifecycle> {
-    const [trust, credential] = await Promise.all([
-      this.ctx.storage.get<WorkersDevAccessTrustV1>(WORKERS_DEV_ACCESS_TRUST_KEY),
-      this.ctx.storage.get<WorkersDevAccessCredentialV1>(WORKERS_DEV_ACCESS_CREDENTIAL_KEY),
-    ]);
-    return {
-      configured: Boolean(trust && credential),
-      workersDevHostname: trust?.workersDevHostname ?? null,
-      tokenExpiresAt: credential?.tokenExpiresAt ?? null,
-      renewalRecommended: credential ? isRenewalRecommended(credential.tokenExpiresAt) : false,
-    };
-  }
-
-  private async deleteExpiredWorkersDevAccessTombstones(now = Date.now()): Promise<number | null> {
-    const tombstones = await this.ctx.storage.list<CompletedWorkersDevAccessJobV1>({
-      prefix: WORKERS_DEV_ACCESS_COMPLETED_JOB_PREFIX,
-    });
-    const expired = [...tombstones.entries()]
-      .filter(([, value]) => Date.parse(value.expiresAt) <= now)
-      .map(([key]) => key);
-    if (expired.length > 0) await this.ctx.storage.delete(expired);
-    const remainingExpirations = [...tombstones.entries()]
-      .filter(([key]) => !expired.includes(key))
-      .map(([, value]) => Date.parse(value.expiresAt))
-      .filter((expiresAt) => Number.isFinite(expiresAt) && expiresAt > now);
-    return remainingExpirations.length > 0 ? Math.min(...remainingExpirations) : null;
-  }
-
-  async beginWorkersDevAccessJob(input: {
-    operation: WorkersDevAccessOperation;
-    origin: string;
-    workerName: string;
-  }): Promise<
-    | { status: "created"; job: PendingWorkersDevAccessJobV1; jobSecret: string }
-    | { status: "registering"; job: PendingWorkersDevAccessJobV1 }
-    | { status: "existing"; job: PendingWorkersDevAccessJobV1 }
-    | { status: "conflict"; job: PendingWorkersDevAccessJobV1 }
-    | { status: "already_configured" }
-    | { status: "not_configured" }
-  > {
-    await this.deleteExpiredWorkersDevAccessTombstones();
-    const now = Date.now();
-    const jobId = crypto.randomUUID();
-    const jobSecret = createAccessJobSecret();
-    const jobSecretSha256 = await sha256Base64Url(jobSecret);
-    const job: PendingWorkersDevAccessJobV1 = {
-      version: 1,
-      jobId,
-      operation: input.operation,
-      origin: input.origin,
-      workerName: input.workerName,
-      jobSecretSha256,
-      registrationState: "registering",
-      registrationDeadline: new Date(
-        now + WORKERS_DEV_ACCESS_REGISTRATION_WINDOW_MS,
-      ).toISOString(),
-      completionDeadline: new Date(now + WORKERS_DEV_ACCESS_COMPLETION_TTL_MS).toISOString(),
-    };
-
-    return this.ctx.storage.transaction(async (txn) => {
-      const current = await txn.get<PendingWorkersDevAccessJobV1>(
-        WORKERS_DEV_ACCESS_PENDING_JOB_KEY,
-      );
-      const currentIsRegistered = current?.registrationState === "registered"
-        && typeof current.registeredAt === "string"
-        && Number.isFinite(Date.parse(current.registeredAt));
-      const currentIsRegistering = current?.registrationState === "registering";
-      const currentMutationStartedAt = Date.parse(current?.mutationStartedAt ?? "");
-      const currentMutationStarted = currentIsRegistered
-        && current !== undefined
-        && Number.isFinite(currentMutationStartedAt)
-        && currentMutationStartedAt <= accessMutationDeadline(current);
-      const currentDeadline = currentIsRegistered
-        ? currentMutationStarted
-          ? Date.parse(current?.completionDeadline ?? "")
-          : accessMutationDeadline(current)
-        : currentIsRegistering
-          ? Date.parse(current?.registrationDeadline ?? "")
-          : Number.NaN;
-      if (current && Number.isFinite(currentDeadline) && currentDeadline > now) {
-        if (
-          current.operation === input.operation
-          && current.origin === input.origin
-          && current.workerName === input.workerName
-        ) {
-          return currentIsRegistered
-            ? { status: "existing" as const, job: current }
-            : { status: "registering" as const, job: current };
-        }
-        return { status: "conflict" as const, job: current };
-      }
-      if (current) await txn.delete(WORKERS_DEV_ACCESS_PENDING_JOB_KEY);
-
-      const trust = await txn.get<WorkersDevAccessTrustV1>(WORKERS_DEV_ACCESS_TRUST_KEY);
-      const credential = await txn.get<WorkersDevAccessCredentialV1>(
-        WORKERS_DEV_ACCESS_CREDENTIAL_KEY,
-      );
-      if (input.operation === "bootstrap" && (trust || credential)) {
-        return { status: "already_configured" as const };
-      }
-      if (input.operation === "renew" && (!trust || !credential)) {
-        return { status: "not_configured" as const };
-      }
-
-      await txn.put(WORKERS_DEV_ACCESS_PENDING_JOB_KEY, job);
-      return { status: "created" as const, job, jobSecret };
-    });
-  }
-
-  async cancelWorkersDevAccessJob(input: {
-    jobId: string;
-    jobSecretSha256: string;
-  }): Promise<boolean> {
-    return this.ctx.storage.transaction(async (txn) => {
-      const current = await txn.get<PendingWorkersDevAccessJobV1>(
-        WORKERS_DEV_ACCESS_PENDING_JOB_KEY,
-      );
-      if (
-        !current
-        || current.jobId !== input.jobId
-        || current.jobSecretSha256 !== input.jobSecretSha256
-        || current.registrationState !== "registering"
-      ) {
-        return false;
-      }
-      await txn.delete(WORKERS_DEV_ACCESS_PENDING_JOB_KEY);
-      return true;
-    });
-  }
-
-  async markWorkersDevAccessJobRegistrationConfirmed(input: {
-    jobId: string;
-    jobSecretSha256: string;
-  }): Promise<
-    | { status: "confirmed" | "already_confirmed"; job: PendingWorkersDevAccessJobV1 }
-    | { status: "stale" | "expired" }
-  > {
-    const now = Date.now();
-    return this.ctx.storage.transaction(async (txn) => {
-      const current = await txn.get<PendingWorkersDevAccessJobV1>(
-        WORKERS_DEV_ACCESS_PENDING_JOB_KEY,
-      );
-      if (
-        !current
-        || current.jobId !== input.jobId
-        || current.jobSecretSha256 !== input.jobSecretSha256
-      ) {
-        return { status: "stale" as const };
-      }
-      if (current.registrationState === "registered") {
-        return typeof current.registeredAt === "string"
-          && Number.isFinite(Date.parse(current.registeredAt))
-          ? { status: "already_confirmed" as const, job: current }
-          : { status: "stale" as const };
-      }
-      if (
-        current.registrationState !== "registering"
-        || !Number.isFinite(Date.parse(current.registrationDeadline))
-        || Date.parse(current.registrationDeadline) <= now
-      ) {
-        return { status: "expired" as const };
-      }
-      const confirmed: PendingWorkersDevAccessJobV1 = {
-        ...current,
-        registrationState: "registered",
-        registeredAt: new Date(now).toISOString(),
-      };
-      await txn.put(WORKERS_DEV_ACCESS_PENDING_JOB_KEY, confirmed);
-      return { status: "confirmed" as const, job: confirmed };
-    });
-  }
-
-  async verifyWorkersDevAccessJobProof(
-    input: WorkersDevAccessJobAuthentication & {
-      intent: "bind" | "mutation_start";
-    },
-  ): Promise<{
-    ok: true;
-    registrationState: "registering" | "registered";
-    completionDeadline: string;
-    mutationState?: "started";
-  } | { ok: false }> {
-    const secretHash = await sha256Base64Url(input.jobSecret);
-    const now = Date.now();
-    return this.ctx.storage.transaction(async (txn) => {
-      const current = await txn.get<PendingWorkersDevAccessJobV1>(
-        WORKERS_DEV_ACCESS_PENDING_JOB_KEY,
-      );
-      if (
-        !current
-        || current.jobId !== input.jobId
-        || current.jobSecretSha256 !== secretHash
-        || current.operation !== input.operation
-        || current.origin !== input.origin
-        || current.workerName !== input.workerName
-      ) {
-        return { ok: false as const };
-      }
-
-      const mutationDeadline = accessMutationDeadline(current);
-      const completionDeadline = Date.parse(current.completionDeadline);
-      const mutationStartedAt = Date.parse(current.mutationStartedAt ?? "");
-      const mutationStarted = current.mutationStartedAt !== undefined
-        && Number.isFinite(mutationStartedAt)
-        && mutationStartedAt <= mutationDeadline;
-      if (
-        !Number.isFinite(mutationDeadline)
-        || !Number.isFinite(completionDeadline)
-        || (current.mutationStartedAt !== undefined && !mutationStarted)
-        || now > (mutationStarted ? completionDeadline : mutationDeadline)
-      ) {
-        return { ok: false as const };
-      }
-
-      if (current.registrationState === "registering") {
-        const registrationDeadline = Date.parse(current.registrationDeadline);
-        if (
-          mutationStarted
-          || input.intent === "mutation_start"
-          || !Number.isFinite(registrationDeadline)
-          || now > registrationDeadline
-        ) {
-          return { ok: false as const };
-        }
-      } else if (
-        current.registrationState !== "registered"
-        || typeof current.registeredAt !== "string"
-        || !Number.isFinite(Date.parse(current.registeredAt))
-      ) {
-        return { ok: false as const };
-      }
-
-      if (input.intent === "mutation_start") {
-        if (!mutationStarted) {
-          if (current.registrationState !== "registered" || now >= mutationDeadline) {
-            return { ok: false as const };
-          }
-          current.mutationStartedAt = new Date(now).toISOString();
-          await txn.put(WORKERS_DEV_ACCESS_PENDING_JOB_KEY, current);
-        }
-        return {
-          ok: true as const,
-          registrationState: "registered" as const,
-          completionDeadline: current.completionDeadline,
-          mutationState: "started" as const,
-        };
-      }
-
-      return {
-        ok: true as const,
-        registrationState: current.registrationState,
-        completionDeadline: current.completionDeadline,
-      };
-    });
-  }
-
-  private async getOrCreateWorkersDevAccessDigestKey(): Promise<string> {
-    return this.ctx.storage.transaction(async (txn) => {
-      const existing = await txn.get<string>(WORKERS_DEV_ACCESS_RESULT_DIGEST_KEY);
-      if (existing) return existing;
-      const created = createDataKey();
-      await txn.put(WORKERS_DEV_ACCESS_RESULT_DIGEST_KEY, created);
-      return created;
-    });
-  }
-
-  private async workersDevAccessResultDigest(
-    operation: WorkersDevAccessOperation,
-    value: unknown,
-  ): Promise<string> {
-    const rawKey = await this.getOrCreateWorkersDevAccessDigestKey();
-    const key = await crypto.subtle.importKey(
-      "raw",
-      base64ToBytes(rawKey),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"],
-    );
-    const signature = await crypto.subtle.sign(
-      "HMAC",
-      key,
-      new TextEncoder().encode(`${operation}\0${stableJson(value)}`),
-    );
-    return bytesToBase64Url(new Uint8Array(signature));
-  }
-
-  async completeWorkersDevAccessJob(input: WorkersDevAccessJobAuthentication & {
-    result: WorkersDevAccessCompletionResult | unknown;
-  }): Promise<{ status: "applied" | "already_applied" }> {
-    const secretHash = await sha256Base64Url(input.jobSecret);
-    const currentTrust = await this.ctx.storage.get<WorkersDevAccessTrustV1>(
-      WORKERS_DEV_ACCESS_TRUST_KEY,
-    );
-    const syntheticJob: PendingWorkersDevAccessJobV1 = {
-      version: 1,
-      jobId: input.jobId,
-      operation: input.operation,
-      origin: input.origin,
-      workerName: input.workerName,
-      jobSecretSha256: secretHash,
-      registrationState: "registered",
-      registrationDeadline: new Date(Date.now() + 1_000).toISOString(),
-      registeredAt: new Date().toISOString(),
-      completionDeadline: new Date(Date.now() + 1_000).toISOString(),
-    };
-    const normalizedResult = input.operation === "bootstrap"
-      ? normalizeBootstrapCompletion(input.result, syntheticJob)
-      : currentTrust
-        ? normalizeRenewCompletion(input.result, currentTrust)
-        : (() => { throw new Error("workers.dev Access is not configured"); })();
-    const resultDigest = await this.workersDevAccessResultDigest(
-      input.operation,
-      normalizedResult,
-    );
-    const tombstoneKey = `${WORKERS_DEV_ACCESS_COMPLETED_JOB_PREFIX}${input.jobId}`;
-
-    const completed = await this.ctx.storage.transaction(async (txn) => {
-      const appliedTombstone = await txn.get<CompletedWorkersDevAccessJobV1>(tombstoneKey);
-      if (appliedTombstone) {
-        if (
-          appliedTombstone.jobSecretSha256 === secretHash
-          && appliedTombstone.resultDigest === resultDigest
-          && Date.parse(appliedTombstone.expiresAt) > Date.now()
-        ) {
-          return { status: "already_applied" as const };
-        }
-        throw new Error("workers.dev Access completion did not match the applied result");
-      }
-
-      const pending = await txn.get<PendingWorkersDevAccessJobV1>(
-        WORKERS_DEV_ACCESS_PENDING_JOB_KEY,
-      );
-      if (
-        !pending
-        || pending.jobId !== input.jobId
-        || pending.jobSecretSha256 !== secretHash
-        || pending.operation !== input.operation
-        || pending.origin !== input.origin
-        || pending.workerName !== input.workerName
-        || pending.registrationState !== "registered"
-        || typeof pending.registeredAt !== "string"
-        || !Number.isFinite(Date.parse(pending.registeredAt))
-        || typeof pending.mutationStartedAt !== "string"
-        || !Number.isFinite(Date.parse(pending.mutationStartedAt))
-        || Date.parse(pending.mutationStartedAt) > accessMutationDeadline(pending)
-        || Date.parse(pending.completionDeadline) < Date.now()
-      ) {
-        throw new Error("workers.dev Access job is invalid or expired");
-      }
-
-      if (input.operation === "bootstrap") {
-        const existingTrust = await txn.get<WorkersDevAccessTrustV1>(
-          WORKERS_DEV_ACCESS_TRUST_KEY,
-        );
-        const existingCredential = await txn.get<WorkersDevAccessCredentialV1>(
-          WORKERS_DEV_ACCESS_CREDENTIAL_KEY,
-        );
-        if (existingTrust || existingCredential) {
-          throw new Error("workers.dev Access is already configured");
-        }
-        const bootstrap = normalizedResult as ReturnType<typeof normalizeBootstrapCompletion>;
-        await txn.put(WORKERS_DEV_ACCESS_TRUST_KEY, bootstrap.trust);
-        await txn.put(WORKERS_DEV_ACCESS_CREDENTIAL_KEY, bootstrap.credential);
-      } else {
-        const trust = await txn.get<WorkersDevAccessTrustV1>(WORKERS_DEV_ACCESS_TRUST_KEY);
-        const credential = await txn.get<WorkersDevAccessCredentialV1>(
-          WORKERS_DEV_ACCESS_CREDENTIAL_KEY,
-        );
-        if (!trust || !credential) throw new Error("workers.dev Access is not configured");
-        const renewal = normalizeRenewCompletion(input.result, trust);
-        if (Date.parse(renewal.tokenExpiresAt) <= Date.parse(credential.tokenExpiresAt)) {
-          throw new Error("Cloudflare service token expiration did not advance");
-        }
-        await txn.put(WORKERS_DEV_ACCESS_CREDENTIAL_KEY, {
-          ...credential,
-          tokenExpiresAt: renewal.tokenExpiresAt,
-          updatedAt: renewal.updatedAt,
-        } satisfies WorkersDevAccessCredentialV1);
-      }
-
-      const completionTombstone: CompletedWorkersDevAccessJobV1 = {
-        version: 1,
-        jobId: pending.jobId,
-        jobSecretSha256: secretHash,
-        resultDigest,
-        expiresAt: new Date(
-          Date.parse(pending.completionDeadline) + WORKERS_DEV_ACCESS_TOMBSTONE_GRACE_MS,
-        ).toISOString(),
-      };
-      await txn.put(tombstoneKey, completionTombstone);
-      await txn.delete(WORKERS_DEV_ACCESS_PENDING_JOB_KEY);
-      const tombstoneExpiresAt = Date.parse(completionTombstone.expiresAt);
-      const currentAlarm = await txn.getAlarm();
-      if (currentAlarm === null || tombstoneExpiresAt < currentAlarm) {
-        await txn.setAlarm(tombstoneExpiresAt);
-      }
-      return { status: "applied" as const };
-    });
-    return completed;
-  }
-
   // ── Config RPC methods (settings page secret storage) ─────────
 
   /**
@@ -2416,19 +1951,13 @@ export class HubDO extends Server<Env> {
    * custom-domain and deployment-mode state. It never calls Cloudflare.
   */
   async ensureExecutionConfiguration(): Promise<ExecutionSelection> {
-    // The binding-backed branch is safe for fresh Hubs. A legacy Hub must read
-    // its own storage directly; RPCing env.HUB from inside HubDO would call the
-    // currently executing object recursively.
-    const trust = this.env.TILLER_INSTALLER_SCHEMA?.trim()
-      ? await readCanonicalWorkersDevAccessTrust(this.env)
-      : await this.ctx.storage.get<WorkersDevAccessTrustV1>(WORKERS_DEV_ACCESS_TRUST_KEY);
+    const trust = await readCanonicalWorkersDevAccessTrust(this.env);
     const localOnly = isLocalOnlyRunnerBackendMode(this.env);
     if (
       !localOnly
       && (
         !trust
-        || !normalizeWorkersDevHostname(trust.workersDevHostname)
-          .endsWith(".workers.dev")
+        || !trust.workersDevHostname.endsWith(".workers.dev")
       )
     ) {
       throw new Error("Canonical workers.dev Access trust is required.");
@@ -3305,7 +2834,6 @@ export class HubDO extends Server<Env> {
   // ── Alarm (stale session/machine cleanup) ─────────────────────
 
   async onAlarm(): Promise<void> {
-    const nextWorkersDevAccessCleanup = await this.deleteExpiredWorkersDevAccessTombstones();
     const live = this.getLiveReferences();
 
     // Mark stale machines with no live connections as inactive after a reconnect grace period.
@@ -3347,13 +2875,8 @@ export class HubDO extends Server<Env> {
     const nextHeartbeat = live.hasConnections || activeMachineCount > 0
       ? Date.now() + HEARTBEAT_INTERVAL_MS
       : null;
-    const nextAlarm = nextHeartbeat === null
-      ? nextWorkersDevAccessCleanup
-      : nextWorkersDevAccessCleanup === null
-        ? nextHeartbeat
-        : Math.min(nextHeartbeat, nextWorkersDevAccessCleanup);
-    if (nextAlarm !== null) {
-      await this.ctx.storage.setAlarm(nextAlarm);
+    if (nextHeartbeat !== null) {
+      await this.ctx.storage.setAlarm(nextHeartbeat);
     }
   }
 

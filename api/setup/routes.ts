@@ -24,7 +24,6 @@ const CONFIGURABLE_KEYS = new Set([
   "TILLER_WORKERS_AI_ACCOUNT_ID",
   "TILLER_WORKERS_AI_API_TOKEN",
   "IDLE_TIMEOUT_MINUTES",
-  "CANONICAL_MAIN_BOOTSTRAP_DEPTH",
 ] as const);
 
 type ConfigurableKey = typeof CONFIGURABLE_KEYS extends Set<infer T> ? T : never;

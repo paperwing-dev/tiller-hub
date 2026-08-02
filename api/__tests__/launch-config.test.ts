@@ -57,28 +57,6 @@ function createEnv() {
       credentialId: "cloudflare-credential",
     })),
     getOpenAIAuthStatus: vi.fn(async () => ({ authenticated: true, status: "connected" })),
-    getWorkersDevAccessLifecycle: vi.fn(async () => ({
-      configured: true,
-      workersDevHostname: "tiller.preview.workers.dev",
-      tokenExpiresAt: "2027-07-17T00:00:00.000Z",
-      renewalRecommended: false,
-    })),
-    getWorkersDevAccessTrust: vi.fn(async (hostname: string) => (
-      hostname === "tiller.preview.workers.dev"
-        ? {
-            version: 1,
-            ownerEmail: "owner@example.com",
-            accountId: "account-1",
-            workerName: "demo",
-            workersDevHostname: hostname,
-            issuer: "https://team.cloudflareaccess.com",
-            audience: "audience-1",
-            serviceTokenId: "token-1",
-            serviceClientId: "client.access",
-            configuredAt: "2026-07-17T00:00:00.000Z",
-          }
-        : null
-    )),
   };
   return {
     ...installedAccessBindings({

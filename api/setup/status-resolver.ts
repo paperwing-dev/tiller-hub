@@ -6,7 +6,6 @@ import {
   readRoutableHostService,
 } from "../service-registry";
 import {
-  getCanonicalMainBootstrapDepth,
   getBillingSelections,
   getIdleTimeoutMinutes,
   getSecret,
@@ -65,7 +64,6 @@ export interface SetupStatusPayload {
   renewalRecommended: boolean;
   hostConnected: boolean;
   idleTimeoutMinutes: number;
-  canonicalMainBootstrapDepth: number;
   githubAppAvailable: boolean;
   githubAppConfigured: boolean;
   githubAppReady: boolean;
@@ -278,6 +276,7 @@ export async function resolveSetupStatus(
     : isLocalDev
       ? null
       : protection.hubUrl;
+  const installerManaged = Boolean(env.TILLER_INSTALLER_SCHEMA?.trim());
   const githubAppRequired = !isLocalDev;
   // Model, execution, and machine configuration are dashboard onboarding. Only
   // a usable GitHub App installation blocks first entry to the dashboard.
@@ -290,7 +289,7 @@ export async function resolveSetupStatus(
     needsSetup: setupPhase !== "complete",
     setupPhase,
     isLocalDev,
-    installerManaged: Boolean(env.TILLER_INSTALLER_SCHEMA?.trim()),
+    installerManaged,
     workersDevHubUrl,
     modelAuthConfigured,
     claudeBillingMode: billingSelections.claudeBillingMode,
@@ -311,10 +310,9 @@ export async function resolveSetupStatus(
     enabledHarnesses,
     protectionMode: protection.protectionMode,
     tokenExpiresAt: workersDevAccess.tokenExpiresAt,
-    renewalRecommended: workersDevAccess.renewalRecommended,
+    renewalRecommended: installerManaged && workersDevAccess.renewalRecommended,
     hostConnected: hostExecution.connected,
     idleTimeoutMinutes: await getIdleTimeoutMinutes(env),
-    canonicalMainBootstrapDepth: await getCanonicalMainBootstrapDepth(env),
     githubAppAvailable: githubAppConfigured,
     githubAppConfigured,
     githubAppReady,

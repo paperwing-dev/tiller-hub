@@ -71,31 +71,10 @@ class FakeSqlStorage {
 
 class FakeStorage {
   readonly sql = new FakeSqlStorage();
-  private readonly values = new Map<string, unknown>();
   private alarm: number | null = null;
-
-  async list<T>(options: { prefix?: string } = {}): Promise<Map<string, T>> {
-    return new Map([...this.values.entries()]
-      .filter(([key]) => !options.prefix || key.startsWith(options.prefix))) as Map<string, T>;
-  }
-
-  async delete(keys: string | string[]): Promise<boolean> {
-    const pending = Array.isArray(keys) ? keys : [keys];
-    let deleted = false;
-    for (const key of pending) deleted = this.values.delete(key) || deleted;
-    return deleted;
-  }
 
   async setAlarm(timestamp: number): Promise<void> {
     this.alarm = timestamp;
-  }
-
-  async getAlarm(): Promise<number | null> {
-    return this.alarm;
-  }
-
-  async deleteAlarm(): Promise<void> {
-    this.alarm = null;
   }
 
   close(): void {
