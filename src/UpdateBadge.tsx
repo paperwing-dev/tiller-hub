@@ -80,7 +80,7 @@ export function describeUpdateButtonState({
 
   if (!status.updateAvailable) {
     return {
-      description: 'No update available',
+      description: `Current version: ${formatUpdateName(status.currentUpdate)}`,
       enabled: false,
     };
   }

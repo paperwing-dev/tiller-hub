@@ -113,7 +113,7 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: false,
     })).toEqual({
-      description: "No update available",
+      description: "Current version: v0.1.0",
       enabled: false,
     });
 
@@ -167,6 +167,17 @@ describe("describeUpdateButtonState", () => {
     })).toEqual({
       description: "Update to v0.2.0",
       enabled: true,
+    });
+
+    expect(describeUpdateButtonState({
+      status: installerUpdateStatus({ updateAvailable: false }),
+      issue: null,
+      dismissed: false,
+      isChecking: false,
+      renewalRecommended: false,
+    })).toEqual({
+      description: "Current version: v0.1.0",
+      enabled: false,
     });
 
     expect(describeUpdateButtonState({
