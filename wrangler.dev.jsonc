@@ -21,6 +21,14 @@
 	"vars": {
 		"LOCAL_DEV_ONLY_BACKEND": "true"
 	},
+	"containers": [
+		{
+			"class_name": "CodexAuthDO",
+			"image": "docker.io/jamieatlason/tiller-sandbox:stable",
+			"max_instances": 1,
+			"instance_type": "basic"
+		}
+	],
 	"durable_objects": {
 		"bindings": [
 			{
@@ -38,6 +46,10 @@
 			{
 				"name": "HUB",
 				"class_name": "HubDO"
+			},
+			{
+				"name": "CODEX_AUTH",
+				"class_name": "CodexAuthDO"
 			},
 			{
 				"name": "SANDBOX",
@@ -70,6 +82,7 @@
 		"EnvLifecycleDO": { "type": "durable-object", "storage": "sqlite" },
 		"ArtifactStoreDO": { "type": "durable-object", "storage": "sqlite" },
 		"HubDO": { "type": "durable-object", "storage": "sqlite" },
+		"CodexAuthDO": { "type": "durable-object", "storage": "sqlite" },
 		"SandboxDO": { "type": "durable-object", "storage": "sqlite" },
 		"TillerVoice": { "type": "durable-object", "storage": "sqlite" },
 		"GitHubJobDO": { "type": "durable-object", "storage": "sqlite" },

@@ -40,5 +40,6 @@
     "deleted_classes": ["RepoMergeLockDO", "ScmOperationDO", "ScmBootstrapDO"]
   },
   { "tag": "v24", "new_sqlite_classes": ["EnvReviewDO"] },
-  { "tag": "v25", "new_sqlite_classes": ["ScheduledRunCapacityDO"] }
+  { "tag": "v25", "new_sqlite_classes": ["ScheduledRunCapacityDO"] },
+  { "tag": "v26", "new_sqlite_classes": ["CodexAuthDO"] }
 ]

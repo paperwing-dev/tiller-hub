@@ -9,6 +9,10 @@ import {
 const mocks = vi.hoisted(() => ({
   readRegisteredHostService: vi.fn(),
   readRoutableHostService: vi.fn(),
+  getBillingSelections: vi.fn(async () => ({
+    claudeBillingMode: null,
+    openaiBillingMode: null,
+  })),
   resolveEnabledHarnesses: vi.fn(() => ["claude-code"]),
   hasEnabledHarnessModelAuth: vi.fn(() => true),
   resolveModelAuthState: vi.fn(async () => ({
@@ -44,10 +48,7 @@ vi.mock("../setup/config", async (importOriginal) => {
     invalidateConfigCache: vi.fn(),
     getIdleTimeoutMinutes: vi.fn(async () => 10),
     getCanonicalMainBootstrapDepth: vi.fn(async () => 0),
-    getBillingSelections: vi.fn(async () => ({
-      claudeBillingMode: null,
-      openaiBillingMode: null,
-    })),
+    getBillingSelections: mocks.getBillingSelections,
   };
 });
 
@@ -158,6 +159,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.readRegisteredHostService.mockResolvedValue(null);
   mocks.readRoutableHostService.mockResolvedValue(null);
+  mocks.getBillingSelections.mockResolvedValue({
+    claudeBillingMode: null,
+    openaiBillingMode: null,
+  });
   mocks.resolveEnabledHarnesses.mockReturnValue(["claude-code"]);
   mocks.hasEnabledHarnessModelAuth.mockReturnValue(true);
   mocks.resolveModelAuthState.mockResolvedValue({
@@ -242,6 +247,36 @@ describe("POST /api/setup", () => {
 });
 
 describe("GET /api/setup/status", () => {
+  it("keeps subscription execution available while a valid cached login refreshes", async () => {
+    mocks.getBillingSelections.mockResolvedValue({
+      claudeBillingMode: null,
+      openaiBillingMode: "subscription",
+    });
+    mocks.resolveEnabledHarnesses.mockReturnValue(["codex"]);
+    mocks.resolveModelAuthState.mockResolvedValue({
+      configured: true,
+      hasClaudeSubscription: false,
+      hasAnthropicKey: false,
+      hasChatGPTAuth: true,
+      chatgptAuthStatus: "refreshing",
+      hasOpenAIKey: false,
+    });
+
+    const response = await createApp().request(
+      "https://demo.preview.workers.dev/api/setup/status",
+      { method: "GET" },
+      createEnv(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      chatgptAuthStatus: "refreshing",
+      codexRouteStatus: "available",
+      openaiPlannerAvailable: true,
+      openaiPlannerRoute: "subscription-app-server",
+    });
+  });
+
   it("returns the canonical workers.dev URL without retired deployment fields", async () => {
     const response = await createApp().request(
       "https://demo.preview.workers.dev/api/setup/status",

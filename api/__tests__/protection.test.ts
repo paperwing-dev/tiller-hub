@@ -167,6 +167,33 @@ describe("hasEnabledHarnessModelAuth", () => {
     ).toBe(true);
   });
 
+  it("accepts connected subscriptions for Cloudflare Container workloads", () => {
+    expect(
+      hasEnabledHarnessModelAuth(
+        {
+          hasClaudeSubscription: false,
+          hasAnthropicKey: false,
+          hasChatGPTAuth: true,
+          hasOpenAIKey: false,
+        },
+        ["codex"],
+        "cf",
+      ),
+    ).toBe(true);
+    expect(
+      hasEnabledHarnessModelAuth(
+        {
+          hasClaudeSubscription: true,
+          hasAnthropicKey: false,
+          hasChatGPTAuth: false,
+          hasOpenAIKey: false,
+        },
+        ["claude-code"],
+        "cf",
+      ),
+    ).toBe(true);
+  });
+
   it("does not accept local Codex auth when codex is enabled", () => {
     expect(
       hasEnabledHarnessModelAuth(

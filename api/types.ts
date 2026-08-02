@@ -24,6 +24,7 @@ export interface Env {
   ASSETS: Fetcher;
   BUCKET: R2Bucket;
   ENVS_KV: KVNamespace;
+  CODEX_AUTH: DurableObjectNamespace;
   LOCAL_DEV_ONLY_BACKEND?: string;
   TILLER_UPDATE_SERVICE_DISABLED?: string;
   /** Temporary endpoint override for the legacy Access broker fallback. */

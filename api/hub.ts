@@ -67,15 +67,6 @@ import type {
   WorkersDevAccessTrustV1,
 } from "./workers-dev-access/types";
 import {
-  OpenAIAuthBroker,
-  toOpenAIImportBoundary,
-  toOpenAIRuntimeAuthBoundary,
-  type OpenAIImportBoundaryResult,
-  type OpenAIAuthStatusResult,
-  type OpenAIRuntimeAuthBoundaryResult,
-  type SeedOpenAIAuthInput,
-} from "./openai-auth-broker";
-import {
   applySessionEnvPatch,
   normalizeSessionEnvPatch,
   type RepoSessionEnvMetadata,
@@ -272,7 +263,6 @@ export class HubDO extends Server<Env> {
   private sessionAppendTails = new Map<string, Promise<void>>();
   private repoSessionEnvPatchQueues = new Map<string, Promise<void>>();
   private cloudflareMcpRefreshQueues = new Map<string, Promise<CloudflareMcpAccessTokenResult>>();
-  private _openAIAuthBroker: OpenAIAuthBroker | null = null;
   private readonly terminalBroadcastMetrics = new HopMetricRecorder(
     "hub_terminal_broadcast",
     this.env.TILLER_TERMINAL_METRICS === "1",
@@ -288,30 +278,6 @@ export class HubDO extends Server<Env> {
       this._schemaReady = true;
     }
     return this._db;
-  }
-
-  private get openAIAuthBroker(): OpenAIAuthBroker {
-    if (!this._openAIAuthBroker) this._openAIAuthBroker = new OpenAIAuthBroker(this.env);
-    return this._openAIAuthBroker;
-  }
-
-  /** HubDO is the sole production mutation authority for imported OpenAI credentials. */
-  async importOpenAIAuth(input: SeedOpenAIAuthInput): Promise<OpenAIImportBoundaryResult> {
-    return toOpenAIImportBoundary(await this.openAIAuthBroker.import(input));
-  }
-
-  async exchangeOpenAIRuntimeAuth(
-    rejectedAccessTokenSha256?: string,
-  ): Promise<OpenAIRuntimeAuthBoundaryResult> {
-    return toOpenAIRuntimeAuthBoundary(
-      await this.openAIAuthBroker.runtimeAuth(rejectedAccessTokenSha256),
-    );
-  }
-
-  getOpenAIAuthStatus(refresh = false): Promise<OpenAIAuthStatusResult> {
-    return refresh
-      ? this.openAIAuthBroker.getStatus({ refresh: true })
-      : this.openAIAuthBroker.getReadOnlyStatus();
   }
 
   // ── Lifecycle ───────────────────────────────────────────────────

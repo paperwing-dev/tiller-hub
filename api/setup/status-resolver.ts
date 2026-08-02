@@ -134,7 +134,7 @@ function resolveOpenAIPlannerStatus(options: {
   }
 
   if (options.codexRouteStatus === "available") {
-    if (options.chatgptAuthStatus === "connected") {
+    if (options.chatgptAuthStatus === "connected" || options.chatgptAuthStatus === "refreshing") {
       return {
         configured: true,
         available: true,
@@ -142,18 +142,10 @@ function resolveOpenAIPlannerStatus(options: {
         reason: null,
       };
     }
-    if (options.hasOpenAIKey) {
-      return {
-        configured: true,
-        available: true,
-        route: "api-key",
-        reason: null,
-      };
-    }
   }
 
   return {
-    configured: options.hasOpenAIKey || options.chatgptAuthStatus !== "missing",
+    configured: options.chatgptAuthStatus !== "missing",
     available: false,
     route: null,
     reason: options.codexRouteStatus === "runtime_update_required"
@@ -165,10 +157,10 @@ function resolveOpenAIPlannerStatus(options: {
           : options.codexRouteStatus === "authentication_unavailable"
             ? "The selected OpenAI authentication route is unavailable."
             : options.chatgptAuthStatus === "needs_reconnect"
-              ? "The active Codex subscription login needs re-import."
+              ? "The active Codex subscription login needs reconnection."
               : options.chatgptAuthStatus === "refreshing" || options.chatgptAuthStatus === "temporarily_unavailable"
                 ? "The active Codex subscription login is temporarily unavailable."
-                : "Import a Codex subscription login or configure an OpenAI API key in Global Settings.",
+                : "Connect a Codex subscription login with `tiller auth connect codex`.",
   };
 }
 
@@ -237,7 +229,8 @@ export async function resolveSetupStatus(
   const authenticationAvailable = billingSelections.openaiBillingMode === "api"
     ? modelAuth.hasOpenAIKey
     : billingSelections.openaiBillingMode === "subscription"
-      && (modelAuth.chatgptAuthStatus === "connected" || modelAuth.hasOpenAIKey);
+      && (modelAuth.chatgptAuthStatus === "connected"
+        || modelAuth.chatgptAuthStatus === "refreshing");
   const directApi = billingSelections.openaiBillingMode === "api";
   const cfCodexReadiness = resolveCodexBackendReadiness({
     backendConnected: Boolean(env.PLANNER_RUN),

@@ -68,15 +68,11 @@ export function hasEnabledHarnessModelAuth(
   return enabledHarnesses.some((harness) => listHarnessModels(harness).some((entry) => {
     switch (entry.credential) {
       case "claude-auth":
-        return backend === "host"
-          ? modelAuth.hasClaudeSubscription || modelAuth.hasAnthropicKey
-          : modelAuth.hasAnthropicKey;
+        return modelAuth.hasClaudeSubscription || modelAuth.hasAnthropicKey;
       case "anthropic-api-key":
         return modelAuth.hasAnthropicKey;
       case "codex-auth":
-        return backend === "host"
-          ? modelAuth.hasChatGPTAuth || modelAuth.hasOpenAIKey
-          : modelAuth.hasOpenAIKey;
+        return modelAuth.hasChatGPTAuth || modelAuth.hasOpenAIKey;
       case "openai-api-key":
         return modelAuth.hasOpenAIKey;
       case "workers-ai":

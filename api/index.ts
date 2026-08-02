@@ -8,9 +8,10 @@ import { parseRpcError } from "./errors";
 import { getArtifactStoreStub } from "./helpers";
 import { authMiddleware, dynamicEntrypointAuthResponse } from "./auth";
 import { DEFAULT_OPENAI_MODEL, listHostedAgentMetadata } from "./agent-core";
-import { getStatus as getOpenAIStatus, validateAndSeedTokens } from "./openai-auth";
+import { getStatus as getOpenAIStatus } from "./openai-auth";
 import setupRoutes from "./setup/routes";
 import cliRoutes from "./cli/routes";
+import authConnectRoutes from "./cli/auth-connect-routes";
 import executionRoutes from "./execution/routes";
 import opencodeRoutes from "./opencode/routes";
 import voiceRoutes from "./voice/routes";
@@ -44,6 +45,7 @@ export { EnvLifecycleDO } from "./env-lifecycle-do";
 export { ScheduledRunCapacityDO } from "./scheduled-run-capacity-do";
 export { EnvReviewDO } from "./env-review/env-review-do";
 export { ArtifactStoreDO } from "./coordination";
+export { CodexAuthDO } from "./codex-auth-do";
 
 // ── DO stub helper ──────────────────────────────────────────────────
 
@@ -96,6 +98,7 @@ app.use("/api/*", authMiddleware);
 // Setup routes remain owner-only even while protection is incomplete — see auth.ts.
 app.route("/", setupRoutes);
 app.route("/", cliRoutes);
+app.route("/", authConnectRoutes);
 app.route("/", executionRoutes);
 app.route("/", githubRoutes);
 app.route("/", opencodeRoutes);
@@ -560,41 +563,6 @@ app.post("/api/machines", async (c) => {
 });
 
 // ── Environments (sandbox) ────────────────────────────────────────────
-
-app.post("/api/auth/openai/seed", async (c) => {
-  const body = await c.req.json<{
-    access_token?: string;
-    refresh_token?: string;
-    id_token?: string;
-    expires_in?: number;
-  }>();
-
-  if (!body.access_token || !body.refresh_token) {
-    return c.json({ error: "access_token and refresh_token are required" }, 400);
-  }
-
-  let stored;
-  try {
-    stored = await validateAndSeedTokens(c.env, {
-      access_token: body.access_token,
-      refresh_token: body.refresh_token,
-      id_token: body.id_token,
-      expires_in: body.expires_in,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return c.json({
-      error: `Imported Codex login could not be refreshed. Re-run \`codex login\` locally, then import again. ${message}`,
-    }, 400);
-  }
-
-  return c.json({
-    authenticated: true,
-    expires_at: stored.expires_at,
-    account_id: stored.account_id,
-    model: c.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL,
-  });
-});
 
 app.get("/api/auth/openai/status", async (c) => {
   const status = await getOpenAIStatus(c.env);

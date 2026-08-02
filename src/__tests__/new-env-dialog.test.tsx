@@ -102,11 +102,17 @@ describe("getScheduledRunRequirementError", () => {
     expect(getScheduledRunRequirementError({ ...ready, chatgptAuthStatus: "needs_reconnect" })).toContain("subscription authentication");
     expect(getScheduledRunRequirementError({
       ...ready,
+      chatgptAuthStatus: "needs_reconnect",
+      hasOpenAIKey: true,
+    })).toContain("subscription authentication");
+    expect(getScheduledRunRequirementError({
+      ...ready,
       openaiBillingMode: "api",
       chatgptAuthStatus: "missing",
       hasOpenAIKey: true,
     })).toBeNull();
     expect(getScheduledRunRequirementError(ready)).toBeNull();
+    expect(getScheduledRunRequirementError({ ...ready, chatgptAuthStatus: "refreshing" })).toBeNull();
   });
 });
 

@@ -62,11 +62,19 @@ describe("generate-manifest container images", () => {
           max_instances: 10,
           instance_type: "standard-1",
         },
+        {
+          class_name: "CodexAuthDO",
+          name: "tiller-hub-codex-auth",
+          image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          max_instances: 1,
+          instance_type: "basic",
+        },
       ],
     })).toMatchObject([
       { class_name: "SandboxDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123" },
       { class_name: "GitHubJobDO", image: "docker.io/jamieatlason/tiller-scm:abc123" },
       { class_name: "PlannerRunDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123" },
+      { class_name: "CodexAuthDO", image: "docker.io/jamieatlason/tiller-sandbox:abc123" },
     ]);
   });
 
@@ -92,6 +100,13 @@ describe("generate-manifest container images", () => {
           image: "docker.io/jamieatlason/tiller-sandbox:stable",
           max_instances: 10,
           instance_type: "standard-1",
+        },
+        {
+          class_name: "CodexAuthDO",
+          name: "tiller-hub-codex-auth",
+          image: "docker.io/jamieatlason/tiller-sandbox:stable",
+          max_instances: 1,
+          instance_type: "basic",
         },
       ],
     })).toThrow(/must use a pinned image ref/);

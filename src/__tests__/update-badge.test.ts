@@ -113,7 +113,7 @@ describe("describeUpdateButtonState", () => {
       dismissed: false,
       isChecking: false,
     })).toEqual({
-      description: "Current version: v0.1.0",
+      description: "No update available\nCurrent version: v0.1.0",
       enabled: false,
     });
 
@@ -176,7 +176,7 @@ describe("describeUpdateButtonState", () => {
       isChecking: false,
       renewalRecommended: false,
     })).toEqual({
-      description: "Current version: v0.1.0",
+      description: "No update available\nCurrent version: v0.1.0",
       enabled: false,
     });
 

@@ -80,7 +80,7 @@ export function describeUpdateButtonState({
 
   if (!status.updateAvailable) {
     return {
-      description: `Current version: ${formatUpdateName(status.currentUpdate)}`,
+      description: `No update available\nCurrent version: ${formatUpdateName(status.currentUpdate)}`,
       enabled: false,
     };
   }
@@ -137,7 +137,7 @@ export default function UpdateButton({
         Update
       </button>
       {open && (
-        <span className="pointer-events-none absolute right-0 top-full z-[1001] mt-1 w-max max-w-72 rounded-md border border-kumo-line bg-kumo-elevated px-2 py-1 text-xs font-medium normal-case tracking-normal text-kumo-default shadow-lg">
+        <span className="pointer-events-none absolute right-0 top-full z-[1001] mt-1 w-max max-w-72 whitespace-pre-line rounded-md border border-kumo-line bg-kumo-elevated px-2 py-1 text-left text-xs font-medium normal-case tracking-normal text-kumo-default shadow-lg">
           {state.description}
         </span>
       )}

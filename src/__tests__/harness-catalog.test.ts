@@ -172,17 +172,31 @@ describe("harness catalog", () => {
       requirement: "codex-auth",
       message: "Self Host runtime is offline.",
     });
-    for (const chatgptAuthStatus of ["missing", "needs_reconnect", "refreshing", "temporarily_unavailable"] as const) {
+    expect(resolveHarnessModelAvailability(codex, "host", {
+      openaiBillingMode: "subscription",
+      chatgptAuthStatus: "refreshing",
+      openaiSubscriptionReady: true,
+    })).toMatchObject({
+      available: true,
+      requirement: "codex-auth",
+      message: null,
+    });
+    for (const chatgptAuthStatus of ["missing", "needs_reconnect", "temporarily_unavailable"] as const) {
       expect(resolveHarnessModelAvailability(codex, "host", {
         openaiBillingMode: "subscription",
         hasOpenAIKey: true,
         chatgptAuthStatus,
         openaiSubscriptionReady: true,
       })).toMatchObject({
-        available: true,
+        available: false,
         requirement: "codex-auth",
-        message: null,
       });
+      expect(resolveHarnessModelAvailability(codex, "host", {
+        openaiBillingMode: "subscription",
+        hasOpenAIKey: true,
+        chatgptAuthStatus,
+        openaiSubscriptionReady: true,
+      }).message).not.toContain("API key");
     }
     expect(resolveHarnessModelAvailability(codex, "host", {
       openaiBillingMode: "subscription",

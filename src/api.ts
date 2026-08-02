@@ -3370,34 +3370,6 @@ export async function dismissDashboardOnboarding(hubUrl: string): Promise<void> 
   if (!response.ok) throw await parseApiError(response, "Failed to dismiss dashboard onboarding.");
 }
 
-export interface SeedOpenAIAuthInput {
-  access_token: string;
-  refresh_token: string;
-  id_token?: string;
-  expires_in?: number;
-}
-
-export async function seedOpenAIAuth(
-  hubUrl: string,
-  input: SeedOpenAIAuthInput,
-): Promise<{ authenticated: boolean; expires_at?: number; account_id?: string }> {
-  const res = await fetch(`${hubUrl}/api/auth/openai/seed`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Codex login import failed: ${res.status}`);
-  }
-  return {
-    authenticated: isRecord(body) && body.authenticated === true,
-    ...(isRecord(body) && typeof body.expires_at === "number" ? { expires_at: body.expires_at } : {}),
-    ...(isRecord(body) && typeof body.account_id === "string" ? { account_id: body.account_id } : {}),
-  };
-}
-
 export interface VerifyModelAuthResult {
   key: string;
   mode: string;

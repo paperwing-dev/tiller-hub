@@ -37,7 +37,7 @@ function toTitleSuffix(bindingName) {
 }
 
 function getContainerImageOverride(className) {
-  if (className === "SandboxDO" || className === "PlannerRunDO") {
+  if (className === "SandboxDO" || className === "PlannerRunDO" || className === "CodexAuthDO") {
     return process.env[CONTAINER_IMAGE_TAG_ENV]?.trim() || "";
   }
   if (className === "GitHubJobDO") {
@@ -47,7 +47,7 @@ function getContainerImageOverride(className) {
 }
 
 function isManagedContainerClass(className) {
-  return className === "SandboxDO" || className === "GitHubJobDO" || className === "PlannerRunDO";
+  return className === "SandboxDO" || className === "GitHubJobDO" || className === "PlannerRunDO" || className === "CodexAuthDO";
 }
 
 function requirePinnedManagedImage(container) {

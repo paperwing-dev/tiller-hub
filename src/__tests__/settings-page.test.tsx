@@ -151,32 +151,8 @@ describe("SettingsPage GitHub App wizard", () => {
 
     expect(html).toContain("Codex Subscription Login");
     expect(html).toContain("Check status");
-    expect(html).toContain("Import Codex Login");
-    expect(html).not.toContain("Import or replace");
-  });
-
-  it("parses only the tokens needed for a Codex subscription import", async () => {
-    const { parseCodexAuthFile } = await import("../SettingsPage");
-
-    expect(parseCodexAuthFile({
-      auth_mode: "chatgpt",
-      tokens: {
-        access_token: " access-token ",
-        refresh_token: " refresh-token ",
-        id_token: " id-token ",
-        account_id: "must-not-be-uploaded",
-      },
-      unknown: "must-not-be-uploaded",
-    })).toEqual({
-      access_token: "access-token",
-      refresh_token: "refresh-token",
-      id_token: "id-token",
-    });
-
-    expect(() => parseCodexAuthFile({
-      auth_mode: "apikey",
-      tokens: { access_token: "access-token", refresh_token: "refresh-token" },
-    })).toThrow("Run codex login with a ChatGPT subscription");
+    expect(html).toContain("tiller auth connect codex");
+    expect(html).not.toContain("Import Codex Login");
   });
 
   it("shows independent unselected modes and configured inactive credentials", async () => {
@@ -246,7 +222,7 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).toContain("Codex Subscription Login");
   });
 
-  it("disables Codex import when a subscription login is already present", async () => {
+  it("shows the reconnection command when a subscription login is already present", async () => {
     const { default: SettingsPage } = await import("../SettingsPage");
     const html = renderToString(
       <SettingsPage
@@ -266,9 +242,9 @@ describe("SettingsPage GitHub App wizard", () => {
     );
 
     expect(html).toContain("Subscription active");
-    // Kumo Button wraps its children in a span, so match the disabled button
-    // by its attributes and accessible text rather than exact inner markup.
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>(?:<[^>]+>)*Import Codex Login/);
+    expect(html).toContain("Reconnect at any time with");
+    expect(html).toContain("tiller auth connect codex");
+    expect(html).not.toContain("Import Codex Login");
   });
 
   it("distinguishes a disconnected execution machine from unavailable authentication", async () => {
@@ -457,4 +433,5 @@ describe("SettingsPage GitHub App wizard", () => {
     expect(html).toContain("Renew and update to v0.3.0");
     expect(html).not.toContain("Renew with Cloudflare");
   });
+
 });

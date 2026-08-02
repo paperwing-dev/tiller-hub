@@ -76,7 +76,7 @@ export function codexRuntimeAuthInactiveResponse(): Response {
 
 export function codexRuntimeAuthAccountChangedResponse(): Response {
   return Response.json({
-    error: "The imported Codex subscription account changed during this runtime. Restart required.",
+    error: "The connected Codex subscription account changed during this runtime. Restart required.",
     code: "needs_reconnect",
   }, { status: 409 });
 }
@@ -109,8 +109,8 @@ export async function exchangeCodexRuntimeAuth(
         code: "needs_reconnect",
         status: 409,
         error: result.reason === "missing"
-          ? "Codex subscription login is not imported."
-          : "Codex subscription login needs re-import.",
+          ? "Codex subscription login is not connected."
+          : "Codex subscription login needs reconnection.",
       };
     }
     return {

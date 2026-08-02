@@ -304,6 +304,10 @@ export async function buildUpdateMetadata(args = {}) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const metadata = await buildUpdateMetadata(args);
+  if (args["check-only"] === "true") {
+    console.log(`Validated update metadata with ${metadata.managedFiles.length} managed file(s)`);
+    return;
+  }
   await writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
   console.log(`Wrote ${metadataPath} with ${metadata.managedFiles.length} managed file(s)`);
 }

@@ -132,8 +132,10 @@ function authPolicyApp(): Hono<HonoEnv> {
   app.post("/api/setup", (c) => c.json({ ok: true }));
   app.get("/api/setup/status", (c) => c.json({ ok: true }));
   app.get("/api/execution/status", (c) => c.json({ ok: true }));
-  app.post("/api/auth/openai/seed", (c) => c.json({ ok: true }));
   app.get("/api/auth/openai/status", (c) => c.json({ ok: true }));
+  app.post("/api/cli/auth-connect-package", (c) => c.json({ ok: true }));
+  app.post("/api/auth/subscriptions/codex/connect", (c) => c.json({ ok: true }));
+  app.post("/api/auth/subscriptions/claude/connect", (c) => c.json({ ok: true }));
   app.post("/api/setup/workers-dev-access/oauth/start", (c) => c.json({ ok: true }));
   app.post("/api/settings/workers-dev-access/oauth/start", (c) => c.json({ ok: true }));
   app.post("/api/setup/workers-dev-access/broker/proof", (c) => c.json({ ok: true }));
@@ -357,8 +359,8 @@ describe("owner-only Settings policy", () => {
 
   it.each([
     ["GET", "/api/execution/status"],
-    ["POST", "/api/auth/openai/seed"],
     ["GET", "/api/auth/openai/status"],
+    ["POST", "/api/cli/auth-connect-package"],
     ["PUT", "/api/settings/execution-backend"],
     ["GET", "/api/settings/legacy-custom-domain-cleanup"],
     ["POST", "/api/setup/workers-dev-access/oauth/start"],
@@ -393,6 +395,23 @@ describe("owner-only Settings policy", () => {
       envFor() as HonoEnv["Bindings"],
     );
     expect(owner.status).toBe(200);
+  });
+
+  it.each([
+    "/api/auth/subscriptions/codex/connect",
+    "/api/auth/subscriptions/claude/connect",
+  ])("allows the service principal to reach grant-protected subscription upload %s", async (path) => {
+    const response = await authPolicyApp().request(
+      `https://${TEST_WORKERS_DEV_HOSTNAME}${path}`,
+      {
+        method: "POST",
+        headers: {
+          "Cf-Access-Jwt-Assertion": await token({ common_name: trust.serviceClientId, sub: "" }),
+        },
+      },
+      envFor() as HonoEnv["Bindings"],
+    );
+    expect(response.status).toBe(200);
   });
 
   it("allows service-authenticated setup status and runtime callbacks", async () => {
@@ -597,4 +616,5 @@ describe("canonical workers.dev trust cache", () => {
     await expect(readWorkersDevAccessTrust(env, trust.workersDevHostname)).resolves.toBeNull();
     expect(getWorkersDevAccessTrust).not.toHaveBeenCalled();
   });
+
 });

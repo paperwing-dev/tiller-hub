@@ -41,6 +41,7 @@ export function resolveCodexBackendReadiness(
 export type CodexSubscriptionStatus =
   | "missing"
   | "connected"
+  | "refreshing"
   | "needs_reconnect"
   | "temporarily_unavailable";
 
@@ -78,17 +79,11 @@ export function resolveCodexExecution(input: ResolveCodexExecutionInput): CodexE
       : { kind: "unavailable", reason: "api_key_missing" };
   }
 
-  if (input.subscriptionStatus === "connected") {
+  if (input.subscriptionStatus === "connected" || input.subscriptionStatus === "refreshing") {
     return {
       kind: "ready",
       profile: { ...target, kind: "subscription-app-server", surface: input.surface },
     };
-  }
-
-  // Subscription preference is allowed to fall back only while resolving a
-  // new launch. Once the returned profile is claimed, callers must reuse it.
-  if (input.apiKeyAvailable) {
-    return { kind: "ready", profile: apiKeyProfile(target, input.surface) };
   }
 
   return {
@@ -110,8 +105,8 @@ export function codexUnavailableReasonMessage(
   reason: Extract<CodexExecutionResolution, { kind: "unavailable" }>,
 ): string {
   switch (reason.reason) {
-    case "subscription_missing": return "Codex subscription login is not imported.";
-    case "subscription_needs_reconnect": return "Codex subscription login needs re-import.";
+    case "subscription_missing": return "Codex subscription login is not connected.";
+    case "subscription_needs_reconnect": return "Codex subscription login needs reconnection.";
     case "subscription_temporarily_unavailable": return "Codex subscription login is temporarily unavailable.";
     case "api_key_missing": return "Codex API key auth requested, but OPENAI_API_KEY is not configured.";
     case "no_usable_credentials": return "No explicit OpenAI billing route is usable for this Codex launch.";
@@ -144,14 +139,12 @@ export async function resolveCodexExecutionForEnv(
   }
 
   const status = await getOpenAIAuthReadOnlyStatus(env);
-  const subscriptionStatus: CodexSubscriptionStatus = status.status === "refreshing"
-    ? "temporarily_unavailable"
-    : status.status;
+  const subscriptionStatus: CodexSubscriptionStatus = status.status;
   return resolveCodexExecution({
     ...target,
     surface: input.surface,
     authPreference: input.authPreference,
     subscriptionStatus,
-    apiKeyAvailable: subscriptionStatus === "connected" ? false : Boolean(await readApiKey()),
+    apiKeyAvailable: false,
   });
 }

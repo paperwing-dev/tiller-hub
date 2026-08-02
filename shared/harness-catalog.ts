@@ -307,16 +307,18 @@ export function resolveHarnessModelAvailability(
     message = available ? null : "Configure the active OpenAI API key in Global Settings.";
   } else {
     const connected = status.chatgptAuthStatus
-      ? status.chatgptAuthStatus === "connected"
+      ? status.chatgptAuthStatus === "connected" || status.chatgptAuthStatus === "refreshing"
       : Boolean(status.hasChatGPTAuth);
     const routeReady = status.openaiSubscriptionReady !== false;
-    available = routeReady && (connected || Boolean(status.hasOpenAIKey));
+    available = routeReady && connected;
     message = available
       ? null
       : !routeReady
         ? status.openaiSubscriptionUnavailableReason
           ?? `The active OpenAI subscription route is not ready for ${backend === "host" ? "Your machine" : "Cloudflare Containers"}.`
-        : "Connect the active OpenAI subscription or configure an OpenAI API key in Global Settings.";
+        : status.chatgptAuthStatus === "temporarily_unavailable"
+          ? "The active OpenAI subscription is temporarily unavailable."
+          : "Connect the active OpenAI subscription in Global Settings.";
   }
   return {
     available,

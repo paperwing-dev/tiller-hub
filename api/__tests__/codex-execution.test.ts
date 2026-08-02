@@ -12,17 +12,19 @@ const targets = [
 
 describe("resolveCodexExecution", () => {
   it.each(targets)("uses subscription app-server for $backend", (target) => {
-    for (const surface of ["implementor", "plan-writer", "plan-reviewer", "environment-reviewer"] as const) {
-      expect(resolveCodexExecution({
-        ...target,
-        surface,
-        authPreference: "subscription",
-        subscriptionStatus: "connected",
-        apiKeyAvailable: true,
-      })).toEqual({
-        kind: "ready",
-        profile: { ...target, kind: "subscription-app-server", surface },
-      });
+    for (const subscriptionStatus of ["connected", "refreshing"] as const) {
+      for (const surface of ["implementor", "plan-writer", "plan-reviewer", "environment-reviewer"] as const) {
+        expect(resolveCodexExecution({
+          ...target,
+          surface,
+          authPreference: "subscription",
+          subscriptionStatus,
+          apiKeyAvailable: true,
+        })).toEqual({
+          kind: "ready",
+          profile: { ...target, kind: "subscription-app-server", surface },
+        });
+      }
     }
   });
 
@@ -47,17 +49,14 @@ describe("resolveCodexExecution", () => {
     ["missing", "subscription_missing"],
     ["needs_reconnect", "subscription_needs_reconnect"],
     ["temporarily_unavailable", "subscription_temporarily_unavailable"],
-  ] as const)("falls back before launch for %s, but reports %s without a key", (subscriptionStatus, reason) => {
+  ] as const)("never falls back from subscription billing for %s", (subscriptionStatus, reason) => {
     const input = {
       backend: "host",
       surface: "plan-reviewer",
       authPreference: "subscription",
       subscriptionStatus,
     } satisfies Omit<ResolveCodexExecutionInput, "apiKeyAvailable">;
-    expect(resolveCodexExecution({ ...input, apiKeyAvailable: true })).toMatchObject({
-      kind: "ready",
-      profile: { kind: "api-key-direct-cli" },
-    });
+    expect(resolveCodexExecution({ ...input, apiKeyAvailable: true })).toEqual({ kind: "unavailable", reason });
     expect(resolveCodexExecution({ ...input, apiKeyAvailable: false })).toEqual({ kind: "unavailable", reason });
   });
 });

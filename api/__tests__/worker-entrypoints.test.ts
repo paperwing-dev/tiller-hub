@@ -183,6 +183,7 @@ describe("Worker dynamic entrypoints", () => {
       ["POST", "/api/setup/self-host/return-to-hosted"],
       ["PUT", "/api/settings/deployment-mode"],
       ["POST", "/api/settings/deployment-mode/rollback"],
+      ["POST", "/api/auth/openai/seed"],
     ] as const;
 
     for (const [method, path] of removed) {

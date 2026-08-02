@@ -309,12 +309,10 @@ export function getScheduledRunRequirementError(options: {
   if (options.openaiBillingMode !== "subscription") {
     return "Select an OpenAI billing mode in Global Settings before scheduling a run.";
   }
-  if (options.chatgptAuthStatus !== "connected" && !options.hasOpenAIKey) {
-    return options.chatgptAuthStatus === "refreshing"
-      ? "Wait for Codex subscription authentication to finish refreshing."
-      : options.chatgptAuthStatus === "temporarily_unavailable"
-        ? "Codex subscription authentication is temporarily unavailable."
-        : "Connect Codex subscription authentication before scheduling a run.";
+  if (options.chatgptAuthStatus !== "connected" && options.chatgptAuthStatus !== "refreshing") {
+    return options.chatgptAuthStatus === "temporarily_unavailable"
+      ? "Codex subscription authentication is temporarily unavailable."
+      : "Connect Codex subscription authentication before scheduling a run.";
   }
   return null;
 }

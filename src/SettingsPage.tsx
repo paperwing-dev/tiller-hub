@@ -11,7 +11,6 @@ import { getStoredThemePreference, setThemePreference, type ThemePreference } fr
 import type {
   ExecutionStatus,
   HubUpdateRepoCandidate,
-  SeedOpenAIAuthInput,
   SetupStatus,
   UpdateCheckResult,
   VerifyModelAuthResult,
@@ -22,7 +21,6 @@ import {
   fetchSetupStatus,
   renewWorkersDevAccess,
   saveBillingMode,
-  seedOpenAIAuth,
   selectSelfUpdateRepo,
   setExecutionBackend,
   submitSetup,
@@ -187,28 +185,6 @@ function WorkersDevAccessLifecycleCard({
   );
 }
 
-export function parseCodexAuthFile(value: unknown): SeedOpenAIAuthInput {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("The selected file is not a Codex auth file.");
-  }
-  const auth = value as Record<string, unknown>;
-  if (auth.auth_mode !== "chatgpt" || !auth.tokens || typeof auth.tokens !== "object" || Array.isArray(auth.tokens)) {
-    throw new Error("Run codex login with a ChatGPT subscription, then select its auth.json file.");
-  }
-  const tokens = auth.tokens as Record<string, unknown>;
-  const accessToken = typeof tokens.access_token === "string" ? tokens.access_token.trim() : "";
-  const refreshToken = typeof tokens.refresh_token === "string" ? tokens.refresh_token.trim() : "";
-  const idToken = typeof tokens.id_token === "string" ? tokens.id_token.trim() : "";
-  if (!accessToken || !refreshToken) {
-    throw new Error("The selected Codex auth file is missing its access or refresh token.");
-  }
-  return {
-    access_token: accessToken,
-    refresh_token: refreshToken,
-    ...(idToken ? { id_token: idToken } : {}),
-  };
-}
-
 function codexSubscriptionStatus(status: SetupStatus): {
   title: string;
   detail: string;
@@ -218,15 +194,15 @@ function codexSubscriptionStatus(status: SetupStatus): {
     return {
       title: status.hasChatGPTAuth ? "Configured · inactive" : "Not configured · inactive",
       detail: status.openaiBillingMode === "api"
-        ? "OpenAI API mode is active. The imported Codex subscription is not used by new launches."
+        ? "OpenAI API mode is active. The connected Codex subscription is not used by new launches."
         : "Select OpenAI Subscription to activate this route for new launches.",
       tone: "neutral",
     };
   }
   if (status.chatgptAuthStatus === "needs_reconnect") {
     return {
-      title: "Subscription needs re-import",
-      detail: "Tiller can no longer refresh the imported Codex subscription.",
+      title: "Subscription needs reconnection",
+      detail: "Tiller can no longer refresh this Codex subscription. Re-run the CLI connection command.",
       tone: "warning",
     };
   }
@@ -234,7 +210,7 @@ function codexSubscriptionStatus(status: SetupStatus): {
   if (status.chatgptAuthStatus === "temporarily_unavailable") {
     return {
       title: "Subscription temporarily unavailable",
-      detail: "Tiller preserved the imported login and will retry without switching an active runtime to API billing.",
+      detail: "Tiller preserved the managed login and will retry without switching an active runtime to API billing.",
       tone: "warning",
     };
   }
@@ -242,7 +218,7 @@ function codexSubscriptionStatus(status: SetupStatus): {
   if (status.openaiPlannerAvailable && status.openaiPlannerRoute === "subscription-app-server") {
     return {
       title: "Subscription active",
-      detail: "New Codex launch profiles use the imported subscription through the app-server runtime.",
+      detail: "New Codex launch profiles use the connected subscription through the app-server runtime.",
       tone: "success",
     };
   }
@@ -250,21 +226,21 @@ function codexSubscriptionStatus(status: SetupStatus): {
   if (status.hasChatGPTAuth || status.chatgptAuthStatus === "refreshing") {
     if (status.codexRouteStatus === "runtime_update_required") {
       return {
-        title: "Subscription imported",
+        title: "Subscription connected",
         detail: "The selected execution backend needs a compatible runtime update.",
         tone: "warning",
       };
     }
     if (status.codexRouteStatus === "backend_offline") {
       return {
-        title: "Subscription imported",
+        title: "Subscription connected",
         detail: "The selected execution backend is offline.",
         tone: "warning",
       };
     }
     if (status.codexRouteStatus === "environment_not_connected") {
       return {
-        title: "Subscription imported",
+        title: "Subscription connected",
         detail: "The selected execution machine is registered but not connected.",
         tone: "warning",
       };
@@ -278,7 +254,7 @@ function codexSubscriptionStatus(status: SetupStatus): {
     }
 
     return {
-      title: "Subscription imported",
+      title: "Subscription connected",
       detail: status.openaiPlannerReason || "The selected Codex runtime is not ready for a new launch.",
       tone: "warning",
     };
@@ -286,15 +262,15 @@ function codexSubscriptionStatus(status: SetupStatus): {
 
   if (status.hasOpenAIKey) {
     return {
-      title: "Subscription not imported",
+      title: "Subscription not connected",
       detail: "The configured OpenAI API key is inactive while OpenAI Subscription mode is selected.",
       tone: "warning",
     };
   }
 
   return {
-    title: "Subscription not imported",
-    detail: "Import an existing Codex subscription to enable subscription-backed Codex launches.",
+    title: "Subscription not connected",
+    detail: "Run the Tiller CLI connection command to enable subscription-backed Codex launches.",
     tone: "neutral",
   };
 }
@@ -619,15 +595,11 @@ function BillingModeSelector({
 function CodexSubscriptionRow({
   status,
   codexStatus,
-  onImport,
-  importDisabled,
   onCheckStatus,
   checkingStatus,
 }: {
   status: SetupStatus;
   codexStatus: ReturnType<typeof codexSubscriptionStatus>;
-  onImport: () => void;
-  importDisabled: boolean;
   onCheckStatus: () => void;
   checkingStatus: boolean;
 }) {
@@ -682,20 +654,12 @@ function CodexSubscriptionRow({
         >
           {checkingStatus ? "Checking..." : "Check status"}
         </Button>
-        <Button
-          variant="primary"
-          size="sm"
-          onClick={onImport}
-          disabled={importDisabled}
-          title={importDisabled ? "Codex login is already imported. Check status to refresh the connection state." : undefined}
-        >
-          Import Codex Login
-        </Button>
       </div>
       <p className="mt-2 text-xs text-kumo-subtle">
-        {importDisabled
-          ? "Codex login is already imported. Use Check status to refresh the connection state."
-          : "Run the import from the computer where Codex is already logged in."}
+        {status.hasChatGPTAuth
+          ? "Reconnect at any time with "
+          : "Connect from a terminal with "}
+        <code>tiller auth connect codex</code>.
       </p>
       {status.hostRegistered && !status.hostConnected && (
         <p className="mt-2 text-xs text-kumo-warning">
@@ -704,98 +668,6 @@ function CodexSubscriptionRow({
         </p>
       )}
     </div>
-  );
-}
-
-export function CodexImportDialog({
-  onClose,
-  onImported,
-  hubUrl = HUB_URL,
-}: {
-  onClose: () => void;
-  onImported: () => Promise<void>;
-  hubUrl?: string;
-}) {
-  const [importDetected, setImportDetected] = useState(false);
-  const [importing, setImporting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function importFile(file: File): Promise<void> {
-    setImporting(true);
-    setError(null);
-    try {
-      if (file.size > 1024 * 1024) throw new Error("The selected Codex auth file is too large.");
-      const input = parseCodexAuthFile(JSON.parse(await file.text()) as unknown);
-      await seedOpenAIAuth(hubUrl, input);
-      setImportDetected(true);
-      await onImported();
-    } catch (importError) {
-      setError(importError instanceof Error ? importError.message : "Codex login import failed.");
-    } finally {
-      setImporting(false);
-    }
-  }
-
-  return (
-    <Dialog.Root
-      open
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
-    >
-      <Dialog size="lg" className="flex max-h-full w-full max-w-3xl flex-col p-0">
-        <div className="border-b border-kumo-line px-5 py-4">
-          <Dialog.Title className="text-base font-semibold text-kumo-strong">Import Codex Login</Dialog.Title>
-          <Dialog.Description className="mt-1 text-sm text-kumo-subtle">
-            Choose the auth file from a computer where Codex already works with your subscription.
-          </Dialog.Description>
-        </div>
-
-        <div className="grid gap-3 overflow-y-auto px-5 py-4">
-          <p className="text-sm text-kumo-subtle">
-            Select <code>~/.codex/auth.json</code>. Your browser sends it only to this owner-authenticated Hub, where the
-            login is refresh-validated before it is stored.
-          </p>
-          <label className="grid gap-2 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-3 text-sm text-kumo-default">
-            <span className="font-medium">Codex auth file</span>
-            <input
-              aria-label="Codex auth file"
-              type="file"
-              accept=".json,application/json"
-              disabled={importing || importDetected}
-              onChange={(event) => {
-                const file = event.currentTarget.files?.[0];
-                if (file) void importFile(file);
-                event.currentTarget.value = "";
-              }}
-              className="block w-full text-xs text-kumo-subtle file:mr-3 file:rounded file:border-0 file:bg-kumo-brand file:px-3 file:py-2 file:font-medium file:text-white"
-            />
-          </label>
-          <p className="text-xs text-kumo-subtle">
-            Hidden files may require showing hidden items in the file picker. Run <code>codex login</code> first if the local login has expired.
-          </p>
-          {error && <p role="alert" className="text-xs text-kumo-danger">{error}</p>}
-          <p
-            aria-live="polite"
-            className={`text-xs ${importDetected ? "font-medium text-kumo-success" : "text-kumo-subtle"}`}
-          >
-            {importDetected
-              ? `Codex subscription imported into ${new URL(hubUrl).hostname}. Settings is up to date.`
-              : importing ? "Validating and importing the Codex login…" : "Choose the auth file to continue."}
-          </p>
-        </div>
-
-        <div className="flex flex-wrap justify-end gap-2 border-t border-kumo-line px-5 py-3">
-          <Dialog.Close
-            render={(props) => (
-              <Button {...props} variant="primary" size="sm">
-                Done
-              </Button>
-            )}
-          />
-        </div>
-      </Dialog>
-    </Dialog.Root>
   );
 }
 
@@ -1887,13 +1759,11 @@ export default function SettingsPage({
   onRefresh,
 }: SettingsPageProps) {
   const [testResults, setTestResults] = useState<Map<string, VerifyModelAuthResult>>(new Map());
-  const [codexImportOpen, setCodexImportOpen] = useState(false);
   const [codexStatusRefreshing, setCodexStatusRefreshing] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [billingSaving, setBillingSaving] = useState<"claude" | "openai" | null>(null);
   const addToast = useToast();
   const codexStatus = codexSubscriptionStatus(status);
-  const codexImportDisabled = status.hasChatGPTAuth && status.chatgptAuthStatus !== "needs_reconnect";
   const opencodeVisible = status.enabledHarnesses.includes("opencode");
 
   const subscriptionCredentials: CredentialDef[] = [
@@ -1986,24 +1856,24 @@ export default function SettingsPage({
       if (latest.chatgptAuthStatus === "connected" || latest.chatgptAuthStatus === "refreshing") {
         const active = latest.openaiPlannerAvailable && latest.openaiPlannerRoute === "subscription-app-server";
         addToast({
-          title: active ? "Subscription active" : "Subscription imported",
+          title: active ? "Subscription active" : "Subscription connected",
           body: active
-            ? "The OpenAI planner can use the imported Codex subscription."
+            ? "The OpenAI planner can use the connected Codex subscription."
             : latest.openaiPlannerReason ??
-              "The subscription is imported, but the selected runtime is not ready.",
+              "The subscription is connected, but the selected runtime is not ready.",
           variant: active ? "success" : "warning",
         });
       } else if (latest.chatgptAuthStatus === "needs_reconnect") {
         addToast({
-          title: "Subscription still needs re-import",
-          body: "Run the import script again on the computer where Codex is logged in.",
+          title: "Subscription still needs reconnection",
+          body: "Run `tiller auth connect codex` again from a terminal.",
           variant: "warning",
           duration: 8000,
         });
       } else {
         addToast({
-          title: "Subscription not imported",
-          body: "Run the import script on the computer where Codex is logged in, then check again.",
+          title: "Subscription not connected",
+          body: "Run `tiller auth connect codex` from a terminal, then check again.",
           variant: "warning",
           duration: 8000,
         });
@@ -2021,12 +1891,6 @@ export default function SettingsPage({
 
   return (
     <div className="flex-1 overflow-y-auto bg-kumo-recessed">
-      {codexImportOpen && (
-        <CodexImportDialog
-          onClose={() => setCodexImportOpen(false)}
-          onImported={onRefresh}
-        />
-      )}
       <div className="border-b border-kumo-line bg-kumo-base px-6 py-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
@@ -2125,8 +1989,6 @@ export default function SettingsPage({
                 <CodexSubscriptionRow
                   status={status}
                   codexStatus={codexStatus}
-                  onImport={() => setCodexImportOpen(true)}
-                  importDisabled={codexImportDisabled}
                   onCheckStatus={() => void handleCodexStatusRefresh()}
                   checkingStatus={codexStatusRefreshing}
                 />
