@@ -1,4 +1,3 @@
-import type { PlanReviewIssue, PlanReviewIssueStats, PlanReviewMeta } from "../agent-core/types";
 import type {
   CodexAuthMode,
   CodexExecutionProfile,
@@ -235,6 +234,27 @@ export interface ArtifactRef {
 
 export interface PlanArtifactBody {
   markdown: string;
+}
+
+export interface PlanReviewIssue {
+  issue: string;
+  evidenceQuote: string;
+  recommendedChange: string;
+}
+
+export interface PlanReviewIssueStats {
+  total: number;
+  kept: number;
+  dropped: number;
+}
+
+export interface PlanReviewMeta {
+  toolCallCount: number;
+  finishReason?: string;
+  truncated?: boolean;
+  warningCount?: number;
+  repaired?: boolean;
+  retriedForToolUse?: boolean;
 }
 
 export interface ReviewArtifactBody {

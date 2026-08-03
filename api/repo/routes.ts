@@ -112,7 +112,7 @@ async function getRepoArtifactState(
     repo.meta.repoId,
     repo.meta.artifactStoreGeneration,
   );
-  const { artifacts, refs } = await loadRepoArtifacts(repo.meta, artifactStore);
+  const { artifacts, refs } = await loadRepoArtifacts(artifactStore);
   return {
     artifactStore,
     artifacts,

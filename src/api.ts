@@ -18,7 +18,6 @@ import type {
   HarnessSettings,
   StartupDiagnosticsState,
 } from "../api/types";
-import type { HostedAgentMetadata } from "../api/agent-core/types";
 import {
   isHarnessCredentialRequirement,
   isHarnessProviderKind,
@@ -70,12 +69,6 @@ import type { BillingMode } from "../shared/billing";
 import { isPlacementRegion, type PlacementRegion } from "../shared/placement";
 import { TerminalRecoveryOverflowError } from "./terminal-recovery";
 
-const HOSTED_AGENT_IDS = [
-  "reviewer-chat",
-] as const;
-const RUNTIME_KINDS = ["think", "direct-tools", "container"] as const;
-const MODEL_PROVIDER_KINDS = ["external-codex", "workers-ai"] as const;
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -98,6 +91,10 @@ function readStringOr(value: unknown, fallback: string): string {
 
 function readNullableString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function readErrorMessage(value: unknown): string | null {
+  return isRecord(value) ? readString(value.error) : null;
 }
 
 function readBooleanOr(value: unknown, fallback = false): boolean {
@@ -771,7 +768,7 @@ function normalizeEnvReviewSession(payload: unknown): EnvReviewSession | null {
   const repoId = readString(payload.repoId);
   const mainSessionId = readString(payload.mainSessionId);
   if (!envSlug || !repoId || !mainSessionId) return null;
-  return payload as EnvReviewSession;
+  return payload as unknown as EnvReviewSession;
 }
 
 function normalizeEnvReviewTab(payload: unknown): EnvReviewTab | null {
@@ -782,7 +779,7 @@ function normalizeEnvReviewTab(payload: unknown): EnvReviewTab | null {
   const provider = readString(payload.provider);
   const model = readString(payload.model);
   if (!threadId || !envSlug || !repoId || !provider || !model) return null;
-  return payload as EnvReviewTab;
+  return payload as unknown as EnvReviewTab;
 }
 
 function normalizeEnvReviewRun(payload: unknown): EnvReviewRun | null {
@@ -792,7 +789,7 @@ function normalizeEnvReviewRun(payload: unknown): EnvReviewRun | null {
   const envSlug = readString(payload.envSlug);
   const repoId = readString(payload.repoId);
   if (!runId || !threadId || !envSlug || !repoId) return null;
-  return payload as EnvReviewRun;
+  return payload as unknown as EnvReviewRun;
 }
 
 function normalizeEnvReviewRunEvent(payload: unknown): EnvReviewRunEvent | null {
@@ -801,7 +798,7 @@ function normalizeEnvReviewRunEvent(payload: unknown): EnvReviewRunEvent | null 
   const type = readString(payload.type);
   const createdAt = readString(payload.createdAt);
   if (!runId || !type || !createdAt) return null;
-  return payload as EnvReviewRunEvent;
+  return payload as unknown as EnvReviewRunEvent;
 }
 
 function normalizeEnvReviewFeedback(payload: unknown): EnvReviewFeedback | null {
@@ -810,7 +807,7 @@ function normalizeEnvReviewFeedback(payload: unknown): EnvReviewFeedback | null 
   const runId = readString(payload.runId);
   const text = readString(payload.text);
   if (!feedbackId || !runId || !text) return null;
-  return payload as EnvReviewFeedback;
+  return payload as unknown as EnvReviewFeedback;
 }
 
 function normalizeEnvReviewState(payload: unknown): EnvReviewState {
@@ -847,29 +844,6 @@ function normalizeStringArray(value: unknown): string[] {
   return normalizeArrayResponse(value).filter((item): item is string => typeof item === "string");
 }
 
-function normalizeHostedAgentMetadata(payload: unknown): HostedAgentMetadata | null {
-  if (!isRecord(payload)) return null;
-  const id = readString(payload.id);
-  const name = readString(payload.name);
-  const label = readString(payload.label);
-  const runtime = readString(payload.runtime);
-  const provider = readString(payload.provider);
-  const model = readString(payload.model);
-  if (!id || !name || !label || !runtime || !provider || !model) return null;
-  if (!HOSTED_AGENT_IDS.includes(id as (typeof HOSTED_AGENT_IDS)[number])) return null;
-  if (!RUNTIME_KINDS.includes(runtime as (typeof RUNTIME_KINDS)[number])) return null;
-  if (!MODEL_PROVIDER_KINDS.includes(provider as (typeof MODEL_PROVIDER_KINDS)[number])) return null;
-
-  return {
-    id: id as HostedAgentMetadata["id"],
-    name,
-    label,
-    runtime: runtime as HostedAgentMetadata["runtime"],
-    provider: provider as HostedAgentMetadata["provider"],
-    model,
-  };
-}
-
 function normalizeVerifyModelAuthResult(payload: unknown): VerifyModelAuthResult | null {
   if (!isRecord(payload)) return null;
   const key = readString(payload.key);
@@ -883,6 +857,59 @@ function normalizeVerifyModelAuthResult(payload: unknown): VerifyModelAuthResult
     ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
     ...(readNullableString(payload.warning) ? { warning: readNullableString(payload.warning) ?? undefined } : {}),
     ...(readNullableString(payload.note) ? { note: readNullableString(payload.note) ?? undefined } : {}),
+  };
+}
+
+function normalizeSetupMutationResult(
+  payload: unknown,
+): { ok: boolean; saved?: string[]; error?: string } | null {
+  if (!isRecord(payload) || typeof payload.ok !== "boolean") return null;
+  if (
+    payload.saved !== undefined
+    && (!Array.isArray(payload.saved) || payload.saved.some((value) => typeof value !== "string"))
+  ) {
+    return null;
+  }
+  return {
+    ok: payload.ok,
+    ...(Array.isArray(payload.saved) ? { saved: normalizeStringArray(payload.saved) } : {}),
+    ...(readString(payload.error) ? { error: readString(payload.error) ?? undefined } : {}),
+  };
+}
+
+function normalizeUpdateApplyResult(payload: unknown): UpdateApplyResult | null {
+  if (!isRecord(payload)) return null;
+  const expectedSourceId = readString(payload.expectedSourceId);
+  if (payload.ok === true && payload.status === "queued") {
+    const commitSha = readString(payload.commitSha);
+    return expectedSourceId && commitSha
+      ? { ok: true, status: "queued", expectedSourceId, commitSha }
+      : null;
+  }
+  if (payload.ok === true && payload.status === "noop") {
+    return expectedSourceId
+      ? { ok: true, status: "noop", expectedSourceId }
+      : null;
+  }
+  const failureStatus = payload.status === "hub_repo_not_configured"
+    || payload.status === "not_a_tiller_hub_repo"
+    || payload.status === "managed_files_removed"
+    || payload.status === "advanced_repair_required"
+    || payload.status === "update_branch_moved"
+    || payload.status === "direct_update_rejected"
+    ? payload.status
+    : null;
+  const error = readString(payload.error);
+  if (payload.ok !== false || !failureStatus || !error) return null;
+  return {
+    ok: false,
+    status: failureStatus,
+    error,
+    ...(typeof payload.retryable === "boolean" ? { retryable: payload.retryable } : {}),
+    ...(Array.isArray(payload.missingManagedFiles)
+      && payload.missingManagedFiles.every((value) => typeof value === "string")
+      ? { missingManagedFiles: normalizeStringArray(payload.missingManagedFiles) }
+      : {}),
   };
 }
 
@@ -1648,8 +1675,8 @@ export async function fetchEnvStartupDiagnostics(
     return { active: null, lastFailed: null };
   }
   return {
-    active: isRecord(body.active) ? body.active as StartupDiagnosticsState["active"] : null,
-    lastFailed: isRecord(body.lastFailed) ? body.lastFailed as StartupDiagnosticsState["lastFailed"] : null,
+    active: isRecord(body.active) ? body.active as unknown as StartupDiagnosticsState["active"] : null,
+    lastFailed: isRecord(body.lastFailed) ? body.lastFailed as unknown as StartupDiagnosticsState["lastFailed"] : null,
   };
 }
 
@@ -1728,14 +1755,6 @@ export async function stopEnv(hubUrl: string, slug: string): Promise<{ ok: boole
     slug: isRecord(body) ? readStringOr(body.slug, slug) : slug,
     status: isRecord(body) ? readStringOr(body.status, "saving") : "saving",
   };
-}
-
-export async function syncEnv(hubUrl: string, slug: string): Promise<void> {
-  const res = await fetch(`${hubUrl}/api/envs/${slug}/sync`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) throw new Error(`Failed to sync env: ${res.status}`);
 }
 
 export async function publishEnvDraftPr(
@@ -1852,7 +1871,7 @@ export async function deleteRepo(
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error || `Failed to delete repo: ${res.status}`);
+    throw new Error(readErrorMessage(body) || `Failed to delete repo: ${res.status}`);
   }
   const body = await res.json().catch(() => null);
   return {
@@ -1862,19 +1881,6 @@ export async function deleteRepo(
       ? normalizeArrayResponse(body.deletedEnvSlugs).filter((candidate): candidate is string => typeof candidate === "string")
       : [],
   };
-}
-
-export async function fetchAgentMetadata(
-  hubUrl: string,
-): Promise<HostedAgentMetadata[]> {
-  const res = await fetch(`${hubUrl}/api/agents`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`Failed to fetch agent metadata: ${res.status}`);
-  return normalizeArrayResponse(await res.json().catch(() => null))
-    .map((agent) => normalizeHostedAgentMetadata(agent))
-    .filter(isPresent);
 }
 
 export async function fetchRepoArtifacts(
@@ -1950,29 +1956,6 @@ export async function removeEnvReviewer(
     credentials: "include",
   });
   if (!res.ok) throw await parseApiError(res, `Failed to remove env reviewer: ${res.status}`);
-  return normalizeEnvReviewState(await res.json().catch(() => null));
-}
-
-export async function startEnvReviewRun(
-  hubUrl: string,
-  envSlug: string,
-  threadId: string,
-  input: {
-    sessionId: string;
-    taskKind: string;
-    customTask?: string | null;
-    provider?: string;
-    model?: string;
-    effort?: PlannerEffort;
-  },
-): Promise<EnvReviewState> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/runs`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to start env review: ${res.status}`);
   return normalizeEnvReviewState(await res.json().catch(() => null));
 }
 
@@ -2478,23 +2461,6 @@ export interface PlanSkillInvocationDetail {
   runs: PlannerRun[];
 }
 
-export async function invokePlanSkill(
-  hubUrl: string,
-  repoId: string,
-  planArtifactId: string,
-  skillId: string,
-  requestId: string,
-): Promise<{ kind: "fanout" } & PlanSkillInvocationDetail> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skills/${encodeURIComponent(skillId)}/invoke`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ requestId }),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to invoke Plan skill: ${res.status}`);
-  return await res.json() as { kind: "fanout" } & PlanSkillInvocationDetail;
-}
-
 export async function fetchPlanSkillInvocations(
   hubUrl: string,
   repoId: string,
@@ -2644,30 +2610,6 @@ export async function sendReviewerMessageToWriter(
   };
 }
 
-export async function fetchPlannerRun(
-  hubUrl: string,
-  repoId: string,
-  artifactId: string,
-  runId: string,
-  afterSeq?: number,
-): Promise<{ run: PlannerRun; events: PlannerRunEvent[] }> {
-  const params = new URLSearchParams();
-  if (afterSeq != null) params.set("afterSeq", String(afterSeq));
-  const qs = params.toString() ? `?${params}` : "";
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/${runId}${qs}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch planner run: ${res.status}`);
-  const body = await res.json().catch(() => null);
-  const run = isRecord(body) ? normalizePlannerRun(body.run) : null;
-  if (!run) throw new Error("Malformed planner run response");
-  return {
-    run,
-    events: isRecord(body) ? normalizeArrayResponse(body.events).map(normalizePlannerRunEvent).filter(isPresent) : [],
-  };
-}
-
 export async function fetchLatestPlannerRun(
   hubUrl: string,
   repoId: string,
@@ -2689,23 +2631,6 @@ export async function fetchLatestPlannerRun(
     run,
     events: isRecord(body) ? normalizeArrayResponse(body.events).map(normalizePlannerRunEvent).filter(isPresent) : [],
   };
-}
-
-export async function cancelPlannerRun(
-  hubUrl: string,
-  repoId: string,
-  artifactId: string,
-  runId: string,
-): Promise<PlannerRun> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/${runId}/cancel`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to cancel planner run: ${res.status}`);
-  const body = await res.json().catch(() => null);
-  const run = isRecord(body) ? normalizePlannerRun(body.run) : null;
-  if (!run) throw new Error("Malformed cancel response");
-  return run;
 }
 
 export async function fetchPlanReviewers(
@@ -2818,7 +2743,7 @@ export async function createRepo(
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(body.error || `Failed to create repo: ${res.status}`);
+    throw new Error(readErrorMessage(body) || `Failed to create repo: ${res.status}`);
   }
   const repo = normalizeRepoMetaObject(await res.json().catch(() => null));
   if (!repo) {
@@ -3387,7 +3312,7 @@ export async function verifyModelAuth(
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
   if (!res.ok) {
-    throw new Error(typeof body.error === "string" ? body.error : `Credential verification failed: ${res.status}`);
+    throw new Error(readErrorMessage(body) || `Credential verification failed: ${res.status}`);
   }
   return {
     ok: isRecord(body) && body.ok === true,
@@ -3410,8 +3335,10 @@ export async function submitSetup(
     credentials: "include",
     body: JSON.stringify({ secrets }),
   });
-  const body = await res.json();
-  if (!res.ok) throw new Error(body.error || `Setup failed: ${res.status}`);
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(readErrorMessage(payload) || `Setup failed: ${res.status}`);
+  const body = normalizeSetupMutationResult(payload);
+  if (!body) throw new Error("Malformed setup response");
   return body;
 }
 
@@ -3427,8 +3354,10 @@ export async function saveBillingMode(
     credentials: "include",
     body: JSON.stringify({ settings: { [key]: mode } }),
   });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `Failed to save billing mode: ${res.status}`);
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(readErrorMessage(payload) || `Failed to save billing mode: ${res.status}`);
+  const body = normalizeSetupMutationResult(payload);
+  if (!body) throw new Error("Malformed billing mode response");
   return body;
 }
 
@@ -3528,6 +3457,49 @@ export async function checkForUpdate(hubUrl: string): Promise<UpdateCheckResult>
   return result;
 }
 
+export interface PredeployCleanSlateStatus {
+  ok: boolean;
+  blockers: Array<{ kind: string; resourceId: string }>;
+}
+
+export async function checkPredeployCleanSlate(
+  hubUrl: string,
+): Promise<PredeployCleanSlateStatus> {
+  const res = await fetch(`${hubUrl}/api/settings/predeploy-clean-slate`, {
+    credentials: "include",
+    cache: "no-store",
+  });
+  const body = await res.json().catch(() => null) as unknown;
+  if (res.status !== 200 && res.status !== 409) {
+    throw new ApiActionError(
+      isRecord(body) && typeof body.error === "string"
+        ? { error: body.error }
+        : {},
+      `Failed to verify maintenance readiness: ${res.status}`,
+    );
+  }
+  if (!isRecord(body) || typeof body.ok !== "boolean" || !Array.isArray(body.blockers)) {
+    throw new Error("Malformed maintenance readiness response");
+  }
+  const blockers = body.blockers.map((blocker) => {
+    if (
+      !isRecord(blocker)
+      || typeof blocker.kind !== "string"
+      || typeof blocker.resourceId !== "string"
+    ) {
+      throw new Error("Malformed maintenance readiness blocker");
+    }
+    return { kind: blocker.kind, resourceId: blocker.resourceId };
+  });
+  if (body.ok !== (blockers.length === 0)) {
+    throw new Error("Inconsistent maintenance readiness response");
+  }
+  if ((res.status === 200) !== body.ok) {
+    throw new Error("Inconsistent maintenance readiness status");
+  }
+  return { ok: body.ok, blockers };
+}
+
 export async function applyUpdate(
   hubUrl: string,
 ): Promise<UpdateApplyResult> {
@@ -3536,9 +3508,11 @@ export async function applyUpdate(
     headers: { "Content-Type": "application/json" },
     credentials: "include",
   });
-  const body = await res.json<UpdateApplyResult | { error?: string }>().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to apply update: ${res.status}`);
-  return body as UpdateApplyResult;
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(readErrorMessage(payload) || `Failed to apply update: ${res.status}`);
+  const body = normalizeUpdateApplyResult(payload);
+  if (!body) throw new Error("Malformed update response");
+  return body;
 }
 
 export async function applyCloudflareRepairUpdate(
@@ -3551,9 +3525,15 @@ export async function applyCloudflareRepairUpdate(
     credentials: "include",
     body: JSON.stringify({ apiToken }),
   });
-  const body = await res.json<{ ok: boolean; error?: string }>().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(body.error || `Failed to apply repair update: ${res.status}`);
-  return body;
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(readErrorMessage(payload) || `Failed to apply repair update: ${res.status}`);
+  if (!isRecord(payload) || typeof payload.ok !== "boolean") {
+    throw new Error("Malformed repair update response");
+  }
+  return {
+    ok: payload.ok,
+    ...(readString(payload.error) ? { error: readString(payload.error) ?? undefined } : {}),
+  };
 }
 
 export async function detectSelfUpdateRepo(hubUrl: string): Promise<HubUpdateRepoState> {

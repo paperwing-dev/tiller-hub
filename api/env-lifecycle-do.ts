@@ -488,6 +488,11 @@ export type EnvDeleteClaimResult =
   | { allowed: true; runnerCommand: RunnerCommandClaim; mutableState: EnvMutableState }
   | { allowed: false; error: string; mutableState: EnvMutableState | null };
 
+export interface RebaseRejectedRunnerCommandInput {
+  rejectedCommand: RunnerCommandClaim;
+  currentCommandGeneration: number;
+}
+
 export class EnvLifecycleDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1144,25 +1149,6 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     });
   }
 
-  private async updateBootSummary(
-    current: EnvMutableState | null,
-    summary: { message?: string | null; stepId?: StartupDiagnosticStepId | null },
-    updatedAt?: string,
-  ): Promise<EnvMutableState | null> {
-    if (!current) {
-      return null;
-    }
-
-    const next = normalizeMutableState({
-      ...current,
-      bootMessage: normalizeDiagnosticMessage(summary.message),
-      bootStepId: summary.stepId ?? null,
-      updatedAt: updatedAt ?? nowIso(),
-    });
-    await this.writeMutableState(next);
-    return next;
-  }
-
   private buildUpdatedStartupDiagnostics(
     snapshot: StartupDiagnosticsSnapshot,
     options: {
@@ -1651,6 +1637,9 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       return existing;
     }
     const highWater = (await txn.get<number>(RUNNER_COMMAND_GENERATION_KEY)) ?? 0;
+    if (!Number.isSafeInteger(highWater) || highWater < 0 || highWater >= Number.MAX_SAFE_INTEGER) {
+      throw new RangeError("Runner command generation high-water mark is invalid or exhausted.");
+    }
     const claim: RunnerCommandClaim = {
       commandGeneration: highWater + 1,
       operationId,
@@ -1709,6 +1698,130 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         throw new Error("The runner command lifecycle operation has been superseded.");
       }
       return existing;
+    });
+  }
+
+  /**
+   * Advances a command that the machine rejected before mutation because its
+   * own durable fence is ahead of the Hub. The transaction is deliberately
+   * bound to the exact lifecycle operation so a racing Stop/Delete cannot be
+   * rebased into the stale caller.
+   */
+  async rebaseRejectedRunnerCommand(
+    input: RebaseRejectedRunnerCommandInput,
+  ): Promise<RunnerCommandClaim> {
+    const rejected = input?.rejectedCommand;
+    const operationId = rejected?.operationId?.trim();
+    const runnerHighWater = input?.currentCommandGeneration;
+    if (
+      !rejected
+      || !Number.isSafeInteger(rejected.commandGeneration)
+      || rejected.commandGeneration <= 0
+      || !operationId
+      || (rejected.desiredState !== "running"
+        && rejected.desiredState !== "stopped"
+        && rejected.desiredState !== "absent")
+      || !Number.isSafeInteger(runnerHighWater)
+      || runnerHighWater <= rejected.commandGeneration
+    ) {
+      throw new TypeError("Rejected runner command reconciliation metadata is invalid.");
+    }
+
+    return this.ctx.storage.transaction(async (txn) => {
+      const [existing, storedMutable, storedHighWater, scheduledRun] = await Promise.all([
+        txn.get<RunnerCommandClaim>(RUNNER_COMMAND_CLAIM_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<number>(RUNNER_COMMAND_GENERATION_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const sameOperation = Boolean(
+        existing
+        && existing.operationId === operationId
+        && existing.desiredState === rejected.desiredState,
+      );
+      const lifecycleOwnsCommand = rejected.desiredState === "running"
+        ? Boolean(
+            current
+            && current.lifecycleOpId === operationId
+            && current.lifecycleOperation === "start"
+            && current.lifecycleDesiredState === "running"
+            && current.lifecyclePhase === "starting",
+          )
+        : rejected.desiredState === "stopped"
+          ? Boolean(
+              current
+              && current.lifecycleOpId === operationId
+              && current.lifecycleOperation === "stop"
+              && current.lifecycleDesiredState === "stopped"
+              && (current.lifecyclePhase === "saving"
+                || current.lifecyclePhase === "stopping"
+                || current.lifecyclePhase === "failed"
+                || current.lifecyclePhase === "stopped"),
+            )
+          : Boolean(current?.status === "deleting");
+      if (!sameOperation || !lifecycleOwnsCommand || !existing) {
+        throw new Error("The rejected runner command lifecycle operation has been superseded.");
+      }
+
+      const highWater = storedHighWater ?? 0;
+      if (!Number.isSafeInteger(highWater) || highWater < 0) {
+        throw new RangeError("Runner command generation high-water mark is invalid or exhausted.");
+      }
+
+      // A retry after the transaction committed receives the same claim.
+      if (existing.commandGeneration !== rejected.commandGeneration) {
+        if (
+          Number.isSafeInteger(existing.commandGeneration)
+          && existing.commandGeneration > runnerHighWater
+          && existing.commandGeneration > rejected.commandGeneration
+          && highWater === existing.commandGeneration
+        ) {
+          const scheduledGenerationMatches = scheduledRun?.kind !== "active"
+            || (rejected.desiredState === "running" && scheduledRun.startOpId === operationId
+              ? scheduledRun.runnerGeneration === existing.commandGeneration
+              : rejected.desiredState === "stopped" && scheduledRun.stopOpId === operationId
+                ? scheduledRun.stopRunnerGeneration === existing.commandGeneration
+                : true);
+          if (scheduledGenerationMatches) return existing;
+        }
+        throw new Error("The rejected runner command lifecycle operation has been superseded.");
+      }
+
+      const baseGeneration = Math.max(highWater, runnerHighWater);
+      if (baseGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new RangeError("Runner command generation high-water mark is exhausted.");
+      }
+      const rebased: RunnerCommandClaim = {
+        commandGeneration: baseGeneration + 1,
+        operationId,
+        desiredState: rejected.desiredState,
+      };
+
+      if (scheduledRun?.kind === "active") {
+        if (rejected.desiredState === "running" && scheduledRun.startOpId === operationId) {
+          if (scheduledRun.runnerGeneration !== rejected.commandGeneration) {
+            throw new Error("The Scheduled Run runner command generation does not match the rejected command.");
+          }
+          await txn.put(SCHEDULED_RUN_RECORD_KEY, {
+            ...scheduledRun,
+            runnerGeneration: rebased.commandGeneration,
+            updatedAt: nowIso(),
+          } satisfies ActiveScheduledRunReceipt);
+        } else if (rejected.desiredState === "stopped" && scheduledRun.stopOpId === operationId) {
+          if (scheduledRun.stopRunnerGeneration !== rejected.commandGeneration) {
+            throw new Error("The Scheduled Run Stop command generation does not match the rejected command.");
+          }
+          await txn.put(SCHEDULED_RUN_RECORD_KEY, {
+            ...scheduledRun,
+            stopRunnerGeneration: rebased.commandGeneration,
+            updatedAt: nowIso(),
+          } satisfies ActiveScheduledRunReceipt);
+        }
+      }
+      await txn.put(RUNNER_COMMAND_GENERATION_KEY, rebased.commandGeneration);
+      await txn.put(RUNNER_COMMAND_CLAIM_KEY, rebased);
+      return rebased;
     });
   }
 

@@ -39,11 +39,23 @@ export interface RunnerDestroyOptions {
 
 export class RunnerBackendControlError extends Error {
   readonly code: RunnerControlErrorCode;
+  readonly currentCommandGeneration?: number;
+  readonly currentCommandGenerationInvalid: boolean;
 
-  constructor(message: string, code: RunnerControlErrorCode, cause?: unknown) {
+  constructor(
+    message: string,
+    code: RunnerControlErrorCode,
+    cause?: unknown,
+    currentCommandGeneration?: unknown,
+  ) {
     super(message);
     this.name = "RunnerBackendControlError";
     this.code = code;
+    this.currentCommandGenerationInvalid = currentCommandGeneration !== undefined
+      && (!Number.isSafeInteger(currentCommandGeneration) || (currentCommandGeneration as number) <= 0);
+    if (!this.currentCommandGenerationInvalid && currentCommandGeneration !== undefined) {
+      this.currentCommandGeneration = currentCommandGeneration as number;
+    }
     if (cause !== undefined) {
       Object.defineProperty(this, "cause", { value: cause, configurable: true });
     }
@@ -64,6 +76,79 @@ export function getRunnerControlErrorCode(error: unknown): RunnerControlErrorCod
   if (typeof candidate.message !== "string") return null;
   const match = /(?:^|:\s)\[(runner_not_found|runner_command_superseded_before_mutation|runner_command_superseded|runner_command_conflict)\]\s/.exec(candidate.message);
   return match ? match[1] as RunnerControlErrorCode : null;
+}
+
+/**
+ * Reads the runner's durable generation from a structured error. During a
+ * mixed-version rollout, older CLIs expose the same value only in the stable
+ * pre-mutation rejection message.
+ */
+export function getRunnerCurrentCommandGeneration(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
+  const candidate = error as {
+    currentCommandGeneration?: unknown;
+    currentCommandGenerationInvalid?: unknown;
+    message?: unknown;
+    cause?: unknown;
+  };
+  if (candidate.currentCommandGenerationInvalid === true) return null;
+  if (
+    "currentCommandGeneration" in candidate
+    && candidate.currentCommandGeneration !== undefined
+  ) {
+    return Number.isSafeInteger(candidate.currentCommandGeneration)
+      && (candidate.currentCommandGeneration as number) > 0
+      ? candidate.currentCommandGeneration as number
+      : null;
+  }
+  if (typeof candidate.message === "string") {
+    const match = /\bRunner command generation \d+ was superseded by (\d+)\b/.exec(candidate.message);
+    if (match) {
+      const parsed = Number(match[1]);
+      return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+    }
+  }
+  return candidate.cause === error ? null : getRunnerCurrentCommandGeneration(candidate.cause);
+}
+
+export type RebaseRejectedRunnerCommand = (
+  rejectedCommand: RunnerCommandClaim,
+  currentCommandGeneration: number,
+) => Promise<RunnerCommandClaim>;
+
+/** Runs only the rejected runner mutation a second time after a safe rebase. */
+export async function runRunnerMutationWithGenerationReconciliation<T>(
+  runnerCommand: RunnerCommandClaim,
+  rebase: RebaseRejectedRunnerCommand,
+  mutation: (runnerCommand: RunnerCommandClaim) => Promise<T>,
+): Promise<T> {
+  try {
+    return await mutation(runnerCommand);
+  } catch (error) {
+    if (getRunnerControlErrorCode(error) !== "runner_command_superseded_before_mutation") {
+      throw error;
+    }
+    const currentCommandGeneration = getRunnerCurrentCommandGeneration(error);
+    if (
+      currentCommandGeneration === null
+      || currentCommandGeneration <= runnerCommand.commandGeneration
+    ) {
+      throw error;
+    }
+    const rebased = await rebase(runnerCommand, currentCommandGeneration);
+    if (
+      !Number.isSafeInteger(rebased.commandGeneration)
+      || rebased.commandGeneration <= currentCommandGeneration
+      || rebased.operationId !== runnerCommand.operationId
+      || rebased.desiredState !== runnerCommand.desiredState
+    ) {
+      throw new RunnerBackendControlError(
+        "Runner command reconciliation returned an invalid command claim.",
+        "runner_command_conflict",
+      );
+    }
+    return mutation(rebased);
+  }
 }
 
 export interface RunnerBackend {

@@ -374,48 +374,6 @@ export class TillerVoice extends VoiceAgent<Env> {
     return getDurableObjectStub<HubStub>(this.env, this.env.HUB, "hub");
   }
 
-  #extractToolCall(result: unknown): ToolCall | null {
-    const rawCall = (
-      result as {
-        tool_calls?:
-          | Array<
-              | {
-                  function?: {
-                    name?: string;
-                    arguments?: string | Record<string, string>;
-                  };
-                }
-              | { name?: string; arguments?: string | Record<string, string> }
-            >
-          | undefined;
-      }
-    ).tool_calls?.[0];
-
-    if (!rawCall) return null;
-
-    if ("function" in rawCall && rawCall.function?.name) {
-      const rawArgs = rawCall.function.arguments;
-      let args: Record<string, string> = {};
-      try {
-        args =
-          typeof rawArgs === "string" ? JSON.parse(rawArgs) : (rawArgs ?? {});
-      } catch {}
-      return { name: rawCall.function.name, args };
-    }
-
-    if ("name" in rawCall && rawCall.name) {
-      const rawArgs = rawCall.arguments;
-      let args: Record<string, string> = {};
-      try {
-        args =
-          typeof rawArgs === "string" ? JSON.parse(rawArgs) : (rawArgs ?? {});
-      } catch {}
-      return { name: rawCall.name, args };
-    }
-
-    return null;
-  }
-
   #cleanAssistantText(text: string): string {
     const trimmed = text.trim();
     if (!trimmed) return "";

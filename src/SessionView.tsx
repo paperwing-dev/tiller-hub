@@ -14,7 +14,6 @@ import { canStopEnvStatus } from "./env-runtime";
 import { TerminalAckTracker } from "./terminal-ack-tracker";
 import type { TerminalRecoveryState } from "./terminal-recovery";
 
-const SHOW_LEGACY_COMPOSER = false;
 const CLI_PROMPT_DISMISS_KEY = "tiller:session-cli-prompt-dismissed";
 
 type TerminalAckMessage =
@@ -64,8 +63,6 @@ export default function SessionView({
   permissions = [],
   onPermissionResolved,
 }: SessionViewProps) {
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [terminalRecoveryState, setTerminalRecoveryState] = useState<TerminalRecoveryState>({ status: "recovering" });
   const [terminalDetached, setTerminalDetached] = useState(false);
@@ -78,7 +75,6 @@ export default function SessionView({
     }
   });
   const termRef = useRef<TerminalViewHandle>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const termOutputBufferRef = useRef("");
   const summarizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSummarySentAtRef = useRef(0);
@@ -195,13 +191,14 @@ export default function SessionView({
     if (msg.type === "tiller-status") {
       setTillerStatus(msg.status ?? null);
     }
-    if (msg.type === "debug" && msg.stage) {
+    const debugStage = msg.stage;
+    if (msg.type === "debug" && debugStage) {
       setVoiceDebugEvents((events) =>
         [
           ...events,
           {
             timestamp: msg.timestamp ?? Date.now(),
-            stage: msg.stage,
+            stage: debugStage,
             details: msg.details,
           },
         ].slice(-200),
@@ -377,21 +374,6 @@ export default function SessionView({
   useEffect(() => {
     if (connected) setSendError(null);
   }, [connected]);
-
-  // Legacy composer is preserved for now, but hidden while the terminal is the
-  // primary interaction surface.
-  useEffect(() => {
-    if (!SHOW_LEGACY_COMPOSER) return;
-    textareaRef.current?.focus();
-  }, [session.id]);
-
-  const cancelSummarizeTimer = () => {
-    if (summarizeTimerRef.current) {
-      clearTimeout(summarizeTimerRef.current);
-      summarizeTimerRef.current = null;
-    }
-    termOutputBufferRef.current = "";
-  };
 
   const clearPendingAcks = useCallback(() => {
     ackTrackerRef.current?.clear();
@@ -633,46 +615,6 @@ export default function SessionView({
     setTerminalRecoveryState(state);
   }, []);
 
-  const handleSend = () => {
-    const text = input.trim();
-    if (!text || sending) return;
-
-    cancelSummarizeTimer();
-
-    if (!wsSend.current?.send) {
-      setSendError("Not connected \u2014 message not sent");
-      return;
-    }
-
-    setSendError(null);
-    setSending(true);
-    setInput("");
-    // Reset textarea height after clearing
-    if (textareaRef.current) textareaRef.current.style.height = "auto";
-    if (!sendRawKey(text.replace(/\n/g, "\r") + "\r")) {
-      setInput(text);
-      setSendError("Send failed \u2014 please try again");
-    }
-    setSending(false);
-  };
-
-  const handleAbort = () => {
-    sendTerminalControl("abort");
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInput(e.target.value);
-    e.target.style.height = "auto";
-    e.target.style.height = e.target.scrollHeight + "px";
-  };
-
   const active = env ? canStopEnvStatus(env.status) : session.active === 1;
   const meta = useMemo(
     () =>
@@ -742,7 +684,7 @@ export default function SessionView({
             onDetach={handleTerminalDetach}
             onDurableMessageComplete={handleDurableMessageComplete}
           />
-          {sendError && !SHOW_LEGACY_COMPOSER && (
+          {sendError && (
             <div className="absolute right-3 top-3 z-40 max-w-md rounded border border-kumo-danger/40 bg-kumo-elevated px-3 py-2 text-xs text-kumo-danger shadow-sm">
               {sendError}
             </div>
@@ -826,69 +768,6 @@ export default function SessionView({
         pendingPermissions={pendingPermissions.length}
       />
 
-      {/* Input */}
-      {SHOW_LEGACY_COMPOSER && (
-        <div className="p-3 border-t border-kumo-line bg-kumo-recessed relative">
-          {sendError && <p className="text-kumo-danger text-xs mb-2">{sendError}</p>}
-          <div className="flex gap-2">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={handleTextareaChange}
-              onKeyDown={handleKeyDown}
-              placeholder={
-                !connected
-                  ? "Reconnecting..."
-                  : active
-                    ? "Type a message\u2026 (Shift+Enter for newline)"
-                    : "Session inactive"
-              }
-              disabled={!active || sending || !connected}
-              rows={1}
-              className="flex-1 bg-kumo-base border border-kumo-line rounded px-3 py-2 text-sm text-kumo-default placeholder:text-kumo-placeholder overflow-hidden disabled:opacity-50 focus:outline-none focus:border-kumo-focus focus:ring-1 focus:ring-kumo-focus/30 transition-colors max-h-40"
-            />
-            {active && connected && (
-              <>
-                <button
-                  onClick={() => sendRawKey("\x1b[A")}
-                  className="rounded px-2 py-2 text-sm font-medium border border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle transition-colors"
-                  title="Up arrow"
-                >
-                  &#x25B2;
-                </button>
-                <button
-                  onClick={() => sendRawKey("\x1b[B")}
-                  className="rounded px-2 py-2 text-sm font-medium border border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle transition-colors"
-                  title="Down arrow"
-                >
-                  &#x25BC;
-                </button>
-                <button
-                  onClick={() => sendRawKey("\r")}
-                  className="rounded px-3 py-2 text-sm font-medium border border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle transition-colors"
-                  title="Send Enter keystroke"
-                >
-                  Enter &#x23CE;
-                </button>
-                <button
-                  onClick={handleAbort}
-                  className="bg-kumo-danger hover:bg-kumo-danger/85 rounded px-3 py-2 text-sm font-medium text-white transition-colors"
-                  title="Send Ctrl+C to abort"
-                >
-                  Abort
-                </button>
-              </>
-            )}
-            <button
-              onClick={handleSend}
-              disabled={!active || sending || !input.trim() || !connected}
-              className="bg-kumo-brand hover:bg-kumo-brand-hover rounded px-4 py-2 text-sm font-medium text-white disabled:opacity-40 transition-colors"
-            >
-              Send
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

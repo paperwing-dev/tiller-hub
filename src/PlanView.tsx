@@ -120,11 +120,13 @@ export default function PlanView({
     effort: "high",
   });
   const [writerHandoffs, setWriterHandoffs] = useState<PlanWriterHandoff[]>([]);
+  const [mainUpdating, setMainUpdating] = useState(false);
   const [writerMode, setWriterMode] = useState<{
     planArtifactId: string;
     writer: PlanWriterState;
   } | null>(null);
   const seenMainEventRef = useRef<string | null>(null);
+  const mainUpdateRequestRef = useRef(0);
   const addToast = useToast();
 
   const selectedPlanArtifactId = planArtifactId ?? null;
@@ -424,15 +426,12 @@ export default function PlanView({
     const key = `${mainEvent.repoId}:${mainEvent.currentMainCommit ?? "unknown"}`;
     if (seenMainEventRef.current === key) return;
     seenMainEventRef.current = key;
-    addToast({
-      title: "Main changed",
-      body: mainEvent.sourceEnvSlug
-        ? `Canonical main advanced from ${mainEvent.sourceEnvSlug}.`
-        : "Canonical main advanced.",
-      variant: "warning",
+    const request = ++mainUpdateRequestRef.current;
+    setMainUpdating(true);
+    void loadArtifacts({ quiet: true }).finally(() => {
+      if (request === mainUpdateRequestRef.current) setMainUpdating(false);
     });
-    void loadArtifacts({ quiet: true });
-  }, [addToast, loadArtifacts, mainEvent, repoId]);
+  }, [loadArtifacts, mainEvent, repoId]);
 
   const handleNewPlan = useCallback(async () => {
     try {
@@ -737,6 +736,7 @@ export default function PlanView({
               key={selectedPlan.id}
               plan={selectedPlan}
               saving={selectedWriterMode?.writer.synchronization.state === "saving"}
+              mainUpdating={mainUpdating}
               onSave={(markdown) => handleSavePlan(selectedPlan.id, markdown)}
             />
           ) : (

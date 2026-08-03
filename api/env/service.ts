@@ -7,6 +7,10 @@ import type { HubDO } from "../hub";
 import type { EnvDefinition, EnvLifecycleState, Env, EnvMeta, RunnerCommandClaim } from "../types";
 import { getEnvDefinitionKey } from "../plan/store";
 import { getRunnerBackend } from "./runner-backends";
+import {
+  runRunnerMutationWithGenerationReconciliation,
+  type RebaseRejectedRunnerCommand,
+} from "./runner-backend";
 import { normalizeRunnerStatus } from "./status";
 import {
   buildEnvSnapshotsPrefix,
@@ -235,6 +239,7 @@ export async function destroyEnv(
   options?: {
     broadcast?: boolean;
     runnerCommand?: RunnerCommandClaim;
+    rebaseRunnerCommand?: RebaseRejectedRunnerCommand;
     skipRunnerDestroy?: boolean;
   },
 ): Promise<void> {
@@ -245,7 +250,15 @@ export async function destroyEnv(
   if (!options?.skipRunnerDestroy) {
     const backend = await getRunnerBackend(env, meta.backend);
     if (meta.backend === "host") {
-      await backend.destroy(meta, options?.runnerCommand ? { runnerCommand: options.runnerCommand } : undefined);
+      if (options?.runnerCommand && options.rebaseRunnerCommand) {
+        await runRunnerMutationWithGenerationReconciliation(
+          options.runnerCommand,
+          options.rebaseRunnerCommand,
+          (runnerCommand) => backend.destroy(meta, { runnerCommand }),
+        );
+      } else {
+        await backend.destroy(meta, options?.runnerCommand ? { runnerCommand: options.runnerCommand } : undefined);
+      }
     } else {
       try {
         await backend.destroy(meta);

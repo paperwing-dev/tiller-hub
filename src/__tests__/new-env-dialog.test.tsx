@@ -7,6 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubRepositorySelection } from "../api";
 import type { Artifact } from "../../api/coordination/types";
+import type { RepoMeta } from "../../api/types";
 
 const useGitHubRepositoriesMock = vi.hoisted(() => vi.fn());
 const apiMocks = vi.hoisted(() => ({
@@ -35,16 +36,27 @@ import {
   REPOSITORY_PAGE_SIZE,
 } from "../NewEnvDialog";
 
-const repo = {
+const repo: RepoMeta = {
   repoId: "repo-1",
+  artifactStoreGeneration: null,
   repoUrl: "https://github.com/example/repo",
-  scmModel: "github" as const,
+  scmModel: "github",
+  githubInstallationId: 7,
   githubFullName: "example/repo",
   githubDefaultBranch: "main",
   githubDefaultBranchHeadSha: "main-sha",
+  githubWebhookConfigured: true,
+  githubWebhookError: null,
   mainCommit: "main-sha",
   gitArtifactId: null,
-  gitStatus: "ready" as const,
+  gitStatus: "ready",
+  gitError: null,
+  gitFormatVersion: 1,
+  gitProgressPhase: null,
+  gitProgressStartedAt: null,
+  gitProgressUpdatedAt: null,
+  gitLastBootstrapDurationMs: null,
+  gitLastBootstrapTimings: null,
   createdAt: "2026-04-13T00:00:00.000Z",
   updatedAt: "2026-04-13T00:00:00.000Z",
   bootstrappedFromRef: "HEAD",
@@ -462,8 +474,8 @@ describe("NewEnvDialog", () => {
     expect(harness?.textContent).toContain("Open Code");
     expect(model?.textContent).toContain("GPT-5.6 Sol");
     expect(effort?.textContent).toContain("xhigh");
-    expect(harness?.compareDocumentPosition(model as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(model?.compareDocumentPosition(effort as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(harness!.compareDocumentPosition(model as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(model!.compareDocumentPosition(effort as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(bodyText()).not.toContain("Tiller will not downgrade or retry automatically");
     expect(document.body.querySelector('[role="dialog"]')).toHaveClass("h-[calc(100vh-2rem)]", "max-h-[52rem]");
   });

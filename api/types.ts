@@ -464,6 +464,7 @@ export interface RunnerControlResponseMessage {
   result?: unknown;
   error?: string;
   errorCode?: RunnerControlErrorCode;
+  currentCommandGeneration?: number;
 }
 
 export interface RepoSessionEnvRow {
@@ -764,7 +765,7 @@ export interface RepoMeta {
 
 export function hasExplicitEnvDefinitionScmFields(
   value: unknown,
-): value is Pick<EnvDefinition, "scmModel" | "startupPlanId" | "branchName"> {
+): value is Record<string, unknown> & Pick<EnvDefinition, "scmModel" | "startupPlanId" | "branchName"> {
   return (
     isRecord(value) &&
     value.scmModel === "github" &&
@@ -775,7 +776,7 @@ export function hasExplicitEnvDefinitionScmFields(
 
 export function hasExplicitEnvScmFields(
   value: unknown,
-): value is Pick<
+): value is Record<string, unknown> & Pick<
   EnvMeta,
   | "startupPlanId"
   | "branchName"
@@ -852,7 +853,7 @@ export function hasExplicitGitHubEnvPendingPublishProjection(value: unknown): va
 
 export function hasExplicitRepoScmFields(
   value: unknown,
-): value is Pick<
+): value is Record<string, unknown> & Pick<
   RepoMeta,
   | "scmModel"
   | "githubDefaultBranch"
@@ -908,7 +909,7 @@ export function hasExplicitGitHubPublishFields(value: unknown): value is GitHubP
 
 export function hasExplicitRepoGitHubPublishFields(
   value: unknown,
-): value is Pick<RepoMeta, "githubPublish"> {
+): value is Record<string, unknown> & Pick<RepoMeta, "githubPublish"> {
   return (
     isRecord(value) &&
     (

@@ -244,7 +244,8 @@ export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaiti
 
   const matchingStartedAt = presentation.elapsedTimeEligible
     && Boolean(env.lifecycleOpId)
-    && activeDiagnostics?.opId === env.lifecycleOpId
+    && activeDiagnostics !== null
+    && activeDiagnostics.opId === env.lifecycleOpId
     ? activeDiagnostics.startedAt
     : null;
 

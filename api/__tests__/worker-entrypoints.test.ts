@@ -7,15 +7,13 @@ import type {
 } from "../workers-dev-access/types";
 import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
 
-const { partyMiddleware, partyserverMiddleware, routeAgentRequest } = vi.hoisted(() => ({
+const { partyMiddleware, partyserverMiddleware } = vi.hoisted(() => ({
   partyMiddleware: vi.fn(async () => new Response("party ok")),
   partyserverMiddleware: vi.fn(() => vi.fn(async () => new Response("party ok"))),
-  routeAgentRequest: vi.fn(async () => new Response("agent ok")),
 }));
 
 vi.mock("agents", () => ({
   Agent: class {},
-  routeAgentRequest,
 }));
 
 vi.mock("@cloudflare/voice", () => ({
@@ -145,7 +143,6 @@ describe("Worker dynamic entrypoints", () => {
     partyMiddleware.mockClear();
     partyserverMiddleware.mockClear();
     partyserverMiddleware.mockReturnValue(partyMiddleware);
-    routeAgentRequest.mockClear();
   });
 
   it("does not expose the retired gateway session exchange route", async () => {
@@ -223,13 +220,11 @@ describe("Worker dynamic entrypoints", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: "Canonical workers.dev Access trust is not configured.",
     });
-    expect(routeAgentRequest).not.toHaveBeenCalled();
   });
 
-  it("requires Access auth on /agents after workers.dev Access is configured", async () => {
+  it("authenticates retired /agents routes before returning gone", async () => {
     const env = mockEnv({
       HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
-      DO_LOCATION_HINT: "wnam",
     }, canonicalTrust);
 
     const missing = await worker.fetch(
@@ -238,7 +233,6 @@ describe("Worker dynamic entrypoints", () => {
       {} as ExecutionContext,
     );
     expect(missing.status).toBe(401);
-    expect(routeAgentRequest).not.toHaveBeenCalled();
 
     const authed = await worker.fetch(
       new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default", {
@@ -251,10 +245,36 @@ describe("Worker dynamic entrypoints", () => {
       env,
       {} as ExecutionContext,
     );
-    expect(authed.status).toBe(200);
-    await expect(authed.text()).resolves.toBe("agent ok");
-    expect(routeAgentRequest).toHaveBeenCalledTimes(1);
-    expect(routeAgentRequest.mock.calls[0]?.[2]).toEqual({ locationHint: "wnam" });
+    expect(authed.status).toBe(410);
+    expect(authed.headers.get("Cache-Control")).toBe("no-store");
+    await expect(authed.json()).resolves.toEqual({
+      error: "Hosted agent routes have been retired. Use planner reviewer threads instead.",
+    });
+  });
+
+  it("authenticates retired hosted-agent metadata before returning gone", async () => {
+    const env = mockEnv({
+      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+    }, canonicalTrust);
+    const missing = await worker.fetch(
+      new Request("https://tiller.preview.workers.dev/api/agents"),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(missing.status).toBe(401);
+
+    const response = await worker.fetch(
+      new Request("https://tiller.preview.workers.dev/api/agents", {
+        headers: { "Cf-Access-Jwt-Assertion": await ownerAssertion() },
+      }),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(response.status).toBe(410);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    await expect(response.json()).resolves.toEqual({
+      error: "Hosted agent routes have been retired. Use planner reviewer threads instead.",
+    });
   });
 
   it("exposes the installer probe only to the exact Access service principal", async () => {
@@ -410,5 +430,42 @@ describe("Worker dynamic entrypoints", () => {
     await expect(authed.text()).resolves.toBe("party ok");
     expect(partyserverMiddleware).toHaveBeenCalledTimes(1);
     expect(partyMiddleware).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "/parties/reviewer-chat/default",
+    "/parties//reviewer-chat/default",
+  ])("authenticates the retired reviewer PartyServer namespace before returning gone for %s", async (path) => {
+    const env = mockEnv({
+      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+    }, canonicalTrust);
+    const url = `https://tiller.preview.workers.dev${path}`;
+
+    const missing = await worker.fetch(
+      new Request(url, { headers: { Upgrade: "websocket" } }),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(missing.status).toBe(401);
+
+    const authed = await worker.fetch(
+      new Request(url, {
+        headers: {
+          "CF-Access-Client-Id": canonicalTrust.serviceClientId,
+          "CF-Access-Client-Secret": canonicalCredential.currentSecret,
+          "Cf-Access-Jwt-Assertion": await serviceAssertion(),
+          Upgrade: "websocket",
+        },
+      }),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(authed.status).toBe(410);
+    expect(authed.headers.get("Cache-Control")).toBe("no-store");
+    await expect(authed.json()).resolves.toEqual({
+      error: "Hosted agent routes have been retired. Use planner reviewer threads instead.",
+    });
+    expect(partyserverMiddleware).not.toHaveBeenCalled();
+    expect(partyMiddleware).not.toHaveBeenCalled();
   });
 });

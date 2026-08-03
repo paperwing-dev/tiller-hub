@@ -635,6 +635,42 @@ describe("HubDO reconnect healing", () => {
     storage.close();
   });
 
+  it("preserves the runner high-water across the websocket response", async () => {
+    const { subject, storage, connections } = createSubject();
+    seedRegisteredHost(subject);
+    const connection = createConnection("conn-1");
+    connections.set(connection.id, connection);
+    advertiseHost(subject, connection);
+    connection.sent.length = 0;
+
+    const requestPromise = subject.requestLocalRunner(null, "create", "demo-env", {
+      repoUrl: "https://github.com/example/repo",
+      envVars: {},
+      commandGeneration: 1,
+      operationId: "start-op-1",
+      desiredState: "running",
+    });
+    const request = JSON.parse(connection.sent[0]) as { requestId: string };
+    (subject as any).handleRunnerControlResponse(connection, {
+      type: "runner-control-response",
+      requestId: request.requestId,
+      ok: false,
+      error: "Runner command generation 1 was superseded by 60.",
+      errorCode: "runner_command_superseded_before_mutation",
+      currentCommandGeneration: 60,
+    });
+
+    const failure = await requestPromise.catch((error) => error) as Error & {
+      code?: string;
+      currentCommandGeneration?: number;
+    };
+    expect(failure).toMatchObject({
+      code: "runner_command_superseded_before_mutation",
+      currentCommandGeneration: 60,
+    });
+    storage.close();
+  });
+
   it("does not treat a different active host as routable for a stored machine id", () => {
     const { subject, storage, connections } = createSubject();
     seedRegisteredHost(subject, MACHINE_ONE);

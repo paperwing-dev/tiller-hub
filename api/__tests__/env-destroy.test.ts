@@ -24,6 +24,97 @@ function createEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
 }
 
 describe("destroyEnv", () => {
+  it("rebases host Destroy once without repeating deletion cleanup", async () => {
+    const kvDelete = vi.fn().mockResolvedValue(undefined);
+    const destroyWorkspace = vi.fn().mockResolvedValue(undefined);
+    const finalizeDeletion = vi.fn().mockResolvedValue(undefined);
+    const revokeTokens = vi.fn().mockResolvedValue(undefined);
+    let attempts = 0;
+    const requestLocalRunner = vi.fn().mockImplementation(async (
+      _machineId: string,
+      action: string,
+      _slug: string,
+      options: Record<string, unknown>,
+    ) => {
+      expect(action).toBe("destroy");
+      attempts += 1;
+      if (attempts === 1) {
+        throw Object.assign(
+          new Error("Runner command generation 1 was superseded by 60."),
+          {
+            code: "runner_command_superseded_before_mutation",
+            currentCommandGeneration: 60,
+          },
+        );
+      }
+      return {
+        machineId: "m-123",
+        result: {
+          removed: true,
+          commandGeneration: options.commandGeneration,
+          operationId: options.operationId,
+          desiredState: options.desiredState,
+        },
+      };
+    });
+    const env = {
+      ENVS_KV: { delete: kvDelete },
+      BUCKET: {
+        list: vi.fn().mockResolvedValue({ objects: [], truncated: false }),
+        delete: vi.fn().mockResolvedValue(undefined),
+      },
+      WORKSPACE: {
+        idFromName: vi.fn().mockReturnValue("ws-id"),
+        get: vi.fn().mockReturnValue({ destroyWorkspace }),
+      },
+      ENV_LIFECYCLE: {
+        idFromName: vi.fn().mockReturnValue("lifecycle-id"),
+        get: vi.fn().mockReturnValue({ finalizeDeletion }),
+      },
+      ENV_REVIEW: {
+        idFromName: vi.fn().mockReturnValue("review-id"),
+        get: vi.fn().mockReturnValue({
+          finalizeEnvironmentDeletion: vi.fn().mockResolvedValue(undefined),
+        }),
+      },
+      HUB: {
+        idFromName: vi.fn().mockReturnValue("hub-id"),
+        get: vi.fn().mockReturnValue({ requestLocalRunner }),
+      },
+    } as any;
+    const hub = {
+      broadcastEnvRemove: vi.fn().mockResolvedValue(undefined),
+      getAllSessions: vi.fn().mockResolvedValue([]),
+      deleteSession: vi.fn(),
+      revokeCloudflareMcpProxyTokensForEnv: revokeTokens,
+    };
+    const initial = {
+      commandGeneration: 1,
+      operationId: "destroy-op-1",
+      desiredState: "absent" as const,
+    };
+    const rebaseRunnerCommand = vi.fn().mockResolvedValue({
+      ...initial,
+      commandGeneration: 61,
+    });
+
+    await destroyEnv(env, createEnvMeta({
+      backend: "host",
+      executionPlacement: { backend: "host", machineId: "m-123" },
+    }), hub, {
+      runnerCommand: initial,
+      rebaseRunnerCommand,
+    });
+
+    expect(rebaseRunnerCommand).toHaveBeenCalledWith(initial, 60);
+    expect(requestLocalRunner).toHaveBeenCalledTimes(2);
+    expect(requestLocalRunner.mock.calls.map((call) => call[3].commandGeneration))
+      .toEqual([1, 61]);
+    expect(revokeTokens).toHaveBeenCalledTimes(1);
+    expect(destroyWorkspace).toHaveBeenCalledTimes(1);
+    expect(finalizeDeletion).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves all durable environment data when host runner destruction fails", async () => {
     const kvDelete = vi.fn().mockResolvedValue(undefined);
     const broadcast = vi.fn().mockResolvedValue(undefined);

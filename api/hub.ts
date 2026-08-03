@@ -132,11 +132,17 @@ interface PendingRunnerRequest {
 
 class RunnerControlError extends Error {
   readonly code?: RunnerControlErrorCode;
+  readonly currentCommandGeneration?: number;
 
-  constructor(message: string, code?: RunnerControlErrorCode) {
+  constructor(
+    message: string,
+    code?: RunnerControlErrorCode,
+    currentCommandGeneration?: number,
+  ) {
     super(code ? `[${code}] ${message}` : message);
     this.name = "RunnerControlError";
     this.code = code;
+    this.currentCommandGeneration = currentCommandGeneration;
   }
 }
 
@@ -635,7 +641,11 @@ export class HubDO extends Server<Env> {
       return;
     }
 
-    pending.reject(new RunnerControlError(data.error || "Runner request failed", data.errorCode));
+    pending.reject(new RunnerControlError(
+      data.error || "Runner request failed",
+      data.errorCode,
+      data.currentCommandGeneration,
+    ));
   }
 
   private stampTerminalAckRouteKey(

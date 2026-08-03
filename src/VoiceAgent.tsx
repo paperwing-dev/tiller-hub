@@ -1,3 +1,5 @@
+import type { VoicePipelineMetrics } from "@cloudflare/voice/react";
+
 // Voice status and transcript types (from @cloudflare/voice — inlined to
 // avoid subpath module resolution issues in the LSP).
 type VoiceStatus = "idle" | "listening" | "thinking" | "speaking";
@@ -8,21 +10,12 @@ interface TranscriptMessage {
   timestamp?: number;
 }
 
-interface PipelineMetrics {
-  vad_ms: number;
-  stt_ms: number;
-  llm_ms: number;
-  tts_ms: number;
-  first_audio_ms: number;
-  total_ms: number;
-}
-
 interface VoiceAgentProps {
   status: VoiceStatus;
   transcript: TranscriptMessage[];
   interimTranscript: string | null;
   audioLevel: number;
-  metrics: PipelineMetrics | null;
+  metrics: VoicePipelineMetrics | null;
   tillerStatus: string | null;
   error: string | null;
   connected: boolean;
@@ -197,13 +190,13 @@ export default function VoiceAgent({
         {/* Metrics */}
         {metrics && (
           <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-[10px] text-kumo-subtle font-mono border-t border-kumo-line pt-1.5">
-            <span>STT {metrics.stt_ms}ms</span>
-            <span className="text-kumo-inactive">/</span>
             <span>LLM {metrics.llm_ms}ms</span>
             <span className="text-kumo-inactive">/</span>
             <span>TTS {metrics.tts_ms}ms</span>
             <span className="text-kumo-inactive">/</span>
             <span>Audio {metrics.first_audio_ms}ms</span>
+            <span className="text-kumo-inactive">/</span>
+            <span>Total {metrics.total_ms}ms</span>
           </div>
         )}
 

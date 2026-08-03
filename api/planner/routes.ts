@@ -229,10 +229,6 @@ function runInBackground(c: any, task: Promise<unknown>): void {
   void guarded;
 }
 
-async function ignoreAsyncFailure<T>(task: T | Promise<T>): Promise<void> {
-  await Promise.resolve(task).then(() => undefined).catch(() => undefined);
-}
-
 async function loadPlanContext(c: any): Promise<LoadedPlanContext> {
   const loadedRepo = await loadTrackedRepoForRequest(c.env, c.req.raw, c.req.param("repoId"));
   if (!loadedRepo.ok) {

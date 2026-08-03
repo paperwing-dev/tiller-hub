@@ -31,7 +31,14 @@ function describeHostStatus(execution: ExecutionStatus | null, hostError: string
   const hostStatus = execution?.selected.target === 'host'
     ? execution.selectedHost
     : execution?.candidate ?? null;
-  switch (hostStatus?.state ?? 'not_connected') {
+  if (!hostStatus) {
+    return {
+      title: 'Machine: not connected',
+      detail: 'No execution machine is connected to this Hub.',
+      dotClassName: 'bg-kumo-fill',
+    };
+  }
+  switch (hostStatus.state) {
     case 'offline':
       return {
         title: 'Machine: selected, offline',
@@ -192,13 +199,13 @@ export function HostConnectionDetails({
   execution: ExecutionStatus | null;
   hostError: string | null;
 }) {
-  const machine = execution?.selectedHost?.state !== "offline"
-    ? execution?.selectedHost ?? (execution?.candidate.state !== "not_connected" ? execution.candidate : null)
-    : execution.selectedHost;
+  const candidate = execution?.candidate ?? null;
+  const machine = execution?.selectedHost
+    ?? (candidate && candidate.state !== "not_connected" ? candidate : null);
 
   return (
     <>
-      {machine && machine.state !== "not_connected" && (
+      {machine && (
         <dl className="mt-2 space-y-1 text-[11px]">
           <div className="flex items-center gap-2">
             <dt className="w-20 text-kumo-subtle">Machine</dt>

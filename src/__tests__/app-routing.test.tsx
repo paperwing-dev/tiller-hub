@@ -5,7 +5,9 @@ import React from "react";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RouterProvider, createMemoryRouter } from "react-router-dom";
-import type { EnvMeta, RepoMeta, StoredSession, UpdateCheckResult } from "../api";
+import type { EnvMeta, RepoMeta, UpdateCheckResult } from "../api";
+import { createInitialEnvScmState, createInitialRepoScmState } from "../../api/scm/model";
+import type { StoredSession } from "../../api/types";
 
 const apiMocks = vi.hoisted(() => ({
   fetchSessions: vi.fn(),
@@ -120,11 +122,16 @@ vi.mock("../api", () => ({
 const now = "2026-06-14T00:00:00.000Z";
 
 function repoFixture(overrides: Partial<RepoMeta> = {}): RepoMeta {
-  return {
+  const repo: RepoMeta = {
     repoId: "repo-1",
+    artifactStoreGeneration: null,
     repoUrl: "https://github.com/example/repo-1",
     githubInstallationId: 123,
     githubFullName: "example/repo-1",
+    ...createInitialRepoScmState(),
+    githubDefaultBranch: "main",
+    githubDefaultBranchHeadSha: "main-sha",
+    githubWebhookConfigured: true,
     mainCommit: "main-sha",
     gitArtifactId: "git-artifact-1",
     gitStatus: "ready",
@@ -139,17 +146,16 @@ function repoFixture(overrides: Partial<RepoMeta> = {}): RepoMeta {
     updatedAt: now,
     bootstrappedFromRef: "main",
     githubPublish: null,
-    ...overrides,
   };
+  return Object.assign(repo, overrides);
 }
 
 function envFixture(overrides: Partial<EnvMeta> = {}): EnvMeta {
-  return {
+  const env: EnvMeta = {
     slug: "env-1",
     incarnationId: "incarnation-1",
     repoUrl: "https://github.com/example/repo-1",
     repoId: "repo-1",
-    scmModel: "github",
     backend: "cf",
     executionPlacement: { backend: "cf", machineId: null },
     harness: "codex",
@@ -157,24 +163,9 @@ function envFixture(overrides: Partial<EnvMeta> = {}): EnvMeta {
     createdAt: now,
     updatedAt: now,
     status: "running",
-    startupPlanId: null,
-    branchName: "env-1",
-    branchStatus: null,
-    workspaceDirty: null,
-    workspaceNeedsAttention: null,
-    workspaceLastSyncedAt: null,
-    baseMainCommit: null,
-    lastKnownMainCommit: null,
-    scmOperationType: null,
-    scmOperationId: null,
-    scmOperationPhase: null,
-    scmOperationStartedAt: null,
-    scmOperationUpdatedAt: null,
-    scmLastCompletedAt: null,
-    scmLastDurationMs: null,
-    scmLastTimings: null,
-    ...overrides,
+    ...createInitialEnvScmState({ slug: "env-1", branchName: "env-1" }),
   };
+  return Object.assign(env, overrides);
 }
 
 function sessionFixture(overrides: Partial<StoredSession> = {}): StoredSession {
@@ -199,7 +190,7 @@ function sessionFixture(overrides: Partial<StoredSession> = {}): StoredSession {
 }
 
 function updateStatus(): UpdateCheckResult {
-  const currentUpdate = {
+  const currentUpdate: UpdateCheckResult["currentUpdate"] = {
     schemaVersion: 1,
     channel: "deploy-button",
     updateMode: "full-source",
@@ -208,7 +199,7 @@ function updateStatus(): UpdateCheckResult {
     version: "0.2.36",
     label: "Current",
     managedFiles: ["package.json"],
-  } as const;
+  };
   return {
     kind: "legacy",
     updateAvailable: false,

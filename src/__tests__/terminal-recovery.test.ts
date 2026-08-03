@@ -6,6 +6,7 @@ import {
   TerminalRecoveryController,
   TerminalRecoveryOverflowError,
   type DurableTerminalMessage,
+  type TerminalRecoveryFetchOptions,
   type TerminalRecoveryState,
 } from "../terminal-recovery";
 
@@ -167,7 +168,7 @@ describe("TerminalRecoveryController", () => {
 
   it("passes only the remaining recovery byte budget to HTTP fetches", async () => {
     let completeRestore!: () => void;
-    const fetchPage = vi.fn(async () => [] as DurableTerminalMessage[]);
+    const fetchPage = vi.fn(async (_options: TerminalRecoveryFetchOptions) => [] as DurableTerminalMessage[]);
     const controller = new TerminalRecoveryController({
       sessionId: "session-1",
       fetchPage,

@@ -59,7 +59,12 @@ import {
   withStartCausePreamble,
   type EnvStartCause,
 } from "./launch-config";
-import { getRunnerControlErrorCode, type RunnerBackend, type RunnerBackendKind } from "./runner-backend";
+import {
+  getRunnerControlErrorCode,
+  runRunnerMutationWithGenerationReconciliation,
+  type RunnerBackend,
+  type RunnerBackendKind,
+} from "./runner-backend";
 import { getRunnerBackend } from "./runner-backends";
 import { normalizeRunnerStatus } from "./status";
 import {
@@ -382,10 +387,20 @@ async function dispatchStopAndFinalizeIfNoCallback(args: {
     : undefined;
   let stopDispatch: Awaited<ReturnType<RunnerBackend["stop"]>>;
   try {
-    stopDispatch = await args.backend.stop(args.meta, {
+    const dispatch = (command = runnerCommand) => args.backend.stop(args.meta, {
       stopOpId: args.stopOpId,
-      ...(runnerCommand ? { runnerCommand } : {}),
+      ...(command ? { runnerCommand: command } : {}),
     });
+    stopDispatch = runnerCommand
+      ? await runRunnerMutationWithGenerationReconciliation(
+          runnerCommand,
+          (rejectedCommand, currentCommandGeneration) => lifecycleStub.rebaseRejectedRunnerCommand({
+            rejectedCommand,
+            currentCommandGeneration,
+          }),
+          dispatch,
+        )
+      : await dispatch();
   } catch (error) {
     const controlErrorCode = getRunnerControlErrorCode(error);
     if (
@@ -1032,21 +1047,40 @@ export async function createEnvAction(args: {
   args.executionCtx.waitUntil(
     (async () => {
       try {
-        const updated = await backend.create({
+        const create = (command = createRunnerCommand) => backend.create({
           ...persistedMeta,
           harnessSettings: claimedStart.harnessSettings,
         }, launchConfig.envVars, {
           startOpId,
-          ...(createRunnerCommand ? { runnerCommand: createRunnerCommand } : {}),
+          ...(command ? { runnerCommand: command } : {}),
         });
+        const updated = createRunnerCommand
+          ? await runRunnerMutationWithGenerationReconciliation(
+              createRunnerCommand,
+              (rejectedCommand, currentCommandGeneration) => lifecycleStub.rebaseRejectedRunnerCommand({
+                rejectedCommand,
+                currentCommandGeneration,
+              }),
+              create,
+            )
+          : await create();
         const stillExists = await envExists(env, slug);
         if (!stillExists) {
           try {
             const deletion = await lifecycleStub.beginDelete();
             if (deletion.allowed) {
-              await backend.destroy(updated, updated.backend === "host"
-                ? { runnerCommand: deletion.runnerCommand }
-                : undefined);
+              if (updated.backend === "host") {
+                await runRunnerMutationWithGenerationReconciliation(
+                  deletion.runnerCommand,
+                  (rejectedCommand, currentCommandGeneration) => lifecycleStub.rebaseRejectedRunnerCommand({
+                    rejectedCommand,
+                    currentCommandGeneration,
+                  }),
+                  (runnerCommand) => backend.destroy(updated, { runnerCommand }),
+                );
+              } else {
+                await backend.destroy(updated);
+              }
               await lifecycleStub.finalizeDeletion();
             }
           } catch { /* best effort */ }
@@ -1923,12 +1957,22 @@ export async function startEnvAction(args: {
   args.executionCtx.waitUntil(
     (async () => {
       try {
-        const updated = await backend.start({
+        const start = (command = runnerCommand) => backend.start({
           ...startingMeta,
         }, launchConfig.envVars, {
           startOpId: claimedStartOpId,
-          ...(runnerCommand ? { runnerCommand } : {}),
+          ...(command ? { runnerCommand: command } : {}),
         });
+        const updated = runnerCommand
+          ? await runRunnerMutationWithGenerationReconciliation(
+              runnerCommand,
+              (rejectedCommand, currentCommandGeneration) => lifecycleStub.rebaseRejectedRunnerCommand({
+                rejectedCommand,
+                currentCommandGeneration,
+              }),
+              start,
+            )
+          : await start();
         await lifecycleStub.setRunnerBinding({
           runnerId: updated.runnerId ?? null,
           opId: claimedStartOpId,
@@ -2122,6 +2166,11 @@ export async function deleteEnvAction(args: {
       try {
         await destroyEnv(env, meta, hub, {
           runnerCommand: deleteClaim.runnerCommand,
+          rebaseRunnerCommand: (rejectedCommand, currentCommandGeneration) =>
+            lifecycleStub.rebaseRejectedRunnerCommand({
+              rejectedCommand,
+              currentCommandGeneration,
+            }),
           skipRunnerDestroy: deletingUnstartedSchedule && backendKind !== "host",
         });
         try {

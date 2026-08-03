@@ -163,10 +163,7 @@ async function materializePlanArtifact(c: any, id: string) {
   );
 
   try {
-    const { artifacts } = await loadRepoArtifacts(
-      repo.meta,
-      artifactStore,
-    );
+    const { artifacts } = await loadRepoArtifacts(artifactStore);
     const artifact = getPlanArtifactById(artifacts, id);
     if (!artifact) {
       return c.json({ error: "Plan artifact not found" }, 404);

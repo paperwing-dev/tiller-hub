@@ -675,24 +675,3 @@ export async function listRepos(env: Env): Promise<RepoMeta[]> {
     right.updatedAt.localeCompare(left.updatedAt),
   );
 }
-
-export async function commitRepoMainState(args: {
-  env: Env;
-  workspace: WorkspaceDO;
-  meta: RepoMeta;
-  mainCommit: string | null;
-  sourceEnvSlug?: string | null;
-  metaOverrides?: Partial<RepoMeta>;
-}): Promise<RepoMeta> {
-  const now = new Date().toISOString();
-  const nextMeta: RepoMeta = {
-    ...args.meta,
-    ...args.metaOverrides,
-    mainCommit: args.mainCommit,
-    updatedAt: now,
-    lastCommittedFromEnvSlug: args.sourceEnvSlug ?? null,
-    lastCommittedAt: args.sourceEnvSlug ? now : args.meta.lastCommittedAt ?? null,
-  };
-  await persistRepoMeta(args.env, args.workspace, nextMeta);
-  return nextMeta;
-}

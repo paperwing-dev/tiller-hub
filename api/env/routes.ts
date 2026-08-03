@@ -917,13 +917,6 @@ function getGitHubBaseError(
   };
 }
 
-function readBooleanHeader(request: Request, name: string): boolean | undefined {
-  const value = request.headers.get(name)?.trim().toLowerCase();
-  if (value === "true" || value === "1") return true;
-  if (value === "false" || value === "0") return false;
-  return undefined;
-}
-
 function readIsoHeader(request: Request, name: string): string | undefined {
   const raw = request.headers.get(name)?.trim();
   if (!raw) return undefined;

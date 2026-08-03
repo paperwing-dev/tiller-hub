@@ -18,7 +18,7 @@ That decision is important for Tiller:
 
 - runners can be local or Cloudflare-backed
 - workspace state stays hosted
-- hosted agents like Research can still work without a live container
+- durable workspace state is available independently of any one runner lifecycle
 
 Putting these files together makes that boundary much clearer:
 

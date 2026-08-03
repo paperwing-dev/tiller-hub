@@ -77,16 +77,6 @@ export function ensureSchema(sql: SqlStorage): void {
     )
   `);
 
-  // DEPRECATED: rpc_methods is no longer used (RPC subsystem removed).
-  // Kept to avoid migration errors on existing DOs that already have this table.
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS rpc_methods (
-      connection_id TEXT NOT NULL,
-      method_name TEXT NOT NULL,
-      PRIMARY KEY (connection_id, method_name)
-    )
-  `);
-
   // ── Self-healing migration: drop old UNIQUE(tag, namespace) constraint ──────
   // The UNIQUE constraint breaks concurrent sessions from the same machine.
   // If it exists, wipe sessions/messages/permissions and recreate with new schema.

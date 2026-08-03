@@ -5,6 +5,8 @@ import type {
 import type { Env } from "./types";
 import { getDurableObjectStub } from "./durable-object";
 
+export const DEFAULT_OPENAI_MODEL = "gpt-5.5";
+
 interface CodexAuthStub {
   exchangeCodexRuntimeAuth(rejectedAccessTokenSha256?: string): Promise<CodexRuntimeAuthBoundaryResult>;
   getCodexAuthStatus(refresh?: boolean): Promise<CodexAuthStatusResult>;

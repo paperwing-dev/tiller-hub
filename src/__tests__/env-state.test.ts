@@ -10,15 +10,15 @@ import {
 } from "../env-state";
 
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
-  return {
+  const env: EnvMeta = {
     slug: "test-env",
     incarnationId: "incarnation-1",
     repoUrl: "https://github.com/user/repo",
     repoId: "repo-1",
-    scmModel: "github",
     backend: "cf",
     executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
+    harnessSettings: null,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
     status: "running",
@@ -26,14 +26,15 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
       slug: "test-env",
       mainCommit: "main-a",
     }),
-    ...overrides,
   };
+  return Object.assign(env, overrides);
 }
 
 function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
   const mainCommit = overrides.mainCommit === undefined ? "main-a" : overrides.mainCommit;
-  return {
+  const repo: RepoMeta = {
     repoId: "repo-1",
+    artifactStoreGeneration: null,
     repoUrl: "https://github.com/user/repo",
     githubInstallationId: 98765,
     githubFullName: "user/repo",
@@ -46,8 +47,8 @@ function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
     bootstrappedFromRef: "HEAD",
-    ...overrides,
   };
+  return Object.assign(repo, overrides);
 }
 
 describe("upsertEnvMeta", () => {

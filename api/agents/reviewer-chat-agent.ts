@@ -9,18 +9,20 @@ import {
 import { createWorkersAI } from "workers-ai-provider";
 import {
   buildSystemPrompt,
-  createHostedToolRegistry,
+  createReviewerTools,
   createWorkspaceAccess,
-  getAgentSpec,
-  getHostedToolsForAgent,
-  toAiSdkTools,
+  REVIEWER_AGENT_SPEC,
 } from "../agent-core";
-import type { AgentSpec } from "../agent-core";
 import { renderArtifactBodyMarkdown } from "../coordination";
 import { getArtifactStoreStub } from "../helpers";
 import { loadRepo } from "../repo/access";
-import { PLAN_REVIEW_MODELS } from "../plan/workflow";
 import type { Env } from "../types";
+import { KIMI_K2_7_CODE } from "../../shared/harness-catalog";
+
+const REVIEWER_MODELS = [
+  "@cf/nvidia/nemotron-3-120b-a12b",
+  KIMI_K2_7_CODE.providerModel,
+] as const;
 
 function readRequiredBodyString(options: OnChatMessageOptions | undefined, key: string): string {
   const body = (options?.body as Record<string, unknown> | undefined) ?? {};
@@ -32,7 +34,7 @@ function readRequiredBodyString(options: OnChatMessageOptions | undefined, key: 
 }
 
 function assertReviewerModel(model: string): void {
-  if (!(PLAN_REVIEW_MODELS as readonly string[]).includes(model)) {
+  if (!(REVIEWER_MODELS as readonly string[]).includes(model)) {
     throw new Error(`Unsupported reviewer model: ${model}`);
   }
 }
@@ -50,12 +52,7 @@ export class ReviewerChatAgent extends AIChatAgent<Env> {
     _onFinish: StreamTextOnFinishCallback<any>,
     options?: OnChatMessageOptions,
   ): Promise<Response> {
-    const spec: AgentSpec = {
-      ...getAgentSpec("reviewer"),
-      toolNames: ["read_file", "list_files", "glob"],
-      includeMemories: false,
-      includeRecentArtifacts: false,
-    };
+    const spec = REVIEWER_AGENT_SPEC;
     const repoId = readRequiredBodyString(options, "repoId");
     const threadId = readRequiredBodyString(options, "threadId");
     const loadedRepo = await loadRepo(this.appEnv, repoId);
@@ -81,9 +78,7 @@ export class ReviewerChatAgent extends AIChatAgent<Env> {
     }
 
     const workspace = createWorkspaceAccess(repo.workspace);
-    const toolRegistry = createHostedToolRegistry(workspace);
-    const hostedTools = getHostedToolsForAgent(toolRegistry, spec);
-    const tools = toAiSdkTools(hostedTools);
+    const tools = createReviewerTools(workspace);
     const baseSystemPrompt = await buildSystemPrompt(spec, workspace);
     const systemPrompt = [
       baseSystemPrompt,
@@ -102,11 +97,9 @@ export class ReviewerChatAgent extends AIChatAgent<Env> {
       system: systemPrompt,
       messages: modelMessages,
       tools,
-      stopWhen: stepCountIs(spec.maxSteps ?? 8),
+      stopWhen: stepCountIs(spec.maxSteps),
     });
 
     return result.toUIMessageStreamResponse();
   }
 }
-
-export const REVIEWER_CHAT_AGENT_PATH = "reviewer-chat";

@@ -401,6 +401,44 @@ describe("EnvLifecycleDO Scheduled Run ownership", () => {
     await expect(storage.get("env-scheduled-run-attempt-sequence")).resolves.toBe(attemptSequence);
   });
 
+  it("keeps Scheduled Run Start and Stop generation pins aligned when rebasing", async () => {
+    const { env } = createKvEnv();
+    const { subject, storage } = createSubject(env);
+    await publishScheduled(subject);
+    const active = await claimScheduledStart(subject);
+    const startCommand = await subject.claimRunnerCommand(active.startOpId, "running");
+
+    const rebasedStart = await subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: startCommand,
+      currentCommandGeneration: 60,
+    });
+    expect(rebasedStart.commandGeneration).toBe(61);
+    await expect(subject.getScheduledRun()).resolves.toMatchObject({
+      kind: "active",
+      runnerGeneration: 61,
+    });
+
+    const outcome = await subject.requestScheduledRunOutcome({
+      opId: active.startOpId,
+      outcome: "completed",
+    });
+    if (outcome.status === "rejected" || !outcome.stop) {
+      throw new Error("Expected the Scheduled Run to claim Stop");
+    }
+    const rebasedStop = await subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: outcome.stop,
+      currentCommandGeneration: 80,
+    });
+    expect(rebasedStop.commandGeneration).toBe(81);
+    await expect(subject.getScheduledRun()).resolves.toMatchObject({
+      kind: "active",
+      runnerGeneration: 61,
+      stopRunnerGeneration: 81,
+    });
+    await expect(storage.get("runner-command-generation")).resolves.toBe(81);
+    await expect(storage.get("runner-command-claim")).resolves.toEqual(rebasedStop);
+  });
+
   it("uses cleanupRequired only for runner uncertainty and permits exact Stop recovery", async () => {
     const { env } = createKvEnv();
     const { subject } = createSubject(env);

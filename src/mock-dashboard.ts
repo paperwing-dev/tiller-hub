@@ -231,11 +231,15 @@ function makeEnv(
 ): EnvMeta {
   const { repoId, slug, backend, harness, status, ...optionalOverrides } = overrides;
   const repo = DEMO_REPOS.find((candidate) => candidate.repoId === repoId) ?? DEMO_REPOS[0]!;
-  const env = {
+  const env: EnvMeta = {
     slug,
+    incarnationId: `mock-incarnation-${slug}`,
     repoUrl: repo.repoUrl,
     repoId: repo.repoId,
     backend,
+    executionPlacement: backend === "host"
+      ? { backend: "host", machineId: "mock-machine" }
+      : { backend: "cf", machineId: null },
     harness,
     harnessSettings: getHarnessDefault(harness),
     createdAt: NOW,
@@ -248,15 +252,15 @@ function makeEnv(
       startupPlanId: optionalOverrides.startupPlanId ?? null,
       mainCommit: MAIN_COMMIT,
     }),
-    ...optionalOverrides,
   };
 
-  return env;
+  return Object.assign(env, optionalOverrides);
 }
 
 function makeRepo(repo: (typeof DEMO_REPOS)[number]): RepoMeta {
   return {
     repoId: repo.repoId,
+    artifactStoreGeneration: null,
     repoUrl: repo.repoUrl,
     githubInstallationId: repo.githubInstallationId,
     githubFullName: repo.githubFullName,

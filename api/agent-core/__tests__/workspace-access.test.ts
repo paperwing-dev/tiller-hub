@@ -2,16 +2,12 @@ import { describe, expect, it } from "vitest";
 import { createWorkspaceAccess, type WorkspaceStub } from "../workspace-access";
 
 function createStub() {
-  const files = new Map<string, string>();
-
+  const files = new Map([["/src/app.ts", "console.log('app')"]]);
   const stub: WorkspaceStub = {
     async readWorkspaceFile(path: string) {
       return files.get(path) ?? null;
     },
-    async writeWorkspaceFile(path: string, content: string) {
-      files.set(path, content);
-    },
-    readWorkspaceDir(path = "/") {
+    async readWorkspaceDir(path = "/") {
       const prefix = path.endsWith("/") ? path : `${path}/`;
       return Array.from(files.entries())
         .filter(([filePath]) => filePath.startsWith(prefix))
@@ -25,7 +21,7 @@ function createStub() {
           updatedAt: Date.now(),
         }));
     },
-    globWorkspace() {
+    async globWorkspace() {
       return Array.from(files.entries()).map(([path, content]) => ({
         name: path.split("/").pop() ?? path,
         path,
@@ -36,7 +32,7 @@ function createStub() {
         updatedAt: Date.now(),
       }));
     },
-    getWorkspaceInfo() {
+    async getWorkspaceInfo() {
       return {
         fileCount: files.size,
         directoryCount: 1,
@@ -46,17 +42,16 @@ function createStub() {
     },
   };
 
-  return { files, stub };
+  return stub;
 }
 
 describe("createWorkspaceAccess", () => {
-  it("reads and writes through the provided workspace stub", async () => {
-    const workspace = createStub();
-    const access = createWorkspaceAccess(workspace.stub);
-
-    await access.writeFile("/src/app.ts", "console.log('app')");
+  it("exposes the retained read-only workspace operations", async () => {
+    const access = createWorkspaceAccess(createStub());
 
     expect(await access.readFile("/src/app.ts")).toBe("console.log('app')");
-    expect(workspace.files.get("/src/app.ts")).toBe("console.log('app')");
+    expect(await access.readDir("/src")).toHaveLength(1);
+    expect(await access.glob("**/*.ts")).toHaveLength(1);
+    expect(await access.getWorkspaceInfo()).toMatchObject({ fileCount: 1 });
   });
 });

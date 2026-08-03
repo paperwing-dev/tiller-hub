@@ -1,7 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Button } from '@cloudflare/kumo/components/button';
 import { Dialog } from '@cloudflare/kumo/components/dialog';
-import { applyUpdate, checkForUpdate, detectSelfUpdateRepo, selectSelfUpdateRepo } from './api';
+import {
+  applyUpdate,
+  checkForUpdate,
+  checkPredeployCleanSlate,
+  detectSelfUpdateRepo,
+  selectSelfUpdateRepo,
+} from './api';
 import type { HubUpdateRepoCandidate, LegacyUpdateCheckResult, UpdateCheckResult } from './api';
 import { useToast } from './Toast';
 import { formatUpdateName, formatUpdateVersion } from './update-display';
@@ -131,6 +137,25 @@ export default function UpdateDialog({
   const intervalRef = useRef<number | null>(null);
   const reloadTimeoutRef = useRef<number | null>(null);
 
+  async function requireCleanSlate(): Promise<boolean> {
+    setError(null);
+    try {
+      const readiness = await checkPredeployCleanSlate(hubUrl);
+      if (readiness.ok) return true;
+      setError(
+        'Tiller maintenance needs a clean Cloudflare workspace. Wait for active work to finish, stop running environments, and remove retained environments or runtimes before trying again.',
+      );
+      return false;
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? `Tiller could not verify that Cloudflare is ready for maintenance: ${err.message}`
+          : 'Tiller could not verify that Cloudflare is ready for maintenance.',
+      );
+      return false;
+    }
+  }
+
   function clearProgressTimer() {
     if (intervalRef.current != null) {
       window.clearInterval(intervalRef.current);
@@ -252,6 +277,10 @@ export default function UpdateDialog({
     setIsApplying(true);
     setError(null);
     setAutoReloadScheduled(false);
+    if (!await requireCleanSlate()) {
+      setIsApplying(false);
+      return;
+    }
     setStage(PROGRESS_STAGES[0]);
     intervalRef.current = window.setInterval(() => {
       setStage((current) => {
@@ -313,6 +342,15 @@ export default function UpdateDialog({
         variant: 'error',
       });
     }
+  }
+
+  async function handleInstallerMaintenance(url: string) {
+    setIsApplying(true);
+    if (!await requireCleanSlate()) {
+      setIsApplying(false);
+      return;
+    }
+    window.location.assign(url);
   }
 
   if (!status && isChecking && !issue) {
@@ -447,6 +485,13 @@ export default function UpdateDialog({
               </div>
             )}
 
+            {error && (
+              <div className="mt-5 rounded-xl border border-kumo-danger/20 bg-kumo-danger-tint px-4 py-3">
+                <p className="text-sm font-semibold text-kumo-default">Maintenance blocked</p>
+                <p className="mt-1 text-sm text-kumo-danger">{error}</p>
+              </div>
+            )}
+
             {hasExecutionMachine && status.updateAvailable && (
               <div className="mt-5 rounded-xl border border-kumo-warning/30 bg-kumo-warning-tint px-4 py-3">
                 <p className="text-sm font-semibold text-kumo-default">Execution machine</p>
@@ -461,9 +506,11 @@ export default function UpdateDialog({
                 <Button
                   type="button"
                   variant="primary"
-                  onClick={() => window.location.assign(action.url)}
+                  onClick={() => void handleInstallerMaintenance(action.url)}
+                  loading={isApplying}
+                  disabled={isApplying}
                 >
-                  {action.label}
+                  {isApplying ? 'Checking...' : action.label}
                 </Button>
               )}
               {status.stableRelease && (

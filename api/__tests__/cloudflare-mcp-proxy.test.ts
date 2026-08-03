@@ -249,7 +249,9 @@ describe("Cloudflare MCP proxy", () => {
 
   it("maps token lookup network failures to sanitized upstream errors", async () => {
     const hub = createHub();
-    hub.getValidCloudflareMcpAccessToken.mockRejectedValueOnce(new Error("network unavailable"));
+    hub.getValidCloudflareMcpAccessToken
+      .mockReset()
+      .mockRejectedValueOnce(new Error("network unavailable"));
 
     const response = await proxyCloudflareMcpRequest(new Request("https://hub.example.com/api/mcp/cloudflare", {
       method: "POST",

@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { createHostRunnerBackend } from "../env/runner-backend-host";
-import { getRunnerControlErrorCode } from "../env/runner-backend";
+import {
+  getRunnerControlErrorCode,
+  getRunnerCurrentCommandGeneration,
+} from "../env/runner-backend";
 
 function createEnv(error: Error, requestLocalRunner = vi.fn().mockRejectedValue(error)) {
   return {
@@ -96,6 +99,70 @@ describe("host runner deletion", () => {
 });
 
 describe("host runner command validation", () => {
+  it("preserves the typed runner high-water through the backend wrapper", async () => {
+    const rejection = Object.assign(
+      new Error("Runner command generation 9 was superseded by 60."),
+      {
+        code: "runner_command_superseded_before_mutation" as const,
+        currentCommandGeneration: 60,
+      },
+    );
+    const backend = await createHostRunnerBackend(createEnv(rejection));
+
+    const failure = await backend.start(meta, {}, {
+      startOpId: "start-op-9",
+      runnerCommand: {
+        commandGeneration: 9,
+        operationId: "start-op-9",
+        desiredState: "running",
+      },
+    }).catch((error) => error);
+
+    expect(getRunnerControlErrorCode(failure)).toBe("runner_command_superseded_before_mutation");
+    expect(getRunnerCurrentCommandGeneration(failure)).toBe(60);
+    expect(failure).toMatchObject({ currentCommandGeneration: 60 });
+  });
+
+  it("parses the legacy superseded message when the CLI omits typed high-water metadata", async () => {
+    const rejection = Object.assign(
+      new Error("Execution machine start failed: Runner command generation 9 was superseded by 60."),
+      { code: "runner_command_superseded_before_mutation" as const },
+    );
+    const backend = await createHostRunnerBackend(createEnv(rejection));
+
+    const failure = await backend.start(meta, {}, {
+      startOpId: "start-op-9",
+      runnerCommand: {
+        commandGeneration: 9,
+        operationId: "start-op-9",
+        desiredState: "running",
+      },
+    }).catch((error) => error);
+
+    expect(getRunnerCurrentCommandGeneration(failure)).toBe(60);
+  });
+
+  it("rejects invalid typed high-water metadata through the backend wrapper", async () => {
+    const rejection = Object.assign(
+      new Error("Runner command generation 9 was superseded by 60."),
+      {
+        code: "runner_command_superseded_before_mutation" as const,
+        currentCommandGeneration: Number.MAX_SAFE_INTEGER + 1,
+      },
+    );
+    const backend = await createHostRunnerBackend(createEnv(rejection));
+    const failure = await backend.start(meta, {}, {
+      startOpId: "start-op-9",
+      runnerCommand: {
+        commandGeneration: 9,
+        operationId: "start-op-9",
+        desiredState: "running",
+      },
+    }).catch((error) => error);
+
+    expect(getRunnerCurrentCommandGeneration(failure)).toBeNull();
+  });
+
   it("rejects a mismatched callback operation id before Start dispatch", async () => {
     const requestLocalRunner = vi.fn();
     const backend = await createHostRunnerBackend(createEnv(new Error("unused"), requestLocalRunner));

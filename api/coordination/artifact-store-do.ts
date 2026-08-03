@@ -37,7 +37,6 @@ import type {
   PlannerRunStatus,
   PlanStatus,
   ReviewerRegistryEntry,
-  ReviewArtifactBody,
   SavePlanInput,
   SetRefInput,
   UpdatePlannerRunInput,

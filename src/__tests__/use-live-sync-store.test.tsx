@@ -22,12 +22,14 @@ vi.mock("../api", () => ({
 import { useLiveSyncStore } from "../useLiveSyncStore";
 
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
-  return {
+  const env: EnvMeta = {
     slug: "demo-env",
+    incarnationId: "incarnation-1",
     repoUrl: "https://github.com/test/repo",
     repoId: "repo-1",
     scmModel: "github",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "codex",
     harnessSettings: null,
     createdAt: "2026-07-16T00:00:00.000Z",
@@ -63,8 +65,8 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
     githubLastPublishedAt: null,
     githubLastPublishedWorkspaceHash: null,
     githubPendingPublish: null,
-    ...overrides,
   };
+  return Object.assign(env, overrides);
 }
 
 describe("useLiveSyncStore publish watchdog", () => {

@@ -502,6 +502,17 @@ function createLifecycleStub() {
       operationId,
       desiredState,
     })),
+    rebaseRejectedRunnerCommand: vi.fn().mockImplementation(async ({
+      rejectedCommand,
+      currentCommandGeneration,
+    }: {
+      rejectedCommand: { operationId: string; desiredState: string };
+      currentCommandGeneration: number;
+    }) => ({
+      commandGeneration: currentCommandGeneration + 1,
+      operationId: rejectedCommand.operationId,
+      desiredState: rejectedCommand.desiredState,
+    })),
     beginDelete: vi.fn().mockImplementation(async () => {
       hydrated = true;
       current = { ...current, status: "deleting", error: null, errorAt: null };
@@ -2741,6 +2752,138 @@ describe("POST /api/envs/:slug/reset-to-repo", () => {
 });
 
 describe("Your machine Stop ambiguity", () => {
+  it.each([
+    { label: "ordinary", intent: undefined },
+    { label: "Scheduled Run", intent: "scheduled" as const },
+  ])("rebases a rejected $label Stop once and retries only runner dispatch", async ({ intent }) => {
+    const stopOpId = "stop-op-rebase";
+    let stopAttempts = 0;
+    const requestLocalRunner = vi.fn().mockImplementation(async (
+      _machineId: string | null,
+      action: string,
+      _slug: string,
+      options?: Record<string, unknown>,
+    ) => {
+      if (action === "status") {
+        return { machineId: "host-1", result: { status: "running" } };
+      }
+      if (action === "stop") {
+        stopAttempts += 1;
+        if (stopAttempts === 1) {
+          throw Object.assign(
+            new Error("Runner command generation 1 was superseded by 60."),
+            {
+              code: "runner_command_superseded_before_mutation",
+              currentCommandGeneration: 60,
+            },
+          );
+        }
+        return {
+          machineId: "host-1",
+          result: {
+            status: "stopping",
+            callbackExpected: true,
+            commandGeneration: options?.commandGeneration,
+            operationId: options?.operationId,
+            desiredState: options?.desiredState,
+          },
+        };
+      }
+      throw new Error(`Unexpected runner action: ${action}`);
+    });
+    const lifecycleStub = createLifecycleStub();
+    const runningMeta = buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      backend: "host",
+      executionPlacement: { backend: "host", machineId: "host-1" },
+      harness: "codex",
+      status: "running",
+      lifecyclePhase: "running",
+      lifecycleOpId: "start-op-1",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
+      lifecycleInfraState: "ready",
+      lifecycleRuntimeReady: true,
+    });
+    const savingMeta = buildStoredEnvRecord({
+      ...runningMeta,
+      status: "saving",
+      lifecyclePhase: "saving",
+      lifecycleOpId: stopOpId,
+      lifecycleOperation: "stop",
+      lifecycleDesiredState: "stopped",
+      lifecycleRuntimeReady: false,
+    });
+    await lifecycleStub.initializeMutableStateFromMeta(runningMeta);
+    const savingLifecycle = {
+      phase: "saving",
+      activeOpId: stopOpId,
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastRunnerState: "running",
+      lastWorkspaceSyncedAckOpId: null,
+      infraState: "ready",
+      runtimeReady: false,
+      lastError: null,
+      lastErrorAt: null,
+      updatedAt: "2026-08-03T00:00:00.000Z",
+    } as const;
+    lifecycleStub.requestStop.mockResolvedValue(savingLifecycle);
+    if (intent === "scheduled") {
+      lifecycleStub.getScheduledRun.mockResolvedValue({
+        kind: "active",
+        incarnationId: "incarnation-my-env",
+        startOpId: "start-op-1",
+        requestedOutcome: null,
+      });
+      lifecycleStub.requestScheduledRunOutcome.mockResolvedValue({
+        status: "accepted",
+        outcome: "interrupted",
+        lifecycle: savingLifecycle,
+        preparationInFlight: false,
+      });
+    }
+    lifecycleStub.persistOwnedProjection.mockResolvedValue(savingMeta);
+    const executionCtx = createExecutionCtx();
+
+    await stopEnvAction({
+      env: {
+        HUB: createHubBinding({ isHostRoutable: true, requestLocalRunner }),
+      } as any,
+      executionCtx: executionCtx as any,
+      slug: "my-env",
+      ...(intent ? { intent } : {}),
+      lifecycleStub: lifecycleStub as any,
+      cachedMeta: runningMeta as any,
+    });
+    await executionCtx.waitUntil.mock.calls[0][0];
+
+    expect(lifecycleStub.rebaseRejectedRunnerCommand).toHaveBeenCalledWith({
+      rejectedCommand: {
+        commandGeneration: 1,
+        operationId: stopOpId,
+        desiredState: "stopped",
+      },
+      currentCommandGeneration: 60,
+    });
+    expect(requestLocalRunner.mock.calls.filter((call) => call[1] === "stop"))
+      .toEqual([
+        ["host-1", "stop", "my-env", {
+          commandGeneration: 1,
+          operationId: stopOpId,
+          desiredState: "stopped",
+        }],
+        ["host-1", "stop", "my-env", {
+          commandGeneration: 61,
+          operationId: stopOpId,
+          desiredState: "stopped",
+        }],
+      ]);
+    expect(lifecycleStub.noteStopDispatchFailed).not.toHaveBeenCalled();
+  });
+
   it("waits for exact Scheduled Run preparation before cleanup or Stop dispatch", async () => {
     const lifecycleStub = createLifecycleStub();
     const scheduledLifecycle = {

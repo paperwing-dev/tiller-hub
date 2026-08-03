@@ -1,10 +1,9 @@
 import type { WorkspaceDO } from "../workspace/do";
-import type { WorkspaceContextAccess, WorkspaceEntry, WorkspaceInfo } from "./types";
+import type { WorkspaceContextAccess } from "./types";
 
 export type WorkspaceStub = Pick<
   WorkspaceDO,
   | "readWorkspaceFile"
-  | "writeWorkspaceFile"
   | "readWorkspaceDir"
   | "globWorkspace"
   | "getWorkspaceInfo"
@@ -15,17 +14,14 @@ export function createWorkspaceAccess(stub: WorkspaceStub): WorkspaceContextAcce
     readFile(path: string) {
       return stub.readWorkspaceFile(path);
     },
-    writeFile(path: string, content: string) {
-      return stub.writeWorkspaceFile(path, content);
+    readDir(path?: string) {
+      return stub.readWorkspaceDir(path);
     },
-    readDir(path?: string): Promise<WorkspaceEntry[]> {
-      return Promise.resolve(stub.readWorkspaceDir(path) as unknown as WorkspaceEntry[]);
+    glob(pattern: string) {
+      return stub.globWorkspace(pattern);
     },
-    glob(pattern: string): Promise<WorkspaceEntry[]> {
-      return Promise.resolve(stub.globWorkspace(pattern) as unknown as WorkspaceEntry[]);
-    },
-    getWorkspaceInfo(): Promise<WorkspaceInfo> {
-      return Promise.resolve(stub.getWorkspaceInfo() as unknown as WorkspaceInfo);
+    getWorkspaceInfo() {
+      return stub.getWorkspaceInfo();
     },
   };
 }

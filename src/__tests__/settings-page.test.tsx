@@ -8,7 +8,7 @@ vi.mock("../Toast", () => ({
 }));
 
 function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
-  return {
+  const status: SetupStatus = {
     needsSetup: false,
     setupPhase: "complete",
     isLocalDev: false,
@@ -51,8 +51,9 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
       workersCiBranch: null,
     },
     selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
-    ...overrides,
+    dashboardOnboarding: { dismissed: false, executionReady: false },
   };
+  return Object.assign(status, overrides);
 }
 
 describe("Global Settings", () => {

@@ -4,7 +4,6 @@ import { createInitialEnvScmState, createInitialRepoScmState } from "../../scm/m
 import { UnsupportedGitHubRepoMetadataError } from "../../github/metadata-validation";
 import { getArtifactStoreStub } from "../../helpers";
 import {
-  commitRepoMainState,
   createRepoWorkspaceFromGitHubAppSelection,
   getSelectedRepoWorkspaceForRepoId,
   listEnvDefinitionSlugs,
@@ -138,52 +137,6 @@ describe("repo store env metadata helpers", () => {
       2,
       "123456:generation:generation-1",
       {},
-    );
-  });
-
-  it("persists canonical main commit updates to repo metadata", async () => {
-    const writeWorkspaceFile = vi.fn().mockResolvedValue(undefined);
-    const env = {
-      ENVS_KV: {
-        put: vi.fn().mockResolvedValue(undefined),
-      },
-    } as any;
-    const workspace = {
-      writeWorkspaceFile,
-    } as any;
-
-    const nextMeta = await commitRepoMainState({
-      env,
-      workspace,
-      meta: {
-        repoId: "repo-123",
-        repoUrl: "https://github.com/paperwing-dev/example",
-        githubInstallationId: 98765,
-        githubFullName: "paperwing-dev/example",
-        ...createInitialRepoScmState(),
-        mainCommit: "abc123",
-        gitArtifactId: "g-old",
-        gitStatus: "ready",
-        createdAt: "2026-03-30T00:00:00.000Z",
-        updatedAt: "2026-03-30T00:00:00.000Z",
-        bootstrappedFromRef: "HEAD",
-      },
-      mainCommit: "def456",
-      sourceEnvSlug: "env-1",
-    });
-
-    expect(nextMeta).toMatchObject({
-      repoId: "repo-123",
-      mainCommit: "def456",
-      lastCommittedFromEnvSlug: "env-1",
-    });
-    expect(writeWorkspaceFile).toHaveBeenCalledWith(
-      "/.tiller/repo/meta.json",
-      expect.stringContaining("\"mainCommit\": \"def456\""),
-    );
-    expect(env.ENVS_KV.put).toHaveBeenCalledWith(
-      "repo:repo-123",
-      expect.stringContaining("\"repoId\":\"repo-123\""),
     );
   });
 

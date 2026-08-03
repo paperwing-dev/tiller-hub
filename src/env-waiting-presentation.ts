@@ -127,7 +127,8 @@ function hasCorrelatedStartupFailure(
     && env.lifecycleOperation === "start"
     && env.lifecycleDesiredState === "running"
     && Boolean(env.lifecycleOpId)
-    && activeDiagnostics?.opId === env.lifecycleOpId
+    && activeDiagnostics !== null
+    && activeDiagnostics.opId === env.lifecycleOpId
     && Boolean(activeDiagnostics.failure);
 }
 

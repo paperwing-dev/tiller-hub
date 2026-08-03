@@ -43,8 +43,9 @@ const previousPublishedAt = "2026-07-15T00:00:00.000Z";
 const completedPublishedAt = "2026-07-16T00:00:00.000Z";
 
 function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
-  return {
+  const repo: RepoMeta = {
     repoId: "repo-1",
+    artifactStoreGeneration: null,
     repoUrl: "https://github.com/test/repo",
     scmModel: "github",
     githubInstallationId: 98765,
@@ -66,17 +67,19 @@ function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
     createdAt: previousPublishedAt,
     updatedAt: previousPublishedAt,
     bootstrappedFromRef: "HEAD",
-    ...overrides,
   };
+  return Object.assign(repo, overrides);
 }
 
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
-  return {
+  const env: EnvMeta = {
     slug: "demo-env",
+    incarnationId: "incarnation-1",
     repoUrl: "https://github.com/test/repo",
     repoId: "repo-1",
     scmModel: "github",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
     harnessSettings: null,
     createdAt: previousPublishedAt,
@@ -112,8 +115,8 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
     githubLastPublishedAt: previousPublishedAt,
     githubLastPublishedWorkspaceHash: null,
     githubPendingPublish: null,
-    ...overrides,
   };
+  return Object.assign(env, overrides);
 }
 
 function publishingEnv(operationId = "operation-1"): EnvMeta {

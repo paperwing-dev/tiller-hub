@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { routeAgentRequest } from "agents";
 import { partyserverMiddleware } from "./partyserver-middleware";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { HonoEnv, Env, StoredSession } from "./types";
@@ -7,8 +6,7 @@ import type { HubDO } from "./hub";
 import { parseRpcError } from "./errors";
 import { getArtifactStoreStub } from "./helpers";
 import { authMiddleware, dynamicEntrypointAuthResponse } from "./auth";
-import { DEFAULT_OPENAI_MODEL, listHostedAgentMetadata } from "./agent-core";
-import { getStatus as getOpenAIStatus } from "./openai-auth";
+import { DEFAULT_OPENAI_MODEL, getStatus as getOpenAIStatus } from "./openai-auth";
 import setupRoutes from "./setup/routes";
 import cliRoutes from "./cli/routes";
 import authConnectRoutes from "./cli/auth-connect-routes";
@@ -39,7 +37,7 @@ import {
 import { planWriterTerminalId } from "./planner/plan-writer-contract";
 import { canonicalIngressResponse } from "./canonical-origin";
 import { loadTrackedRepo } from "./repo/access";
-import { durableObjectOptions, getDurableObjectStub } from "./durable-object";
+import { getDurableObjectStub } from "./durable-object";
 export { TillerVoice } from "./voice/agent";
 export { EnvLifecycleDO } from "./env-lifecycle-do";
 export { ScheduledRunCapacityDO } from "./scheduled-run-capacity-do";
@@ -84,6 +82,10 @@ function getHub(env: Env): HubStub {
 // ── Hono app ────────────────────────────────────────────────────────
 
 const app = new Hono<HonoEnv>();
+
+const RETIRED_HOSTED_AGENT_BODY = {
+  error: "Hosted agent routes have been retired. Use planner reviewer threads instead.",
+} as const;
 
 // Error handler
 app.onError((err, c) => {
@@ -570,8 +572,9 @@ app.get("/api/auth/openai/status", async (c) => {
   });
 });
 
-app.get("/api/agents", (c) => {
-  return c.json(listHostedAgentMetadata(c.env));
+app.all("/api/agents", (c) => {
+  c.header("Cache-Control", "no-store");
+  return c.json(RETIRED_HOSTED_AGENT_BODY, 410);
 });
 
 app.route("/", envRoutes);
@@ -597,6 +600,11 @@ app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 app.use("/parties/*", (c, next) => {
   return dynamicEntrypointAuthResponse(c.req.raw, c.env).then((blocked) => {
     if (blocked) return blocked;
+    const [prefix, namespace] = new URL(c.req.url).pathname.split("/").filter(Boolean);
+    if (prefix === "parties" && namespace === "reviewer-chat") {
+      c.header("Cache-Control", "no-store");
+      return c.json(RETIRED_HOSTED_AGENT_BODY, 410);
+    }
     const middleware = partyserverMiddleware();
     return middleware(c as never, next as never);
   });
@@ -620,8 +628,10 @@ export default {
     if (url.pathname.startsWith("/agents/")) {
       const blocked = await dynamicEntrypointAuthResponse(req, env);
       if (blocked) return blocked;
-      const agentResp = await routeAgentRequest(req, env, durableObjectOptions(env));
-      if (agentResp) return agentResp;
+      return Response.json(RETIRED_HOSTED_AGENT_BODY, {
+        status: 410,
+        headers: { "Cache-Control": "no-store" },
+      });
     }
     const isPartyWs =
       req.headers.get("Upgrade")?.toLowerCase() === "websocket" &&

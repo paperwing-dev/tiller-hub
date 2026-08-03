@@ -36,6 +36,19 @@ describe("regional Durable Object access", () => {
   it("constructs named stubs with the shared options", () => {
     const stub = { fetch: vi.fn() };
     const namespace = {
+      getByName: vi.fn(() => stub),
+    };
+    expect(getDurableObjectStub(
+      { DO_LOCATION_HINT: "weur" },
+      namespace as unknown as DurableObjectNamespace,
+      "workspace-1",
+    )).toBe(stub);
+    expect(namespace.getByName).toHaveBeenCalledWith("workspace-1", { locationHint: "weur" });
+  });
+
+  it("supports existing namespace test doubles", () => {
+    const stub = { fetch: vi.fn() };
+    const namespace = {
       idFromName: vi.fn(() => "durable-id"),
       get: vi.fn(() => stub),
     };

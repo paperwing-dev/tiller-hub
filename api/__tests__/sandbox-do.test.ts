@@ -428,7 +428,7 @@ describe("SandboxDO", () => {
     expect(mocks.projectAndPersistEnvSummary).toHaveBeenCalledTimes(1);
   });
 
-  it("requests lifecycle-controlled save before idle auto-stop", async () => {
+  it("requests lifecycle-controlled save only after the harness grants an idle claim", async () => {
     const requestStop = vi.fn().mockResolvedValue(createLifecycleState());
     const noteStopDispatchFailed = vi.fn().mockResolvedValue(null);
     mocks.getEnvLifecycleStub.mockReturnValue({
@@ -451,9 +451,22 @@ describe("SandboxDO", () => {
       });
 
     const stopSandbox = vi.fn().mockResolvedValue(undefined);
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        ok: true,
+        eligible: true,
+        remainingIdleMs: 0,
+        reason: "eligible",
+        claimId: "idle-claim-1",
+      }),
+    });
     const instance = Object.create(SandboxDO.prototype) as SandboxDO & {
       ctx: {
-        container: { running: boolean };
+        container: {
+          running: boolean;
+          getTcpPort: ReturnType<typeof vi.fn>;
+        };
         storage: { get: ReturnType<typeof vi.fn> };
       };
       env: {
@@ -464,9 +477,14 @@ describe("SandboxDO", () => {
     };
 
     instance.ctx = {
-      container: { running: true },
+      container: {
+        running: true,
+        getTcpPort: vi.fn().mockReturnValue({ fetch }),
+      },
       storage: {
-        get: vi.fn().mockResolvedValue("demo-env"),
+        get: vi.fn().mockImplementation((key: string) => Promise.resolve(
+          key === "idle-timeout-ms" ? 60_000 : "demo-env",
+        )),
       },
     } as any;
     instance.lifecycleOpStorageKey = "lifecycle-op-id";
@@ -496,7 +514,140 @@ describe("SandboxDO", () => {
     expect(requestStop).toHaveBeenCalledTimes(1);
     expect(instance.env.ENVS_KV.put).not.toHaveBeenCalled();
     expect(mocks.projectAndPersistEnvSummary).toHaveBeenCalledTimes(2);
-    expect(stopSandbox).toHaveBeenCalledWith("stop-op-1");
+    expect(stopSandbox).toHaveBeenCalledWith("stop-op-1", "idle-claim-1");
     expect(noteStopDispatchFailed).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1/prepare-idle-stop",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ idleTimeoutMs: 60_000 }),
+      }),
+    );
+  });
+
+  it("keeps a silent working turn alive across repeated timeout callbacks", async () => {
+    const fetch = vi.fn().mockImplementation(() => Promise.resolve({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        ok: true,
+        eligible: false,
+        remainingIdleMs: 60_000,
+        reason: "working",
+      }),
+    }));
+    const renewActivityTimeout = vi.fn();
+    const instance = Object.create(SandboxDO.prototype) as SandboxDO & {
+      ctx: any;
+      env: any;
+      renewActivityTimeout: typeof renewActivityTimeout;
+    };
+    instance.ctx = {
+      container: {
+        running: true,
+        getTcpPort: vi.fn().mockReturnValue({ fetch }),
+      },
+      storage: {
+        get: vi.fn().mockResolvedValue(60_000),
+      },
+    };
+    instance.env = {};
+    instance.renewActivityTimeout = renewActivityTimeout;
+
+    await instance.onActivityExpired();
+    await instance.onActivityExpired();
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(renewActivityTimeout).toHaveBeenCalledTimes(2);
+    expect(instance.sleepAfter).toBe("60s");
+    expect(mocks.projectAndPersistEnvSummary).not.toHaveBeenCalled();
+    expect(mocks.getEnvLifecycleStub).not.toHaveBeenCalled();
+  });
+
+  it("fails closed and renews when harness activity control is unavailable", async () => {
+    const fetch = vi.fn().mockRejectedValue(new Error("connect ENOENT"));
+    const renewActivityTimeout = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const instance = Object.create(SandboxDO.prototype) as SandboxDO & {
+      ctx: any;
+      env: any;
+      renewActivityTimeout: typeof renewActivityTimeout;
+    };
+    instance.ctx = {
+      container: {
+        running: true,
+        getTcpPort: vi.fn().mockReturnValue({ fetch }),
+      },
+      storage: {
+        get: vi.fn().mockResolvedValue(90_000),
+      },
+    };
+    instance.env = {};
+    instance.renewActivityTimeout = renewActivityTimeout;
+
+    await instance.onActivityExpired();
+
+    expect(renewActivityTimeout).toHaveBeenCalledTimes(1);
+    expect(instance.sleepAfter).toBe("90s");
+    expect(mocks.projectAndPersistEnvSummary).not.toHaveBeenCalled();
+    expect(mocks.getEnvLifecycleStub).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("releases an eligible claim instead of falling back when lifecycle state is unreadable", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          ok: true,
+          eligible: true,
+          remainingIdleMs: 0,
+          reason: "eligible",
+          claimId: "idle-claim-unreadable",
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true });
+    const renewActivityTimeout = vi.fn();
+    const stopSandbox = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.getHub.mockReturnValue({});
+    mocks.projectAndPersistEnvSummary.mockRejectedValue(new Error("lifecycle unavailable"));
+    const instance = Object.create(SandboxDO.prototype) as SandboxDO & {
+      ctx: any;
+      env: any;
+      renewActivityTimeout: typeof renewActivityTimeout;
+      stopSandbox: typeof stopSandbox;
+    };
+    instance.ctx = {
+      container: {
+        running: true,
+        getTcpPort: vi.fn().mockReturnValue({ fetch }),
+      },
+      storage: {
+        get: vi.fn().mockImplementation((key: string) => Promise.resolve(
+          key === "idle-timeout-ms" ? 60_000 : "demo-env",
+        )),
+      },
+    };
+    instance.env = {};
+    instance.renewActivityTimeout = renewActivityTimeout;
+    instance.stopSandbox = stopSandbox;
+
+    await instance.onActivityExpired();
+
+    expect(stopSandbox).not.toHaveBeenCalled();
+    expect(mocks.getEnvLifecycleStub).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[1]).toEqual([
+      "http://127.0.0.1/prepare-idle-stop",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          action: "release",
+          claimId: "idle-claim-unreadable",
+        }),
+      }),
+    ]);
+    expect(renewActivityTimeout).toHaveBeenCalledTimes(1);
+    error.mockRestore();
   });
 });

@@ -259,6 +259,83 @@ describe("EnvLifecycleDO", () => {
     expect(state.activeOpId).toMatch(/^start-/);
   });
 
+  it("atomically rebases an active runner command above the machine high-water", async () => {
+    const subject = createSubject();
+    const storage = (subject as unknown as { ctx: { storage: MemoryStorage } }).ctx.storage;
+    await subject.initializeMutableStateFromMeta(createEnvMeta({
+      backend: "host",
+      status: "stopped",
+      lifecyclePhase: "stopped",
+    }));
+    const start = await subject.beginStart({ model: "gpt-5.6-sol", effort: "high" });
+    const operationId = start.lifecycle!.activeOpId!;
+    const rejected = await subject.claimRunnerCommand(operationId, "running");
+
+    expect(rejected.commandGeneration).toBe(1);
+    const rebased = await subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: rejected,
+      currentCommandGeneration: 60,
+    });
+
+    expect(rebased).toEqual({
+      commandGeneration: 61,
+      operationId,
+      desiredState: "running",
+    });
+    await expect(storage.get("runner-command-generation")).resolves.toBe(61);
+    await expect(storage.get("runner-command-claim")).resolves.toEqual(rebased);
+    await expect(subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: rejected,
+      currentCommandGeneration: 60,
+    })).resolves.toEqual(rebased);
+  });
+
+  it("refuses invalid, exhausted, mismatched, and superseded runner rebases", async () => {
+    const createActiveStart = async () => {
+      const subject = createSubject();
+      const storage = (subject as unknown as { ctx: { storage: MemoryStorage } }).ctx.storage;
+      await subject.initializeMutableStateFromMeta(createEnvMeta({
+        backend: "host",
+        status: "stopped",
+        lifecyclePhase: "stopped",
+      }));
+      const start = await subject.beginStart({ model: "gpt-5.6-sol", effort: "high" });
+      const rejected = await subject.claimRunnerCommand(start.lifecycle!.activeOpId!, "running");
+      return { subject, storage, rejected };
+    };
+
+    const invalid = await createActiveStart();
+    await expect(invalid.subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: invalid.rejected,
+      currentCommandGeneration: invalid.rejected.commandGeneration,
+    })).rejects.toThrow(/metadata is invalid/i);
+    await expect(invalid.subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: { ...invalid.rejected, operationId: "another-start" },
+      currentCommandGeneration: 60,
+    })).rejects.toThrow(/superseded/i);
+
+    const exhausted = await createActiveStart();
+    await exhausted.storage.put("runner-command-generation", Number.MAX_SAFE_INTEGER);
+    await expect(exhausted.subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: exhausted.rejected,
+      currentCommandGeneration: 60,
+    })).rejects.toThrow(/exhausted/i);
+
+    const stopped = await createActiveStart();
+    await stopped.subject.requestStop();
+    await expect(stopped.subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: stopped.rejected,
+      currentCommandGeneration: 60,
+    })).rejects.toThrow(/superseded/i);
+
+    const deleted = await createActiveStart();
+    await deleted.subject.beginDelete();
+    await expect(deleted.subject.rebaseRejectedRunnerCommand({
+      rejectedCommand: deleted.rejected,
+      currentCommandGeneration: 60,
+    })).rejects.toThrow(/superseded/i);
+  });
+
   it("freezes the implementor profile per Start and invalidates its capability subject on Stop", async () => {
     const subject = createSubject();
     const storage = (subject as unknown as { ctx: { storage: MemoryStorage } }).ctx.storage;

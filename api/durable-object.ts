@@ -3,13 +3,10 @@ import type { Env } from "./types";
 
 type LocationEnv = Pick<Env, "DO_LOCATION_HINT">;
 
-interface NamedDurableObjectNamespace {
-  idFromName(name: string): DurableObjectId;
-  get(
-    id: DurableObjectId,
-    options?: DurableObjectNamespaceGetDurableObjectOptions,
-  ): unknown;
-}
+type NamedDurableObjectNamespace = Pick<
+  DurableObjectNamespace,
+  "getByName" | "idFromName" | "get"
+>;
 
 /** Fail closed on altered placement bindings before a new Durable Object can be created globally. */
 export function durableObjectOptions(
@@ -29,6 +26,12 @@ export function getDurableObjectStub<T>(
   namespace: NamedDurableObjectNamespace,
   name: string,
 ): T {
+  const options = durableObjectOptions(env);
+  if (typeof namespace.getByName === "function") {
+    return namespace.getByName(name, options) as T;
+  }
+  // Keep existing namespace test doubles compatible while production uses the
+  // built-in named lookup above.
   const id = namespace.idFromName(name);
-  return namespace.get(id, durableObjectOptions(env)) as T;
+  return namespace.get(id, options) as T;
 }

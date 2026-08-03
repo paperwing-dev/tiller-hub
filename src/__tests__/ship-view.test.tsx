@@ -10,8 +10,9 @@ vi.mock("../Toast", () => ({
 }));
 
 function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
-  return {
+  const repo: RepoMeta = {
     repoId: "repo-1",
+    artifactStoreGeneration: null,
     repoUrl: "https://github.com/test/repo",
     scmModel: "github",
     githubInstallationId: 98765,
@@ -33,17 +34,19 @@ function makeRepo(overrides: Partial<RepoMeta> = {}): RepoMeta {
     createdAt: "2026-05-01T00:00:00.000Z",
     updatedAt: "2026-05-01T00:00:00.000Z",
     bootstrappedFromRef: "HEAD",
-    ...overrides,
   };
+  return Object.assign(repo, overrides);
 }
 
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
-  return {
+  const env: EnvMeta = {
     slug: "demo-env",
+    incarnationId: "incarnation-1",
     repoUrl: "https://github.com/test/repo",
     repoId: "repo-1",
     scmModel: "github",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
     harnessSettings: null,
     createdAt: "2026-05-01T00:00:00.000Z",
@@ -79,8 +82,8 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
     githubLastPublishedAt: null,
     githubLastPublishedWorkspaceHash: null,
     githubPendingPublish: null,
-    ...overrides,
   };
+  return Object.assign(env, overrides);
 }
 
 function render(env: EnvMeta, repo = makeRepo()) {

@@ -1,4 +1,5 @@
 import {
+  getRunnerCurrentCommandGeneration,
   getRunnerControlErrorCode,
   RunnerBackendControlError,
   type RunnerBackend,
@@ -119,7 +120,24 @@ function normalizeRunnerCommand(
 function wrapHostRunnerError(prefix: string, error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
   const code = getRunnerControlErrorCode(error);
-  if (code) return new RunnerBackendControlError(`${prefix}: ${message}`, code, error);
+  if (code) {
+    const candidate = error && typeof error === "object"
+      ? error as { currentCommandGeneration?: unknown; currentCommandGenerationInvalid?: unknown }
+      : null;
+    const typedGeneration = candidate?.currentCommandGenerationInvalid === true
+      ? null
+      : candidate
+        && "currentCommandGeneration" in candidate
+        && candidate.currentCommandGeneration !== undefined
+        ? candidate.currentCommandGeneration
+        : getRunnerCurrentCommandGeneration(error) ?? undefined;
+    return new RunnerBackendControlError(
+      `${prefix}: ${message}`,
+      code,
+      error,
+      typedGeneration,
+    );
+  }
   if (message === EXISTING_EXECUTION_UNAVAILABLE_MESSAGE) {
     return new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE, { cause: error });
   }
@@ -154,21 +172,25 @@ export async function createHostRunnerBackend(env: Env): Promise<RunnerBackend> 
       options?: RunnerStartOptions,
     ): Promise<EnvMeta> {
       const runnerCommand = normalizeRunnerCommand(options?.runnerCommand, "running", options?.startOpId);
-      const response = await requestHostRunner(env, "create", meta, {
-        envVars,
-        runnerCommand,
-      });
-      const result = parseHostRunnerStatus(response.result);
-      requireRunnerCommandAcknowledgement(result, runnerCommand);
-      if (response.machineId !== meta.executionPlacement.machineId) {
-        throw new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE);
+      try {
+        const response = await requestHostRunner(env, "create", meta, {
+          envVars,
+          runnerCommand,
+        });
+        const result = parseHostRunnerStatus(response.result);
+        requireRunnerCommandAcknowledgement(result, runnerCommand);
+        if (response.machineId !== meta.executionPlacement.machineId) {
+          throw new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE);
+        }
+        const runnerId = result.runnerId ?? meta.runnerId ?? meta.slug;
+        return {
+          ...meta,
+          backend: "host",
+          runnerId,
+        };
+      } catch (error) {
+        throw wrapHostRunnerError("Your machine create failed", error);
       }
-      const runnerId = result.runnerId ?? meta.runnerId ?? meta.slug;
-      return {
-        ...meta,
-        backend: "host",
-        runnerId,
-      };
     },
 
     async getStatus(meta: EnvMeta): Promise<string> {
@@ -191,21 +213,25 @@ export async function createHostRunnerBackend(env: Env): Promise<RunnerBackend> 
       options?: RunnerStartOptions,
     ): Promise<EnvMeta> {
       const runnerCommand = normalizeRunnerCommand(options?.runnerCommand, "running", options?.startOpId);
-      const response = await requestHostRunner(env, "start", meta, {
-        envVars,
-        runnerCommand,
-      });
-      const result = parseHostRunnerStatus(response.result);
-      requireRunnerCommandAcknowledgement(result, runnerCommand);
-      if (response.machineId !== meta.executionPlacement.machineId) {
-        throw new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE);
+      try {
+        const response = await requestHostRunner(env, "start", meta, {
+          envVars,
+          runnerCommand,
+        });
+        const result = parseHostRunnerStatus(response.result);
+        requireRunnerCommandAcknowledgement(result, runnerCommand);
+        if (response.machineId !== meta.executionPlacement.machineId) {
+          throw new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE);
+        }
+        const runnerId = result.runnerId ?? meta.runnerId ?? meta.slug;
+        return {
+          ...meta,
+          backend: "host",
+          runnerId,
+        };
+      } catch (error) {
+        throw wrapHostRunnerError("Your machine start failed", error);
       }
-      const runnerId = result.runnerId ?? meta.runnerId ?? meta.slug;
-      return {
-        ...meta,
-        backend: "host",
-        runnerId,
-      };
     },
 
     async stop(meta: EnvMeta, options?: RunnerStopOptions) {

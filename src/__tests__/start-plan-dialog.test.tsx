@@ -8,6 +8,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Artifact } from "../../api/coordination/types";
 import type { EnvMeta } from "../../api/types";
+import { createInitialEnvScmState } from "../../api/scm/model";
 import StartPlanDialog from "../StartPlanDialog";
 
 const mocks = vi.hoisted(() => ({
@@ -21,7 +22,7 @@ vi.mock("../api", () => ({
 }));
 
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
-  return {
+  const env: EnvMeta = {
     slug: "demo-env",
     incarnationId: "incarnation-1",
     repoUrl: "https://github.com/test/repo",
@@ -33,24 +34,13 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
     createdAt: "2026-05-01T00:00:00.000Z",
     updatedAt: "2026-05-01T00:00:00.000Z",
     status: "stopped",
-    startupPlanId: null,
-    branchName: "tiller/demo-env",
-    branchStatus: "up-to-date",
-    workspaceDirty: false,
-    workspaceNeedsAttention: false,
-    workspaceLastSyncedAt: null,
-    baseMainCommit: "main-a",
-    lastKnownMainCommit: "main-a",
-    scmOperationType: null,
-    scmOperationId: null,
-    scmOperationPhase: null,
-    scmOperationStartedAt: null,
-    scmOperationUpdatedAt: null,
-    scmLastCompletedAt: null,
-    scmLastDurationMs: null,
-    scmLastTimings: null,
-    ...overrides,
+    ...createInitialEnvScmState({
+      slug: "demo-env",
+      branchName: "tiller/demo-env",
+      mainCommit: "main-a",
+    }),
   };
+  return Object.assign(env, overrides);
 }
 
 function makePlan(overrides: Partial<Artifact> = {}): Artifact {

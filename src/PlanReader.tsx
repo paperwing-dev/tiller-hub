@@ -8,12 +8,14 @@ import { renderArtifactBodyMarkdown } from "./plan-artifacts";
 interface PlanReaderProps {
   plan: PlanArtifact | null;
   saving?: boolean;
+  mainUpdating?: boolean;
   onSave?: (markdown: string) => Promise<void>;
 }
 
 export default function PlanReader({
   plan,
   saving = false,
+  mainUpdating = false,
   onSave,
 }: PlanReaderProps) {
   const markdown = plan ? renderArtifactBodyMarkdown(plan.body) : "";
@@ -130,8 +132,11 @@ export default function PlanReader({
           <h1 className="truncate text-lg font-semibold text-kumo-strong">
             {plan.title || "Untitled plan"}
           </h1>
-          <div className="mt-1 text-xs text-kumo-subtle">
-            v{displayVersion} · {formatTimestamp(plan.updatedAt)}
+          <div className="mt-1 flex items-center gap-1 text-xs text-kumo-subtle">
+            <span>v{displayVersion} · {formatTimestamp(plan.updatedAt)}</span>
+            {mainUpdating && (
+              <span role="status" aria-live="polite">· Main updating…</span>
+            )}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">

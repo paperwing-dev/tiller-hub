@@ -33,12 +33,13 @@ vi.mock("../SailingScene", async () => {
 import EnvWaitingView from "../EnvWaitingView";
 
 function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
-  return {
+  const env: EnvMeta = {
     slug: "demo-env",
     incarnationId: "incarnation-1",
     repoUrl: "https://github.com/test/repo",
     repoId: "repo-1",
     backend: "cf",
+    executionPlacement: { backend: "cf", machineId: null },
     harness: "claude-code",
     harnessSettings: null,
     createdAt: "2026-07-16T12:00:00.000Z",
@@ -51,8 +52,8 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
       slug: "demo-env",
       mainCommit: "main-old",
     }),
-    ...overrides,
   };
+  return Object.assign(env, overrides);
 }
 
 function makeSnapshot(

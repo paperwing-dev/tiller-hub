@@ -1,17 +1,22 @@
 # Agents
 
-This folder contains the live hosted chat agents for Tiller.
+This folder contains hosted chat agent classes retained by Tiller.
 
-## Live Agents
+## Retained Agents
 
-- `reviewer-chat-agent.ts` is the legacy hosted Plan Reviewer. New planning reviewer tabs use provider-neutral planner runs and Tiller-owned threads.
+- `reviewer-chat-agent.ts` is the legacy hosted Plan Reviewer. Its Durable Object
+  export and binding remain for deployment-topology compatibility, but no Worker
+  route dispatches requests to it. Current reviewer tabs use provider-neutral
+  planner runs and Tiller-owned threads.
 
 ## Boundaries
 
 - `agent-core/` contains shared model, prompt, workspace, and hosted-tool helpers.
-- `agents/` contains product-facing Durable Object agent classes that are still exposed through `/agents/*`.
+- `agents/` contains retained Durable Object agent classes. `/agents/*` returns
+  `410 Gone` and does not invoke these classes.
 - Plan writer behavior lives under `api/planner/` and persists through the repo-scoped artifact store.
-- Wrangler bindings should exist only for live agent classes exported from `api/index.ts`.
+- Wrangler bindings may remain for compatibility with already-installed Durable
+  Object topology even when the corresponding class is no longer routed.
 
 ## Removed Agents
 

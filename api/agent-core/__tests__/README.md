@@ -1,18 +1,17 @@
 # Agent Core Tests
 
-This folder contains tests for the shared hosted-agent harness.
+This folder contains tests for the hosted-agent harness retained by the
+unrouted `ReviewerChatAgent`.
 
 ## Purpose
 
-These tests cover the reusable pieces in `agent-core/`, such as:
+These tests cover the retained pieces in `agent-core/`, such as:
 
-- tool definitions
+- read-only reviewer tool definitions
 - context building
-- specs
-- Codex language model resolution
+- the reviewer spec
 
 ## Why this folder exists
 
-`agent-core/` is meant to be reusable infrastructure, so it benefits from tests that are grouped and easy to scan as a set.
-
-Keeping these tests under `agent-core/__tests__/` reinforces that `agent-core/` is a coherent subsystem with its own behavior, not just a loose collection of helper files.
+These tests keep the dormant reviewer implementation buildable while its
+Durable Object class remains part of deployment topology.

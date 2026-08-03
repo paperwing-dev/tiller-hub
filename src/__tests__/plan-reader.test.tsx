@@ -66,6 +66,14 @@ describe("PlanReader", () => {
     ]);
   });
 
+  it("shows main refresh progress beneath the plan title", () => {
+    act(() => {
+      root?.render(<PlanReader plan={plan} mainUpdating />);
+    });
+
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Main updating");
+  });
+
   it("edits, saves, and cancels plain Markdown", async () => {
     const onSave = vi.fn(async () => undefined);
     act(() => {

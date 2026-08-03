@@ -71,7 +71,7 @@ describe("SessionView", () => {
     const render = (terminalFastLane: boolean) => renderToString(
       <SessionView
         session={makeSession()}
-        env={{ slug: "demo-env", repoId: "repo-1", status: "running", harness: "codex" }}
+        env={{ slug: "demo-env", repoId: "repo-1", status: "running" }}
         hubUrl="https://example.com"
         onWsMessage={{ current: null }}
         wsSend={{ current: null }}
@@ -88,14 +88,13 @@ describe("SessionView", () => {
     expect(render(true)).toContain('data-harness-input-ready="false"');
   });
 
-  it("does not render the legacy message composer", () => {
+  it("renders the terminal as the session input surface", () => {
     const html = renderToString(
       <SessionView
         session={makeSession()}
         env={{
           slug: "demo-env",
           status: "running",
-          harness: "codex",
         }}
         hubUrl="https://example.com"
         onWsMessage={{ current: null }}
@@ -108,8 +107,8 @@ describe("SessionView", () => {
       />,
     );
 
-    expect(html).not.toContain("Type a message");
-    expect(html).not.toContain(">Send<");
+    expect(html).toContain("terminal");
+    expect(html).not.toContain("<textarea");
   });
 
   it("shows the global CLI install command in the reminder", () => {
@@ -119,7 +118,6 @@ describe("SessionView", () => {
         env={{
           slug: "demo-env",
           status: "running",
-          harness: "codex",
         }}
         hubUrl="https://example.com"
         onWsMessage={{ current: null }}
@@ -143,7 +141,6 @@ describe("SessionView", () => {
         env={{
           slug: "demo-env",
           status: "running",
-          harness: "claude-code",
         }}
         hubUrl="https://example.com"
         onWsMessage={{ current: null }}
@@ -166,7 +163,6 @@ describe("SessionView", () => {
         env={{
           slug: "demo-env",
           status: "starting",
-          harness: "claude-code",
         }}
         hubUrl="https://example.com"
         onWsMessage={{ current: null }}
@@ -192,7 +188,6 @@ describe("SessionView", () => {
         env={{
           slug: "demo-env",
           status: "running",
-          harness: "claude-code",
         }}
         hubUrl="https://example.com"
         onWsMessage={{ current: null }}
@@ -215,7 +210,6 @@ describe("SessionView", () => {
         env={{
           slug: "demo-env",
           status: "saving",
-          harness: "claude-code",
         }}
         hubUrl="https://example.com"
         onWsMessage={{ current: null }}
