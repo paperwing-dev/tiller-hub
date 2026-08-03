@@ -35,12 +35,14 @@ import { resolveCodexBackendReadiness } from "../codex-execution";
 import { readWorkersDevAccessLifecycle } from "../workers-dev-access/records";
 import { readExecutionStatus } from "../execution";
 import { CLOUDFLARE_IDLE_TIMEOUT_DEFAULT_MINUTES } from "../../shared/cloudflare-timeout";
+import { isPlacementRegion, type PlacementRegion } from "../../shared/placement";
 
 export interface SetupStatusPayload {
   needsSetup: boolean;
   setupPhase: "github-app" | "complete";
   isLocalDev: boolean;
   installerManaged: boolean;
+  installationRegion: PlacementRegion | null;
   workersDevHubUrl: string | null;
   modelAuthConfigured: boolean;
   claudeBillingMode: BillingMode | null;
@@ -277,6 +279,11 @@ export async function resolveSetupStatus(
       ? null
       : protection.hubUrl;
   const installerManaged = Boolean(env.TILLER_INSTALLER_SCHEMA?.trim());
+  const installationRegion = !isLocalDev
+    && installerManaged
+    && isPlacementRegion(env.DO_LOCATION_HINT)
+    ? env.DO_LOCATION_HINT
+    : null;
   const githubAppRequired = !isLocalDev;
   // Model, execution, and machine configuration are dashboard onboarding. Only
   // a usable GitHub App installation blocks first entry to the dashboard.
@@ -290,6 +297,7 @@ export async function resolveSetupStatus(
     setupPhase,
     isLocalDev,
     installerManaged,
+    installationRegion,
     workersDevHubUrl,
     modelAuthConfigured,
     claudeBillingMode: billingSelections.claudeBillingMode,

@@ -11,6 +11,7 @@ import type {
   SetExecutionBackendResult,
 } from "../types";
 import { inspectPredeployCleanSlate } from "../predeploy-clean-slate";
+import { getDurableObjectStub } from "../durable-object";
 
 interface ExecutionSettingsStore {
   getExecutionStatus(): Promise<ExecutionStatus>;
@@ -24,8 +25,7 @@ interface ExecutionSettingsStore {
 }
 
 function getStore(env: Env): ExecutionSettingsStore {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as ExecutionSettingsStore;
+  return getDurableObjectStub<ExecutionSettingsStore>(env, env.HUB, "hub");
 }
 
 function noStore(c: { header(name: string, value: string): void }): void {

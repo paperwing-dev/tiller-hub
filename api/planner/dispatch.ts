@@ -50,6 +50,7 @@ import {
   resolveNewExecutionPlacement,
   selectionToPlacement,
 } from "../execution";
+import { getDurableObjectStub } from "../durable-object";
 
 // Dispatches one-shot reviewer runs to disposable containers. The run row is the
 // complete job record before dispatch; the container reports back through the
@@ -91,8 +92,7 @@ function runtimeStatus(value: unknown): string | null {
 }
 
 function getHub(env: Env): HubRunnerControl {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as HubRunnerControl;
+  return getDurableObjectStub<HubRunnerControl>(env, env.HUB, "hub");
 }
 
 export function plannerJobSlug(runId: string): string {

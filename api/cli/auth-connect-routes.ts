@@ -3,6 +3,7 @@ import { CompactEncrypt, importJWK, type JWK } from "jose";
 import type { AuthConnectProvider, CodexConnectBoundaryResult } from "../codex-auth-coordinator";
 import { invalidateConfigCache } from "../setup/config";
 import type { Env, HonoEnv } from "../types";
+import { getDurableObjectStub } from "../durable-object";
 
 const MAX_PACKAGE_BODY_BYTES = 8 * 1_024;
 const MAX_UPLOAD_BODY_BYTES = 64 * 1_024;
@@ -31,11 +32,11 @@ interface HubConfigStub {
 }
 
 function authStub(env: Env): AuthConnectStub {
-  return env.CODEX_AUTH.get(env.CODEX_AUTH.idFromName("codex-auth")) as unknown as AuthConnectStub;
+  return getDurableObjectStub<AuthConnectStub>(env, env.CODEX_AUTH, "codex-auth");
 }
 
 function hubStub(env: Env): HubConfigStub {
-  return env.HUB.get(env.HUB.idFromName("hub")) as unknown as HubConfigStub;
+  return getDurableObjectStub<HubConfigStub>(env, env.HUB, "hub");
 }
 
 function setNoStore(c: Context<HonoEnv>): void {

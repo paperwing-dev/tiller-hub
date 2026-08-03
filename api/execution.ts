@@ -11,6 +11,7 @@ import type {
   SetExecutionBackendResult,
 } from "./types";
 import { classifyHostRuntimeCompatibility } from "./setup/runtime-compatibility";
+import { getDurableObjectStub } from "./durable-object";
 
 export const EXECUTION_SELECTION_KEY = "__private:execution_selection:v1";
 export const EXECUTION_MIGRATION_KEY = "__private:execution_configuration_migration:v1";
@@ -247,8 +248,7 @@ export function readExecutionStatus(env: Env): Promise<ExecutionStatus> {
 }
 
 function getExecutionPlacementStore(env: Env): ExecutionPlacementStore {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as ExecutionPlacementStore;
+  return getDurableObjectStub<ExecutionPlacementStore>(env, env.HUB, "hub");
 }
 
 /** Linearizable choice point for a brand-new durable workload only. */

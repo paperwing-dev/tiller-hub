@@ -229,6 +229,7 @@ describe("Worker dynamic entrypoints", () => {
   it("requires Access auth on /agents after workers.dev Access is configured", async () => {
     const env = mockEnv({
       HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+      DO_LOCATION_HINT: "wnam",
     }, canonicalTrust);
 
     const missing = await worker.fetch(
@@ -253,6 +254,7 @@ describe("Worker dynamic entrypoints", () => {
     expect(authed.status).toBe(200);
     await expect(authed.text()).resolves.toBe("agent ok");
     expect(routeAgentRequest).toHaveBeenCalledTimes(1);
+    expect(routeAgentRequest.mock.calls[0]?.[2]).toEqual({ locationHint: "wnam" });
   });
 
   it("exposes the installer probe only to the exact Access service principal", async () => {

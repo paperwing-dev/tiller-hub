@@ -44,6 +44,7 @@ import {
   type LegacyCustomDomainCleanupManifestV1,
 } from "./execution";
 import { inspectPredeployCleanSlate } from "./predeploy-clean-slate";
+import { getDurableObjectStub } from "./durable-object";
 import {
   applySessionEnvPatch,
   normalizeSessionEnvPatch,
@@ -1676,8 +1677,11 @@ export class HubDO extends Server<Env> {
 
   private getSessionThreadStub(sessionId: string): ThreadDO | null {
     if (!this.env.THREAD) return null;
-    const id = this.env.THREAD.idFromName(this.getSessionThreadId(sessionId));
-    return this.env.THREAD.get(id) as unknown as ThreadDO;
+    return getDurableObjectStub<ThreadDO>(
+      this.env,
+      this.env.THREAD,
+      this.getSessionThreadId(sessionId),
+    );
   }
 
   private threadMessageToStoredMessage(sessionId: string, message: ThreadMessage): StoredMessage {

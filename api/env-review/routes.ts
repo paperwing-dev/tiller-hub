@@ -47,6 +47,7 @@ import {
 import { assignSkillOverview, readIncludedSkillReports } from "./skill-orchestration";
 import { buildEnvReviewPrompt } from "./context";
 import { backendSelectionRemovedError } from "../execution";
+import { getDurableObjectStub } from "../durable-object";
 
 const PREPARATION_WAIT_MS = 130_000;
 const MAX_UPLOAD_METADATA_BYTES = 200_000;
@@ -58,8 +59,7 @@ interface HubSessionLookup {
 }
 
 function getHub(env: Env): HubSessionLookup {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as HubDO & HubSessionLookup;
+  return getDurableObjectStub<HubDO & HubSessionLookup>(env, env.HUB, "hub");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

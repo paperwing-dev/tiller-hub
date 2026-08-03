@@ -75,6 +75,7 @@ import { cleanupGitHubPublishRuntime } from "./github/publish-runtime";
 import { revokeGitHubBridgesForEnvPublish } from "./github/bridge";
 import { resolveCanonicalHubOrigin } from "./canonical-origin";
 import { isLoopbackHostname } from "../shared/local-dev";
+import { getDurableObjectStub } from "./durable-object";
 
 const MUTABLE_STATE_KEY = "env-mutable-state";
 const ENV_SLUG_KEY = "env-slug";
@@ -787,10 +788,9 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     await persistEnvSummary(this.env, meta);
     if (!shouldBroadcast) return meta;
 
-    const hubId = this.env.HUB.idFromName("hub");
-    const hub = this.env.HUB.get(hubId) as unknown as {
+    const hub = getDurableObjectStub<{
       broadcastEnvUpsert: (env: EnvMeta) => Promise<void> | void;
-    };
+    }>(this.env, this.env.HUB, "hub");
     await hub.broadcastEnvUpsert(projectEnvSummary(meta));
     await this.confirmProjectionDelivery(projectionVersion!);
     return meta;
@@ -4045,8 +4045,11 @@ export class EnvLifecycleDO extends DurableObject<Env> {
   }
 
   private getScheduledRunCapacityStub(): ScheduledRunCapacityDO {
-    const id = this.env.SCHEDULED_RUN_CAPACITY.idFromName("scheduled-runs");
-    return this.env.SCHEDULED_RUN_CAPACITY.get(id) as unknown as ScheduledRunCapacityDO;
+    return getDurableObjectStub<ScheduledRunCapacityDO>(
+      this.env,
+      this.env.SCHEDULED_RUN_CAPACITY,
+      "scheduled-runs",
+    );
   }
 
   private alarmExecutionContext(): ExecutionContext {

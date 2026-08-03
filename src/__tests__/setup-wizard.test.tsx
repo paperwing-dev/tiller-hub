@@ -9,6 +9,7 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     setupPhase: "github-app",
     isLocalDev: false,
     installerManaged: false,
+    installationRegion: null,
     workersDevHubUrl: "https://demo.preview.workers.dev",
     modelAuthConfigured: false,
     claudeBillingMode: null,

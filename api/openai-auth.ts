@@ -3,6 +3,7 @@ import type {
   CodexRuntimeAuthBoundaryResult,
 } from "./codex-auth-coordinator";
 import type { Env } from "./types";
+import { getDurableObjectStub } from "./durable-object";
 
 interface CodexAuthStub {
   exchangeCodexRuntimeAuth(rejectedAccessTokenSha256?: string): Promise<CodexRuntimeAuthBoundaryResult>;
@@ -10,8 +11,7 @@ interface CodexAuthStub {
 }
 
 function codexAuth(env: Env): CodexAuthStub {
-  const id = env.CODEX_AUTH.idFromName("codex-auth");
-  return env.CODEX_AUTH.get(id) as unknown as CodexAuthStub;
+  return getDurableObjectStub<CodexAuthStub>(env, env.CODEX_AUTH, "codex-auth");
 }
 
 export function exchangeOpenAIRuntimeAuth(

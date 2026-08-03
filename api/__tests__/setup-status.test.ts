@@ -299,6 +299,7 @@ describe("GET /api/setup/status", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(body.workersDevHubUrl).toBe("https://tiller.demo.workers.dev");
     expect(body.installerManaged).toBe(true);
+    expect(body.installationRegion).toBe(null);
     expect(body.tokenExpiresAt).toBe("2027-07-17T00:00:00.000Z");
     expect(body.renewalRecommended).toBe(false);
     expect(body).not.toHaveProperty("deploymentMode");
@@ -306,6 +307,27 @@ describe("GET /api/setup/status", () => {
     expect(body).not.toHaveProperty("selfHostStatus");
     expect(body).not.toHaveProperty("routeKind");
     expect(body).not.toHaveProperty("workerServiceName");
+  });
+
+  it("reports only a validated live regional placement for installer-managed production", async () => {
+    for (const [extra, expected] of [
+      [{ DO_LOCATION_HINT: "wnam" }, "wnam"],
+    ] as const) {
+      const response = await createApp().request(
+        "https://demo.preview.workers.dev/api/setup/status",
+        { method: "GET" },
+        createEnv(extra),
+      );
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ installationRegion: expected });
+    }
+
+    const local = await createApp().request(
+      "http://localhost:5173/api/setup/status",
+      { method: "GET" },
+      createEnv({ DO_LOCATION_HINT: "wnam", LOCAL_DEV_ONLY_BACKEND: "1" }),
+    );
+    await expect(local.json()).resolves.toMatchObject({ installationRegion: null });
   });
 
   it("exposes binding-based Access renewal readiness to installer-managed owners", async () => {
@@ -332,6 +354,7 @@ describe("GET /api/setup/status", () => {
       { method: "GET" },
       createEnv({
         TILLER_INSTALLER_SCHEMA: undefined,
+        DO_LOCATION_HINT: "wnam",
         ...maintainerDevAccessBindings({ tokenExpiresAt }),
       }),
     );
@@ -339,6 +362,7 @@ describe("GET /api/setup/status", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       installerManaged: false,
+      installationRegion: null,
       tokenExpiresAt,
       renewalRecommended: false,
     });

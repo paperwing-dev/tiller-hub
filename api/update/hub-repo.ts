@@ -15,6 +15,7 @@ import type {
   HubUpdateRepoDetected,
   HubUpdateRepoState,
 } from "./types";
+import { getDurableObjectStub } from "../durable-object";
 
 const CONFIG_KEYS = {
   status: "HUB_UPDATE_REPO_STATUS",
@@ -44,8 +45,7 @@ interface GitHubContentResponse {
 }
 
 function getConfigStore(env: Env): ConfigStore {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as ConfigStore;
+  return getDurableObjectStub<ConfigStore>(env, env.HUB, "hub");
 }
 
 function nowIso(): string {

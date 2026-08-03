@@ -17,6 +17,7 @@ import { deleteReviewSnapshotArtifacts } from "../env-review/snapshots";
 import { requireExplicitStoredEnvMeta } from "../sync/projectors";
 import { listManagedSessionIdsForEnv } from "../session-attachment";
 import { revokeGitHubBridgesForInteractiveEnv } from "../github/bridge";
+import { getDurableObjectStub } from "../durable-object";
 
 export { buildEnvMetaFromLayers } from "./state";
 export { envExists, envSlugReserved, listEnvViews, loadEnvView } from "./view";
@@ -36,8 +37,7 @@ export function getHub(
   | "revokeCloudflareMcpProxyTokenForStart"
   | "revokeCloudflareMcpProxyTokensForStart"
 > {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as Pick<
+  return getDurableObjectStub<Pick<
     HubDO,
     | "broadcastEnvUpsert"
     | "broadcastEnvRemove"
@@ -49,7 +49,7 @@ export function getHub(
     | "revokeCloudflareMcpProxyTokensForEnv"
     | "revokeCloudflareMcpProxyTokenForStart"
     | "revokeCloudflareMcpProxyTokensForStart"
-  >;
+  >>(env, env.HUB, "hub");
 }
 
 export async function revokeCloudflareMcpProxyTokensForStartBestEffort(

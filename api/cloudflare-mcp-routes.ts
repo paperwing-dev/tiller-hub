@@ -3,6 +3,7 @@ import type { Context } from "hono";
 import type { HonoEnv } from "./types";
 import type { HubDO } from "./hub";
 import { proxyCloudflareMcpRequest, type CloudflareMcpProxyHub } from "./cloudflare-mcp";
+import { getDurableObjectStub } from "./durable-object";
 
 type CloudflareMcpHub = Pick<
   HubDO,
@@ -12,8 +13,7 @@ type CloudflareMcpHub = Pick<
 >;
 
 function getHub(env: HonoEnv["Bindings"]): CloudflareMcpHub {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as CloudflareMcpHub;
+  return getDurableObjectStub<CloudflareMcpHub>(env, env.HUB, "hub");
 }
 
 const cloudflareMcpRoutes = new Hono<HonoEnv>();

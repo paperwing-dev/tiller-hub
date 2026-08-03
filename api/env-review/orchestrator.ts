@@ -35,6 +35,7 @@ import type {
   EnvReviewSnapshotMode,
 } from "./types";
 import { assignSkillOverview, finalizeSuccessfulReviewOutput } from "./skill-orchestration";
+import { getDurableObjectStub } from "../durable-object";
 
 const ACTIVE_SYNC_TIMEOUT_MS = 130_000;
 
@@ -54,8 +55,7 @@ interface HubEnvReviewSnapshotSender {
 }
 
 function getHub(env: Env): HubEnvReviewSnapshotSender {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as HubDO & HubEnvReviewSnapshotSender;
+  return getDurableObjectStub<HubDO & HubEnvReviewSnapshotSender>(env, env.HUB, "hub");
 }
 
 function nowIso(): string {

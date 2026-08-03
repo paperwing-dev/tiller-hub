@@ -41,6 +41,7 @@ import {
 } from "../codex-runtime-auth";
 import { parseReviewerRuntimeEventBatch } from "../reviewer-runtime-events";
 import { loadTrackedRepo } from "../repo/access";
+import { getDurableObjectStub } from "../durable-object";
 
 // Callback surface for one-shot reviewer containers and Plan Writer supervisors. Every route requires the
 // run-scoped HMAC token: edge auth (CF Access service token or browser JWT)
@@ -112,11 +113,10 @@ async function loadAuthorizedPlanWriter(c: any, runtimeAuth = false) {
 
 async function broadcastPlanWriterHints(c: any, repoId: string, planArtifactId: string, artifactUpdated: boolean) {
   try {
-    const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId) as unknown as {
+    const hub = getDurableObjectStub<{
       broadcastPlanWriterState(repoId: string, planArtifactId: string): void | Promise<void>;
       broadcastPlanArtifactUpdated(repoId: string, planArtifactId: string): void | Promise<void>;
-    };
+    }>(c.env, c.env.HUB, "hub");
     await hub.broadcastPlanWriterState(repoId, planArtifactId);
     if (artifactUpdated) await hub.broadcastPlanArtifactUpdated(repoId, planArtifactId);
   } catch {
@@ -458,10 +458,9 @@ plannerRuntimeRoutes.post(
     }
     const terminalId = planWriterTerminalId(loaded.repoId, loaded.planArtifactId, loaded.generation);
     try {
-      const hubId = c.env.HUB.idFromName("hub");
-      const hub = c.env.HUB.get(hubId) as unknown as {
+      const hub = getDurableObjectStub<{
         revokePlanWriterTerminal(id: string, repoId: string, planArtifactId: string, generation: number): void | Promise<void>;
-      };
+      }>(c.env, c.env.HUB, "hub");
       await hub.revokePlanWriterTerminal(terminalId, loaded.repoId, loaded.planArtifactId, loaded.generation);
     } catch {
       // The PTY may not have registered before a startup cancellation.

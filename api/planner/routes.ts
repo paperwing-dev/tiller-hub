@@ -64,6 +64,7 @@ import {
   isCurrentLaunchProvenance,
   isCurrentPlanWriterRuntimeProvenance,
 } from "../coordination/execution-provenance";
+import { getDurableObjectStub } from "../durable-object";
 
 const STALE_ACTIVE_RUN_MS = 15 * 60 * 1000;
 const STALE_RUN_ERROR = "Reviewer run timed out without reporting a result.";
@@ -75,10 +76,9 @@ function isEditablePlanStatus(status: unknown): boolean {
 
 async function broadcastWriterStateHint(c: any, repoId: string, planArtifactId: string): Promise<void> {
   try {
-    const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId) as unknown as {
+    const hub = getDurableObjectStub<{
       broadcastPlanWriterState(repoId: string, planArtifactId: string): void | Promise<void>;
-    };
+    }>(c.env, c.env.HUB, "hub");
     await hub.broadcastPlanWriterState(repoId, planArtifactId);
   } catch {
     // Hints are lossy; clients reconcile authoritative state on reconnect.
@@ -87,10 +87,9 @@ async function broadcastWriterStateHint(c: any, repoId: string, planArtifactId: 
 
 async function broadcastPlanArtifactHint(c: any, repoId: string, planArtifactId: string): Promise<void> {
   try {
-    const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId) as unknown as {
+    const hub = getDurableObjectStub<{
       broadcastPlanArtifactUpdated(repoId: string, planArtifactId: string): void | Promise<void>;
-    };
+    }>(c.env, c.env.HUB, "hub");
     await hub.broadcastPlanArtifactUpdated(repoId, planArtifactId);
   } catch {
     // Hints are lossy; clients reconcile authoritative state on reconnect.
@@ -970,10 +969,9 @@ plannerRoutes.post("/api/repos/:repoId/plans/:planArtifactId/live-writer/stop", 
   }
   const writer = fenced.writer!;
   try {
-    const hubId = c.env.HUB.idFromName("hub");
-    const hub = c.env.HUB.get(hubId) as unknown as {
+    const hub = getDurableObjectStub<{
       revokePlanWriterTerminal(sessionId: string, repoId: string, planArtifactId: string, generation: number): void | Promise<void>;
-    };
+    }>(c.env, c.env.HUB, "hub");
     await hub.revokePlanWriterTerminal(
       planWriterTerminalId(loaded.repoId, loaded.plan.id, expectedGeneration as number),
       loaded.repoId,

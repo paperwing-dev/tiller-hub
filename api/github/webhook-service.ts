@@ -12,6 +12,7 @@ import { handleGitHubDraftPrPublishResult } from "./env-publish-service";
 import { adoptionPayload, hmacHex } from "./adoption";
 import { mintGitHubInstallationToken } from "./app";
 import { canonicalizeGitHubRepo, githubRepoUrlFromFullName } from "./repo";
+import { getDurableObjectStub } from "../durable-object";
 
 type RouteResult = { status: number; body: Record<string, unknown> };
 
@@ -25,8 +26,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function getHubConfigStore(env: Env): HubWebhookConfigStore {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as HubWebhookConfigStore;
+  return getDurableObjectStub<HubWebhookConfigStore>(env, env.HUB, "hub");
 }
 
 function nowIso(): string {

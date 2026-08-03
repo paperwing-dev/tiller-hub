@@ -67,6 +67,7 @@ import type {
   UpdateCheckResult,
 } from "../api/update/types";
 import type { BillingMode } from "../shared/billing";
+import { isPlacementRegion, type PlacementRegion } from "../shared/placement";
 import { TerminalRecoveryOverflowError } from "./terminal-recovery";
 
 const HOSTED_AGENT_IDS = [
@@ -1176,6 +1177,7 @@ const SETUP_STATUS_KEYS = [
   ...SETUP_BOOLEAN_FIELDS,
   "setupPhase",
   "workersDevHubUrl",
+  "installationRegion",
   "claudeBillingMode",
   "openaiBillingMode",
   "chatgptAuthStatus",
@@ -1221,6 +1223,7 @@ function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void
       value !== "claude-code" && value !== "codex" && value !== "opencode"
     )
     || !isCloudflareIdleTimeoutMinutes(payload.idleTimeoutMinutes)
+    || (payload.installationRegion !== null && !isPlacementRegion(payload.installationRegion))
     || typeof payload.githubAppManageUrl !== "string"
     || !isRecord(payload.codexBackendReadiness)
     || !isCodexRouteStatus(payload.codexRouteStatus)
@@ -3195,6 +3198,7 @@ export interface SetupStatus {
   setupPhase: "github-app" | "complete";
   isLocalDev: boolean;
   installerManaged: boolean;
+  installationRegion: PlacementRegion | null;
   workersDevHubUrl: string | null;
   modelAuthConfigured: boolean;
   claudeBillingMode: BillingMode | null;

@@ -13,6 +13,7 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
     setupPhase: "complete",
     isLocalDev: false,
     installerManaged: false,
+    installationRegion: null,
     workersDevHubUrl: "https://demo.preview.workers.dev",
     modelAuthConfigured: true,
     claudeBillingMode: "subscription",
@@ -107,7 +108,7 @@ describe("Global Settings", () => {
     expect(html).not.toContain("Canonical main history depth");
   });
 
-  it("keeps only the Cloudflare idle timeout behind Advanced", async () => {
+  it("keeps Cloudflare installation and idle-timeout details behind Advanced", async () => {
     const { default: SettingsPage, IdleTimeoutRow } = await import("../SettingsPage");
     const html = renderToString(
       <SettingsPage status={baseStatus()} onDone={() => undefined} onRefresh={async () => undefined} />,
@@ -126,6 +127,26 @@ describe("Global Settings", () => {
     expect(idleTimeoutHtml).toContain("Cloudflare environments and newly started Cloudflare Plan Writers");
     expect(idleTimeoutHtml).toContain("does not affect workloads on Your machine");
     expect(idleTimeoutHtml).not.toContain("Canonical main history depth");
+  });
+
+  it("shows regional and legacy installer placement without a change action", async () => {
+    const {
+      InstallationRegionRow,
+      shouldShowInstallationRegion,
+    } = await import("../SettingsPage");
+    const regional = renderToString(<InstallationRegionRow region="wnam" />);
+    const automatic = renderToString(<InstallationRegionRow region={null} />);
+
+    expect(regional).toContain("Installation region");
+    expect(regional).toContain("Western North America (WNAM)");
+    expect(regional).toContain("Chosen during installation. Reinstall Tiller to change it.");
+    expect(regional).not.toContain("<button");
+    expect(automatic).toContain("Automatic (Cloudflare-managed)");
+    expect(automatic).toContain("Reinstall Tiller to select a region.");
+    expect(automatic).not.toContain("<button");
+    expect(shouldShowInstallationRegion({ installerManaged: true, isLocalDev: false })).toBe(true);
+    expect(shouldShowInstallationRegion({ installerManaged: false, isLocalDev: false })).toBe(false);
+    expect(shouldShowInstallationRegion({ installerManaged: true, isLocalDev: true })).toBe(false);
   });
 
   it("keeps Codex subscription actions on the subscription row", async () => {

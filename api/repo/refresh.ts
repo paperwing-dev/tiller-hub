@@ -1,4 +1,5 @@
 import type { HubDO } from "../hub";
+import { getDurableObjectStub } from "../durable-object";
 import {
   patchRepoDefaultHeadIfCurrent,
   readGitHubDefaultBranchState,
@@ -25,8 +26,7 @@ export interface GitHubDefaultBranchRefreshResult {
 type RepoRefreshHub = Pick<HubDO, "broadcastRepoUpsert" | "broadcastRepoMainChange">;
 
 function getHub(env: Env): RepoRefreshHub {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as RepoRefreshHub;
+  return getDurableObjectStub<RepoRefreshHub>(env, env.HUB, "hub");
 }
 
 function successResult(args: {

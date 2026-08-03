@@ -8,6 +8,7 @@ import {
 import type { HubDO } from "../hub";
 import type { Env } from "../types";
 import { KIMI_K2_7_CODE } from "../../shared/harness-catalog";
+import { getDurableObjectStub } from "../durable-object";
 
 // ── Hub stub type ───────────────────────────────────────────────────
 
@@ -370,8 +371,7 @@ export class TillerVoice extends VoiceAgent<Env> {
   // --- Hub helper ---
 
   #getHub(): HubStub {
-    const id = this.env.HUB.idFromName("hub");
-    return this.env.HUB.get(id) as unknown as HubStub;
+    return getDurableObjectStub<HubStub>(this.env, this.env.HUB, "hub");
   }
 
   #extractToolCall(result: unknown): ToolCall | null {

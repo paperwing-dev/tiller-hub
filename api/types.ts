@@ -34,6 +34,7 @@ export interface Env {
   TILLER_INSTALLATION_ID?: string;
   TILLER_RELEASE_ID?: string;
   TILLER_WORKERS_DEV_HOSTNAME?: string;
+  DO_LOCATION_HINT?: string;
   CF_ACCESS_ISSUER?: string;
   CF_ACCESS_AUDIENCE?: string;
   CF_ACCESS_IDENTITY_PROVIDER_ID?: string;

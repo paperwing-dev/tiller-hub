@@ -21,6 +21,7 @@ import { canonicalizeGitHubRepo } from "../github/repo";
 import { mintEnvReviewRunToken } from "./runtime-token";
 import type { EnvReviewDO } from "./env-review-do";
 import type { EnvReviewRun } from "./types";
+import { getDurableObjectStub } from "../durable-object";
 
 interface HubRunnerControl {
   requestLocalRunner(
@@ -32,8 +33,7 @@ interface HubRunnerControl {
 }
 
 function getHub(env: Env): HubRunnerControl {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as HubDO & HubRunnerControl;
+  return getDurableObjectStub<HubDO & HubRunnerControl>(env, env.HUB, "hub");
 }
 
 export function envReviewJobSlug(runId: string): string {

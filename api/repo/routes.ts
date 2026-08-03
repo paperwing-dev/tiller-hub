@@ -37,6 +37,7 @@ import {
   type CloudflareMcpStatus,
 } from "../cloudflare-mcp";
 import { resolveCanonicalRequestOrigin } from "../canonical-origin";
+import { getDurableObjectStub } from "../durable-object";
 
 const repoRoutes = new Hono<HonoEnv>();
 type RepoWorkspaceHandle = RepoWorkspace;
@@ -70,8 +71,7 @@ async function broadcastRepoSummary(
   env: Env,
   repo: RepoMeta,
 ): Promise<void> {
-  const hubId = env.HUB.idFromName("hub");
-  const hub = env.HUB.get(hubId) as unknown as Pick<HubDO, "broadcastRepoUpsert">;
+  const hub = getDurableObjectStub<Pick<HubDO, "broadcastRepoUpsert">>(env, env.HUB, "hub");
   await hub.broadcastRepoUpsert(projectRepoSummary(repo));
 }
 
@@ -363,8 +363,7 @@ repoRoutes.post("/api/repos/:repoId/artifacts", async (c) => {
 });
 
 function getHub(env: Env): RepoHub {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as RepoHub;
+  return getDurableObjectStub<RepoHub>(env, env.HUB, "hub");
 }
 
 function sessionEnvJson(body: unknown, status = 200): Response {

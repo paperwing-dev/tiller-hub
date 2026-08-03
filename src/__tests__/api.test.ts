@@ -787,60 +787,63 @@ describe("single-object api helpers", () => {
   });
 
   it("accepts only the complete current workers.dev onboarding schema", async () => {
+    const payload = {
+      needsSetup: true,
+      setupPhase: "github-app",
+      isLocalDev: false,
+      installerManaged: true,
+      installationRegion: "wnam",
+      workersDevHubUrl: "https://demo.preview.workers.dev",
+      modelAuthConfigured: false,
+      claudeBillingMode: null,
+      openaiBillingMode: null,
+      workersAiConfigured: false,
+      hasClaudeSubscription: false,
+      hasAnthropicKey: false,
+      hasChatGPTAuth: false,
+      chatgptAuthStatus: "missing",
+      hasOpenAIKey: false,
+      codexRouteStatus: "unavailable",
+      openaiPlannerConfigured: false,
+      openaiPlannerAvailable: false,
+      openaiPlannerRoute: null,
+      openaiPlannerReason: null,
+      codexBackendReadiness: { cf: "unavailable", host: "unavailable" },
+      hostRegistered: false,
+      enabledHarnesses: ["claude-code", "codex", "opencode"],
+      protectionMode: "cf-access",
+      tokenExpiresAt: null,
+      renewalRecommended: false,
+      hostConnected: false,
+      idleTimeoutMinutes: 15,
+      githubAppAvailable: false,
+      githubAppConfigured: false,
+      githubAppReady: false,
+      githubAppSlug: null,
+      githubAppInstallUrl: null,
+      githubAppManageUrl: "https://github.com/settings/installations",
+      githubAppPublicHubDisabled: true,
+      buildDiagnostics: {
+        channel: "release",
+        version: "0.2.36",
+        workersCiCommitSha: null,
+        workersCiBranch: null,
+      },
+      selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
+      dashboardOnboarding: {
+        dismissed: false,
+        executionReady: true,
+      },
+    };
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({
-        needsSetup: true,
-        setupPhase: "github-app",
-        isLocalDev: false,
-        installerManaged: true,
-        workersDevHubUrl: "https://demo.preview.workers.dev",
-        modelAuthConfigured: false,
-        claudeBillingMode: null,
-        openaiBillingMode: null,
-        workersAiConfigured: false,
-        hasClaudeSubscription: false,
-        hasAnthropicKey: false,
-        hasChatGPTAuth: false,
-        chatgptAuthStatus: "missing",
-        hasOpenAIKey: false,
-        codexRouteStatus: "unavailable",
-        openaiPlannerConfigured: false,
-        openaiPlannerAvailable: false,
-        openaiPlannerRoute: null,
-        openaiPlannerReason: null,
-        codexBackendReadiness: { cf: "unavailable", host: "unavailable" },
-        hostRegistered: false,
-        enabledHarnesses: ["claude-code", "codex", "opencode"],
-        protectionMode: "cf-access",
-        tokenExpiresAt: null,
-        renewalRecommended: false,
-        hostConnected: false,
-        idleTimeoutMinutes: 15,
-        githubAppAvailable: false,
-        githubAppConfigured: false,
-        githubAppReady: false,
-        githubAppSlug: null,
-        githubAppInstallUrl: null,
-        githubAppManageUrl: "https://github.com/settings/installations",
-        githubAppPublicHubDisabled: true,
-        buildDiagnostics: {
-          channel: "release",
-          version: "0.2.36",
-          workersCiCommitSha: null,
-          workersCiBranch: null,
-        },
-        selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
-        dashboardOnboarding: {
-          dismissed: false,
-          executionReady: true,
-        },
-      }), { status: 200 }),
+      new Response(JSON.stringify(payload), { status: 200 }),
     );
 
     await expect(fetchSetupStatus("https://demo.preview.workers.dev"))
       .resolves.toMatchObject({
         setupPhase: "github-app",
         installerManaged: true,
+        installationRegion: "wnam",
         workersDevHubUrl: "https://demo.preview.workers.dev",
         enabledHarnesses: ["claude-code", "codex", "opencode"],
       });
@@ -848,6 +851,12 @@ describe("single-object api helpers", () => {
       "https://demo.preview.workers.dev/api/setup/status",
       expect.objectContaining({ cache: "no-store" }),
     );
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...payload,
+      installationRegion: "WNAM",
+    }), { status: 200 }));
+    await expect(fetchSetupStatus("https://demo.preview.workers.dev"))
+      .rejects.toThrow("Malformed setup status");
   });
 
   it("rejects removed custom-domain setup fields instead of normalizing them", async () => {

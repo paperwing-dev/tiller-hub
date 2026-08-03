@@ -29,6 +29,7 @@ import {
   CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES,
   isCloudflareIdleTimeoutMinutes,
 } from "../shared/cloudflare-timeout";
+import { placementRegionDefinition } from "../shared/placement";
 
 const HUB_URL = window.location.origin;
 
@@ -36,6 +37,12 @@ interface SettingsPageProps {
   status: SetupStatus;
   onDone: () => void;
   onRefresh: () => Promise<void>;
+}
+
+export function shouldShowInstallationRegion(
+  status: Pick<SetupStatus, "installerManaged" | "isLocalDev">,
+): boolean {
+  return status.installerManaged && !status.isLocalDev;
 }
 
 function Card({
@@ -619,6 +626,29 @@ export function IdleTimeoutRow({
   );
 }
 
+export function InstallationRegionRow({
+  region,
+}: {
+  region: SetupStatus["installationRegion"];
+}) {
+  const definition = region ? placementRegionDefinition(region) : null;
+  return (
+    <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
+      <p className="text-sm font-semibold text-kumo-default">Installation region</p>
+      <p className="mt-2 text-sm text-kumo-strong">
+        {definition
+          ? `${definition.label} (${definition.code})`
+          : "Automatic (Cloudflare-managed)"}
+      </p>
+      <p className="mt-1 text-xs text-kumo-subtle">
+        {definition
+          ? "Chosen during installation. Reinstall Tiller to change it."
+          : "This legacy installation uses Cloudflare-managed placement. Reinstall Tiller to select a region."}
+      </p>
+    </div>
+  );
+}
+
 function ExecutionBackendCard({ canonicalHubUrl }: { canonicalHubUrl: string }) {
   const [execution, setExecution] = useState<ExecutionStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1051,6 +1081,14 @@ export default function SettingsPage({
           </div>
           {advancedOpen && (
             <div className="mt-4 grid gap-3">
+              {shouldShowInstallationRegion(status) && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">Installation</p>
+                  <div className="mt-3 grid gap-3">
+                    <InstallationRegionRow region={status.installationRegion} />
+                  </div>
+                </div>
+              )}
               <div>
                 <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">Cloudflare auto-stop</p>
                 <div className="mt-3 grid gap-3">

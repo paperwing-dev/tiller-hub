@@ -2,6 +2,7 @@ import type {
   Env,
   HostServiceRegistration,
 } from "./types";
+import { getDurableObjectStub } from "./durable-object";
 
 type HubServiceRegistry = {
   getHostService(machineId?: string | null): HostServiceRegistration | null | Promise<HostServiceRegistration | null>;
@@ -11,8 +12,7 @@ type HubServiceRegistry = {
 
 function getHub(env: Env): HubServiceRegistry | null {
   if (!env.HUB) return null;
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as HubServiceRegistry;
+  return getDurableObjectStub<HubServiceRegistry>(env, env.HUB, "hub");
 }
 
 function normalizeHostService(service: HostServiceRegistration | null | undefined): HostServiceRegistration | null {

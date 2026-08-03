@@ -39,6 +39,7 @@ import {
 import { planWriterTerminalId } from "./planner/plan-writer-contract";
 import { canonicalIngressResponse } from "./canonical-origin";
 import { loadTrackedRepo } from "./repo/access";
+import { durableObjectOptions, getDurableObjectStub } from "./durable-object";
 export { TillerVoice } from "./voice/agent";
 export { EnvLifecycleDO } from "./env-lifecycle-do";
 export { ScheduledRunCapacityDO } from "./scheduled-run-capacity-do";
@@ -77,8 +78,7 @@ type HubStub = Pick<
 >;
 
 function getHub(env: Env): HubStub {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as HubStub;
+  return getDurableObjectStub<HubStub>(env, env.HUB, "hub");
 }
 
 // ── Hono app ────────────────────────────────────────────────────────
@@ -620,7 +620,7 @@ export default {
     if (url.pathname.startsWith("/agents/")) {
       const blocked = await dynamicEntrypointAuthResponse(req, env);
       if (blocked) return blocked;
-      const agentResp = await routeAgentRequest(req, env);
+      const agentResp = await routeAgentRequest(req, env, durableObjectOptions(env));
       if (agentResp) return agentResp;
     }
     const isPartyWs =

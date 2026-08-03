@@ -15,6 +15,7 @@ import {
   isCloudflareIdleTimeoutMinutes,
 } from "../../shared/cloudflare-timeout";
 import { normalizeBillingMode, type BillingMode } from "../../shared/billing";
+import { getDurableObjectStub } from "../durable-object";
 
 // Keys that can be managed via the settings page.
 const CONFIGURABLE_KEYS = new Set([
@@ -29,10 +30,9 @@ const CONFIGURABLE_KEYS = new Set([
 type ConfigurableKey = typeof CONFIGURABLE_KEYS extends Set<infer T> ? T : never;
 
 function getHub(env: Env) {
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as {
+  return getDurableObjectStub<{
     setConfig(key: string, value: string): void;
-  };
+  }>(env, env.HUB, "hub");
 }
 
 // ── Routes ─────────────────────────────────────────────────────────

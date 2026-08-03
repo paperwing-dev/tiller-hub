@@ -62,6 +62,7 @@ import { getEnvLifecycleStub } from "../helpers";
 import { mintImplementorCodexRuntimeCapability } from "./codex-runtime-capability";
 import type { CodexExecutionProfile } from "../types";
 import { BillingResolutionError, createBillingResolutionError } from "../billing-resolution";
+import { getDurableObjectStub } from "../durable-object";
 import {
   resolveBillingCompatibility,
   type BillingMode,
@@ -113,8 +114,7 @@ interface LaunchMcpServer {
 }
 
 function getHub(env: Env): RepoLaunchSettingsHub {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as RepoLaunchSettingsHub;
+  return getDurableObjectStub<RepoLaunchSettingsHub>(env, env.HUB, "hub");
 }
 
 async function resolveRepoSessionEnvVars(

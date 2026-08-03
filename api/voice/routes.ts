@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { authenticateAccessRequest } from "../auth";
 import type { HonoEnv } from "../types";
+import { getDurableObjectStub } from "../durable-object";
 
 // Authenticated voice WebSocket route.
 //
@@ -24,8 +25,11 @@ voiceApp.get("/api/voice/session", async (c) => {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const id = c.env.TILLER_VOICE.idFromName(sessionId);
-  const stub = c.env.TILLER_VOICE.get(id);
+  const stub = getDurableObjectStub<DurableObjectStub>(
+    c.env,
+    c.env.TILLER_VOICE,
+    sessionId,
+  );
   return stub.fetch(new Request(c.req.url, c.req.raw));
 });
 

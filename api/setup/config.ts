@@ -1,4 +1,5 @@
 import type { Env } from "../types";
+import { getDurableObjectStub } from "../durable-object";
 import { normalizeCloudflareIdleTimeoutMinutes } from "../../shared/cloudflare-timeout";
 import {
   normalizeBillingSelections,
@@ -26,8 +27,7 @@ function getHubConfigStore(env: Env): HubConfigStore {
   if (!(env as Partial<Env>).HUB) {
     throw new Error("The HubDO binding is required to read Tiller settings.");
   }
-  const id = env.HUB.idFromName("hub");
-  return env.HUB.get(id) as unknown as HubConfigStore;
+  return getDurableObjectStub<HubConfigStore>(env, env.HUB, "hub");
 }
 
 function getEnvSecretValue(env: Env, key: string): string | undefined {

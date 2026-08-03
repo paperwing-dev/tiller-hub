@@ -14,6 +14,7 @@ import type {
   RunnerControlAction,
 } from "../types";
 import { EXISTING_EXECUTION_UNAVAILABLE_MESSAGE } from "../execution";
+import { getDurableObjectStub } from "../durable-object";
 
 interface HostRunnerStatus {
   runnerId?: string;
@@ -41,8 +42,7 @@ interface HubRunnerControl {
 }
 
 function getHub(env: Env): HubRunnerControl {
-  const hubId = env.HUB.idFromName("hub");
-  return env.HUB.get(hubId) as unknown as HubRunnerControl;
+  return getDurableObjectStub<HubRunnerControl>(env, env.HUB, "hub");
 }
 
 function parseHostRunnerStatus(value: unknown): HostRunnerStatus {

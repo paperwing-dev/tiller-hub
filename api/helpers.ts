@@ -10,10 +10,10 @@ import type { PlannerRunDO } from "./planner-run-do";
 import type { SandboxDO } from "./sandbox-do";
 import type { ThreadDO } from "./coordination";
 import type { WorkspaceDO } from "./workspace/do";
+import { getDurableObjectStub } from "./durable-object";
 
 export function getSandboxStub(env: Env, slug: string): SandboxDO {
-  const id = env.SANDBOX.idFromName(slug);
-  return env.SANDBOX.get(id) as unknown as SandboxDO;
+  return getDurableObjectStub<SandboxDO>(env, env.SANDBOX, slug);
 }
 
 export function getArtifactStoreStub(
@@ -29,46 +29,43 @@ export function getArtifactStoreStub(
   if (generation !== null && !normalizedGeneration) {
     throw new Error("Artifact store lifecycle generation cannot be empty.");
   }
-  const id = env.ARTIFACT_STORE.idFromName(normalizedGeneration === null
+  const name = normalizedGeneration === null
     ? normalizedRepoId
-    : `${normalizedRepoId}:generation:${normalizedGeneration}`);
-  return env.ARTIFACT_STORE.get(id) as unknown as ArtifactStoreDO;
+    : `${normalizedRepoId}:generation:${normalizedGeneration}`;
+  return getDurableObjectStub<ArtifactStoreDO>(env, env.ARTIFACT_STORE, name);
 }
 
 export function getEnvLifecycleStub(env: Env, slug: string): EnvLifecycleDO {
-  const id = env.ENV_LIFECYCLE.idFromName(slug);
-  return env.ENV_LIFECYCLE.get(id) as unknown as EnvLifecycleDO;
+  return getDurableObjectStub<EnvLifecycleDO>(env, env.ENV_LIFECYCLE, slug);
 }
 
 export function getScheduledRunCapacityStub(env: Env): ScheduledRunCapacityDO {
   if (!env.SCHEDULED_RUN_CAPACITY) {
     throw new Error("Required SCHEDULED_RUN_CAPACITY Durable Object binding is unavailable.");
   }
-  const id = env.SCHEDULED_RUN_CAPACITY.idFromName("scheduled-runs");
-  return env.SCHEDULED_RUN_CAPACITY.get(id) as unknown as ScheduledRunCapacityDO;
+  return getDurableObjectStub<ScheduledRunCapacityDO>(
+    env,
+    env.SCHEDULED_RUN_CAPACITY,
+    "scheduled-runs",
+  );
 }
 
 export function getEnvReviewStub(env: Env, slug: string): EnvReviewDO {
-  const id = env.ENV_REVIEW.idFromName(slug);
-  return env.ENV_REVIEW.get(id) as unknown as EnvReviewDO;
+  return getDurableObjectStub<EnvReviewDO>(env, env.ENV_REVIEW, slug);
 }
 
 export function getGitHubJobStub(env: Env, slug: string): GitHubJobDO {
-  const id = env.GITHUB_JOB.idFromName(slug);
-  return env.GITHUB_JOB.get(id) as unknown as GitHubJobDO;
+  return getDurableObjectStub<GitHubJobDO>(env, env.GITHUB_JOB, slug);
 }
 
 export function getPlannerRunStub(env: Env, slug: string): PlannerRunDO {
-  const id = env.PLANNER_RUN.idFromName(slug);
-  return env.PLANNER_RUN.get(id) as unknown as PlannerRunDO;
+  return getDurableObjectStub<PlannerRunDO>(env, env.PLANNER_RUN, slug);
 }
 
 export function getWorkspaceStub(env: Env, slug: string): WorkspaceDO {
-  const id = env.WORKSPACE.idFromName(slug);
-  return env.WORKSPACE.get(id) as unknown as WorkspaceDO;
+  return getDurableObjectStub<WorkspaceDO>(env, env.WORKSPACE, slug);
 }
 
 export function getThreadStub(env: Env, threadId: string): ThreadDO {
-  const id = env.THREAD.idFromName(threadId);
-  return env.THREAD.get(id) as unknown as ThreadDO;
+  return getDurableObjectStub<ThreadDO>(env, env.THREAD, threadId);
 }
