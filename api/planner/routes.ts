@@ -674,19 +674,11 @@ plannerRoutes.put("/api/repos/:repoId/plan-writer-settings", async (c) => {
   if (!route.supportedEfforts.includes(requestedEffort as PlannerEffort)) {
     return c.json({ error: `${route.label} does not support ${requestedEffort} reasoning.` }, 400);
   }
-  if (body.fastMode !== undefined && typeof body.fastMode !== "boolean") {
-    return c.json({ error: "fastMode must be a boolean" }, 400);
-  }
-  const fastMode = body.fastMode === true;
-  if (fastMode && route.provider !== "codex") {
-    return c.json({ error: "Fast mode requires a Codex Plan Writer route." }, 400);
-  }
   if (!planFormat) return c.json({ error: "planFormat is required" }, 400);
   const settings = await loaded.artifactStore.setRepoPlanWriterSettings({
     repoId: loaded.repoId,
     routeKey: route.key,
     effort: requestedEffort as PlannerEffort,
-    fastMode,
     planFormat,
   });
   return c.json({ ok: true, settings });
@@ -699,7 +691,7 @@ async function resolvePlanWriterSelection(
   requestedModel: unknown,
   requestedEffort: unknown,
 ): Promise<
-  | { ok: true; provider: PlanWriterProvider; model: string; effort: PlannerEffort; fastMode: boolean }
+  | { ok: true; provider: PlanWriterProvider; model: string; effort: PlannerEffort }
   | { ok: false; response: Response }
 > {
   const providerInput = readString(requestedProvider);
@@ -747,7 +739,6 @@ async function resolvePlanWriterSelection(
     provider,
     model,
     effort: effortMetadata.id,
-    fastMode: provider === "codex" && settings.fastMode,
   };
 }
 
@@ -896,7 +887,6 @@ plannerRoutes.post("/api/repos/:repoId/plans/:planArtifactId/live-writer/start",
         provider: selection.provider,
         model: selection.model,
         effort: selection.effort,
-        fastMode: selection.fastMode,
         basisCommit,
         startBodyDigest,
         launchProvenance: {

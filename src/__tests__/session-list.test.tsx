@@ -230,6 +230,29 @@ describe("SessionList implementor cards", () => {
     expect(html).not.toContain("min-h-32");
   });
 
+  it("shows pending repository setup once as an indeterminate status", () => {
+    const html = renderToString(
+      <SessionList
+        repos={[makeRepo({
+          gitStatus: "pending",
+          githubDefaultBranchHeadSha: null,
+          mainCommit: null,
+          gitProgressPhase: "Reading GitHub default branch",
+        })]}
+        sessions={[]}
+        envs={[]}
+      />,
+    );
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const indicator = document.querySelector('[data-testid="repo-main-pending-indicator"]');
+
+    expect(document.body.textContent?.match(/Reading GitHub default branch/g)).toHaveLength(1);
+    expect(indicator?.getAttribute("role")).toBe("status");
+    expect(indicator?.getAttribute("aria-live")).toBe("polite");
+    expect(indicator?.querySelector(".animate-spin")).not.toBeNull();
+    expect(indicator?.textContent).toBe("Reading GitHub default branch…");
+  });
+
   it("uses a plain environment name header with a separate linked plan", () => {
     const html = render(makeEnv({
       startupPlanId: "plan-1",

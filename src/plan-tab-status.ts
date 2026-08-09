@@ -55,10 +55,10 @@ export function planWriterTabStatus(
     return status("error", "Error", withConfiguration(localError, configuration));
   }
   if (options.operation === "stopping") {
-    return status("stopping", "Stopping", withConfiguration("Shutting down the live Plan Writer.", configuration));
+    return status("stopping", "Stopping", withConfiguration("Shutting down the live Scribe.", configuration));
   }
   if (options.operation === "starting") {
-    return status("starting", "Starting", withConfiguration("Starting the live Plan Writer.", configuration));
+    return status("starting", "Starting", withConfiguration("Starting the live Scribe.", configuration));
   }
   if (options.saving || writer.synchronization.state === "saving") {
     return status("saving", "Saving", withConfiguration("Saving the latest plan changes.", configuration));
@@ -68,18 +68,18 @@ export function planWriterTabStatus(
       "starting",
       options.connecting ? "Connecting" : "Starting",
       withConfiguration(
-        options.connecting ? "Connecting to the live Plan Writer." : "Starting the live Plan Writer.",
+        options.connecting ? "Connecting to the live Scribe." : "Starting the live Scribe.",
         configuration,
       ),
     );
   }
   if (writer.lifecycle === "running") {
-    return status("running", "Live", withConfiguration("The Plan Writer is live and ready.", configuration));
+    return status("running", "Live", withConfiguration("The Scribe is live and ready.", configuration));
   }
   if (writer.generation !== null || writer.stopReason) {
     return status("stopped", "Stopped", withConfiguration(writerStopReason(writer), configuration));
   }
-  return status("idle", "Not started", withConfiguration("Start the Writer when you are ready.", configuration));
+  return status("idle", "Not started", withConfiguration("Start the Scribe when you are ready.", configuration));
 }
 
 export function reviewerTabStatus(input: {
@@ -103,13 +103,13 @@ export function reviewerTabStatus(input: {
   // New reviewer registry rows start as queued before any run exists. A run ID
   // is the durable proof that there is actually work to display.
   if (!runId || !runStatus) {
-    return status("idle", "Ready", withConfiguration("No review is in progress.", configuration));
+    return status("idle", "Ready", withConfiguration("Ready for your next question.", configuration));
   }
   if (runStatus === "queued") {
     return status("starting", "Queued", withConfiguration("Waiting for a reviewer container.", configuration), runId);
   }
   if (runStatus === "running") {
-    return status("working", "Working", withConfiguration("The reviewer is analyzing the plan.", configuration), runId);
+    return status("working", "Working", withConfiguration("The reviewer is working on your question.", configuration), runId);
   }
   if (runStatus === "saving") {
     return status("saving", "Saving", withConfiguration("Saving the reviewer response.", configuration), runId);
@@ -243,12 +243,12 @@ function withConfiguration(detail: string, configuration: string): string {
 }
 
 function writerStopReason(writer: PlanWriterState): string {
-  if (writer.stopReason === "user") return "The live Plan Writer was stopped.";
-  if (writer.stopReason === "idle") return "The live Plan Writer stopped after inactivity.";
-  if (writer.stopReason === "completed") return "The live Plan Writer stopped when the plan was completed.";
-  if (writer.stopReason === "archived") return "The live Plan Writer stopped when the plan was archived.";
-  if (writer.stopReason === "mode_invalidated") return "The live Plan Writer stopped because planning mode changed.";
-  if (writer.stopReason === "watchdog") return "The live Plan Writer was stopped by its watchdog.";
-  if (writer.stopReason === "runtime_ended") return "The live Plan Writer runtime ended.";
-  return "The live Plan Writer is not running.";
+  if (writer.stopReason === "user") return "The live Scribe was stopped.";
+  if (writer.stopReason === "idle") return "The live Scribe stopped after inactivity.";
+  if (writer.stopReason === "completed") return "The live Scribe stopped when the plan was completed.";
+  if (writer.stopReason === "archived") return "The live Scribe stopped when the plan was archived.";
+  if (writer.stopReason === "mode_invalidated") return "The live Scribe stopped because planning mode changed.";
+  if (writer.stopReason === "watchdog") return "The live Scribe was stopped by its watchdog.";
+  if (writer.stopReason === "runtime_ended") return "The live Scribe runtime ended.";
+  return "The live Scribe is not running.";
 }

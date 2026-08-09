@@ -7,7 +7,10 @@ import type { AgentSkillDefinition } from "./api";
 
 interface PlanChatInputProps {
   disabled?: boolean;
+  busy?: boolean;
   placeholder: string;
+  busyPlaceholder?: string;
+  optimisticClear?: boolean;
   // Return (or resolve) false to indicate the send failed — the draft is
   // preserved in the composer instead of being cleared.
   onSend: (message: string) => void | boolean | Promise<void | boolean>;
@@ -17,7 +20,10 @@ interface PlanChatInputProps {
 
 export default function PlanChatInput({
   disabled = false,
+  busy = false,
   placeholder,
+  busyPlaceholder,
+  optimisticClear = false,
   onSend,
   skills = [],
   onInvokeSkill,
@@ -51,19 +57,26 @@ export default function PlanChatInput({
       await invokeSkill(exact ?? matchingSkills[0]!);
       return;
     }
+    if (busy) return;
     setPending(true);
+    if (optimisticClear) setInput("");
     try {
       const result = await onSend(message);
-      if (result !== false) {
+      if (result === false && optimisticClear) {
+        setInput(message);
+      } else if (result !== false && !optimisticClear) {
         setInput("");
       }
     } finally {
       setPending(false);
       inputRef.current?.focus();
     }
-  }, [commandMode, commandQuery, disabled, input, invokeSkill, matchingSkills, onSend, pending]);
+  }, [busy, commandMode, commandQuery, disabled, input, invokeSkill, matchingSkills, onSend, optimisticClear, pending]);
 
-  const canSubmit = Boolean(input.trim()) && (!commandMode || matchingSkills.length > 0);
+  const skillReady = commandMode && matchingSkills.length > 0;
+  const canSubmit = Boolean(input.trim())
+    && (!commandMode || skillReady)
+    && (!busy || skillReady);
 
   return (
     <div className="relative border-t border-kumo-line bg-kumo-base px-4 py-3">
@@ -100,7 +113,7 @@ export default function PlanChatInput({
               void handleSend();
             }
           }}
-          placeholder={placeholder}
+          placeholder={busy ? busyPlaceholder ?? placeholder : placeholder}
           rows={1}
           className="flex-1 resize-none"
           disabled={disabled || pending}

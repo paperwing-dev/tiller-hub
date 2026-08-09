@@ -12,7 +12,7 @@ import {
   Outlet,
   useLocation,
   useNavigate,
-} from 'react-router-dom';
+} from 'react-router';
 import type { EnvMeta, RepoMeta, StoredSession, StoredPermission, WsServerMessage } from '../api/types';
 import {
   fetchSessions,
@@ -24,6 +24,7 @@ import {
   checkForUpdate,
   dismissDashboardOnboarding as dismissDashboardOnboardingRequest,
   ApiActionError,
+  isApiAuthenticationError,
   type CreateEnvOptions,
 } from './api';
 import type {
@@ -57,6 +58,38 @@ import {
 } from './dashboard-paths';
 
 const HUB_URL = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
+const AUTH_RELOAD_STORAGE_KEY = 'tiller-auth-reload';
+const AUTH_RELOAD_COOLDOWN_MS = 10_000;
+
+interface BrowserAuthenticationTarget {
+  location: Pick<Location, 'reload'>;
+  sessionStorage: Pick<Storage, 'getItem' | 'setItem'>;
+}
+
+export function recoverBrowserAuthentication(
+  error: unknown,
+  target: BrowserAuthenticationTarget = window,
+  now = Date.now(),
+): boolean {
+  if (!isApiAuthenticationError(error)) return false;
+
+  let shouldReload = true;
+  try {
+    const lastReload = Number(target.sessionStorage.getItem(AUTH_RELOAD_STORAGE_KEY) ?? '');
+    const reloadIsRecent = Number.isFinite(lastReload)
+      && now >= lastReload
+      && now - lastReload < AUTH_RELOAD_COOLDOWN_MS;
+    shouldReload = !reloadIsRecent;
+    if (shouldReload) {
+      target.sessionStorage.setItem(AUTH_RELOAD_STORAGE_KEY, String(now));
+    }
+  } catch {
+    // A browser may deny sessionStorage while still allowing a top-level auth navigation.
+  }
+
+  if (shouldReload) target.location.reload();
+  return true;
+}
 
 export type LoadState = 'idle' | 'loading' | 'loaded' | 'error';
 
@@ -315,7 +348,11 @@ export default function DashboardDataProvider() {
       const nextStatus = await fetchSetupStatus(HUB_URL);
       setSetupStatus(nextStatus);
       setSetupLoadError(null);
-    } catch {
+    } catch (error) {
+      if (recoverBrowserAuthentication(error)) {
+        setSetupLoadError('Your Cloudflare Access session expired. Reload this page to sign in again.');
+        return;
+      }
       setSetupLoadError('Setup status could not be loaded.');
     }
   }, []);
@@ -334,13 +371,7 @@ export default function DashboardDataProvider() {
       setSessionsLoadState('loaded');
       return true;
     } catch (err) {
-      if ((err as Error).message.includes('401')) {
-        const lastReload = Number(sessionStorage.getItem('tiller-auth-reload') || '0');
-        if (Date.now() - lastReload > 10_000) {
-          sessionStorage.setItem('tiller-auth-reload', String(Date.now()));
-          window.location.reload();
-        }
-      }
+      recoverBrowserAuthentication(err);
       setSessionsLoadState('error');
       return false;
     }
@@ -853,6 +884,7 @@ function DashboardDialogs({
           workersAiConfigured={data.setupStatus?.workersAiConfigured ?? false}
           enabledHarnesses={data.setupStatus?.enabledHarnesses ?? ['claude-code']}
           repo={newEnvRepo}
+          onRefreshSetupStatus={data.refreshSetupStatus}
           onCreate={data.handleCreateEnv}
         />
       )}
@@ -873,6 +905,7 @@ function DashboardDialogs({
           chatgptAuthStatus={data.setupStatus?.chatgptAuthStatus ?? 'missing'}
           claudeBillingMode={data.setupStatus?.claudeBillingMode ?? null}
           openaiBillingMode={data.setupStatus?.openaiBillingMode ?? null}
+          onRefreshSetupStatus={data.refreshSetupStatus}
         />
       )}
       {showUpdate && (

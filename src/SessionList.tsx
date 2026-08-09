@@ -148,11 +148,7 @@ export default function SessionList({
                       </span>
                     </button>
                   </div>
-                ) : (
-                  <p className="tiller-sidebar-open-text px-3 pb-3 text-xs text-kumo-subtle whitespace-normal tiller-sidebar-wrap">
-                    {getRepoMainStatusDetail(repo)}
-                  </p>
-                )
+                ) : null
               )
             ) : (
               repoEnvs
@@ -684,16 +680,34 @@ function RepoGroupHeader({
     onPlanSelect?.(repo.repoId);
   };
   const statusBadge = !repoMainReady ? (
-    <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2 text-xs text-kumo-subtle">
-      <Badge variant={repo.gitStatus === "repair-required" ? "error" : "warning"}>
-        {repoMainStatusLabel}
-      </Badge>
-      {repoMainStatusDetail && (
-        <span className="tiller-sidebar-open-text min-w-0 whitespace-normal text-[11px] font-normal text-kumo-subtle tiller-sidebar-wrap">
-          {repoMainStatusDetail}
-        </span>
-      )}
-    </div>
+    repo.gitStatus === "repair-required" ? (
+      <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2 text-xs text-kumo-subtle">
+        <Badge variant="error">{repoMainStatusLabel}</Badge>
+        {repoMainStatusDetail && (
+          <span className="tiller-sidebar-open-text min-w-0 whitespace-normal text-[11px] font-normal text-kumo-subtle tiller-sidebar-wrap">
+            {repoMainStatusDetail}
+          </span>
+        )}
+      </div>
+    ) : (
+      <div
+        role="status"
+        aria-live="polite"
+        aria-label={`${repoMainStatusLabel}. Repository setup is in progress.`}
+        className="mt-2 flex min-w-0 items-center"
+        data-testid="repo-main-pending-indicator"
+      >
+        <Badge variant="warning">
+          <span className="flex items-center gap-1.5">
+            <span
+              className="block h-2.5 w-2.5 shrink-0 animate-spin rounded-full border-2 border-current border-r-transparent motion-reduce:animate-none"
+              aria-hidden="true"
+            />
+            <span>{repoMainStatusLabel}…</span>
+          </span>
+        </Badge>
+      </div>
+    )
   ) : null;
 
   return (

@@ -132,7 +132,7 @@ vi.mock("../terminal-recovery", () => ({
   },
 }));
 
-import TerminalView from "../TerminalView";
+import TerminalView, { type TerminalViewHandle } from "../TerminalView";
 
 function makeSession() {
   return {
@@ -244,6 +244,24 @@ describe("TerminalView resizing", () => {
     flushFrame();
     expect(onResize).toHaveBeenCalledTimes(2);
     expect(onResize).toHaveBeenLastCalledWith(100, 30);
+  });
+
+  it("refits through its handle after a sibling changes the available layout", () => {
+    const ref = React.createRef<TerminalViewHandle>();
+    render(
+      <TerminalView
+        ref={ref}
+        session={makeSession()}
+        hubUrl="https://hub.test"
+      />,
+    );
+
+    expect(mocks.fit).toHaveBeenCalledTimes(1);
+    act(() => ref.current?.refit());
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+
+    flushFrame();
+    expect(mocks.fit).toHaveBeenCalledTimes(2);
   });
 
   it("fits and reports dimensions using a supplied font size", () => {

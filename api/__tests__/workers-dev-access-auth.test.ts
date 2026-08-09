@@ -635,18 +635,18 @@ describe("installer binding-backed workers.dev trust", () => {
     });
   });
 
-  it("fails closed for mixed schemas or any other dev hostname", async () => {
+  it("fails closed for mixed schemas or a non-dev Worker hostname", async () => {
     const mixed = {
       ...maintainerDevAccessBindings(),
       TILLER_INSTALLER_SCHEMA: "1",
     } as unknown as Env;
     const otherHostname = maintainerDevAccessBindings({
-      hostname: "tiller-dev.other-account.workers.dev",
+      hostname: "tiller.other-account.workers.dev",
     }) as unknown as Env;
     await expect(readWorkersDevAccessTrust(mixed, TEST_MAINTAINER_DEV_HOSTNAME)).resolves.toBeNull();
     await expect(readWorkersDevAccessTrust(
       otherHostname,
-      "tiller-dev.other-account.workers.dev",
+      "tiller.other-account.workers.dev",
     )).resolves.toBeNull();
   });
 

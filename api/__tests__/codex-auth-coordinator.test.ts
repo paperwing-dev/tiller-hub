@@ -487,6 +487,51 @@ describe("CodexAuthCoordinator", () => {
     await expect(test.store.get(AUTH_CONNECT_GRANTS_KEY)).resolves.toEqual({ version: 1, grants: [] });
   });
 
+  it("tracks each Settings connection from approval through provider completion", async () => {
+    let next = 0;
+    const connectionId = "connection-attempt-1234";
+    const test = subject({ createGrant: () => `secret-grant-${++next}` });
+    const grants = await test.coordinator.issueGrants(["codex", "claude"], connectionId);
+
+    await expect(test.coordinator.connectionStatus(connectionId)).resolves.toEqual({
+      status: "pending",
+      providers: { codex: "pending", claude: "pending" },
+    });
+    await expect(test.coordinator.recordGrantResult("codex", grants.codex!, "success")).resolves.toBe(false);
+    await expect(test.coordinator.consumeGrant("codex", grants.codex!)).resolves.toBe(true);
+    await expect(test.coordinator.recordGrantResult("codex", grants.codex!, "success")).resolves.toBe(true);
+    await expect(test.coordinator.connectionStatus(connectionId)).resolves.toEqual({
+      status: "pending",
+      providers: { codex: "success", claude: "pending" },
+    });
+
+    await expect(test.coordinator.consumeGrant("claude", grants.claude!)).resolves.toBe(true);
+    await expect(test.coordinator.recordGrantResult(
+      "claude",
+      grants.claude!,
+      "error",
+      "Claude could not be saved.",
+    )).resolves.toBe(true);
+    await expect(test.coordinator.connectionStatus(connectionId)).resolves.toEqual({
+      status: "error",
+      providers: { codex: "success", claude: "error" },
+      error: "Claude could not be saved.",
+    });
+  });
+
+  it("reports a tracked connection as successful once all grants finish", async () => {
+    const connectionId = "connection-attempt-5678";
+    const test = subject({ createGrant: () => "secret-grant" });
+    const grants = await test.coordinator.issueGrants(["codex"], connectionId);
+    await test.coordinator.consumeGrant("codex", grants.codex!);
+    await test.coordinator.recordGrantResult("codex", grants.codex!, "success");
+
+    await expect(test.coordinator.connectionStatus(connectionId)).resolves.toEqual({
+      status: "success",
+      providers: { codex: "success" },
+    });
+  });
+
   it("bounds outstanding and consumed grant storage", async () => {
     let next = 0;
     const test = subject({ createGrant: () => `secret-grant-${++next}` });

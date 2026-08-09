@@ -182,7 +182,7 @@ export default function ResizablePlanPanes({
       </div>
       <div
         role="separator"
-        aria-label="Resize Plan and Plan Reviewers"
+        aria-label="Resize Plan and Plan Collaborators"
         aria-orientation="horizontal"
         aria-valuenow={reviewersHeight ?? undefined}
         tabIndex={0}

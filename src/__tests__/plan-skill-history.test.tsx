@@ -119,9 +119,9 @@ describe("PlanSkillHistory", () => {
     render(<PlanSkillHistory repoId="repo-1" planArtifactId="plan-1" />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Plan Review · completed" }));
-    const checkbox = await screen.findByLabelText("Forward to Plan Writer");
+    const checkbox = await screen.findByLabelText("Share with Scribe");
     fireEvent.click(checkbox);
-    const send = screen.getByRole("button", { name: "Send to Plan Writer" });
+    const send = screen.getByRole("button", { name: "Share with Scribe" });
     fireEvent.click(send);
     await waitFor(() => expect(mocks.forwardReports).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(send).toBeEnabled());
@@ -155,8 +155,8 @@ describe("PlanSkillHistory", () => {
     );
 
     fireEvent.click(await screen.findByRole("button", { name: "Plan Review · completed" }));
-    fireEvent.click(await screen.findByLabelText("Forward to Plan Writer"));
-    fireEvent.click(screen.getByRole("button", { name: "Send to Plan Writer" }));
+    fireEvent.click(await screen.findByLabelText("Share with Scribe"));
+    fireEvent.click(screen.getByRole("button", { name: "Share with Scribe" }));
 
     await waitFor(() => expect(onForwarded).toHaveBeenCalledWith([contribution]));
   });

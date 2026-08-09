@@ -24,7 +24,7 @@ export default function FastModeField({
       <span className="min-w-0">
         <span className="block text-sm font-medium text-kumo-default">Fast mode</span>
         <span className="block text-xs text-kumo-subtle">
-          Runs supported Codex models faster at a higher usage rate.
+          Runs the selected model faster at a higher usage rate.
         </span>
       </span>
     </label>

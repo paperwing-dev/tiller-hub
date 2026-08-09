@@ -11,6 +11,12 @@ const RETRY_BASE_MS = 15_000;
 const RETRY_MAX_MS = 2 * 60_000;
 
 export type AuthConnectProvider = "codex" | "claude";
+export type AuthConnectProviderStatus = "pending" | "success" | "error";
+export interface AuthConnectStatusResult {
+  status: AuthConnectProviderStatus | "expired";
+  providers: Partial<Record<AuthConnectProvider, AuthConnectProviderStatus>>;
+  error?: string;
+}
 export type CodexAuthDurableStatus =
   | "connected"
   | "needs_reconnect"
@@ -103,6 +109,9 @@ interface StoredAuthConnectGrantV1 {
   provider: AuthConnectProvider;
   expiresAt: number;
   consumedAt: number | null;
+  connectionId?: string;
+  result?: Exclude<AuthConnectProviderStatus, "pending">;
+  error?: string;
 }
 
 interface StoredAuthConnectGrantSetV1 {
@@ -120,7 +129,14 @@ function isStoredAuthConnectGrant(value: unknown): value is StoredAuthConnectGra
     && typeof grant.expiresAt === "number"
     && Number.isSafeInteger(grant.expiresAt)
     && (grant.consumedAt === null
-      || (typeof grant.consumedAt === "number" && Number.isSafeInteger(grant.consumedAt)));
+      || (typeof grant.consumedAt === "number" && Number.isSafeInteger(grant.consumedAt)))
+    && (grant.connectionId === undefined || isAuthConnectConnectionId(grant.connectionId))
+    && (grant.result === undefined || grant.result === "success" || grant.result === "error")
+    && (grant.error === undefined || (typeof grant.error === "string" && grant.error.length <= 512));
+}
+
+function isAuthConnectConnectionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(value);
 }
 
 function byteLength(value: string): number {
@@ -491,7 +507,13 @@ export class CodexAuthCoordinator {
     };
   }
 
-  async issueGrants(providers: AuthConnectProvider[]): Promise<Record<AuthConnectProvider, string | undefined>> {
+  async issueGrants(
+    providers: AuthConnectProvider[],
+    connectionId?: string,
+  ): Promise<Record<AuthConnectProvider, string | undefined>> {
+    if (connectionId !== undefined && !isAuthConnectConnectionId(connectionId)) {
+      throw new Error("Invalid authentication connection ID");
+    }
     const unique = [...new Set(providers)];
     const result: Record<AuthConnectProvider, string | undefined> = { codex: undefined, claude: undefined };
     await this.enqueue(async () => {
@@ -510,6 +532,7 @@ export class CodexAuthCoordinator {
           provider,
           expiresAt: now + AUTH_CONNECT_GRANT_TTL_MS,
           consumedAt: null,
+          ...(connectionId ? { connectionId } : {}),
         };
         issued.push(record);
         result[provider] = grant;
@@ -559,6 +582,89 @@ export class CodexAuthCoordinator {
         grants,
       });
       return true;
+    });
+  }
+
+  async recordGrantResult(
+    provider: AuthConnectProvider,
+    grant: string,
+    result: Exclude<AuthConnectProviderStatus, "pending">,
+    error?: string,
+  ): Promise<boolean> {
+    if (!grant.trim() || grant.length > 256) return false;
+    return await this.enqueue(async () => {
+      const hash = await sha256Hex(grant.trim());
+      const now = this.now();
+      const stored = await this.options.store.get<StoredAuthConnectGrantSetV1>(AUTH_CONNECT_GRANTS_KEY);
+      const storedSetIsValid = stored?.version === 1 && Array.isArray(stored.grants);
+      const storedGrantCount = storedSetIsValid ? stored.grants.length : 0;
+      const grants = storedSetIsValid
+        ? stored.grants.filter((record) => isStoredAuthConnectGrant(record) && record.expiresAt > now)
+        : [];
+      const record = grants.find((candidate) => candidate.hash === hash);
+      if (
+        !record
+        || record.provider !== provider
+        || record.consumedAt === null
+        || !record.connectionId
+      ) {
+        if (stored && (!storedSetIsValid || grants.length !== storedGrantCount)) {
+          await this.options.store.put<StoredAuthConnectGrantSetV1>(AUTH_CONNECT_GRANTS_KEY, {
+            version: 1,
+            grants,
+          });
+        }
+        return false;
+      }
+      record.result = result;
+      const sanitizedError = error?.trim().slice(0, 512);
+      if (result === "error" && sanitizedError) record.error = sanitizedError;
+      else delete record.error;
+      await this.options.store.put<StoredAuthConnectGrantSetV1>(AUTH_CONNECT_GRANTS_KEY, {
+        version: 1,
+        grants,
+      });
+      return true;
+    });
+  }
+
+  async connectionStatus(connectionId: string): Promise<AuthConnectStatusResult> {
+    if (!isAuthConnectConnectionId(connectionId)) {
+      return { status: "expired", providers: {} };
+    }
+    return await this.enqueue(async () => {
+      const now = this.now();
+      const stored = await this.options.store.get<StoredAuthConnectGrantSetV1>(AUTH_CONNECT_GRANTS_KEY);
+      const storedSetIsValid = stored?.version === 1 && Array.isArray(stored.grants);
+      const storedGrantCount = storedSetIsValid ? stored.grants.length : 0;
+      const grants = storedSetIsValid
+        ? stored.grants.filter((record) => isStoredAuthConnectGrant(record) && record.expiresAt > now)
+        : [];
+      if (stored && (!storedSetIsValid || grants.length !== storedGrantCount)) {
+        await this.options.store.put<StoredAuthConnectGrantSetV1>(AUTH_CONNECT_GRANTS_KEY, {
+          version: 1,
+          grants,
+        });
+      }
+      const connectionGrants = grants.filter((record) => record.connectionId === connectionId);
+      if (connectionGrants.length === 0) return { status: "expired", providers: {} };
+
+      const providers: Partial<Record<AuthConnectProvider, AuthConnectProviderStatus>> = {};
+      for (const record of connectionGrants) {
+        providers[record.provider] = record.result ?? "pending";
+      }
+      const failed = connectionGrants.find((record) => record.result === "error");
+      if (failed) {
+        return {
+          status: "error",
+          providers,
+          ...(failed.error ? { error: failed.error } : {}),
+        };
+      }
+      return {
+        status: connectionGrants.every((record) => record.result === "success") ? "success" : "pending",
+        providers,
+      };
     });
   }
 }

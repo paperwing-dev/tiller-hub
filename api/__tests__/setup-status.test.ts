@@ -350,7 +350,7 @@ describe("GET /api/setup/status", () => {
   it("does not route maintainer dev Access renewal through the customer installer", async () => {
     const tokenExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString();
     const response = await createApp().request(
-      "https://tiller-dev.personal-infrastructure.workers.dev/api/setup/status",
+      "https://tiller-dev.maintainer-preview.workers.dev/api/setup/status",
       { method: "GET" },
       createEnv({
         TILLER_INSTALLER_SCHEMA: undefined,

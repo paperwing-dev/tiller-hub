@@ -33,6 +33,7 @@ export interface TerminalViewHandle {
   acceptMessage: (message: DurableTerminalMessage) => void;
   recover: () => void;
   clear: () => void;
+  refit: () => void;
 }
 
 interface TerminalViewProps {
@@ -135,6 +136,7 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
   const onRecoveryStateRef = useRef(onRecoveryState);
   const onDurableMessageCompleteRef = useRef(onDurableMessageComplete);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const scheduleFitRef = useRef<(() => void) | null>(null);
   const resolvedTheme = useResolvedTheme();
 
   interactiveRef.current = interactive;
@@ -185,6 +187,7 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
   useImperativeHandle(ref, () => ({
     acceptMessage: (message) => recoveryRef.current?.acceptLive(message),
     recover,
+    refit: () => scheduleFitRef.current?.(),
     clear: () => {
       termRef.current?.clear();
       try {
@@ -261,6 +264,7 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
         reportSize();
       });
     };
+    scheduleFitRef.current = scheduleFit;
     window.addEventListener("resize", scheduleFit);
     const resizeObserver = typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(scheduleFit)
@@ -438,6 +442,7 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
       window.removeEventListener("resize", scheduleFit);
       resizeObserver?.disconnect();
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
+      if (scheduleFitRef.current === scheduleFit) scheduleFitRef.current = null;
       term.dispose();
       termRef.current = null;
       serializeRef.current = null;

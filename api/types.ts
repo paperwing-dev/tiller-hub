@@ -174,7 +174,7 @@ export type HarnessEffort = (typeof HARNESS_EFFORTS)[number];
 export interface HarnessSettings {
   model: HarnessModelId;
   effort: HarnessEffort;
-  /** Codex Fast mode. Omitted for Standard mode and non-Codex harnesses. */
+  /** Provider Fast mode. Omitted for Standard mode and unsupported models. */
   fastMode?: boolean;
 }
 export interface EnvHarnessPresentation {

@@ -4,7 +4,7 @@ import {
   convertToModelMessages,
   stepCountIs,
   streamText,
-  type StreamTextOnFinishCallback,
+  type GenerateTextOnFinishCallback,
 } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import {
@@ -49,7 +49,7 @@ export class ReviewerChatAgent extends AIChatAgent<Env> {
   }
 
   async onChatMessage(
-    _onFinish: StreamTextOnFinishCallback<any>,
+    _onFinish: GenerateTextOnFinishCallback<any>,
     options?: OnChatMessageOptions,
   ): Promise<Response> {
     const spec = REVIEWER_AGENT_SPEC;

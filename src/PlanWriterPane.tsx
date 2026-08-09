@@ -24,7 +24,15 @@ import { codexAuthModeLabel } from "./codex-auth-ui";
 import { planWriterEffortLabel, type PlanWriterModelSelection } from "./PlanWriterModelPicker";
 
 const NO_ACTIVE_TERMINAL_OWNER_ERROR = "No active terminal owner for session";
-const WRITER_STOPPED_DELIVERY_ERROR = "The Plan Writer stopped before receiving the message";
+const WRITER_STOPPED_DELIVERY_ERROR = "The Scribe stopped before receiving the message";
+
+export interface PlanContributionPresentation {
+  sourceLabel: string;
+  sourceDetail?: string;
+  canViewSource: boolean;
+}
+
+const EMPTY_CONTRIBUTION_PRESENTATIONS: ReadonlyMap<string, PlanContributionPresentation> = new Map();
 
 interface PlanWriterPaneProps {
   repoId: string;
@@ -33,14 +41,20 @@ interface PlanWriterPaneProps {
   routes: AgentRoute[];
   selection: PlanWriterModelSelection;
   contributions: PlanContribution[];
+  contributionPresentations?: ReadonlyMap<string, PlanContributionPresentation>;
   handoff?: PlanWriterHandoff | null;
   queuedHandoffContributionIds?: string[];
   hidden?: boolean;
+  canAddReviewer?: boolean;
   onWriterChange(writer: PlanWriterState): void;
   onTabStatusChange(status: PlanTabStatus): void;
   onArtifactChanged(): void;
   onContributionsChanged(): void;
   onHandoffSettled(handoffId: string, error?: string): void;
+  onViewContributionSource?(contributionId: string): void;
+  onAddReviewer?(): void;
+  onOpenSettings?(): void;
+  settingsAvailable?: boolean;
 }
 
 export interface PlanWriterHandoff {
@@ -53,7 +67,7 @@ function syntheticTerminalSession(writer: PlanWriterState): StoredSession | null
   const now = new Date().toISOString();
   return {
     id: writer.terminalId,
-    tag: "Plan Writer",
+    tag: "Scribe",
     machine_id: null,
     metadata: JSON.stringify({ terminalScope: { kind: "plan-writer", generation: writer.generation } }),
     agent_state: "{}",
@@ -77,14 +91,20 @@ export default function PlanWriterPane({
   routes,
   selection,
   contributions,
+  contributionPresentations = EMPTY_CONTRIBUTION_PRESENTATIONS,
   handoff = null,
   queuedHandoffContributionIds = [],
   hidden = false,
+  canAddReviewer = true,
   onWriterChange,
   onTabStatusChange,
   onArtifactChanged,
   onContributionsChanged,
   onHandoffSettled,
+  onViewContributionSource,
+  onAddReviewer,
+  onOpenSettings,
+  settingsAvailable = true,
 }: PlanWriterPaneProps) {
   const {
     hubUrl,
@@ -99,6 +119,7 @@ export default function PlanWriterPane({
   const [writer, setWriter] = useState(initialWriter);
   const [operation, setOperation] = useState<"starting" | "stopping" | null>(null);
   const [contributionPending, setContributionPending] = useState(false);
+  const [startupContributionIds, setStartupContributionIds] = useState<string[]>([]);
   const [deliveredContributionIds, setDeliveredContributionIds] = useState<Set<string>>(() => new Set());
   const [operationError, setOperationError] = useState<string | null>(null);
   const [terminalError, setTerminalError] = useState<string | null>(null);
@@ -135,6 +156,14 @@ export default function PlanWriterPane({
     && connected
     && terminalFastLane
     && recovery.status === "ready";
+  const queuedContributionIds = useMemo(() => new Set([
+    ...queuedHandoffContributionIds,
+    ...(handoff?.contributionIds ?? []),
+    ...startupContributionIds,
+  ]), [handoff?.contributionIds, queuedHandoffContributionIds, startupContributionIds]);
+  const pendingContributions = useMemo(() => contributions.filter((contribution) => (
+    contribution.status === "pending" && !deliveredContributionIds.has(contribution.id)
+  )), [contributions, deliveredContributionIds]);
 
   const acceptWriter = useCallback((next: PlanWriterState) => {
     setWriter(next);
@@ -248,7 +277,7 @@ export default function PlanWriterPane({
             ...(message.ok ? {} : {
               error: message.error === NO_ACTIVE_TERMINAL_OWNER_ERROR
                 ? WRITER_STOPPED_DELIVERY_ERROR
-                : message.error ?? "Writer rejected the message",
+                : message.error ?? "Scribe rejected the message",
             }),
           });
         }
@@ -274,7 +303,7 @@ export default function PlanWriterPane({
     if (connected) return;
     for (const pending of pendingInputAcksRef.current.values()) {
       window.clearTimeout(pending.timer);
-      pending.resolve({ ok: false, error: "Writer disconnected before receiving the message" });
+      pending.resolve({ ok: false, error: "Scribe disconnected before receiving the message" });
     }
     pendingInputAcksRef.current.clear();
   }, [connected]);
@@ -282,7 +311,7 @@ export default function PlanWriterPane({
   useEffect(() => () => {
     for (const pending of pendingInputAcksRef.current.values()) {
       window.clearTimeout(pending.timer);
-      pending.resolve({ ok: false, error: "Writer closed before receiving the message" });
+      pending.resolve({ ok: false, error: "Scribe closed before receiving the message" });
     }
     pendingInputAcksRef.current.clear();
   }, []);
@@ -304,14 +333,14 @@ export default function PlanWriterPane({
 
   const submitText = useCallback(async (text: string): Promise<{ ok: boolean; error?: string }> => {
     if (!terminalInteractive || !writer.terminalId) {
-      return { ok: false, error: "The live Plan Writer is not ready" };
+      return { ok: false, error: "The live Scribe is not ready" };
     }
     const inputSeq = ++inputSeqRef.current;
     const data = bracketedPasteAndSubmit(text);
     return await new Promise((resolve) => {
       const timer = window.setTimeout(() => {
         pendingInputAcksRef.current.delete(inputSeq);
-        resolve({ ok: false, error: "Timed out waiting for the Plan Writer" });
+        resolve({ ok: false, error: "Timed out waiting for the Scribe" });
       }, 15_000);
       pendingInputAcksRef.current.set(inputSeq, { resolve, timer });
       const sent = wsRef.current?.send({
@@ -325,8 +354,8 @@ export default function PlanWriterPane({
       if (!sent) {
         window.clearTimeout(timer);
         pendingInputAcksRef.current.delete(inputSeq);
-        setTerminalError("Plan Writer input could not be delivered");
-        resolve({ ok: false, error: "Plan Writer input could not be delivered" });
+        setTerminalError("Scribe input could not be delivered");
+        resolve({ ok: false, error: "Scribe input could not be delivered" });
       }
     });
   }, [terminalInteractive, writer.terminalId, wsRef]);
@@ -344,7 +373,11 @@ export default function PlanWriterPane({
     }) ?? false;
   }, [terminalInteractive, writer.terminalId, wsRef]);
 
-  const start = async () => {
+  const start = async (includeSharedItems = false) => {
+    const sharedItemIds = includeSharedItems
+      ? pendingContributions.map((contribution) => contribution.id)
+      : [];
+    setStartupContributionIds(sharedItemIds);
     setOperation("starting");
     setOperationError(null);
     try {
@@ -360,7 +393,11 @@ export default function PlanWriterPane({
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
       const next = await refresh().catch(() => null);
-      if (next?.lifecycle === "running") setOperationError(null);
+      if (next?.lifecycle === "running") {
+        setOperationError(null);
+      } else {
+        setStartupContributionIds([]);
+      }
     } finally {
       setOperation(null);
     }
@@ -387,8 +424,12 @@ export default function PlanWriterPane({
     setContributionPending(true);
     setOperationError(null);
     try {
-      const result = await submitText(pending.map((contribution) => contribution.text).join("\n\n---\n\n"));
-      if (!result.ok) throw new Error(result.error ?? "The Plan Writer did not accept the feedback");
+      const prompt = pending.map((contribution) => formatContributionForScribe(
+        contribution,
+        contributionPresentations.get(contribution.id),
+      )).join("\n\n---\n\n");
+      const result = await submitText(prompt);
+      if (!result.ok) throw new Error(result.error ?? "The Scribe did not accept the shared context");
       setDeliveredContributionIds((current) => {
         const next = new Set(current);
         for (const contribution of pending) next.add(contribution.id);
@@ -401,7 +442,7 @@ export default function PlanWriterPane({
       } catch {
         // Delivery is authoritative once the writer ACKs it. Never resend a
         // completed prompt just because the bookkeeping refresh failed.
-        setOperationError("Feedback was sent, but its delivery status could not be refreshed.");
+        setOperationError("Context was shared, but its delivery status could not be refreshed.");
       }
       onContributionsChanged();
       return { ok: true };
@@ -412,7 +453,7 @@ export default function PlanWriterPane({
     } finally {
       setContributionPending(false);
     }
-  }, [hubUrl, onContributionsChanged, planArtifactId, repoId, submitText]);
+  }, [contributionPresentations, hubUrl, onContributionsChanged, planArtifactId, repoId, submitText]);
 
   const dismissContribution = async (contribution: PlanContribution) => {
     try {
@@ -436,6 +477,19 @@ export default function PlanWriterPane({
     });
   }, [contributions, handoff, onHandoffSettled, submitContributions, terminalInteractive]);
 
+  useEffect(() => {
+    if (!terminalInteractive || startupContributionIds.length === 0 || activeHandoffRef.current) return;
+    const items = startupContributionIds
+      .map((id) => contributions.find((contribution) => contribution.id === id))
+      .filter((contribution): contribution is PlanContribution => Boolean(contribution));
+    if (items.length !== startupContributionIds.length) return;
+    activeHandoffRef.current = "scribe-startup";
+    void submitContributions(items).then(() => {
+      activeHandoffRef.current = null;
+      setStartupContributionIds([]);
+    });
+  }, [contributions, startupContributionIds, submitContributions, terminalInteractive]);
+
   if (hidden) return <div className="hidden" />;
   const showTerminal = Boolean(terminalSession && writer.lifecycle !== "starting");
   const errorNotice = operationError
@@ -445,47 +499,65 @@ export default function PlanWriterPane({
     ?? (writer.synchronization.state === "sync_failed"
       ? `Sync failed: ${writer.synchronization.error ?? "retry the last plan publication"}`
       : null);
-  const queuedContributionIds = new Set([
-    ...queuedHandoffContributionIds,
-    ...(handoff?.contributionIds ?? []),
-  ]);
-  const pendingContributions = contributions.filter((contribution) => (
-    contribution.status === "pending"
-    && !queuedContributionIds.has(contribution.id)
-    && !deliveredContributionIds.has(contribution.id)
-  ));
   return (
     <div className="flex h-full min-h-0 flex-col bg-kumo-base">
       <div className="shrink-0 border-b border-kumo-line bg-kumo-recessed px-3 py-1">
         <div className="flex items-center justify-between gap-3">
-          <div className="min-w-0 truncate text-xs text-kumo-subtle">
-            {displayedRoute && `${displayedRoute.label} · ${planWriterEffortLabel(displayedEffort)} reasoning`}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="min-w-0 truncate text-xs text-kumo-subtle">
+              Interactive Plan Mode{displayedRoute && ` · ${displayedRoute.label} · ${planWriterEffortLabel(displayedEffort)} reasoning`}
+            </div>
             {writer.codexAuthMode && (
-              <span className="rounded border border-kumo-line bg-kumo-base px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-kumo-subtle">
+              <span className="shrink-0 rounded border border-kumo-line bg-kumo-base px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-kumo-subtle">
                 {codexAuthModeLabel(writer.codexAuthMode)}
               </span>
             )}
-            {writer.lifecycle === "not_running" ? (
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {onOpenSettings && (
               <button
                 type="button"
-                disabled={operationPending || !writer.editable || !selectionUsable}
-                onClick={() => void start()}
-                className="rounded bg-kumo-brand px-3 py-1 text-xs font-medium text-white disabled:opacity-50"
+                onClick={onOpenSettings}
+                disabled={!settingsAvailable}
+                title={settingsAvailable ? "Repository Scribe model, reasoning effort, and Plan Format" : "Scribe Settings are loading"}
+                className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Start Writer
+                Scribe Settings
               </button>
-            ) : (
+            )}
+            {writer.lifecycle === "not_running" && showTerminal ? (
+              <>
+                {pendingContributions.length > 0 && (
+                  <button
+                    type="button"
+                    disabled={operationPending || !writer.editable || !selectionUsable}
+                    onClick={() => void start(false)}
+                    className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs font-medium text-kumo-subtle hover:bg-kumo-tint disabled:opacity-50"
+                  >
+                    Start without context
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={operationPending || !writer.editable || !selectionUsable}
+                  onClick={() => void start(pendingContributions.length > 0)}
+                  className="rounded bg-kumo-brand px-3 py-1 text-xs font-medium text-white disabled:opacity-50"
+                >
+                  {pendingContributions.length > 0
+                    ? `Start Scribe with ${pendingContributions.length}`
+                    : "Start Scribe"}
+                </button>
+              </>
+            ) : writer.lifecycle !== "not_running" ? (
               <Tooltip
-                content="Ends this writer generation and its provider conversation. The saved plan and terminal history remain; Start Writer creates a new conversation."
+                content="Ends this Scribe generation and its provider conversation. The saved plan and terminal history remain; Start Scribe creates a new conversation."
                 side="bottom"
                 align="end"
                 delay={250}
                 render={(
                   <button
                     type="button"
-                    aria-label="Stop Plan Writer"
+                    aria-label="Stop Scribe"
                     disabled={operationPending || !writer.generation}
                     onClick={() => void stop()}
                     className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded bg-kumo-danger text-white transition-colors hover:bg-kumo-danger/85 disabled:cursor-not-allowed disabled:opacity-40"
@@ -494,7 +566,7 @@ export default function PlanWriterPane({
               >
                 <StopIcon aria-hidden="true" size={14} weight="fill" />
               </Tooltip>
-            )}
+            ) : null}
           </div>
         </div>
         {errorNotice && (
@@ -502,36 +574,69 @@ export default function PlanWriterPane({
         )}
       </div>
 
-      {handoff && (
-        <div className="shrink-0 border-b border-kumo-line bg-kumo-info/5 px-3 py-2 text-xs text-kumo-subtle">
-          {terminalInteractive ? "Sending feedback to the Plan Writer…" : "Feedback is queued until the live Plan Writer is ready."}
-        </div>
-      )}
-
       {pendingContributions.length > 0 && (
-        <div className="max-h-32 shrink-0 overflow-y-auto border-b border-kumo-line px-3 py-2">
-          {pendingContributions.map((contribution) => (
-            <div key={contribution.id} className="mb-2 flex items-start justify-between gap-3 last:mb-0">
-              <div className="line-clamp-2 min-w-0 text-xs text-kumo-subtle">{contribution.text}</div>
-              <div className="flex shrink-0 gap-1">
-                <ContributionAction
-                  label={contributionPending ? "Sending…" : "Send now"}
-                  disabled={!terminalInteractive || contributionPending}
-                  onClick={() => void submitContributions([contribution])}
-                />
-                <ContributionAction
-                  label="Dismiss"
-                  disabled={contributionPending}
-                  onClick={() => void dismissContribution(contribution)}
-                />
-              </div>
+        <div data-testid="scribe-context-tray" className="max-h-44 shrink-0 overflow-y-auto border-b border-kumo-line bg-kumo-info/5 px-3 py-2">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="text-xs font-semibold text-kumo-default">From reviewers</div>
+            <div className="text-[10px] font-medium uppercase tracking-wide text-kumo-subtle">
+              {pendingContributions.length} waiting
             </div>
-          ))}
+          </div>
+          {pendingContributions.map((contribution) => {
+            const presentation = contributionPresentations.get(contribution.id);
+            const queued = queuedContributionIds.has(contribution.id);
+            return (
+              <div key={contribution.id} className="mb-2 rounded border border-kumo-line bg-kumo-base px-2.5 py-2 last:mb-0">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-medium text-kumo-default">
+                      {presentation?.sourceLabel ?? "Shared plan context"}
+                    </div>
+                    {(presentation?.sourceDetail || contribution.sourcePlanVersion) && (
+                      <div className="mt-0.5 truncate text-[10px] text-kumo-subtle">
+                        {[presentation?.sourceDetail, contribution.sourcePlanVersion
+                          ? `Plan v${contribution.sourcePlanVersion}`
+                          : null].filter(Boolean).join(" · ")}
+                      </div>
+                    )}
+                    <div className="mt-1 line-clamp-2 text-xs text-kumo-subtle">{contribution.text}</div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {presentation?.canViewSource && onViewContributionSource && (
+                      <ContributionAction
+                        label="View conversation"
+                        disabled={contributionPending}
+                        onClick={() => onViewContributionSource(contribution.id)}
+                      />
+                    )}
+                    {queued ? (
+                      <span className="px-1.5 py-1 text-[11px] text-kumo-info">
+                        {terminalInteractive && contributionPending ? "Sharing…" : "Waiting for Scribe"}
+                      </span>
+                    ) : terminalInteractive ? (
+                      <ContributionAction
+                        label={contributionPending ? "Sharing…" : "Share now"}
+                        disabled={contributionPending}
+                        onClick={() => void submitContributions([contribution])}
+                      />
+                    ) : (
+                      <span className="px-1.5 py-1 text-[11px] text-kumo-subtle">Waiting for Scribe</span>
+                    )}
+                    <ContributionAction
+                      label="Dismiss"
+                      disabled={contributionPending || queued}
+                      onClick={() => void dismissContribution(contribution)}
+                    />
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
       {writer.lifecycle === "starting" && (
-        <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-kumo-subtle">Starting Plan Writer…</div>
+        <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-kumo-subtle">Starting Scribe…</div>
       )}
       {showTerminal && terminalSession && (
         <div className="flex min-h-0 flex-1 flex-col">
@@ -552,8 +657,44 @@ export default function PlanWriterPane({
         </div>
       )}
       {!showTerminal && writer.lifecycle === "not_running" && (
-        <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-kumo-subtle">
-          Start Writer to open a provider planning conversation.
+        <div className="flex min-h-0 flex-1 items-center justify-center px-6 py-8 text-center">
+          <div className="max-w-lg">
+            <div className="text-sm font-medium text-kumo-default">Start an interactive Scribe session</div>
+            <p className="mt-1 text-xs leading-5 text-kumo-subtle">
+              The Scribe uses the native provider TUI in Plan Mode to converse with you, run Plan Skills, show live harness output, and update this plan. Reviewers advise without editing it.
+            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+              {pendingContributions.length > 0 && (
+                <button
+                  type="button"
+                  disabled={operationPending || !writer.editable || !selectionUsable}
+                  onClick={() => void start(false)}
+                  className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
+                >
+                  Start without shared items
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={operationPending || !writer.editable || !selectionUsable}
+                onClick={() => void start(pendingContributions.length > 0)}
+                className="rounded bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+              >
+                {pendingContributions.length > 0
+                  ? `Start Scribe with ${pendingContributions.length} shared ${pendingContributions.length === 1 ? "item" : "items"}`
+                  : "Start Scribe in Plan Mode"}
+              </button>
+              {canAddReviewer && onAddReviewer && (
+                <button
+                  type="button"
+                  onClick={onAddReviewer}
+                  className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
+                >
+                  + Reviewer
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -571,4 +712,21 @@ function ContributionAction({ label, onClick, disabled = false }: { label: strin
       {label}
     </button>
   );
+}
+
+export function formatContributionForScribe(
+  contribution: PlanContribution,
+  presentation?: PlanContributionPresentation,
+): string {
+  const metadata = [
+    `Source: ${presentation?.sourceLabel ?? "Shared plan context"}`,
+    ...(presentation?.sourceDetail ? [`Context: ${presentation.sourceDetail}`] : []),
+    ...(contribution.sourcePlanVersion ? [`Plan version: ${contribution.sourcePlanVersion}`] : []),
+  ];
+  return [
+    "## Context shared with the Scribe",
+    ...metadata,
+    "",
+    contribution.text.trim(),
+  ].join("\n");
 }

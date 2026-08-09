@@ -1,6 +1,10 @@
 import { Hono, type Context } from "hono";
 import { CompactEncrypt, importJWK, type JWK } from "jose";
-import type { AuthConnectProvider, CodexConnectBoundaryResult } from "../codex-auth-coordinator";
+import type {
+  AuthConnectProvider,
+  AuthConnectStatusResult,
+  CodexConnectBoundaryResult,
+} from "../codex-auth-coordinator";
 import { invalidateConfigCache } from "../setup/config";
 import type { Env, HonoEnv } from "../types";
 import { getDurableObjectStub } from "../durable-object";
@@ -22,8 +26,18 @@ export interface AuthConnectPackageV1 {
 }
 
 interface AuthConnectStub {
-  issueAuthConnectGrants(providers: AuthConnectProvider[]): Promise<Record<AuthConnectProvider, string | undefined>>;
+  issueAuthConnectGrants(
+    providers: AuthConnectProvider[],
+    connectionId?: string,
+  ): Promise<Record<AuthConnectProvider, string | undefined>>;
   consumeAuthConnectGrant(provider: AuthConnectProvider, grant: string): Promise<boolean>;
+  recordAuthConnectResult(
+    provider: AuthConnectProvider,
+    grant: string,
+    result: "success" | "error",
+    error?: string,
+  ): Promise<boolean>;
+  getAuthConnectStatus(connectionId: string): Promise<AuthConnectStatusResult>;
   connectCodexAuth(authJson: string): Promise<CodexConnectBoundaryResult>;
 }
 
@@ -127,87 +141,46 @@ function parsePackageRequest(value: unknown): {
   };
 }
 
-function renderAuthConnectPage(): string {
-  return `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="referrer" content="no-referrer" />
-    <title>Connect subscriptions to Tiller</title>
-    <style>
-      :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; background: #f6f8fa; color: #24292f; }
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top left, #0969da1a, transparent 28rem), #f6f8fa; }
-      main { box-sizing: border-box; width: min(38rem, calc(100vw - 2rem)); border: 1px solid #d0d7de; border-radius: 1.25rem; background: #fffc; box-shadow: 0 18px 50px #1f232814; padding: 1.5rem; }
-      .eyebrow { margin: 0; font-size: .75rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: #57606a; }
-      h1 { margin: .5rem 0 0; font-size: 1.6rem; } p { color: #57606a; line-height: 1.5; }
-      .panel { margin-top: 1.25rem; border: 1px solid #d0d7de; border-radius: 1rem; padding: 1rem; background: #fff; }
-      .status { margin: 0; font-size: 1rem; font-weight: 650; color: #24292f; } .success { color: #1a7f37; } .error { color: #cf222e; }
-      .detail { margin: .5rem 0 0; font-size: .925rem; }
-      .code { display: none; margin-top: 1rem; border-radius: .75rem; background: #f6f8fa; padding: .75rem; }
-      .code.visible { display: grid; gap: .75rem; } code { overflow-wrap: anywhere; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-      button { width: fit-content; border: 1px solid #0969da; border-radius: 999px; background: #0969da; color: #fff; padding: .5rem 1rem; font: inherit; font-weight: 650; cursor: pointer; }
-    </style>
-  </head>
-  <body>
-    <main>
-      <p class="eyebrow">Tiller CLI</p>
-      <h1>Approve subscription connection</h1>
-      <div class="panel">
-        <p id="status" class="status">Checking owner access…</p>
-        <p id="detail" class="detail">This approval creates five-minute, single-use grants for the providers requested by your terminal.</p>
-        <div id="code-shell" class="code"><code id="code"></code><button id="copy" type="button">Copy connection code</button></div>
-      </div>
-    </main>
-    <script>
-      const statusEl = document.getElementById("status");
-      const detailEl = document.getElementById("detail");
-      const codeShell = document.getElementById("code-shell");
-      const codeEl = document.getElementById("code");
-      const copyEl = document.getElementById("copy");
-      function state(kind, title, detail) { statusEl.className = "status " + kind; statusEl.textContent = title; detailEl.textContent = detail; }
-      function showCode(code) { codeEl.textContent = code; codeShell.classList.add("visible"); copyEl.onclick = async () => { try { await navigator.clipboard.writeText(code); copyEl.textContent = "Copied"; } catch { copyEl.textContent = "Copy failed"; } setTimeout(() => copyEl.textContent = "Copy connection code", 1200); }; }
-      function decode(value) { const normalized = value.replace(/-/g, "+").replace(/_/g, "/"); return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(normalized + "=".repeat((4 - normalized.length % 4) % 4)), c => c.charCodeAt(0)))); }
-      async function run() {
-        const params = new URLSearchParams(location.search);
-        const port = Number.parseInt(params.get("port") || "", 10);
-        const stateValue = params.get("state") || "";
-        const key = params.get("key") || "";
-        const providers = (params.get("providers") || "").split(",").filter(Boolean);
-        if (!Number.isInteger(port) || port < 1 || port > 65535 || !stateValue || !key || providers.length < 1) { state("error", "Invalid connection link", "Return to the Tiller CLI and retry."); return; }
-        try {
-          const response = await fetch("/api/cli/auth-connect-package", { method: "POST", credentials: "include", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicKeyJwk: decode(key), state: stateValue, providers }) });
-          const value = await response.json().catch(() => ({}));
-          if (!response.ok || !value.envelope) throw new Error(value.error || "Connection approval failed.");
-          showCode(value.envelope);
-          state("", "Sending approval to Tiller…", "If the browser is on another machine, paste the connection code into your terminal.");
-          try {
-            const callback = await fetch("http://127.0.0.1:" + port + "/auth-connect-callback", { method: "POST", mode: "cors", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ envelope: value.envelope }) });
-            if (!callback.ok) throw new Error();
-            codeShell.classList.remove("visible");
-            state("success", "Subscriptions approved", "Return to your terminal while Tiller finishes the connection.");
-          } catch { state("", "Connection code ready", "Paste the connection code into your terminal."); }
-        } catch (error) { state("error", "Connection approval failed", error instanceof Error ? error.message : "Retry from the Tiller CLI."); }
-      }
-      void run();
-    </script>
-  </body>
-</html>`;
-}
-
-async function requireGrant(c: Context<HonoEnv>, provider: AuthConnectProvider): Promise<Response | null> {
+async function requireGrant(
+  c: Context<HonoEnv>,
+  provider: AuthConnectProvider,
+): Promise<{ ok: true; grant: string } | { ok: false; response: Response }> {
   const grant = c.req.header("X-Tiller-Auth-Grant")?.trim() ?? "";
   if (!grant || !await authStub(c.env).consumeAuthConnectGrant(provider, grant)) {
-    return c.json({ error: "The authentication connection grant is invalid or expired.", code: "auth_grant_invalid" }, 403);
+    return {
+      ok: false,
+      response: c.json({ error: "The authentication connection grant is invalid or expired.", code: "auth_grant_invalid" }, 403),
+    };
   }
-  return null;
+  return { ok: true, grant };
+}
+
+async function recordResult(
+  c: Context<HonoEnv>,
+  provider: AuthConnectProvider,
+  grant: string,
+  result: "success" | "error",
+  error?: string,
+): Promise<void> {
+  try {
+    await authStub(c.env).recordAuthConnectResult(provider, grant, result, error);
+  } catch {
+    // Result tracking must never turn a completed credential upload into a failure.
+  }
 }
 
 const authConnectRoutes = new Hono<HonoEnv>();
 
 authConnectRoutes.get("/cli/auth-connect", (c) => {
   setNoStore(c);
-  return c.html(renderAuthConnectPage());
+  const source = new URL(c.req.url);
+  const destination = new URL("/settings", source);
+  destination.searchParams.set("auth_connect", "1");
+  for (const key of ["port", "state", "key", "providers"]) {
+    const value = source.searchParams.get(key);
+    if (value !== null) destination.searchParams.set(key, value);
+  }
+  return c.redirect(`${destination.pathname}${destination.search}`, 302);
 });
 
 authConnectRoutes.post("/api/cli/auth-connect-package", async (c) => {
@@ -215,7 +188,8 @@ authConnectRoutes.post("/api/cli/auth-connect-package", async (c) => {
   try {
     const raw = await readBoundedText(c.req.raw, MAX_PACKAGE_BODY_BYTES);
     const input = parsePackageRequest(JSON.parse(raw) as unknown);
-    const grants = await authStub(c.env).issueAuthConnectGrants(input.providers);
+    const connectionId = crypto.randomUUID();
+    const grants = await authStub(c.env).issueAuthConnectGrants(input.providers, connectionId);
     const now = Math.floor(Date.now() / 1_000);
     const hubUrl = new URL(c.req.url).origin;
     const authPackage: AuthConnectPackageV1 = {
@@ -231,13 +205,22 @@ authConnectRoutes.post("/api/cli/auth-connect-package", async (c) => {
     const envelope = await new CompactEncrypt(plaintext)
       .setProtectedHeader({ alg: "ECDH-ES", enc: "A256GCM", typ: "tiller-auth-connect+jwe" })
       .encrypt(publicKey);
-    return c.json({ envelope });
+    return c.json({ envelope, connection_id: connectionId });
   } catch (error) {
     if (error instanceof RequestBodyTooLargeError) {
       return c.json({ error: "Authentication connection request is too large." }, 413);
     }
     return c.json({ error: "Authentication connection request was rejected." }, 400);
   }
+});
+
+authConnectRoutes.get("/api/cli/auth-connect-status", async (c) => {
+  setNoStore(c);
+  const connectionId = c.req.query("connection_id")?.trim() ?? "";
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(connectionId)) {
+    return c.json({ error: "Invalid authentication connection ID." }, 400);
+  }
+  return c.json(await authStub(c.env).getAuthConnectStatus(connectionId));
 });
 
 authConnectRoutes.post("/api/auth/subscriptions/codex/connect", async (c) => {
@@ -259,25 +242,36 @@ authConnectRoutes.post("/api/auth/subscriptions/codex/connect", async (c) => {
     || typeof body.auth_json !== "string"
     || !body.auth_json.trim()
   ) return c.json({ error: "Codex authentication upload was rejected." }, 400);
-  const blocked = await requireGrant(c, "codex");
-  if (blocked) return blocked;
-  const result = await authStub(c.env).connectCodexAuth(body.auth_json);
-  if (!result.ok) {
-    return c.json({
-      error: result.reason === "needs_reconnect"
+  const authorization = await requireGrant(c, "codex");
+  if (!authorization.ok) return authorization.response;
+  try {
+    const result = await authStub(c.env).connectCodexAuth(body.auth_json);
+    if (!result.ok) {
+      const error = result.reason === "needs_reconnect"
         ? "Codex rejected the subscription login. Run `tiller auth connect codex` again."
-        : "Codex subscription authentication is temporarily unavailable. Retry the connection.",
-      code: result.reason,
-    }, result.reason === "needs_reconnect" ? 409 : 503);
+        : "Codex subscription authentication is temporarily unavailable. Retry the connection.";
+      await recordResult(c, "codex", authorization.grant, "error", error);
+      return c.json({ error, code: result.reason }, result.reason === "needs_reconnect" ? 409 : 503);
+    }
+    await hubStub(c.env).setConfig("openaiBillingMode", "subscription");
+    invalidateConfigCache();
+    await recordResult(c, "codex", authorization.grant, "success");
+    return c.json({
+      ok: true,
+      authenticated: true,
+      expires_at: Date.parse(result.credential.expiresAt),
+      account_id: result.credential.accountId,
+    });
+  } catch (error) {
+    await recordResult(
+      c,
+      "codex",
+      authorization.grant,
+      "error",
+      "Tiller could not finish the Codex connection. Retry the connection.",
+    );
+    throw error;
   }
-  await hubStub(c.env).setConfig("openaiBillingMode", "subscription");
-  invalidateConfigCache();
-  return c.json({
-    ok: true,
-    authenticated: true,
-    expires_at: Date.parse(result.credential.expiresAt),
-    account_id: result.credential.accountId,
-  });
 });
 
 authConnectRoutes.post("/api/auth/subscriptions/claude/connect", async (c) => {
@@ -300,13 +294,25 @@ authConnectRoutes.post("/api/auth/subscriptions/claude/connect", async (c) => {
     || !body.oauth_token.trim()
     || body.oauth_token.length > 16 * 1_024
   ) return c.json({ error: "Claude authentication upload was rejected." }, 400);
-  const blocked = await requireGrant(c, "claude");
-  if (blocked) return blocked;
-  const hub = hubStub(c.env);
-  await hub.setConfig("CLAUDE_CODE_OAUTH_TOKEN", body.oauth_token.trim());
-  await hub.setConfig("claudeBillingMode", "subscription");
-  invalidateConfigCache();
-  return c.json({ ok: true, authenticated: true });
+  const authorization = await requireGrant(c, "claude");
+  if (!authorization.ok) return authorization.response;
+  try {
+    const hub = hubStub(c.env);
+    await hub.setConfig("CLAUDE_CODE_OAUTH_TOKEN", body.oauth_token.trim());
+    await hub.setConfig("claudeBillingMode", "subscription");
+    invalidateConfigCache();
+    await recordResult(c, "claude", authorization.grant, "success");
+    return c.json({ ok: true, authenticated: true });
+  } catch (error) {
+    await recordResult(
+      c,
+      "claude",
+      authorization.grant,
+      "error",
+      "Tiller could not save the Claude subscription. Retry the connection.",
+    );
+    throw error;
+  }
 });
 
 export default authConnectRoutes;

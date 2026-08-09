@@ -1,12 +1,10 @@
 import React from "react";
 import type { AgentRoute, PlannerEffort, PlannerProviderMetadata } from "./api";
 import ModelEffortPicker, { type ModelEffortOption } from "./ModelEffortPicker";
-import FastModeField from "./FastModeField";
 
 export interface PlanWriterModelSelection {
   routeKey: string;
   effort: PlannerEffort;
-  fastMode?: boolean;
 }
 
 interface PlanWriterModelPickerProps {
@@ -14,6 +12,7 @@ interface PlanWriterModelPickerProps {
   providers: PlannerProviderMetadata[];
   value: PlanWriterModelSelection;
   onChange: (value: PlanWriterModelSelection) => void;
+  settingsHref?: string;
   disabled?: boolean;
   className?: string;
 }
@@ -29,10 +28,6 @@ const EFFORT_LABELS: Record<PlannerEffort, string> = {
 
 export function planWriterEffortLabel(effort: PlannerEffort | null | undefined): string {
   return effort ? EFFORT_LABELS[effort] : "Default";
-}
-
-export function planWriterRouteSupportsFastMode(routes: AgentRoute[], routeKey: string): boolean {
-  return routes.some((route) => route.key === routeKey && route.provider === "codex");
 }
 
 export function buildPlanWriterModelOptions(
@@ -59,38 +54,35 @@ export default function PlanWriterModelPicker({
   providers,
   value,
   onChange,
+  settingsHref,
   disabled = false,
   className,
 }: PlanWriterModelPickerProps) {
-  const selectedRouteSupportsFastMode = planWriterRouteSupportsFastMode(routes, value.routeKey);
   return (
     <div className={className}>
       <ModelEffortPicker
         options={buildPlanWriterModelOptions(routes, providers)}
         value={{ model: value.routeKey, effort: value.effort }}
-        onChange={(selection) => {
-          const nextRoute = routes.find((route) => route.key === selection.model) ?? null;
-          onChange({
-            routeKey: selection.model,
-            effort: selection.effort,
-            ...(nextRoute?.provider === "codex" && value.fastMode ? { fastMode: true } : {}),
-          });
-        }}
+        onChange={(selection) => onChange({
+          routeKey: selection.model,
+          effort: selection.effort,
+        })}
         disabled={disabled}
-        modelLabel="Writer model"
+        modelLabel="Scribe model"
         effortLabel="Reasoning effort"
       />
-      {selectedRouteSupportsFastMode && (
-        <FastModeField
-          className="mt-3"
-          checked={Boolean(value.fastMode)}
-          disabled={disabled}
-          onChange={(fastMode) => onChange({
-            routeKey: value.routeKey,
-            effort: value.effort,
-            ...(fastMode ? { fastMode: true } : {}),
-          })}
-        />
+      {settingsHref && (
+        <p className="mt-2 text-xs text-kumo-subtle">
+          <a
+            href={settingsHref}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-kumo-link underline underline-offset-2 hover:no-underline"
+          >
+            Open model access settings
+            <span className="sr-only"> (opens in a new tab)</span>
+          </a>
+        </p>
       )}
     </div>
   );

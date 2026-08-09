@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Dialog } from "@cloudflare/kumo/components/dialog";
 import {
+  ApiActionError,
   addPlanReviewer,
   createPlan,
   discardPlan,
@@ -13,6 +14,7 @@ import {
   fetchPlannerProviders,
   fetchPlanReviewers,
   fetchRepoArtifacts,
+  invokePlanSkill,
   removePlanReviewer,
   savePlan,
   sendReviewerMessageToWriter,
@@ -33,18 +35,22 @@ import type {
 import PlanCategorySidebar from "./PlanCategorySidebar";
 import PlanReader from "./PlanReader";
 import PlanChatTabs from "./PlanChatTabs";
-import ReviewerChat from "./ReviewerChat";
+import ReviewerChat, { type ReviewerMessageHandoffStatus } from "./ReviewerChat";
 import type { AddReviewerAction } from "./AddReviewerMenu";
 import { useToast } from "./Toast";
 import { getRepoLabel } from "./plan-repo";
 import { listPlanArtifacts } from "./plan-artifacts";
-import { planPath } from "./dashboard-paths";
+import { planPath, projectGlobalSettingsPath } from "./dashboard-paths";
 import SkillEditorDialog from "./SkillEditorDialog";
 import PlanSkillHistory from "./PlanSkillHistory";
 import LoadingIndicator from "./LoadingIndicator";
-import PlanWriterPane, { type PlanWriterHandoff } from "./PlanWriterPane";
+import PlanWriterPane, {
+  type PlanContributionPresentation,
+  type PlanWriterHandoff,
+} from "./PlanWriterPane";
 import PlanWriterModelPicker, { type PlanWriterModelSelection } from "./PlanWriterModelPicker";
 import ResizablePlanPanes from "./ResizablePlanPanes";
+import { SETTINGS_TARGET_IDS, settingsTargetHref } from "./settings-targets";
 import {
   newestReviewerRun,
   planReviewerFinishedAckStorageKey,
@@ -77,7 +83,7 @@ type ArtifactLoadState = "loading" | "loaded" | "error";
 const NOT_STARTED_WRITER_STATUS: PlanTabStatus = {
   kind: "idle",
   label: "Not started",
-  detail: "Start the Writer when you are ready.",
+  detail: "Start the Scribe when you are ready.",
 };
 
 export default function PlanView({
@@ -102,12 +108,19 @@ export default function PlanView({
   const [writerSettingsDraft, setWriterSettingsDraft] = useState<{
     routeKey: string;
     effort: RepoPlanWriterSettings["effort"];
-    fastMode: boolean;
     planFormat: string;
-  }>({ routeKey: "", effort: "high", fastMode: false, planFormat: "" });
+  }>({ routeKey: "", effort: "high", planFormat: "" });
+  const [runningPlanSkillId, setRunningPlanSkillId] = useState<string | null>(null);
+  const [planHistoryToken, setPlanHistoryToken] = useState(0);
   const [reviewersLoading, setReviewersLoading] = useState(false);
   const [addingReviewer, setAddingReviewer] = useState(false);
+  const [reviewerDialogOpen, setReviewerDialogOpen] = useState(false);
   const [activeChatTab, setActiveChatTab] = useState("writer");
+  const [reviewerMessageFocus, setReviewerMessageFocus] = useState<{
+    threadId: string;
+    messageId: string;
+    requestId: string;
+  } | null>(null);
   const [reviewerRunsByPlan, setReviewerRunsByPlan] = useState<
     Record<string, Record<string, PlannerRun | null>>
   >({});
@@ -127,6 +140,7 @@ export default function PlanView({
   } | null>(null);
   const seenMainEventRef = useRef<string | null>(null);
   const mainUpdateRequestRef = useRef(0);
+  const planSkillRequestRef = useRef(new Map<string, string>());
   const addToast = useToast();
 
   const selectedPlanArtifactId = planArtifactId ?? null;
@@ -145,6 +159,43 @@ export default function PlanView({
   const selectedWriterMode = selectedPlan && writerMode?.planArtifactId === selectedPlan.id
     ? writerMode
     : null;
+  const pendingScribeCount = selectedContributions.filter((contribution) => contribution.status === "pending").length;
+  const contributionPresentations = useMemo(() => {
+    const reviewerThreads = new Set(selectedReviewers.map((reviewer) => reviewer.threadId));
+    const skillLabels = new Map(planAgentSkills.map((skill) => [skill.command, skill.label]));
+    const presentations = new Map<string, PlanContributionPresentation>();
+    for (const contribution of selectedContributions) {
+      const modelLabel = plannerModelDisplayName(plannerProviders, contribution.provider, contribution.model);
+      const skillLabel = contribution.skill ? skillLabels.get(contribution.skill) ?? contribution.skill : null;
+      const sourceLabel = contribution.sourceKind === "skill_guidance"
+        ? "Your Plan Skill guidance"
+        : `${modelLabel} reviewer`;
+      presentations.set(contribution.id, {
+        sourceLabel,
+        ...(skillLabel ? { sourceDetail: `${skillLabel} Plan Skill` } : {}),
+        canViewSource: contribution.sourceKind === "reviewer_message"
+          && Boolean(contribution.sourceThreadId && reviewerThreads.has(contribution.sourceThreadId))
+          && Boolean(contribution.sourceMessageId),
+      });
+    }
+    return presentations;
+  }, [planAgentSkills, plannerProviders, selectedContributions, selectedReviewers]);
+  const reviewerMessageHandoffStatuses = useMemo(() => {
+    const byThread = new Map<string, Map<string, ReviewerMessageHandoffStatus>>();
+    for (const contribution of selectedContributions) {
+      if (contribution.sourceKind !== "reviewer_message" || !contribution.sourceThreadId || !contribution.sourceMessageId) {
+        continue;
+      }
+      const statuses = byThread.get(contribution.sourceThreadId) ?? new Map<string, ReviewerMessageHandoffStatus>();
+      statuses.set(contribution.sourceMessageId, contribution.status === "pending"
+        ? "waiting"
+        : contribution.status === "incorporated"
+          ? "shared"
+          : "removed");
+      byThread.set(contribution.sourceThreadId, statuses);
+    }
+    return byThread;
+  }, [selectedContributions]);
   const writerProviders = useMemo(
     () => plannerProviders.filter((provider) => provider.capabilities.writer),
     [plannerProviders],
@@ -243,6 +294,8 @@ export default function PlanView({
 
   useEffect(() => {
     setActiveChatTab("writer");
+    setReviewerDialogOpen(false);
+    setReviewerMessageFocus(null);
     setPlanSkillsOpen(false);
     setWriterHandoffs([]);
   }, [planArtifactId, repoId]);
@@ -365,16 +418,45 @@ export default function PlanView({
         setWriterSettingsDraft({
           routeKey: settings.routeKey,
           effort: settings.effort,
-          fastMode: settings.fastMode,
           planFormat: settings.planFormat,
         });
       })
       .catch((error) => addToast({
-        title: "Failed to load Plan Writer Settings",
+        title: "Failed to load Scribe Settings",
         body: error instanceof Error ? error.message : "Unknown error",
         variant: "error",
       }));
   }, [addToast, loadPlanAgentSkills, repoId]);
+
+  const runPlanSkill = useCallback(async (skill: AgentSkillDefinition) => {
+    if (!selectedPlan || runningPlanSkillId) return false;
+    const actionKey = `${selectedPlan.id}:${skill.id}`;
+    const requestId = planSkillRequestRef.current.get(actionKey) ?? crypto.randomUUID();
+    planSkillRequestRef.current.set(actionKey, requestId);
+    setRunningPlanSkillId(skill.id);
+    try {
+      await invokePlanSkill(HUB_URL, repoId, selectedPlan.id, skill.id, requestId);
+      planSkillRequestRef.current.delete(actionKey);
+      setPlanHistoryToken((value) => value + 1);
+      addToast({
+        title: `${skill.label} fanout started`,
+        variant: "success",
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof ApiActionError && error.code !== "skill_setup_incomplete") {
+        planSkillRequestRef.current.delete(actionKey);
+      }
+      addToast({
+        title: `Failed to run /${skill.command}`,
+        body: error instanceof Error ? error.message : "Unknown error",
+        variant: "error",
+      });
+      return false;
+    } finally {
+      setRunningPlanSkillId(null);
+    }
+  }, [addToast, repoId, runningPlanSkillId, selectedPlan]);
 
   useEffect(() => {
     if (!selectedPlan || reviewersByPlan[selectedPlan.id]) return;
@@ -466,7 +548,6 @@ export default function PlanView({
       setWriterSettingsDraft({
         routeKey: repoWriterSettings.routeKey,
         effort: repoWriterSettings.effort,
-        fastMode: repoWriterSettings.fastMode,
         planFormat: repoWriterSettings.planFormat,
       });
     }
@@ -482,7 +563,7 @@ export default function PlanView({
       if (route) setWriterSelection({ routeKey: route.key, effort: settings.effort });
     } catch (error) {
       addToast({
-        title: "Failed to save Plan Writer Settings",
+        title: "Failed to save Scribe Settings",
         body: error instanceof Error ? error.message : "Unknown error",
         variant: "error",
       });
@@ -639,7 +720,9 @@ export default function PlanView({
     const contributionIds = contributions
       .filter((contribution) => contribution.status === "pending")
       .map((contribution) => contribution.id);
-    if (contributionIds.length > 0) {
+    const scribeAlreadyActive = selectedWriterMode?.writer.lifecycle === "running"
+      || selectedWriterMode?.writer.lifecycle === "starting";
+    if (contributionIds.length > 0 && scribeAlreadyActive) {
       setWriterHandoffs((current) => {
         const queued = new Set(current.flatMap((handoff) => handoff.contributionIds));
         const unqueuedIds = contributionIds.filter((id) => !queued.has(id));
@@ -649,7 +732,7 @@ export default function PlanView({
       });
     }
     setActiveChatTab("writer");
-  }, [selectedPlan]);
+  }, [selectedPlan, selectedWriterMode?.writer.lifecycle]);
 
   const forwardReviewerMessage = useCallback(async (reviewer: ReviewerRegistryEntry, messageId: string) => {
     try {
@@ -664,7 +747,7 @@ export default function PlanView({
       sendContributionsToWriter([result.contribution]);
     } catch (error) {
       addToast({
-        title: "Feedback not sent to writer",
+        title: "Context not shared with Scribe",
         body: error instanceof Error ? error.message : "Unknown error",
         variant: "error",
       });
@@ -676,32 +759,31 @@ export default function PlanView({
     setWriterHandoffs((current) => current.filter((handoff) => handoff.id !== handoffId));
     if (error) {
       addToast({
-        title: "Feedback not sent to writer",
+        title: "Context not shared with Scribe",
         body: error,
         variant: "error",
       });
       return;
     }
     addToast({
-      title: "Feedback sent to writer",
-      body: "The live Plan Writer is working on it now.",
+      title: "Context shared with Scribe",
+      body: "The live Scribe is working on it now.",
       variant: "success",
       duration: 2500,
     });
   }, [addToast]);
 
-  const sentReviewerMessageIdsByThread = useMemo(() => {
-    const byThread = new Map<string, Set<string>>();
-    for (const contribution of selectedContributions) {
-      if (contribution.sourceKind !== "reviewer_message" || !contribution.sourceThreadId || !contribution.sourceMessageId) {
-        continue;
-      }
-      const set = byThread.get(contribution.sourceThreadId) ?? new Set<string>();
-      set.add(contribution.sourceMessageId);
-      byThread.set(contribution.sourceThreadId, set);
-    }
-    return byThread;
-  }, [selectedContributions]);
+  const viewContributionSource = useCallback((contributionId: string) => {
+    const contribution = selectedContributions.find((candidate) => candidate.id === contributionId);
+    if (!contribution?.sourceThreadId || !contribution.sourceMessageId) return;
+    if (!selectedReviewers.some((reviewer) => reviewer.threadId === contribution.sourceThreadId)) return;
+    setReviewerMessageFocus({
+      threadId: contribution.sourceThreadId,
+      messageId: contribution.sourceMessageId,
+      requestId: crypto.randomUUID(),
+    });
+    setActiveChatTab(contribution.sourceThreadId);
+  }, [selectedContributions, selectedReviewers]);
 
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -711,15 +793,6 @@ export default function PlanView({
             <span className="truncate text-sm font-medium text-kumo-default">{getRepoLabel(repoUrl)}</span>
           </div>
           <div className="flex shrink-0 items-center gap-3">
-            <button
-              type="button"
-              onClick={openRepoWriterSettings}
-              disabled={!repoWriterSettings}
-              title={repoWriterSettings ? "Repository Plan Writer model, reasoning effort, Fast mode, and Plan Format" : "Plan Writer Settings are loading"}
-              className="rounded border border-kumo-line bg-kumo-base px-2.5 py-1 text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint disabled:opacity-50"
-            >
-              Plan Writer Settings
-            </button>
             <button
               type="button"
               onClick={() => void handleNewPlan()}
@@ -756,9 +829,12 @@ export default function PlanView({
                     providers={plannerProviders}
                     activeTab={activeChatTab}
                     writerTabStatus={writerTabStatus}
+                    pendingScribeCount={pendingScribeCount}
                     reviewerTabStatuses={selectedReviewerTabStatuses}
                     adding={addingReviewer || reviewersLoading}
+                    reviewerDialogOpen={reviewerDialogOpen}
                     onActiveTabChange={setActiveChatTab}
+                    onReviewerDialogOpenChange={setReviewerDialogOpen}
                     onOpenPlanSkills={() => setPlanSkillsOpen(true)}
                     onAddReviewer={(model) => void handleAddReviewer(model)}
                     onCloseReviewer={(threadId) => void handleCloseReviewer(threadId)}
@@ -766,6 +842,7 @@ export default function PlanView({
                   <PlanSkillHistory
                     repoId={repoId}
                     planArtifactId={selectedPlan.id}
+                    refreshToken={planHistoryToken}
                     onContributionsChanged={() => void loadContributions(selectedPlan.id, { quiet: true })}
                     onForwarded={sendContributionsToWriter}
                   />
@@ -779,9 +856,11 @@ export default function PlanView({
                         routes={writerRouteOptions}
                         selection={writerSelection}
                         contributions={selectedContributions}
+                        contributionPresentations={contributionPresentations}
                         handoff={writerHandoffs[0] ?? null}
                         queuedHandoffContributionIds={writerHandoffs.flatMap((handoff) => handoff.contributionIds)}
                         hidden={activeChatTab !== "writer"}
+                        canAddReviewer={selectedReviewers.length < 4}
                         onWriterChange={(writer) => setWriterMode({
                           planArtifactId: selectedPlan.id,
                           writer,
@@ -790,10 +869,14 @@ export default function PlanView({
                         onArtifactChanged={() => void loadArtifacts({ quiet: true, selectId: selectedPlan.id })}
                         onContributionsChanged={() => void loadContributions(selectedPlan.id, { quiet: true })}
                         onHandoffSettled={settleWriterHandoff}
+                        onViewContributionSource={viewContributionSource}
+                        onAddReviewer={() => setReviewerDialogOpen(true)}
+                        onOpenSettings={openRepoWriterSettings}
+                        settingsAvailable={Boolean(repoWriterSettings)}
                       />
                     ) : (
                       <div className="flex h-full items-center justify-center">
-                        <LoadingIndicator label="Loading Plan Writer" />
+                        <LoadingIndicator label="Loading Scribe" />
                       </div>
                     )}
                     {selectedReviewers.map((reviewer) => (
@@ -805,7 +888,15 @@ export default function PlanView({
                         provider={reviewer.provider}
                         model={reviewer.model}
                         hidden={activeChatTab !== reviewer.threadId}
-                        sentMessageIds={sentReviewerMessageIdsByThread.get(reviewer.threadId) ?? new Set()}
+                        skills={planAgentSkills}
+                        onInvokeSkill={runPlanSkill}
+                        handoffStatuses={reviewerMessageHandoffStatuses.get(reviewer.threadId)}
+                        focusMessage={reviewerMessageFocus?.threadId === reviewer.threadId
+                          ? {
+                              messageId: reviewerMessageFocus.messageId,
+                              requestId: reviewerMessageFocus.requestId,
+                            }
+                          : null}
                         onLatestRunChange={(run) => handleReviewerRunChange(
                           selectedPlan.id,
                           reviewer.threadId,
@@ -818,7 +909,7 @@ export default function PlanView({
                 </div>
               ) : (
                 <div className="flex h-full items-center justify-center text-sm text-kumo-subtle">
-                  Create a plan to start a Plan Writer or reviewer.
+                  Create a plan to start a Scribe or add a reviewer.
                 </div>
               )}
             </div>
@@ -845,11 +936,11 @@ export default function PlanView({
         onChanged={loadPlanAgentSkills}
       />
       <Dialog.Root open={writerSettingsOpen} onOpenChange={setWriterSettingsOpen}>
-        <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-2xl flex-col overflow-hidden p-0">
+        <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-3xl flex-col overflow-hidden p-0 sm:w-[calc(100vw-2rem)]">
           <div className="border-b border-kumo-line px-4 py-3">
-            <Dialog.Title className="text-sm font-semibold text-kumo-strong">Plan Writer Settings</Dialog.Title>
+            <Dialog.Title className="text-sm font-semibold text-kumo-strong">Scribe Settings</Dialog.Title>
             <Dialog.Description className="mt-0.5 text-xs text-kumo-subtle">
-              Repository defaults are frozen when a new Plan Writer generation starts.
+              Repository defaults are frozen when a new Scribe generation starts.
             </Dialog.Description>
           </div>
           <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
@@ -858,6 +949,10 @@ export default function PlanView({
               providers={plannerProviders}
               value={writerSettingsDraft}
               onChange={(selection) => setWriterSettingsDraft((draft) => ({ ...draft, ...selection }))}
+              settingsHref={settingsTargetHref(
+                projectGlobalSettingsPath(repoId),
+                SETTINGS_TARGET_IDS.modelAccess,
+              )}
             />
             <label className="flex min-h-72 flex-1 flex-col text-xs font-medium text-kumo-subtle">
               <span className="mb-1.5 block">Plan Format</span>
@@ -941,6 +1036,15 @@ function getSessionStorage(): Storage | null {
   } catch {
     return null;
   }
+}
+
+function plannerModelDisplayName(
+  providers: PlannerProviderMetadata[],
+  providerId: string,
+  modelId: string,
+): string {
+  const provider = providers.find((candidate) => candidate.id === providerId);
+  return provider?.models.find((candidate) => candidate.id === modelId)?.displayName ?? modelId;
 }
 
 function plannerEffortLabel(effort: string): string {

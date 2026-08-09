@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Navigate, useLocation, useParams } from 'react-router-dom';
+import { Navigate, useLocation, useParams } from 'react-router';
 import type { DashboardData } from './DashboardDataProvider';
 import { useDashboardData } from './DashboardDataProvider';
 import { RouteLoading, RouteLoadError } from './dashboard-route-state';

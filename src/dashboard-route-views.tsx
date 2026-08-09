@@ -1,4 +1,4 @@
-import { Navigate, useNavigate, useParams } from 'react-router-dom';
+import { Navigate, useLocation, useNavigate, useParams } from 'react-router';
 import { Button } from '@cloudflare/kumo/components/button';
 import type { EnvMeta, RepoMeta } from '../api/types';
 import { useDashboardData } from './DashboardDataProvider';
@@ -7,7 +7,7 @@ import EnvWaitingView from './EnvWaitingView';
 import PlanView from './PlanView';
 import ShipView from './ShipView';
 import ProjectsHome from './ProjectsHome';
-import SettingsPage from './SettingsPage';
+import SettingsPage, { parseAuthConnectIntent } from './SettingsPage';
 import RepoSettingsPage from './RepoSettingsPage';
 import { isRepoMainReady } from './repo-status';
 import { getSessionEnvSlug } from './dashboard-route-scope';
@@ -53,6 +53,7 @@ export function ProjectsHomeRoute() {
 
 export function SettingsRoute() {
   const data = useDashboardData();
+  const location = useLocation();
   const navigate = useNavigate();
   if (!data.setupStatus) {
     return <RouteLoading label="Loading settings" />;
@@ -63,6 +64,7 @@ export function SettingsRoute() {
         status={data.setupStatus}
         onRefresh={data.refreshSetupStatus}
         onDone={() => navigate('/', { replace: true })}
+        authConnectIntent={parseAuthConnectIntent(location.search)}
       />
     </HomeSettingsFrame>
   );

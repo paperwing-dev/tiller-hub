@@ -4,7 +4,7 @@
 import React, { act, type ComponentProps } from "react";
 import userEvent from "@testing-library/user-event";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Artifact } from "../../api/coordination/types";
 import type { EnvMeta } from "../../api/types";
@@ -249,6 +249,9 @@ describe("StartPlanDialog", () => {
     expect(document.body.querySelector('[aria-label="Model"]')?.textContent).toContain("GPT-5.5");
     expect(document.body.textContent).toContain("Configure the active OpenAI API key");
     expect(document.body.querySelectorAll('[data-testid="harness-model-requirement"]')).toHaveLength(1);
+    const settingsLink = document.body.querySelector<HTMLAnchorElement>('[data-testid="harness-model-requirement"] a');
+    expect(settingsLink).toHaveAttribute("href", "/projects/repo-1/global-settings#openai-api-key");
+    expect(settingsLink).toHaveAttribute("target", "_blank");
     const startButton = Array.from(document.body.querySelectorAll("button"))
       .find((button) => button.textContent === "Start") as HTMLButtonElement | undefined;
     expect(startButton?.disabled).toBe(true);

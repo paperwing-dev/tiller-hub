@@ -56,6 +56,15 @@ vi.mock("../UpdateDialog", () => ({
 }));
 
 vi.mock("../api", () => ({
+  ApiAuthenticationError: class ApiAuthenticationError extends Error {
+    constructor(message = "Browser authentication is required.") {
+      super(message);
+      this.name = "ApiAuthenticationError";
+    }
+  },
+  isApiAuthenticationError: (error: unknown) => (
+    error instanceof Error && error.name === "ApiAuthenticationError"
+  ),
   ApiActionError: class ApiActionError extends Error {
     readonly code?: string;
     readonly hint?: string;
@@ -140,7 +149,8 @@ describe("Dashboard", () => {
   });
 
   it("renders without touching uninitialized callbacks", async () => {
-    const { RouterProvider, createMemoryRouter } = await import("react-router-dom");
+    const { createMemoryRouter } = await import("react-router");
+    const { RouterProvider } = await import("react-router/dom");
     const { dashboardRoutes } = await import("../App");
     const router = createMemoryRouter(dashboardRoutes, { initialEntries: ["/"] });
     expect(() => renderToString(React.createElement(RouterProvider, { router }))).not.toThrow();
@@ -164,6 +174,31 @@ describe("Dashboard", () => {
     expect(refreshEnvs).toHaveBeenCalledTimes(1);
     expect(refreshRepos).toHaveBeenCalledTimes(1);
     expect(refreshSetupStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("reloads once to renew expired browser authentication", async () => {
+    const { recoverBrowserAuthentication } = await import("../App");
+    const { ApiAuthenticationError } = await import("../api");
+    const stored = new Map<string, string>();
+    const reload = vi.fn();
+    const target = {
+      location: { reload },
+      sessionStorage: {
+        getItem: (key: string) => stored.get(key) ?? null,
+        setItem: (key: string, value: string) => stored.set(key, value),
+      },
+    };
+    const error = new ApiAuthenticationError("expired");
+
+    expect(recoverBrowserAuthentication(error, target, 100_000)).toBe(true);
+    expect(reload).toHaveBeenCalledTimes(1);
+
+    expect(recoverBrowserAuthentication(error, target, 105_000)).toBe(true);
+    expect(reload).toHaveBeenCalledTimes(1);
+
+    expect(recoverBrowserAuthentication(error, target, 110_000)).toBe(true);
+    expect(reload).toHaveBeenCalledTimes(2);
+    expect(recoverBrowserAuthentication(new Error("offline"), target, 120_000)).toBe(false);
   });
 
   it("surfaces update-check failures returned as typed update issues", async () => {

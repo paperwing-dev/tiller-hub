@@ -4,7 +4,8 @@
 import React from "react";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RouterProvider, createMemoryRouter } from "react-router-dom";
+import { createMemoryRouter } from "react-router";
+import { RouterProvider } from "react-router/dom";
 import type { EnvMeta, RepoMeta, UpdateCheckResult } from "../api";
 import { createInitialEnvScmState, createInitialRepoScmState } from "../../api/scm/model";
 import type { StoredSession } from "../../api/types";
@@ -63,6 +64,7 @@ vi.mock("../StartPlanDialog", () => ({
 
 vi.mock("../SettingsPage", () => ({
   default: () => <div data-testid="settings-page" />,
+  parseAuthConnectIntent: () => null,
 }));
 
 vi.mock("../RepoSettingsPage", () => ({
@@ -89,6 +91,15 @@ vi.mock("../ConnectionsBadge", () => ({
 }));
 
 vi.mock("../api", () => ({
+  ApiAuthenticationError: class ApiAuthenticationError extends Error {
+    constructor(message = "Browser authentication is required.") {
+      super(message);
+      this.name = "ApiAuthenticationError";
+    }
+  },
+  isApiAuthenticationError: (error: unknown) => (
+    error instanceof Error && error.name === "ApiAuthenticationError"
+  ),
   ApiActionError: class ApiActionError extends Error {
     readonly code?: string;
     readonly hint?: string;

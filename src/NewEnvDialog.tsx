@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Dialog } from "@cloudflare/kumo/components/dialog";
 import { Input } from "@cloudflare/kumo/components/input";
@@ -9,10 +9,13 @@ import type {
   HarnessSettings,
   RepoMeta,
 } from "../api/types";
+import { isEnvHarness } from "../api/types";
 import {
   getHarnessDefault,
   getHarnessModel,
+  listHarnessModels,
   resolveHarnessModelAvailability,
+  type HarnessCredentialStatus,
 } from "../shared/harness-catalog";
 import type { BillingMode } from "../shared/billing";
 import {
@@ -25,6 +28,7 @@ import {
 } from "./api";
 import { getHarnessBadgeLabel } from "./env-harness";
 import { NEW_EXECUTION_UNAVAILABLE_MESSAGE } from "./env-display";
+import { projectGlobalSettingsPath } from "./dashboard-paths";
 import HarnessSettingsFields from "./HarnessSettingsFields";
 import MarkdownContent from "./MarkdownContent";
 import { isPlanOutdatedForMain, listPlanArtifacts, renderArtifactBodyMarkdown } from "./plan-artifacts";
@@ -293,6 +297,7 @@ interface NewEnvDialogProps {
   workersAiConfigured?: boolean;
   enabledHarnesses: EnvHarness[];
   repo: RepoMeta;
+  onRefreshSetupStatus?: () => Promise<void>;
   onCreate: (options: CreateEnvOptions) => Promise<void>;
 }
 
@@ -335,16 +340,61 @@ export function getScheduledRunRequirementError(options: {
   return null;
 }
 
-export function getInitialEnvHarnessSelection(enabledHarnesses: EnvHarness[]): EnvHarness {
+export const LAST_ENV_HARNESS_STORAGE_KEY = "tiller:last-env-harness";
+
+function readLastEnvHarnessSelection(): EnvHarness | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const stored = window.localStorage.getItem(LAST_ENV_HARNESS_STORAGE_KEY);
+    return isEnvHarness(stored) ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeLastEnvHarnessSelection(harness: EnvHarness): void {
+  try {
+    window.localStorage.setItem(LAST_ENV_HARNESS_STORAGE_KEY, harness);
+  } catch {
+    // Environment creation should still succeed when browser storage is unavailable.
+  }
+}
+
+export function getInitialEnvHarnessSelection(
+  enabledHarnesses: EnvHarness[],
+  preferredHarness: string | null = readLastEnvHarnessSelection(),
+): EnvHarness {
+  if (isEnvHarness(preferredHarness) && enabledHarnesses.includes(preferredHarness)) {
+    return preferredHarness;
+  }
   return enabledHarnesses.includes("opencode")
     ? "opencode"
     : enabledHarnesses[0] ?? "claude-code";
 }
 
-export function getNewEnvHarnessDefault(harness: EnvHarness): HarnessSettings {
-  return harness === "opencode"
+export function getNewEnvHarnessDefault(
+  harness: EnvHarness,
+  backend?: "cf" | "host",
+  credentialStatus?: HarnessCredentialStatus,
+): HarnessSettings {
+  const fallback = harness === "opencode"
     ? { model: "gpt-5.6-sol", effort: "xhigh" }
     : getHarnessDefault(harness);
+
+  if (!backend || !credentialStatus) return fallback;
+
+  const availableModels = listHarnessModels(harness).filter(
+    (entry) => resolveHarnessModelAvailability(entry, backend, credentialStatus).available,
+  );
+  if (availableModels.length !== 1) return fallback;
+
+  const [onlyModel] = availableModels;
+  return {
+    model: onlyModel.id,
+    effort: onlyModel.efforts.includes(fallback.effort)
+      ? fallback.effort
+      : onlyModel.efforts[onlyModel.efforts.length - 1] ?? fallback.effort,
+  };
 }
 
 export function NewEnvDialog({
@@ -360,12 +410,23 @@ export function NewEnvDialog({
   workersAiConfigured = false,
   enabledHarnesses,
   repo,
+  onRefreshSetupStatus,
   onCreate,
 }: NewEnvDialogProps) {
   const initialHarness = getInitialEnvHarnessSelection(enabledHarnesses);
+  const initialCredentialStatus: HarnessCredentialStatus = {
+    hasClaudeSubscription,
+    hasAnthropicKey,
+    hasChatGPTAuth,
+    hasOpenAIKey,
+    workersAiConfigured,
+    claudeBillingMode,
+    openaiBillingMode,
+    chatgptAuthStatus,
+  };
   const [harness, setHarness] = useState<EnvHarness>(initialHarness);
   const [harnessSettings, setHarnessSettings] = useState<HarnessSettings>(() =>
-    getNewEnvHarnessDefault(initialHarness),
+    getNewEnvHarnessDefault(initialHarness, "cf", initialCredentialStatus),
   );
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatus | null>(null);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -376,12 +437,20 @@ export function NewEnvDialog({
   const [scheduleTonight, setScheduleTonight] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const refreshAfterSettings = useCallback(async () => {
+    await onRefreshSetupStatus?.();
+    try {
+      setExecutionStatus(await fetchExecutionStatus(hubUrl));
+    } catch {
+      setExecutionStatus(null);
+    }
+  }, [hubUrl, onRefreshSetupStatus]);
   const backend = executionStatus?.selected.target ?? "cf";
   const executionReady = executionStatus?.executionReady ?? false;
   const repoMainReady = isRepoMainReady(repo);
   const repoMainDetail = getRepoMainStatusDetail(repo);
   const selectedCatalogModel = getHarnessModel(harness, harnessSettings.model);
-  const credentialStatus = {
+  const credentialStatus = useMemo<HarnessCredentialStatus>(() => ({
     hasClaudeSubscription,
     hasAnthropicKey,
     hasChatGPTAuth,
@@ -394,7 +463,17 @@ export function NewEnvDialog({
     openaiSubscriptionUnavailableReason: executionReady
       ? null
       : NEW_EXECUTION_UNAVAILABLE_MESSAGE,
-  };
+  }), [
+    chatgptAuthStatus,
+    claudeBillingMode,
+    executionReady,
+    hasAnthropicKey,
+    hasChatGPTAuth,
+    hasClaudeSubscription,
+    hasOpenAIKey,
+    openaiBillingMode,
+    workersAiConfigured,
+  ]);
   const selectedAvailability = selectedCatalogModel
     ? resolveHarnessModelAvailability(selectedCatalogModel, backend, credentialStatus)
     : null;
@@ -465,9 +544,9 @@ export function NewEnvDialog({
     if (!enabledHarnesses.includes(harness)) {
       const nextHarness = getInitialEnvHarnessSelection(enabledHarnesses);
       setHarness(nextHarness);
-      setHarnessSettings(getNewEnvHarnessDefault(nextHarness));
+      setHarnessSettings(getNewEnvHarnessDefault(nextHarness, backend, credentialStatus));
     }
-  }, [enabledHarnesses, harness]);
+  }, [backend, credentialStatus, enabledHarnesses, harness]);
 
   useEffect(() => {
     setError(null);
@@ -499,6 +578,7 @@ export function NewEnvDialog({
         harnessSettings,
         schedule: scheduleTonight ? getNextLocalThreeAm() : undefined,
       });
+      storeLastEnvHarnessSelection(harness);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -513,7 +593,7 @@ export function NewEnvDialog({
         if (!open) onClose();
       }}
     >
-      <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-2xl flex-col overflow-hidden p-0">
+      <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-3xl flex-col overflow-hidden p-0 sm:w-[calc(100vw-2rem)]">
         <div className="border-b border-kumo-line px-5 py-4">
           <Dialog.Title className="text-sm font-semibold text-kumo-strong">New Environment</Dialog.Title>
           <Dialog.Description className="text-xs text-kumo-subtle mt-0.5">{repoLabel(repo.repoUrl)}</Dialog.Description>
@@ -540,7 +620,7 @@ export function NewEnvDialog({
             onValueChange={(value) => {
               const nextHarness = (value ?? getInitialEnvHarnessSelection(enabledHarnesses)) as EnvHarness;
               setHarness(nextHarness);
-              setHarnessSettings(getNewEnvHarnessDefault(nextHarness));
+              setHarnessSettings(getNewEnvHarnessDefault(nextHarness, backend, credentialStatus));
             }}
             disabled={loading}
             renderValue={(value) => getHarnessBadgeLabel(value as EnvHarness)}
@@ -558,6 +638,8 @@ export function NewEnvDialog({
             value={harnessSettings}
             credentialStatus={credentialStatus}
             disabled={loading}
+            settingsPath={projectGlobalSettingsPath(repo.repoId)}
+            onRefreshSettings={refreshAfterSettings}
             onChange={(nextSettings) => {
               setHarnessSettings(nextSettings);
               setError(null);
@@ -603,19 +685,25 @@ export function NewEnvDialog({
                     <span className="block text-sm font-medium text-kumo-default">Select from Plans to Do</span>
                     <Select
                       aria-label="Startup Plan"
-                      className="mt-2 w-full"
+                      className="mt-2 h-auto min-h-6.5 w-full py-1.5"
                       size="sm"
                       value={selectedPlanId}
                       onValueChange={(value) => setSelectedPlanId(value ?? "")}
                       disabled={planChoice !== "specific" || planArtifacts.length === 0 || loading}
                       renderValue={(value) => {
                         const plan = planArtifacts.find((candidate) => candidate.id === value);
-                        return plan ? planOptionLabel(plan, repo.mainCommit ?? null) : "";
+                        return plan ? (
+                          <span className="block min-w-0 whitespace-normal break-words text-left">
+                            {planOptionLabel(plan, repo.mainCommit ?? null)}
+                          </span>
+                        ) : "";
                       }}
                     >
                       {planArtifacts.map((plan) => (
-                        <Select.Option key={plan.id} value={plan.id}>
-                          {planOptionLabel(plan, repo.mainCommit ?? null)}
+                        <Select.Option key={plan.id} value={plan.id} className="min-w-0">
+                          <span className="min-w-0 whitespace-normal break-words text-left">
+                            {planOptionLabel(plan, repo.mainCommit ?? null)}
+                          </span>
                         </Select.Option>
                       ))}
                     </Select>
@@ -633,7 +721,12 @@ export function NewEnvDialog({
           {selectedPlan && planChoice === "specific" && !plansLoading && (
             <div className="mt-3 rounded border border-kumo-line bg-kumo-recessed px-3 py-3">
               <div className="text-xs font-medium text-kumo-subtle">Selected plan</div>
-              <div className="mt-1 text-sm font-medium text-kumo-default">{selectedPlan.title || "Untitled plan"}</div>
+              <div
+                data-testid="selected-plan-title"
+                className="mt-1 max-w-full whitespace-normal break-words text-sm font-medium text-kumo-default"
+              >
+                {selectedPlan.title || "Untitled plan"}
+              </div>
               <div className="mt-1 text-xs text-kumo-subtle">
                 Updated {formatTimestamp(selectedPlan.updatedAt)}
               </div>
@@ -643,7 +736,9 @@ export function NewEnvDialog({
                 </div>
               )}
               <div className="mt-3 max-h-[min(18rem,35vh)] overflow-y-auto rounded border border-kumo-line bg-kumo-base px-3 py-3">
-                <MarkdownContent>{renderArtifactBodyMarkdown(selectedPlan.body)}</MarkdownContent>
+                <MarkdownContent className="break-words">
+                  {renderArtifactBodyMarkdown(selectedPlan.body)}
+                </MarkdownContent>
               </div>
             </div>
           )}

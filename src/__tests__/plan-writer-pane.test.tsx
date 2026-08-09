@@ -83,7 +83,7 @@ vi.mock("../api", async () => {
   };
 });
 
-import PlanWriterPane from "../PlanWriterPane";
+import PlanWriterPane, { type PlanContributionPresentation } from "../PlanWriterPane";
 
 const routes: AgentRoute[] = [{
   key: "codex:gpt-5.5",
@@ -129,7 +129,11 @@ function stoppedWriter(): PlanWriterState {
   };
 }
 
-function contribution(id: string, text: string): PlanContribution {
+function contribution(
+  id: string,
+  text: string,
+  overrides: Partial<PlanContribution> = {},
+): PlanContribution {
   return {
     id,
     repoId: "repo-1",
@@ -141,16 +145,22 @@ function contribution(id: string, text: string): PlanContribution {
     status: "pending",
     createdAt: "2026-07-14T00:00:00.000Z",
     updatedAt: "2026-07-14T00:00:00.000Z",
+    ...overrides,
   };
 }
 
 function renderPane(options: {
   initialWriter?: PlanWriterState;
   contributions?: PlanContribution[];
+  contributionPresentations?: ReadonlyMap<string, PlanContributionPresentation>;
   handoff?: { id: string; contributionIds: string[] } | null;
   onHandoffSettled?: (handoffId: string, error?: string) => void;
   onTabStatusChange?: (status: any) => void;
   onArtifactChanged?: () => void;
+  onViewContributionSource?: (contributionId: string) => void;
+  onAddReviewer?: () => void;
+  onOpenSettings?: () => void;
+  settingsAvailable?: boolean;
 } = {}) {
   const initialWriter = options.initialWriter ?? writer("running");
   mocks.fetchWriter.mockResolvedValue(initialWriter);
@@ -162,12 +172,17 @@ function renderPane(options: {
       routes={routes}
       selection={{ routeKey: "codex:gpt-5.5", effort: "xhigh" }}
       contributions={options.contributions ?? []}
+      contributionPresentations={options.contributionPresentations}
       handoff={options.handoff}
       onWriterChange={vi.fn()}
       onTabStatusChange={options.onTabStatusChange ?? vi.fn()}
       onArtifactChanged={options.onArtifactChanged ?? vi.fn()}
       onContributionsChanged={vi.fn()}
       onHandoffSettled={options.onHandoffSettled ?? vi.fn<(handoffId: string, error?: string) => void>()}
+      onViewContributionSource={options.onViewContributionSource}
+      onAddReviewer={options.onAddReviewer}
+      onOpenSettings={options.onOpenSettings ?? vi.fn()}
+      settingsAvailable={options.settingsAvailable}
     />,
   );
 }
@@ -179,6 +194,8 @@ describe("PlanWriterPane", () => {
     mocks.planWriterHintRef.current = null;
     mocks.terminalProps = null;
     mocks.incorporate.mockResolvedValue({});
+    mocks.startWriter.mockReset();
+    mocks.startWriter.mockResolvedValue(writer("running"));
     mocks.stopWriter.mockReset();
     mocks.stopWriter.mockResolvedValue(stoppedWriter());
     mocks.wsSend.mockImplementation((message: any) => {
@@ -195,22 +212,25 @@ describe("PlanWriterPane", () => {
 
   afterEach(cleanup);
 
-  it("leaves writer configuration to Plan Writer Settings", () => {
-    renderPane({ initialWriter: writer("not_running") });
+  it("opens Scribe Settings from the Scribe header", () => {
+    const onOpenSettings = vi.fn();
+    renderPane({ initialWriter: writer("not_running"), onOpenSettings });
 
-    expect(screen.getByText("GPT 5.5 · Extra High reasoning")).toBeInTheDocument();
+    expect(screen.getByText(/GPT 5\.5 · Extra High reasoning/)).toBeInTheDocument();
     expect(screen.queryByText("Not running")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Writer" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Scribe in Plan Mode" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Scribe Settings" }));
+    expect(onOpenSettings).toHaveBeenCalledOnce();
     expect(screen.queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
   });
 
-  it("keeps Start Writer for a stopped generation without visible lifecycle text", () => {
+  it("keeps Start Scribe for a stopped generation without visible lifecycle text", () => {
     renderPane({ initialWriter: { ...stoppedWriter(), stopReason: "idle" } });
 
     expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
     expect(screen.queryByText("Writer stopped after inactivity")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Writer" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Stop Plan Writer" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop Scribe" })).not.toBeInTheDocument();
   });
 
   it("uses the compact terminal and control row as the only live writer input", async () => {
@@ -226,10 +246,13 @@ describe("PlanWriterPane", () => {
     expect(terminal).toHaveAttribute("data-font-size", "12");
     expect(terminal.parentElement).toHaveClass("min-h-0", "flex-1");
     expect(mocks.terminalProps?.onInput).toEqual(expect.any(Function));
-    const configuration = screen.getByText("GPT 5.5 · High reasoning");
+    const configuration = screen.getByText(/GPT 5\.5 · High reasoning/);
     expect(configuration).toBeInTheDocument();
-    expect(configuration.parentElement?.parentElement).toHaveClass("px-3", "py-1");
-    expect(screen.getByText("Subscription")).toBeInTheDocument();
+    expect(configuration.closest(".shrink-0")).toHaveClass("px-3", "py-1");
+    const subscription = screen.getByText("Subscription");
+    expect(configuration.parentElement).toContainElement(subscription);
+    expect(screen.getByRole("button", { name: "Scribe Settings" }).parentElement)
+      .not.toBe(configuration.parentElement);
     expect(screen.queryByText("Running")).not.toBeInTheDocument();
     expect(screen.queryByText("Saving")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Message")).not.toBeInTheDocument();
@@ -239,8 +262,8 @@ describe("PlanWriterPane", () => {
   it("renders an icon-only danger stop control with its hover and focus tooltip", async () => {
     const user = userEvent.setup();
     renderPane();
-    const stopControl = screen.getByRole("button", { name: "Stop Plan Writer" });
-    const tooltip = "Ends this writer generation and its provider conversation. The saved plan and terminal history remain; Start Writer creates a new conversation.";
+    const stopControl = screen.getByRole("button", { name: "Stop Scribe" });
+    const tooltip = "Ends this Scribe generation and its provider conversation. The saved plan and terminal history remain; Start Scribe creates a new conversation.";
 
     expect(stopControl).toHaveClass("h-6", "w-6", "bg-kumo-danger");
     expect(stopControl).not.toHaveTextContent(/\S/);
@@ -260,7 +283,7 @@ describe("PlanWriterPane", () => {
     mocks.stopWriter.mockReturnValue(new Promise((resolve) => { resolveStop = resolve; }));
     renderPane();
 
-    const stopControl = screen.getByRole("button", { name: "Stop Plan Writer" });
+    const stopControl = screen.getByRole("button", { name: "Stop Scribe" });
     fireEvent.click(stopControl);
 
     expect(mocks.stopWriter).toHaveBeenCalledWith("http://localhost", "repo-1", "plan-1", 1);
@@ -269,7 +292,7 @@ describe("PlanWriterPane", () => {
     expect(mocks.stopWriter).toHaveBeenCalledTimes(1);
 
     act(() => resolveStop(stoppedWriter()));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Writer" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument());
   });
 
   it("renders only the highest-precedence durable error notice", () => {
@@ -300,7 +323,7 @@ describe("PlanWriterPane", () => {
     expect(screen.getAllByRole("alert")).toHaveLength(1);
     expect(onTabStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "running", label: "Live" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Stop Plan Writer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop Scribe" }));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Stop failed"));
     expect(screen.getAllByRole("alert")).toHaveLength(1);
     expect(onTabStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "running", label: "Live" }));
@@ -325,8 +348,8 @@ describe("PlanWriterPane", () => {
     act(() => mocks.terminalProps?.onInput?.("Update the plan"));
 
     await waitFor(() => expect(mocks.terminalRecover.mock.calls.length).toBeGreaterThan(recoverCalls));
-    expect(screen.getByRole("button", { name: "Stop Plan Writer" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start Writer" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop Scribe" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start Scribe" })).not.toBeInTheDocument();
     expect(screen.queryByText("No active terminal owner for session")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
@@ -350,8 +373,8 @@ describe("PlanWriterPane", () => {
 
     act(() => mocks.terminalProps?.onInput?.("Update the plan"));
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Writer" })).toBeInTheDocument());
-    expect(screen.queryByRole("button", { name: "Stop Plan Writer" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Stop Scribe" })).not.toBeInTheDocument();
   });
 
   it("never stops a running writer during refresh or unmount", async () => {
@@ -380,14 +403,14 @@ describe("PlanWriterPane", () => {
       repoId: "repo-1",
       planArtifactId: "plan-1",
     }));
-    fireEvent.click(screen.getByRole("button", { name: "Stop Plan Writer" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Writer" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Stop Scribe" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument());
 
     act(() => resolveRefresh(writer("running")));
     await act(async () => {});
 
-    expect(screen.getByRole("button", { name: "Start Writer" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Stop Plan Writer" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop Scribe" })).not.toBeInTheDocument();
   });
 
   it("does not lose an artifact notification when its writer refresh becomes stale", async () => {
@@ -413,19 +436,99 @@ describe("PlanWriterPane", () => {
     await waitFor(() => expect(onArtifactChanged).toHaveBeenCalledTimes(initialNotifications + 1));
   });
 
+  it("keeps offline reviewer context visible with explicit Scribe start choices", () => {
+    const item = contribution("contribution-1", "Check the migration rollback path", {
+      sourceThreadId: "reviewer-thread-1",
+      sourceMessageId: "message-1",
+      sourcePlanVersion: 4,
+    });
+    const onViewContributionSource = vi.fn();
+    const onAddReviewer = vi.fn();
+    renderPane({
+      initialWriter: writer("not_running"),
+      contributions: [item],
+      contributionPresentations: new Map([[item.id, {
+        sourceLabel: "GPT 5.5 reviewer",
+        sourceDetail: "Plan Review Plan Skill",
+        canViewSource: true,
+      }]]),
+      onViewContributionSource,
+      onAddReviewer,
+    });
+
+    expect(screen.getByTestId("scribe-context-tray")).toHaveTextContent("From reviewers");
+    expect(screen.getByTestId("scribe-context-tray")).toHaveTextContent("GPT 5.5 reviewer");
+    expect(screen.getByTestId("scribe-context-tray")).toHaveTextContent("Plan Review Plan Skill · Plan v4");
+    expect(screen.getByTestId("scribe-context-tray")).toHaveTextContent("Waiting for Scribe");
+    expect(screen.getByRole("button", { name: "Start without shared items" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Scribe with 1 shared item" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "View conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "+ Reviewer" }));
+    expect(onViewContributionSource).toHaveBeenCalledWith(item.id);
+    expect(onAddReviewer).toHaveBeenCalledOnce();
+  });
+
+  it("delivers durable reviewer context when the Scribe starts with shared items", async () => {
+    const item = contribution("contribution-1", "Check the migration rollback path");
+    renderPane({
+      initialWriter: writer("not_running"),
+      contributions: [item],
+      contributionPresentations: new Map([[item.id, {
+        sourceLabel: "GPT 5.5 reviewer",
+        canViewSource: false,
+      }]]),
+    });
+    await waitFor(() => expect(mocks.fetchWriter).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: "Start Scribe with 1 shared item" }));
+
+    await waitFor(() => expect(mocks.startWriter).toHaveBeenCalledWith(
+      "http://localhost",
+      "repo-1",
+      "plan-1",
+      { provider: "codex", model: "gpt-5.5", effort: "xhigh" },
+    ));
+    await waitFor(() => expect(mocks.wsSend).toHaveBeenCalled());
+    expect(mocks.wsSend.mock.calls[0][0].data).toContain(
+      "## Context shared with the Scribe\nSource: GPT 5.5 reviewer\n\nCheck the migration rollback path",
+    );
+    await waitFor(() => expect(mocks.incorporate).toHaveBeenCalledWith(
+      "http://localhost",
+      "repo-1",
+      "plan-1",
+      item.id,
+    ));
+  });
+
   it("pastes, waits for an ACK, and incorporates a queued one-shot handoff", async () => {
     mocks.wsSend.mockReturnValue(true);
-    const item = contribution("contribution-1", "Address this reviewer feedback");
+    const item = contribution("contribution-1", "Address this reviewer feedback", {
+      sourceThreadId: "reviewer-thread-1",
+      sourceMessageId: "message-1",
+      sourcePlanVersion: 3,
+    });
     const onHandoffSettled = vi.fn();
     renderPane({
       contributions: [item],
+      contributionPresentations: new Map([[item.id, {
+        sourceLabel: "GPT 5.5 reviewer",
+        sourceDetail: "Plan Review Plan Skill",
+        canViewSource: true,
+      }]]),
       handoff: { id: "handoff-1", contributionIds: [item.id] },
       onHandoffSettled,
     });
 
     await waitFor(() => expect(mocks.wsSend).toHaveBeenCalled());
     const sent = mocks.wsSend.mock.calls[0][0];
-    expect(sent.data).toBe("\u001b[200~Address this reviewer feedback\u001b[201~\r");
+    expect(sent.data).toBe(
+      "\u001b[200~## Context shared with the Scribe\n"
+      + "Source: GPT 5.5 reviewer\n"
+      + "Context: Plan Review Plan Skill\n"
+      + "Plan version: 3\n\n"
+      + "Address this reviewer feedback\u001b[201~\r",
+    );
     expect(mocks.incorporate).not.toHaveBeenCalled();
 
     act(() => mocks.terminalAckRef.current?.({

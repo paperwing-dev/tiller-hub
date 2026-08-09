@@ -45,6 +45,7 @@ export interface HarnessModelCatalogEntry {
   label: string;
   harness: EnvHarness;
   efforts: readonly HarnessEffort[];
+  supportsFastMode?: boolean;
   credential: HarnessCredentialRequirement;
   binding:
     | { kind: "codex"; model: string; providerLabel: string }
@@ -81,6 +82,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "GPT-5.6 Sol",
     harness: "codex",
     efforts: LOW_TO_MAX_AND_ULTRA,
+    supportsFastMode: true,
     credential: "codex-auth",
     binding: { kind: "codex", model: "gpt-5.6-sol", providerLabel: "Codex" },
   },
@@ -89,6 +91,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "GPT-5.5",
     harness: "codex",
     efforts: LOW_TO_XHIGH,
+    supportsFastMode: true,
     credential: "codex-auth",
     binding: { kind: "codex", model: "gpt-5.5", providerLabel: "Codex" },
   },
@@ -97,6 +100,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "Opus 4.8",
     harness: "claude-code",
     efforts: LOW_TO_MAX,
+    supportsFastMode: true,
     credential: "claude-auth",
     binding: { kind: "claude", model: "claude-opus-4-8", providerLabel: "Claude" },
   },
@@ -196,7 +200,7 @@ export function validateHarnessSettings(
   if (!isHarnessSettings(value)) return null;
   const entry = getHarnessModel(harness, value.model);
   return entry?.efforts.includes(value.effort)
-    && !(value.fastMode && harness !== "codex")
+    && !(value.fastMode && !entry.supportsFastMode)
     ? {
         model: value.model,
         effort: value.effort,

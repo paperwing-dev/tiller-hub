@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { Button, LinkButton } from "@cloudflare/kumo/components/button";
 import ReactDiffViewer from "react-diff-viewer-continued";
 import type { EnvMeta, RepoMeta } from "../api/types";

@@ -54,7 +54,7 @@ const reviewers: ReviewerRegistryEntry[] = [
 const writerTabStatus: PlanTabStatus = {
   kind: "running",
   label: "Live",
-  detail: "The live Plan Writer is ready. GPT-5.5 · High reasoning.",
+  detail: "The live Scribe is ready. GPT-5.5 · High reasoning.",
 };
 
 const reviewerTabStatuses = new Map<string, PlanTabStatus>([[
@@ -98,6 +98,7 @@ describe("PlanChatTabs", () => {
           providers={providers}
           activeTab="writer"
           writerTabStatus={writerTabStatus}
+          pendingScribeCount={2}
           reviewerTabStatuses={reviewerTabStatuses}
           onActiveTabChange={vi.fn()}
           onOpenPlanSkills={vi.fn()}
@@ -107,15 +108,16 @@ describe("PlanChatTabs", () => {
       );
     });
 
-    expect(container.querySelector('button[aria-label="Plan Writer, Live"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label="Scribe, Live, 2 items waiting"]')).not.toBeNull();
     expect(container.querySelector('button[aria-label="GPT-5.5, Working"]')).not.toBeNull();
     expect(container.querySelector('[data-agent-tab-status="running"]')).not.toBeNull();
     expect(container.querySelector('[data-agent-tab-status="working"]')).not.toBeNull();
-    expect(container.textContent).toContain("Plan Writer");
-    expect(container.textContent).not.toContain("Reset Plan Writer");
+    expect(container.textContent).toContain("Scribe");
+    expect(container.textContent).toContain("2");
+    expect(container.textContent).not.toContain("Plan Writer");
   });
 
-  it("places Plan Skills immediately before Add reviewer", () => {
+  it("groups the Scribe as editor and reviewers as advisors", () => {
     const onOpenPlanSkills = vi.fn();
     const onActiveTabChange = vi.fn();
     act(() => {
@@ -133,14 +135,23 @@ describe("PlanChatTabs", () => {
       );
     });
 
-    const buttons = Array.from(container.querySelectorAll("button"));
-    const planSkillsIndex = buttons.findIndex((button) => button.textContent?.trim() === "Plan Skills");
-    const addReviewerIndex = buttons.findIndex((button) => button.textContent?.trim() === "Add reviewer");
-    expect(planSkillsIndex).toBeGreaterThanOrEqual(0);
-    expect(addReviewerIndex).toBe(planSkillsIndex + 1);
+    const editorGroup = container.querySelector('[role="group"][aria-label="Edits the plan"]');
+    const advisorGroup = container.querySelector('[role="group"][aria-label="Advises on the plan"]');
+    expect(editorGroup?.textContent).toContain("Scribe");
+    expect(advisorGroup?.textContent).toContain("GPT-5.5");
+    expect(advisorGroup?.textContent).toContain("+ Reviewer");
+
+    const removeReviewerButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Remove reviewer");
+    expect(removeReviewerButton).toHaveClass("text-kumo-danger", "border-kumo-danger/30");
+    expect(removeReviewerButton).not.toHaveClass("text-kumo-subtle");
+
+    const planSkillsButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Plan Skills");
+    expect(planSkillsButton).toBeInstanceOf(HTMLButtonElement);
 
     act(() => {
-      buttons[planSkillsIndex]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      planSkillsButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(onOpenPlanSkills).toHaveBeenCalledOnce();
     expect(onActiveTabChange).not.toHaveBeenCalled();

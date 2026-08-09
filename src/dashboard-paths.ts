@@ -1,4 +1,4 @@
-import { generatePath } from "react-router-dom";
+import { generatePath } from "react-router";
 
 export function projectPath(repoId: string): string {
   return generatePath("/projects/:repoId", {

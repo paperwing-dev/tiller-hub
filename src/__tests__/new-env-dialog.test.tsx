@@ -31,6 +31,7 @@ import {
   getNewEnvHarnessDefault,
   getRepositoryPagination,
   getScheduledRunRequirementError,
+  LAST_ENV_HARNESS_STORAGE_KEY,
   NewEnvDialog,
   NewRepoDialog,
   REPOSITORY_PAGE_SIZE,
@@ -91,10 +92,23 @@ function makeGitHubRepository(index: number): GitHubRepositorySelection {
 }
 
 describe("getInitialEnvHarnessSelection", () => {
-  it("prefers Open Code when it is enabled", () => {
+  it("prefers the last enabled harness and otherwise falls back to Open Code", () => {
+    expect(getInitialEnvHarnessSelection(["claude-code", "codex", "opencode"], "codex")).toBe("codex");
+    expect(getInitialEnvHarnessSelection(["claude-code", "opencode"], "codex")).toBe("opencode");
+    expect(getInitialEnvHarnessSelection(["claude-code", "opencode"], "unknown")).toBe("opencode");
     expect(getInitialEnvHarnessSelection(["claude-code", "codex", "opencode"])).toBe("opencode");
     expect(getInitialEnvHarnessSelection(["claude-code", "codex"])).toBe("claude-code");
     expect(getNewEnvHarnessDefault("opencode")).toEqual({ model: "gpt-5.6-sol", effort: "xhigh" });
+    expect(getNewEnvHarnessDefault("opencode", "cf", {
+      hasOpenAIKey: false,
+      openaiBillingMode: "api",
+      workersAiConfigured: true,
+    })).toEqual({ model: "kimi-k2.7-code", effort: "high" });
+    expect(getNewEnvHarnessDefault("opencode", "cf", {
+      hasOpenAIKey: true,
+      openaiBillingMode: "api",
+      workersAiConfigured: true,
+    })).toEqual({ model: "gpt-5.6-sol", effort: "xhigh" });
   });
 });
 
@@ -346,6 +360,7 @@ describe("NewEnvDialog", () => {
   setupDom();
 
   beforeEach(() => {
+    window.localStorage.removeItem(LAST_ENV_HARNESS_STORAGE_KEY);
     apiMocks.fetchExecutionStatus.mockReset();
     apiMocks.fetchExecutionStatus.mockResolvedValue({
       selected: { target: "cf" },
@@ -402,11 +417,25 @@ describe("NewEnvDialog", () => {
     expect(text).not.toContain("uses OPENAI_API_KEY");
   });
 
-  it("shows a blocking credential error without disabling harness selection", () => {
-    renderNewEnvDialog();
+  it("links a blocking credential error to the exact settings row without disabling harness selection", async () => {
+    const onRefreshSetupStatus = vi.fn(async () => undefined);
+    renderNewEnvDialog({ onRefreshSetupStatus });
 
     expect(bodyText()).toContain("Configure the active OpenAI API key");
     expect(document.body.querySelectorAll('[data-testid="harness-model-requirement"]')).toHaveLength(1);
+    const settingsLink = document.body.querySelector<HTMLAnchorElement>('[data-testid="harness-model-requirement"] a');
+    expect(settingsLink).toHaveAttribute("href", "/projects/repo-1/global-settings#openai-api-key");
+    expect(settingsLink).toHaveAttribute("target", "_blank");
+    expect(settingsLink).toHaveAttribute("rel", "noreferrer");
+
+    act(() => {
+      settingsLink?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+    expect(onRefreshSetupStatus).toHaveBeenCalledOnce();
 
     const harnessTrigger = document.body.querySelector<HTMLElement>('[aria-label="Harness"]');
     expect(harnessTrigger).not.toBeNull();
@@ -416,6 +445,18 @@ describe("NewEnvDialog", () => {
     const submitButton = findButtonByText("Create");
     expect(submitButton).toBeInstanceOf(HTMLButtonElement);
     expect(submitButton?.disabled).toBe(true);
+  });
+
+  it("links an incompatible API model to the billing-mode selector", () => {
+    renderNewEnvDialog({
+      hasChatGPTAuth: true,
+      chatgptAuthStatus: "connected",
+      openaiBillingMode: "subscription",
+    });
+
+    const settingsLink = document.body.querySelector<HTMLAnchorElement>('[data-testid="harness-model-requirement"] a');
+    expect(settingsLink).toHaveAttribute("href", "/projects/repo-1/global-settings#openai-billing");
+    expect(settingsLink?.textContent).toContain("Open OpenAI billing settings");
   });
 
   it("keeps unavailable non-selected models visible and disabled", async () => {
@@ -435,6 +476,18 @@ describe("NewEnvDialog", () => {
     expect(isDisabledOption(sol!)).toBe(true);
     expect(isDisabledOption(gpt55!)).toBe(true);
     expect(isDisabledOption(kimi!)).toBe(false);
+  });
+
+  it("defaults to the only model available for the selected harness", () => {
+    renderNewEnvDialog({
+      enabledHarnesses: ["opencode"],
+      workersAiConfigured: true,
+      hasOpenAIKey: false,
+    });
+
+    expect(document.body.querySelector('[aria-label="Model"]')?.textContent).toContain("Kimi K2.7 Code");
+    expect(document.body.querySelector('[aria-label="Effort"]')?.textContent).toContain("high");
+    expect(document.body.querySelector('[data-testid="harness-model-requirement"]')).toBeNull();
   });
 
   it("clears a failed Create error when either model or effort changes", async () => {
@@ -463,6 +516,7 @@ describe("NewEnvDialog", () => {
 
     await chooseSelectOption("Effort", "high");
     expect(bodyText()).not.toContain("Create provider rejected the request");
+    expect(window.localStorage.getItem(LAST_ENV_HARNESS_STORAGE_KEY)).toBeNull();
   });
 
   it("defaults to Open Code with GPT-5.6 and renders compact Model and Effort selectors", () => {
@@ -477,7 +531,19 @@ describe("NewEnvDialog", () => {
     expect(harness!.compareDocumentPosition(model as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(model!.compareDocumentPosition(effort as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(bodyText()).not.toContain("Tiller will not downgrade or retry automatically");
-    expect(document.body.querySelector('[role="dialog"]')).toHaveClass("h-[calc(100vh-2rem)]", "max-h-[52rem]");
+    expect(document.body.querySelector('[role="dialog"]')).toHaveClass(
+      "h-[calc(100vh-2rem)]",
+      "max-h-[52rem]",
+      "max-w-3xl",
+      "sm:w-[calc(100vw-2rem)]",
+    );
+  });
+
+  it("defaults to the last successfully used harness", () => {
+    window.localStorage.setItem(LAST_ENV_HARNESS_STORAGE_KEY, "codex");
+    renderNewEnvDialog({ hasOpenAIKey: true });
+
+    expect(document.body.querySelector('[aria-label="Harness"]')?.textContent).toContain("Codex");
   });
 
   it("retains a supported effort when the rendered model selection changes", async () => {
@@ -497,7 +563,7 @@ describe("NewEnvDialog", () => {
     });
   });
 
-  it("updates the harness and its catalog default together", async () => {
+  it("updates the harness and its catalog default together when multiple models are available", async () => {
     const onCreate = vi.fn(async () => undefined);
     renderNewEnvDialog({ hasOpenAIKey: true, hasAnthropicKey: true, onCreate });
 
@@ -513,6 +579,32 @@ describe("NewEnvDialog", () => {
       harnessSettings: { model: "claude-opus-4.8", effort: "xhigh" },
       schedule: undefined,
     });
+    expect(window.localStorage.getItem(LAST_ENV_HARNESS_STORAGE_KEY)).toBe("claude-code");
+  });
+
+  it("updates a changed harness to its only available model", async () => {
+    window.localStorage.setItem(LAST_ENV_HARNESS_STORAGE_KEY, "codex");
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({
+      enabledHarnesses: ["codex", "opencode"],
+      workersAiConfigured: true,
+      hasOpenAIKey: false,
+      onCreate,
+    });
+
+    await chooseSelectOption("Harness", "Open Code");
+    expect(document.body.querySelector('[aria-label="Model"]')?.textContent).toContain("Kimi K2.7 Code");
+    expect(document.body.querySelector('[aria-label="Effort"]')?.textContent).toContain("high");
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "opencode",
+      planSelection: { mode: "none" },
+      harnessSettings: { model: "kimi-k2.7-code", effort: "high" },
+      schedule: undefined,
+    });
+    expect(window.localStorage.getItem(LAST_ENV_HARNESS_STORAGE_KEY)).toBe("opencode");
   });
 
   it("offers Fast mode for Codex implementors and submits the persisted setting", async () => {
@@ -526,7 +618,7 @@ describe("NewEnvDialog", () => {
     const fastMode = document.body.querySelector<HTMLInputElement>('input[aria-label="Fast mode"]');
     expect(fastMode).toBeInstanceOf(HTMLInputElement);
     expect(fastMode?.checked).toBe(false);
-    expect(bodyText()).toContain("Runs supported Codex models faster at a higher usage rate.");
+    expect(bodyText()).toContain("Runs the selected model faster at a higher usage rate.");
 
     await act(async () => {
       fastMode?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -543,21 +635,64 @@ describe("NewEnvDialog", () => {
     });
   });
 
-  it("does not offer Fast mode for non-Codex implementors", () => {
+  it("offers Fast mode for Claude Code Opus implementors", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({
+      enabledHarnesses: ["claude-code"],
+      claudeBillingMode: "subscription",
+      hasClaudeSubscription: true,
+      onCreate,
+    });
+
+    const fastMode = document.body.querySelector<HTMLInputElement>('input[aria-label="Fast mode"]');
+    expect(fastMode).toBeInstanceOf(HTMLInputElement);
+    expect(fastMode?.checked).toBe(false);
+
+    await act(async () => {
+      fastMode?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "claude-code",
+      planSelection: { mode: "none" },
+      harnessSettings: { model: "claude-opus-4.8", effort: "xhigh", fastMode: true },
+      schedule: undefined,
+    });
+  });
+
+  it("does not offer Fast mode for OpenCode implementors", () => {
     renderNewEnvDialog({ enabledHarnesses: ["opencode"], hasOpenAIKey: true });
     expect(document.body.querySelector('input[aria-label="Fast mode"]')).toBeNull();
   });
 
-  it("closes without persisting settings when Create is cancelled", async () => {
+  it("removes Fast mode when a Claude Code implementor selects an unsupported model", async () => {
+    renderNewEnvDialog({
+      enabledHarnesses: ["claude-code"],
+      claudeBillingMode: "api",
+      hasAnthropicKey: true,
+    });
+
+    await chooseSelectOption("Model", "Fable 5");
+    expect(document.body.querySelector('[aria-label="Model"]')?.textContent).toContain("Fable 5");
+    expect(document.body.querySelector('input[aria-label="Fast mode"]')).toBeNull();
+  });
+
+  it("closes without remembering a harness when Create is cancelled", async () => {
     const onClose = vi.fn();
     const onCreate = vi.fn(async () => undefined);
-    renderNewEnvDialog({ hasOpenAIKey: true, onClose, onCreate });
+    renderNewEnvDialog({ hasOpenAIKey: true, hasAnthropicKey: true, onClose, onCreate });
+
+    await chooseSelectOption("Harness", "Claude Code");
 
     await act(async () => {
       findButtonByText("Cancel")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(onCreate).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(LAST_ENV_HARNESS_STORAGE_KEY)).toBeNull();
   });
 
   it("defaults startup plan selection to no plan", async () => {
@@ -612,6 +747,34 @@ describe("NewEnvDialog", () => {
       harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
       schedule: undefined,
     });
+  });
+
+  it("wraps long selected plan titles in the selector and preview", async () => {
+    const longTitle = `Long plan title ${"unbroken".repeat(30)}`;
+    apiMocks.fetchRepoArtifacts.mockResolvedValue({
+      artifacts: [makePlan({ title: longTitle })],
+      refs: [],
+    });
+    renderNewEnvDialog({ hasOpenAIKey: true });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const specificRadio = document.body.querySelector<HTMLInputElement>(
+      'input[name="new-env-plan-choice-repo-1"][value="specific"]',
+    );
+    await act(async () => {
+      specificRadio?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const planTrigger = document.body.querySelector<HTMLElement>('[aria-label="Startup Plan"]');
+    expect(planTrigger).toHaveClass("h-auto", "min-h-6.5");
+    expect(planTrigger?.querySelector(".break-words")).toHaveTextContent(longTitle);
+
+    const selectedTitle = document.body.querySelector<HTMLElement>('[data-testid="selected-plan-title"]');
+    expect(selectedTitle).toHaveClass("whitespace-normal", "break-words");
+    expect(selectedTitle).toHaveTextContent(longTitle);
   });
 
   it("schedules a selected plan on the Settings-selected backend", async () => {

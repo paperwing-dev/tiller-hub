@@ -10,9 +10,12 @@ interface PlanChatTabsProps {
   providers: PlannerProviderMetadata[];
   activeTab: string;
   writerTabStatus: PlanTabStatus;
+  pendingScribeCount?: number;
   reviewerTabStatuses?: ReadonlyMap<string, PlanTabStatus>;
   adding?: boolean;
+  reviewerDialogOpen?: boolean;
   onActiveTabChange: (tab: string) => void;
+  onReviewerDialogOpenChange?: (open: boolean) => void;
   onOpenPlanSkills: () => void;
   onAddReviewer: (input: AddReviewerAction) => void;
   onCloseReviewer: (threadId: string) => void;
@@ -23,45 +26,68 @@ export default function PlanChatTabs({
   providers,
   activeTab,
   writerTabStatus,
+  pendingScribeCount = 0,
   reviewerTabStatuses = new Map(),
   adding = false,
+  reviewerDialogOpen,
   onActiveTabChange,
+  onReviewerDialogOpenChange,
   onOpenPlanSkills,
   onAddReviewer,
   onCloseReviewer,
 }: PlanChatTabsProps) {
   const tabLabels = getReviewerTabLabels(reviewers, providers);
-  const writerLabel = "Plan Writer";
+  const writerLabel = "Scribe";
   const activeReviewer = reviewers.find((reviewer) => reviewer.threadId === activeTab) ?? null;
 
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-kumo-line bg-kumo-recessed px-3 py-2">
-      <div className="flex min-w-0 flex-1 items-center gap-2">
-        <div className="flex max-h-16 min-w-0 flex-1 flex-wrap items-center gap-1 overflow-y-auto pr-1">
+    <div className="flex items-end justify-between gap-3 border-b border-kumo-line bg-kumo-recessed px-3 py-2">
+      <div className="flex min-w-0 flex-1 items-stretch gap-3" aria-label="Plan collaborators">
+        <div role="group" aria-label="Edits the plan" className="flex shrink-0 flex-col justify-end gap-0.5">
+          <span className="px-2 text-[9px] font-semibold uppercase tracking-wide text-kumo-subtle">
+            Edits the plan
+          </span>
           <AgentTabButton
             label={writerLabel}
             status={writerTabStatus}
             active={activeTab === "writer"}
+            badge={pendingScribeCount}
             onClick={() => onActiveTabChange("writer")}
           />
-          <span
-            role="separator"
-            aria-orientation="vertical"
-            className="mx-1 h-5 w-px shrink-0 bg-kumo-line"
-          />
-          {reviewers.map((reviewer) => {
-            const label = tabLabels.get(reviewer.threadId) ?? "Reviewer";
-            const status = reviewerTabStatuses.get(reviewer.threadId) ?? READY_REVIEWER_STATUS;
-            return (
-              <AgentTabButton
-                key={reviewer.threadId}
-                label={label}
-                status={status}
-                active={activeTab === reviewer.threadId}
-                onClick={() => onActiveTabChange(reviewer.threadId)}
-              />
-            );
-          })}
+        </div>
+        <span
+          role="separator"
+          aria-orientation="vertical"
+          className="h-10 w-px shrink-0 self-end bg-kumo-line"
+        />
+        <div role="group" aria-label="Advises on the plan" className="flex min-w-0 flex-1 flex-col justify-end gap-0.5">
+          <span className="px-2 text-[9px] font-semibold uppercase tracking-wide text-kumo-subtle">
+            Advises on the plan
+          </span>
+          <div className="flex min-w-0 items-center gap-1 overflow-x-auto pr-1">
+            {reviewers.map((reviewer) => {
+              const label = tabLabels.get(reviewer.threadId) ?? "Reviewer";
+              const status = reviewerTabStatuses.get(reviewer.threadId) ?? READY_REVIEWER_STATUS;
+              return (
+                <AgentTabButton
+                  key={reviewer.threadId}
+                  label={label}
+                  status={status}
+                  active={activeTab === reviewer.threadId}
+                  onClick={() => onActiveTabChange(reviewer.threadId)}
+                />
+              );
+            })}
+            <AddReviewerMenu
+              activeReviewerCount={reviewers.length}
+              providers={providers}
+              disabled={adding}
+              label="+ Reviewer"
+              open={reviewerDialogOpen}
+              onOpenChange={onReviewerDialogOpenChange}
+              onAdd={onAddReviewer}
+            />
+          </div>
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
@@ -69,7 +95,7 @@ export default function PlanChatTabs({
           <button
             type="button"
             onClick={() => onCloseReviewer(activeReviewer.threadId)}
-            className="h-8 rounded border border-kumo-line bg-kumo-base px-2 text-xs font-medium text-kumo-subtle hover:bg-kumo-tint"
+            className="h-8 rounded border border-kumo-danger/30 bg-kumo-base px-2 text-xs font-medium text-kumo-danger transition-colors hover:border-kumo-danger/50 hover:bg-kumo-danger-tint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-focus"
           >
             Remove reviewer
           </button>
@@ -81,12 +107,6 @@ export default function PlanChatTabs({
         >
           Plan Skills
         </button>
-        <AddReviewerMenu
-          activeReviewerCount={reviewers.length}
-          providers={providers}
-          disabled={adding}
-          onAdd={onAddReviewer}
-        />
       </div>
     </div>
   );
@@ -95,7 +115,7 @@ export default function PlanChatTabs({
 const READY_REVIEWER_STATUS: PlanTabStatus = {
   kind: "idle",
   label: "Ready",
-  detail: "No review is in progress.",
+  detail: "Ready for your next question.",
 };
 
 // Reviewer tabs are labeled by the model's display name ("GPT 5.5"), numbered

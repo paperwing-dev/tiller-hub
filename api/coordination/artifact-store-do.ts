@@ -1884,7 +1884,6 @@ export class ArtifactStoreDO extends DurableObject<Env> {
       repoId,
       routeKey: row?.route_key?.trim() || defaults.routeKey,
       effort: isPlannerEffort(row?.effort) ? row.effort : defaults.effort,
-      fastMode: row?.fast_mode === 1,
       planFormat: row?.plan_format?.trim() || defaults.planFormat,
       updatedAt: row?.updated_at ?? null,
     };
@@ -1894,7 +1893,6 @@ export class ArtifactStoreDO extends DurableObject<Env> {
     repoId: string;
     routeKey: string;
     effort: PlannerEffort;
-    fastMode: boolean;
     planFormat: string;
   }): RepoPlanWriterSettings {
     this.assertRepositoryWritable();
@@ -1908,7 +1906,7 @@ export class ArtifactStoreDO extends DurableObject<Env> {
       `
         INSERT INTO repo_plan_writer_settings (
           repo_id, updated_at, route_key, effort, fast_mode, plan_format
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, 0, ?)
         ON CONFLICT(repo_id) DO UPDATE SET
           route_key = excluded.route_key,
           effort = excluded.effort,
@@ -1920,7 +1918,6 @@ export class ArtifactStoreDO extends DurableObject<Env> {
       now,
       routeKey,
       input.effort,
-      input.fastMode ? 1 : 0,
       planFormat,
     );
     return this.getRepoPlanWriterSettings(input.repoId, { routeKey, effort: input.effort, planFormat });

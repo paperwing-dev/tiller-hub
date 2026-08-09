@@ -1112,6 +1112,20 @@ function normalizeUpdateCheckResult(payload: unknown): UpdateCheckResult | null 
   } satisfies LegacyUpdateCheckResult;
 }
 
+export class ApiAuthenticationError extends Error {
+  readonly status: number | null;
+
+  constructor(message = "Browser authentication is required.", status: number | null = null) {
+    super(message);
+    this.name = "ApiAuthenticationError";
+    this.status = status;
+  }
+}
+
+export function isApiAuthenticationError(error: unknown): error is ApiAuthenticationError {
+  return error instanceof ApiAuthenticationError;
+}
+
 export class ApiActionError extends Error {
   readonly code?: string;
   readonly hint?: string;
@@ -1527,9 +1541,12 @@ async function readJsonWithinLimit(
 
 export async function fetchSessions(hubUrl: string): Promise<StoredSession[]> {
   const res = await fetch(`${hubUrl}/api/sessions`, {
+    headers: { Accept: "application/json" },
     credentials: "include",
     cache: "no-store",
+    redirect: "manual",
   });
+  await throwIfBrowserAuthenticationRequired(res);
   if (!res.ok) throw new Error(`Failed to fetch sessions: ${res.status}`);
   return normalizeArrayResponse(await res.json().catch(() => null))
     .map((session) => normalizeStoredSession(session))
@@ -2312,10 +2329,10 @@ export async function fetchPlanWriter(
     credentials: "include",
     cache: "no-store",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan Writer: ${res.status}`);
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Scribe: ${res.status}`);
   const body = await res.json().catch(() => null);
   const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
-  if (!writer) throw new Error("Malformed Plan Writer response");
+  if (!writer) throw new Error("Malformed Scribe response");
   return writer;
 }
 
@@ -2332,9 +2349,9 @@ export async function startPlanWriter(
     body: JSON.stringify(input),
   });
   const body = await res.json().catch(() => null);
-  if (!res.ok) throw await parseApiError(new Response(JSON.stringify(body), { status: res.status, headers: { "Content-Type": "application/json" } }), `Failed to start Plan Writer: ${res.status}`);
+  if (!res.ok) throw await parseApiError(new Response(JSON.stringify(body), { status: res.status, headers: { "Content-Type": "application/json" } }), `Failed to start Scribe: ${res.status}`);
   const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
-  if (!writer) throw new Error("Malformed Plan Writer response");
+  if (!writer) throw new Error("Malformed Scribe response");
   return writer;
 }
 
@@ -2350,10 +2367,10 @@ export async function stopPlanWriter(
     credentials: "include",
     body: JSON.stringify({ expectedGeneration }),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to stop Plan Writer: ${res.status}`);
+  if (!res.ok) throw await parseApiError(res, `Failed to stop Scribe: ${res.status}`);
   const body = await res.json().catch(() => null);
   const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
-  if (!writer) throw new Error("Malformed Plan Writer response");
+  if (!writer) throw new Error("Malformed Scribe response");
   return writer;
 }
 
@@ -2432,16 +2449,16 @@ export async function fetchRepoPlanWriterSettings(hubUrl: string, repoId: string
     credentials: "include",
     cache: "no-store",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan Writer Settings: ${res.status}`);
+  if (!res.ok) throw await parseApiError(res, `Failed to fetch Scribe Settings: ${res.status}`);
   const body = await res.json().catch(() => null);
-  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Plan Writer Settings response");
+  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Scribe Settings response");
   return body.settings as unknown as RepoPlanWriterSettings;
 }
 
 export async function updateRepoPlanWriterSettings(
   hubUrl: string,
   repoId: string,
-  input: Pick<RepoPlanWriterSettings, "routeKey" | "effort" | "fastMode" | "planFormat">,
+  input: Pick<RepoPlanWriterSettings, "routeKey" | "effort" | "planFormat">,
 ): Promise<RepoPlanWriterSettings> {
   const res = await fetch(`${hubUrl}/api/repos/${repoId}/plan-writer-settings`, {
     method: "PUT",
@@ -2449,9 +2466,9 @@ export async function updateRepoPlanWriterSettings(
     credentials: "include",
     body: JSON.stringify(input),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to save Plan Writer Settings: ${res.status}`);
+  if (!res.ok) throw await parseApiError(res, `Failed to save Scribe Settings: ${res.status}`);
   const body = await res.json().catch(() => null);
-  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Plan Writer Settings response");
+  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Scribe Settings response");
   return body.settings as unknown as RepoPlanWriterSettings;
 }
 
@@ -2459,6 +2476,23 @@ export interface PlanSkillInvocationDetail {
   invocation: PlanSkillInvocation;
   reviewers: ReviewerRegistryEntry[];
   runs: PlannerRun[];
+}
+
+export async function invokePlanSkill(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  skillId: string,
+  requestId: string,
+): Promise<{ kind: "fanout" } & PlanSkillInvocationDetail> {
+  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skills/${encodeURIComponent(skillId)}/invoke`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ requestId }),
+  });
+  if (!res.ok) throw await parseApiError(res, `Failed to invoke Plan skill: ${res.status}`);
+  return await res.json() as { kind: "fanout" } & PlanSkillInvocationDetail;
 }
 
 export async function fetchPlanSkillInvocations(
@@ -2600,7 +2634,7 @@ export async function sendReviewerMessageToWriter(
       body: "{}",
     },
   );
-  if (!res.ok) throw await parseApiError(res, `Failed to send feedback to writer: ${res.status}`);
+  if (!res.ok) throw await parseApiError(res, `Failed to share context with Scribe: ${res.status}`);
   const body = await res.json().catch(() => null);
   const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
   if (!contribution) throw new Error("Malformed send-to-writer response");
@@ -3162,6 +3196,77 @@ export interface SetupStatus {
   };
 }
 
+export type AuthConnectProvider = "codex" | "claude";
+export type AuthConnectProviderStatus = "pending" | "success" | "error";
+export interface AuthConnectStatus {
+  status: AuthConnectProviderStatus | "expired";
+  providers: Partial<Record<AuthConnectProvider, AuthConnectProviderStatus>>;
+  error: string | null;
+}
+
+function normalizeAuthConnectStatus(value: unknown): AuthConnectStatus {
+  if (!isRecord(value) || !isRecord(value.providers)) {
+    throw new Error("Malformed authentication connection status response");
+  }
+  const status = value.status;
+  if (status !== "pending" && status !== "success" && status !== "error" && status !== "expired") {
+    throw new Error("Malformed authentication connection status response");
+  }
+  const providers: Partial<Record<AuthConnectProvider, AuthConnectProviderStatus>> = {};
+  for (const provider of ["codex", "claude"] as const) {
+    const providerStatus = value.providers[provider];
+    if (providerStatus === "pending" || providerStatus === "success" || providerStatus === "error") {
+      providers[provider] = providerStatus;
+    }
+  }
+  return {
+    status,
+    providers,
+    error: typeof value.error === "string" ? value.error : null,
+  };
+}
+
+export async function approveAuthConnect(
+  hubUrl: string,
+  input: {
+    publicKeyJwk: Record<string, unknown>;
+    state: string;
+    providers: AuthConnectProvider[];
+  },
+): Promise<{ envelope: string; connectionId: string }> {
+  const response = await fetch(`${hubUrl}/api/cli/auth-connect-package`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    cache: "no-store",
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await parseApiError(response, "Connection approval failed.");
+  const body = await response.json().catch(() => null);
+  if (
+    !isRecord(body)
+    || typeof body.envelope !== "string"
+    || !body.envelope
+    || typeof body.connection_id !== "string"
+    || !/^[A-Za-z0-9_-]{16,128}$/.test(body.connection_id)
+  ) {
+    throw new Error("Malformed authentication connection approval response");
+  }
+  return { envelope: body.envelope, connectionId: body.connection_id };
+}
+
+export async function fetchAuthConnectStatus(
+  hubUrl: string,
+  connectionId: string,
+): Promise<AuthConnectStatus> {
+  const response = await fetch(
+    `${hubUrl}/api/cli/auth-connect-status?connection_id=${encodeURIComponent(connectionId)}`,
+    { credentials: "include", cache: "no-store" },
+  );
+  if (!response.ok) throw await parseApiError(response, "Failed to check the connection status.");
+  return normalizeAuthConnectStatus(await response.json().catch(() => null));
+}
+
 export type ExecutionSelection =
   | { target: "cf" }
   | { target: "host"; machineId: string };
@@ -3276,11 +3381,39 @@ export async function setExecutionBackend(
   return normalizeExecutionStatus(body);
 }
 
+async function throwIfBrowserAuthenticationRequired(response: Response): Promise<void> {
+  if (response.type === "opaqueredirect" || response.status === 401) {
+    throw new ApiAuthenticationError(
+      "Your Cloudflare Access session has expired.",
+      response.status || null,
+    );
+  }
+
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  const responseUrl = response.url.toLowerCase();
+  if (responseUrl.includes("/cdn-cgi/access/") || contentType.includes("text/html")) {
+    const raw = await response.clone().text().catch(() => "");
+    const looksLikeAccessLogin =
+      responseUrl.includes("/cdn-cgi/access/")
+      || /Cloudflare Access/i.test(raw)
+      || /Sign in ・ Cloudflare Access/i.test(raw);
+    if (looksLikeAccessLogin || contentType.includes("text/html")) {
+      throw new ApiAuthenticationError(
+        "Your Cloudflare Access session has expired.",
+        response.status || null,
+      );
+    }
+  }
+}
+
 export async function fetchSetupStatus(hubUrl: string): Promise<SetupStatus> {
   const res = await fetch(`${hubUrl}/api/setup/status`, {
+    headers: { Accept: "application/json" },
     credentials: "include",
     cache: "no-store",
+    redirect: "manual",
   });
+  await throwIfBrowserAuthenticationRequired(res);
   if (!res.ok) throw new Error(`Failed to fetch setup status: ${res.status}`);
   return normalizeSetupStatus(await res.json().catch(() => null));
 }

@@ -138,7 +138,6 @@ export interface RepoPlanWriterSettings {
   repoId: string;
   routeKey: string;
   effort: PlannerEffort;
-  fastMode: boolean;
   planFormat: string;
   updatedAt: string | null;
 }

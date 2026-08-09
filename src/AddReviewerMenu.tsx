@@ -21,6 +21,8 @@ interface AddReviewerMenuProps {
   providers: PlannerProviderMetadata[];
   disabled?: boolean;
   label?: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   onAdd: (input: AddReviewerAction) => void;
 }
 
@@ -29,11 +31,18 @@ export default function AddReviewerMenu({
   providers,
   disabled = false,
   label = "Add reviewer",
+  open: controlledOpen,
+  onOpenChange,
   onAdd,
 }: AddReviewerMenuProps) {
   const options = useMemo(() => buildReviewerModelOptions(providers), [providers]);
   const enabledOptions = useMemo(() => options.filter((option) => !option.disabled), [options]);
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = controlledOpen ?? internalOpen;
+  const setOpen = (next: boolean) => {
+    if (controlledOpen === undefined) setInternalOpen(next);
+    onOpenChange?.(next);
+  };
   const [selection, setSelection] = useState<{ model: string; effort: PlannerEffort }>(() => ({
     model: enabledOptions[0]?.value ?? "",
     effort: enabledOptions[0]?.defaultEffort ?? "high",
@@ -60,7 +69,6 @@ export default function AddReviewerMenu({
       <Button
         size="sm"
         disabled={disabled || enabledOptions.length === 0}
-        title="Add reviewer"
         onClick={() => setOpen(true)}
       >
         {label}
@@ -70,7 +78,7 @@ export default function AddReviewerMenu({
           <div className="border-b border-kumo-line px-4 py-3">
             <Dialog.Title className="text-sm font-semibold text-kumo-strong">Add reviewer</Dialog.Title>
             <Dialog.Description className="mt-0.5 text-xs text-kumo-subtle">
-              Choose the model and reasoning effort for this reviewer.
+              Create a retained conversation with an advisor that can inspect the code and run Plan Skills, but cannot edit the plan.
             </Dialog.Description>
           </div>
           <div className="p-4">

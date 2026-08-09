@@ -78,7 +78,7 @@ describe("ResizablePlanPanes", () => {
     const layout = screen.getByTestId("plan-pane-layout");
     const reviewers = screen.getByTestId("plan-reviewers-pane");
     const divider = screen.getByRole("separator", {
-      name: "Resize Plan and Plan Reviewers",
+      name: "Resize Plan and Plan Collaborators",
     });
     vi.spyOn(layout, "getBoundingClientRect").mockReturnValue(rect(800));
     vi.spyOn(reviewers, "getBoundingClientRect").mockReturnValue(rect(320));
@@ -106,7 +106,7 @@ describe("ResizablePlanPanes", () => {
     const layout = screen.getByTestId("plan-pane-layout");
     const reviewers = screen.getByTestId("plan-reviewers-pane");
     const divider = screen.getByRole("separator", {
-      name: "Resize Plan and Plan Reviewers",
+      name: "Resize Plan and Plan Collaborators",
     });
     vi.spyOn(layout, "getBoundingClientRect").mockReturnValue(rect(800));
     vi.spyOn(reviewers, "getBoundingClientRect").mockReturnValue(rect(320));

@@ -153,6 +153,7 @@ export default function SessionView({
     isMuted: false,
     connected: false,
     error: null,
+    outputDeviceError: null,
     startCall: async () => {},
     endCall: () => {},
     toggleMute: () => {},
@@ -317,6 +318,10 @@ export default function SessionView({
   const handleClear = () => {
     termRef.current?.clear();
   };
+
+  const handleReviewLayoutChange = useCallback(() => {
+    termRef.current?.refit();
+  }, []);
 
   const handleToggleVoiceDebug = useCallback(() => {
     setVoiceDebugEnabled((enabled) => !enabled);
@@ -757,6 +762,7 @@ export default function SessionView({
               !terminalDetached
             }
             onSendToHarness={sendTextToHarness}
+            onLayoutChange={handleReviewLayoutChange}
           />
         )}
       </div>

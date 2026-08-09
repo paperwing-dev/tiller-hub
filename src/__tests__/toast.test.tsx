@@ -13,6 +13,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@cloudflare/kumo/components/toast", () => ({
+  Toast: {
+    Description: "p",
+    Title: "h2",
+  },
   Toasty: ({ children }: { children: unknown }) => children,
   useKumoToastManager: () => mocks.manager,
 }));
@@ -64,12 +68,36 @@ describe("useToast", () => {
     observedToast?.({ title: "Connected", variant: "success", duration: 2000 });
 
     expect(firstManager.add).not.toHaveBeenCalled();
-    expect(secondManager.add).toHaveBeenCalledWith({
-      title: "Connected",
-      description: undefined,
-      variant: "success",
-      timeout: 2000,
+    expect(secondManager.add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Connected",
+        description: undefined,
+        variant: "success",
+        timeout: 2000,
+        content: expect.anything(),
+      }),
+    );
+  });
+
+  it("makes toast content selectable without starting a swipe gesture", () => {
+    act(() => {
+      root?.render(<ToastProbe onToast={(toast) => { observedToast = toast; }} />);
     });
+
+    observedToast?.({ title: "Failed", body: "Copy this error", variant: "error" });
+
+    const content = mocks.manager.add.mock.calls[0]?.[0]?.content;
+    expect(React.isValidElement(content)).toBe(true);
+
+    if (!React.isValidElement<{
+      className: string;
+      "data-base-ui-swipe-ignore": string;
+    }>(content)) {
+      throw new Error("Expected selectable toast content");
+    }
+
+    expect(content.props.className.split(" ")).toContain("select-text");
+    expect(content.props["data-base-ui-swipe-ignore"]).toBe("");
   });
 });
 

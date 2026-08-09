@@ -3,11 +3,17 @@
  */
 import React from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   dashboardData: null as Record<string, unknown> | null,
+  connectionsProps: null as null | {
+    hubUrl: string;
+    hubConnected: boolean;
+    hostRefreshNonce: number;
+    showHost: boolean;
+  },
   updateProps: null as null | {
     status: unknown;
     issue: string | null;
@@ -25,7 +31,15 @@ vi.mock("../SessionList", () => ({
 }));
 
 vi.mock("../ConnectionsBadge", () => ({
-  default: () => null,
+  default: (props: {
+    hubUrl: string;
+    hubConnected: boolean;
+    hostRefreshNonce: number;
+    showHost: boolean;
+  }) => {
+    mocks.connectionsProps = props;
+    return null;
+  },
 }));
 
 vi.mock("../UpdateBadge", () => ({
@@ -65,6 +79,7 @@ describe("WorkspaceLayout maintenance actions", () => {
       })),
     });
     mocks.updateProps = null;
+    mocks.connectionsProps = null;
   });
 
   afterEach(() => {
@@ -167,5 +182,44 @@ describe("WorkspaceLayout maintenance actions", () => {
       "href",
       "https://install.paperwing.dev/maintenance?intent=renew",
     );
+  });
+
+  it("shows machine status only after an execution machine has been added", () => {
+    mocks.dashboardData = {
+      hubUrl: "https://hub.example.com",
+      setupStatus: {
+        hostRegistered: false,
+        renewalRecommended: false,
+      },
+      connected: true,
+      hostRefreshNonce: 0,
+    };
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <HomeSettingsFrame>
+          <div>Settings</div>
+        </HomeSettingsFrame>
+      </MemoryRouter>,
+    );
+
+    expect(mocks.connectionsProps).toMatchObject({ showHost: false });
+
+    mocks.dashboardData = {
+      ...mocks.dashboardData,
+      setupStatus: {
+        hostRegistered: true,
+        renewalRecommended: false,
+      },
+    };
+    rerender(
+      <MemoryRouter>
+        <HomeSettingsFrame>
+          <div>Settings</div>
+        </HomeSettingsFrame>
+      </MemoryRouter>,
+    );
+
+    expect(mocks.connectionsProps).toMatchObject({ showHost: true });
   });
 });

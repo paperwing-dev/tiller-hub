@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Dialog } from "@cloudflare/kumo/components/dialog";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import type { Artifact } from "../api/coordination/types";
 import type { EnvMeta, HarnessSettings } from "../api/types";
 import type { BillingMode } from "../shared/billing";
@@ -12,7 +12,7 @@ import {
   validateHarnessSettings,
 } from "../shared/harness-catalog";
 import { fetchRepoArtifacts, startEnv } from "./api";
-import { planPath } from "./dashboard-paths";
+import { planPath, projectGlobalSettingsPath } from "./dashboard-paths";
 import HarnessSettingsFields from "./HarnessSettingsFields";
 import MarkdownContent from "./MarkdownContent";
 import { isPlanOutdatedForMain, listPlanArtifacts, renderArtifactBodyMarkdown } from "./plan-artifacts";
@@ -31,6 +31,7 @@ interface StartPlanDialogProps {
   chatgptAuthStatus?: "missing" | "connected" | "refreshing" | "needs_reconnect" | "temporarily_unavailable";
   claudeBillingMode?: BillingMode | null;
   openaiBillingMode?: BillingMode | null;
+  onRefreshSetupStatus?: () => Promise<void>;
 }
 
 export default function StartPlanDialog({
@@ -47,6 +48,7 @@ export default function StartPlanDialog({
   chatgptAuthStatus = "missing",
   claudeBillingMode = null,
   openaiBillingMode = null,
+  onRefreshSetupStatus,
 }: StartPlanDialogProps) {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [loading, setLoading] = useState(Boolean(env.startupPlanId));
@@ -166,6 +168,8 @@ export default function StartPlanDialog({
               value={harnessSettings}
               credentialStatus={credentialStatus}
               disabled={starting}
+              settingsPath={projectGlobalSettingsPath(env.repoId)}
+              onRefreshSettings={onRefreshSetupStatus}
               onChange={(nextSettings) => {
                 setHarnessSettings(nextSettings);
                 setStartError(null);

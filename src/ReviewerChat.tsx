@@ -1,16 +1,17 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@cloudflare/kumo/components/button";
-import { Textarea } from "@cloudflare/kumo/components/input";
 import {
   fetchLatestPlannerRun,
   fetchReviewerMessages,
   sendReviewerMessage,
+  type AgentSkillDefinition,
   type PlannerRun,
   type PlannerRunEvent,
   type ThreadMessage,
 } from "./api";
 import LoadingIndicator from "./LoadingIndicator";
 import { codexAuthModeLabel } from "./codex-auth-ui";
+import PlanChatInput from "./PlanChatInput";
 
 function isActiveRun(run: PlannerRun | null): boolean {
   return run?.status === "queued" || run?.status === "running" || run?.status === "saving";
@@ -23,79 +24,24 @@ interface ReviewerChatProps {
   provider: string;
   model: string;
   hidden?: boolean;
-  sentMessageIds?: Set<string>;
+  handoffStatuses?: ReadonlyMap<string, ReviewerMessageHandoffStatus>;
+  focusMessage?: { messageId: string; requestId: string } | null;
   disabled?: boolean;
   disabledReason?: string | null;
+  skills?: AgentSkillDefinition[];
+  onInvokeSkill?: (skill: AgentSkillDefinition) => void | boolean | Promise<void | boolean>;
   onLatestRunChange?: (run: PlannerRun | null) => void;
   onForward: (messageId: string) => Promise<void> | void;
 }
+
+export type ReviewerMessageHandoffStatus = "waiting" | "shared" | "removed";
+
+const EMPTY_HANDOFF_STATUSES: ReadonlyMap<string, ReviewerMessageHandoffStatus> = new Map();
 
 const HUB_URL = window.location.origin;
 const ACTIVE_RUN_POLL_INTERVAL_MS = 750;
 const IDLE_RUN_POLL_INTERVAL_MS = 2_000;
 const STICKY_BOTTOM_THRESHOLD_PX = 24;
-
-function ReviewerComposer({
-  disabled,
-  busy,
-  placeholder,
-  onSend,
-}: {
-  disabled: boolean;
-  busy: boolean;
-  placeholder: string;
-  onSend: (message: string) => void | boolean | Promise<void | boolean>;
-}) {
-  const [input, setInput] = useState("");
-  const [pending, setPending] = useState(false);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-
-  const handleSend = useCallback(async () => {
-    const message = input.trim();
-    if (!message || disabled || pending || busy) return;
-    setPending(true);
-    setInput("");
-    try {
-      const result = await onSend(message);
-      if (result === false) setInput(message);
-    } catch (error) {
-      setInput(message);
-      throw error;
-    } finally {
-      setPending(false);
-      inputRef.current?.focus();
-    }
-  }, [busy, disabled, input, onSend, pending]);
-
-  return (
-    <div className="border-t border-kumo-line bg-kumo-base px-4 py-3">
-      <div className="flex gap-2">
-        <Textarea
-          ref={inputRef}
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void handleSend();
-            }
-          }}
-          placeholder={busy && !disabled ? "Wait for this reviewer..." : placeholder}
-          rows={1}
-          className="flex-1 resize-none"
-          disabled={disabled || pending}
-        />
-        <Button
-          variant="primary"
-          onClick={() => void handleSend()}
-          disabled={disabled || pending || busy || !input.trim()}
-        >
-          {pending ? "Sending…" : "Send"}
-        </Button>
-      </div>
-    </div>
-  );
-}
 
 export default function ReviewerChat({
   repoId,
@@ -103,9 +49,12 @@ export default function ReviewerChat({
   threadId,
   model,
   hidden = false,
-  sentMessageIds = new Set(),
+  handoffStatuses = EMPTY_HANDOFF_STATUSES,
+  focusMessage = null,
   disabled = false,
   disabledReason = null,
+  skills = [],
+  onInvokeSkill,
   onLatestRunChange,
   onForward,
 }: ReviewerChatProps) {
@@ -116,6 +65,9 @@ export default function ReviewerChat({
   const [forwarding, setForwarding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const messageRefs = useRef(new Map<string, HTMLDivElement>());
+  const handledFocusRequestRef = useRef<string | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const stickToBottomRef = useRef(true);
   const forceScrollToBottomRef = useRef(false);
   const latestRunChangeRef = useRef(onLatestRunChange);
@@ -195,6 +147,19 @@ export default function ReviewerChat({
   }, [activeRun?.runId, activeRun?.status, error, latestActivity, messages.length, pendingMessage, runError]);
 
   useEffect(() => {
+    if (hidden || !focusMessage || handledFocusRequestRef.current === focusMessage.requestId) return;
+    const message = messageRefs.current.get(focusMessage.messageId);
+    if (!message) return;
+    handledFocusRequestRef.current = focusMessage.requestId;
+    message.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    setHighlightedMessageId(focusMessage.messageId);
+    const timer = window.setTimeout(() => setHighlightedMessageId((current) => (
+      current === focusMessage.messageId ? null : current
+    )), 2_500);
+    return () => window.clearTimeout(timer);
+  }, [focusMessage?.messageId, focusMessage?.requestId, hidden, messages]);
+
+  useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       try {
@@ -261,28 +226,31 @@ export default function ReviewerChat({
 
   const handleForward = useCallback(async (message: ThreadMessage) => {
     const text = readThreadMessageText(message);
-    if (!text || forwarding || sentMessageIds.has(message.id) || disabled) return;
+    if (!text || forwarding || handoffStatuses.has(message.id) || disabled) return;
     setForwarding(true);
     try {
       await onForward(message.id);
       setError(null);
     } catch (error) {
-      setError(error instanceof Error ? error.message : "Failed to send feedback to the writer");
+      setError(error instanceof Error ? error.message : "Failed to share context with the Scribe");
     } finally {
       setForwarding(false);
     }
-  }, [disabled, forwarding, onForward, sentMessageIds]);
+  }, [disabled, forwarding, handoffStatuses, onForward]);
 
   return (
     <div className={`h-full min-h-0 flex-1 flex-col ${hidden ? "hidden" : "flex"}`}>
       <div className="border-b border-kumo-line bg-kumo-recessed px-4 py-2 text-xs font-medium text-kumo-subtle">
-        <div className="flex items-center gap-2">
-          <span>Reviewer · {model}</span>
-          {latestRun?.codexAuthMode && (
-            <span className="rounded border border-kumo-line bg-kumo-base px-1.5 py-0.5 text-[10px] uppercase tracking-wide">
-              {codexAuthModeLabel(latestRun.codexAuthMode)}
-            </span>
-          )}
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="shrink-0">Reviewer · {model}</span>
+            {latestRun?.codexAuthMode && (
+              <span className="rounded border border-kumo-line bg-kumo-base px-1.5 py-0.5 text-[10px] uppercase tracking-wide">
+                {codexAuthModeLabel(latestRun.codexAuthMode)}
+              </span>
+            )}
+          </div>
+          <span className="truncate text-[10px] font-normal">Advises on the plan · conversation retained</span>
         </div>
       </div>
       <div
@@ -298,16 +266,26 @@ export default function ReviewerChat({
         {loading && <LoadingIndicator label="Loading reviewer messages" className="py-8" />}
         {!loading && !activeRun && messages.length === 0 && !error && !runError && (
           <div className="py-8 text-center text-sm text-kumo-subtle">
-            Ask this reviewer anything about the plan — it reads the actual code.
+            Ask this reviewer anything about the plan. The conversation is retained between turns, and Plan Skills can investigate deeper.
           </div>
         )}
         {messages.map((message) => {
           const role = readThreadMessageRole(message);
           const text = readThreadMessageText(message);
           const canForward = role === "assistant" && text.trim().length > 0;
-          const sent = sentMessageIds.has(message.id);
+          const handoffStatus = handoffStatuses.get(message.id);
           return (
-            <div key={message.id} className={`flex ${role === "user" ? "justify-end" : "justify-start"}`}>
+            <div
+              key={message.id}
+              ref={(node) => {
+                if (node) messageRefs.current.set(message.id, node);
+                else messageRefs.current.delete(message.id);
+              }}
+              data-reviewer-message-id={message.id}
+              className={`flex rounded transition-shadow ${role === "user" ? "justify-end" : "justify-start"} ${
+                highlightedMessageId === message.id ? "ring-2 ring-kumo-focus ring-offset-2" : ""
+              }`}
+            >
               <div
                 className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
                   role === "user"
@@ -320,11 +298,19 @@ export default function ReviewerChat({
                   <Button
                     size="sm"
                     onClick={() => void handleForward(message)}
-                    disabled={forwarding || sent || disabled}
-                    className="mt-2 disabled:bg-kumo-success-tint disabled:!text-kumo-success"
+                    disabled={forwarding || Boolean(handoffStatus) || disabled}
+                    className={`mt-2 ${handoffStatus === "shared" ? "disabled:bg-kumo-success-tint disabled:!text-kumo-success" : ""}`}
                     title={disabled ? disabledReason ?? undefined : undefined}
                   >
-                    {sent ? "Sent to Writer" : "Send to Writer"}
+                    {forwarding
+                      ? "Sharing…"
+                      : handoffStatus === "waiting"
+                        ? "Waiting for Scribe"
+                        : handoffStatus === "shared"
+                          ? "Shared with Scribe"
+                          : handoffStatus === "removed"
+                            ? "Removed from Scribe"
+                            : "Share with Scribe"}
                   </Button>
                 )}
               </div>
@@ -362,10 +348,14 @@ export default function ReviewerChat({
           </div>
         )}
       </div>
-      <ReviewerComposer
+      <PlanChatInput
         disabled={disabled}
         busy={sending || Boolean(activeRun)}
         placeholder={disabled ? disabledReason ?? "Reviewer input is disabled" : "Ask for a code-aware critique..."}
+        busyPlaceholder="Run a /skill or wait for this reviewer..."
+        optimisticClear
+        skills={skills}
+        onInvokeSkill={onInvokeSkill}
         onSend={(message) => handleSend(message)}
       />
     </div>

@@ -14,6 +14,11 @@ function createEnv(overrides: Record<string, unknown> = {}) {
   const auth = {
     issueAuthConnectGrants: vi.fn(async () => ({ codex: "codex-grant", claude: "claude-grant" })),
     consumeAuthConnectGrant: vi.fn(async () => true),
+    recordAuthConnectResult: vi.fn(async () => true),
+    getAuthConnectStatus: vi.fn(async () => ({
+      status: "pending" as const,
+      providers: { codex: "pending" as const },
+    })),
     connectCodexAuth: vi.fn(async () => ({
       ok: true,
       credential: {
@@ -41,6 +46,21 @@ function createEnv(overrides: Record<string, unknown> = {}) {
 describe("subscription authentication connection routes", () => {
   beforeEach(() => vi.restoreAllMocks());
 
+  it("redirects legacy approval links into Global Settings", async () => {
+    const { env } = createEnv();
+    const response = await createApp().request(
+      "https://hub.example.test/cli/auth-connect?port=1455&state=state-1&key=public-key&providers=codex",
+      undefined,
+      env,
+    );
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe(
+      "/settings?auth_connect=1&port=1455&state=state-1&key=public-key&providers=codex",
+    );
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
   it("issues one encrypted owner package with provider-scoped grants", async () => {
     const { publicKey, privateKey } = await generateKeyPair("ECDH-ES", { crv: "P-256", extractable: true });
     const publicKeyJwk = await exportJWK(publicKey);
@@ -55,7 +75,8 @@ describe("subscription authentication connection routes", () => {
       env,
     );
     expect(response.status).toBe(200);
-    const envelope = (await response.json() as { envelope: string }).envelope;
+    const approval = await response.json() as { envelope: string; connection_id: string };
+    const envelope = approval.envelope;
     const decrypted = await compactDecrypt(envelope, privateKey);
     expect(decrypted.protectedHeader).toMatchObject({ typ: "tiller-auth-connect+jwe" });
     expect(JSON.parse(new TextDecoder().decode(decrypted.plaintext))).toMatchObject({
@@ -64,7 +85,31 @@ describe("subscription authentication connection routes", () => {
       state: "state-1",
       grants: { codex: "codex-grant", claude: "claude-grant" },
     });
-    expect(auth.issueAuthConnectGrants).toHaveBeenCalledWith(["codex", "claude"]);
+    expect(approval.connection_id).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+    expect(auth.issueAuthConnectGrants).toHaveBeenCalledWith(
+      ["codex", "claude"],
+      approval.connection_id,
+    );
+  });
+
+  it("reports tracked connection progress to Settings", async () => {
+    const { env, auth } = createEnv({
+      auth: {
+        getAuthConnectStatus: vi.fn(async () => ({
+          status: "success",
+          providers: { codex: "success" },
+        })),
+      },
+    });
+    const response = await createApp().request(
+      "https://hub.example.test/api/cli/auth-connect-status?connection_id=connection-id-1234",
+      undefined,
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "success", providers: { codex: "success" } });
+    expect(auth.getAuthConnectStatus).toHaveBeenCalledWith("connection-id-1234");
   });
 
   it("rejects credential uploads when only normal service authentication is present", async () => {
@@ -103,6 +148,7 @@ describe("subscription authentication connection routes", () => {
     );
     expect(auth.connectCodexAuth).toHaveBeenCalledWith("opaque-auth");
     expect(hub.setConfig).toHaveBeenCalledWith("openaiBillingMode", "subscription");
+    expect(auth.recordAuthConnectResult).toHaveBeenCalledWith("codex", "codex-grant", "success", undefined);
   });
 
   it("stores a Claude setup token as the existing runtime secret and activates billing", async () => {
@@ -123,6 +169,7 @@ describe("subscription authentication connection routes", () => {
     expect(auth.consumeAuthConnectGrant).toHaveBeenCalledWith("claude", "claude-grant");
     expect(hub.setConfig).toHaveBeenNthCalledWith(1, "CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-secret");
     expect(hub.setConfig).toHaveBeenNthCalledWith(2, "claudeBillingMode", "subscription");
+    expect(auth.recordAuthConnectResult).toHaveBeenCalledWith("claude", "claude-grant", "success", undefined);
   });
 
   it("enforces the 64 KiB upload boundary before consuming a grant", async () => {
@@ -144,7 +191,7 @@ describe("subscription authentication connection routes", () => {
   });
 
   it("returns only sanitized provider failures after consuming the grant", async () => {
-    const { env } = createEnv({
+    const { env, auth } = createEnv({
       auth: {
         connectCodexAuth: vi.fn(async () => ({
           ok: false,
@@ -167,5 +214,11 @@ describe("subscription authentication connection routes", () => {
     );
     expect(response.status).toBe(409);
     expect(await response.text()).not.toContain("secret-sentinel");
+    expect(auth.recordAuthConnectResult).toHaveBeenCalledWith(
+      "codex",
+      "codex-grant",
+      "error",
+      "Codex rejected the subscription login. Run `tiller auth connect codex` again.",
+    );
   });
 });

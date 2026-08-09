@@ -96,4 +96,29 @@ describe("PlanChatInput skill commands", () => {
     fireEvent.keyDown(composer, { key: "Enter" });
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("Please inspect this"));
   });
+
+  it("allows skill invocation while an ordinary message is blocked by a busy reviewer", async () => {
+    const onSend = vi.fn();
+    const onInvokeSkill = vi.fn().mockResolvedValue(true);
+    render(
+      <PlanChatInput
+        busy
+        busyPlaceholder="Run a /skill or wait"
+        placeholder="Message"
+        onSend={onSend}
+        skills={skills}
+        onInvokeSkill={onInvokeSkill}
+      />,
+    );
+    const composer = screen.getByLabelText("Message");
+
+    expect(composer).toHaveAttribute("placeholder", "Run a /skill or wait");
+    fireEvent.change(composer, { target: { value: "ordinary message" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(composer, { target: { value: "/security-review" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+    await waitFor(() => expect(onInvokeSkill).toHaveBeenCalledWith(skills[1]));
+  });
 });

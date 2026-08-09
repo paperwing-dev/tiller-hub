@@ -6,7 +6,7 @@ import {
   Outlet,
   useLocation,
   useNavigate,
-} from 'react-router-dom';
+} from 'react-router';
 import { GearSixIcon } from '@phosphor-icons/react';
 import { Button } from '@cloudflare/kumo/components/button';
 import { Sidebar, useSidebar } from '@cloudflare/kumo/components/sidebar';
@@ -266,7 +266,7 @@ export function StatusActions({ settingsPath = '/settings' }: { settingsPath?: s
         hubUrl={data.hubUrl}
         hubConnected={data.connected}
         hostRefreshNonce={data.hostRefreshNonce}
-        showHost
+        showHost={Boolean(data.setupStatus?.hostRegistered)}
       />
       <span
         className="relative z-[1000] inline-flex"

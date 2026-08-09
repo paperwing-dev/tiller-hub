@@ -1,5 +1,5 @@
-import { Navigate } from 'react-router-dom';
-import type { RouteObject } from 'react-router-dom';
+import { Navigate } from 'react-router';
+import type { RouteObject } from 'react-router';
 import DashboardDataProvider from './DashboardDataProvider';
 import { EnvGuard, ProjectGuard, SessionGuard } from './dashboard-guards';
 import { WorkspaceLayout } from './DashboardLayout';
@@ -20,6 +20,7 @@ import {
 export {
   getTopLevelUpdateIssue,
   getUpdateCheckFailure,
+  recoverBrowserAuthentication,
   refreshDashboardStateAfterHubConnect,
   useDashboardData,
 } from './DashboardDataProvider';

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  ApiAuthenticationError,
   checkForUpdate,
   cancelScheduledRun,
   createEnv,
@@ -15,6 +16,7 @@ import {
   fetchRepos,
   fetchSessions,
   fetchSetupStatus,
+  invokePlanSkill,
   savePlan,
   startEnv,
   testGitHubAppAccess,
@@ -260,6 +262,41 @@ describe("fetchRepoArtifacts", () => {
   });
 });
 
+describe("invokePlanSkill", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("launches the selected Plan skill with an idempotency key", async () => {
+    const response = {
+      kind: "fanout",
+      invocation: { invocationId: "request-1" },
+      reviewers: [],
+      runs: [],
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(response), { status: 201 }),
+    );
+
+    await expect(invokePlanSkill(
+      "https://example.com",
+      "repo-1",
+      "plan-1",
+      "plan/review",
+      "request-1",
+    )).resolves.toEqual(response);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://example.com/api/repos/repo-1/plans/plan-1/skills/plan%2Freview/invoke",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ requestId: "request-1" }),
+      },
+    );
+  });
+});
+
 describe("list-style api helpers", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -272,8 +309,10 @@ describe("list-style api helpers", () => {
 
     await expect(fetchSessions("https://example.com")).resolves.toEqual([]);
     expect(fetchSpy).toHaveBeenCalledWith("https://example.com/api/sessions", {
+      headers: { Accept: "application/json" },
       credentials: "include",
       cache: "no-store",
+      redirect: "manual",
     });
   });
 
@@ -772,6 +811,30 @@ describe("single-object api helpers", () => {
     await expect(fetchEnv("https://example.com", "env-1")).rejects.toThrow("Malformed env response");
   });
 
+  it("identifies an unauthorized setup-status response as expired browser authentication", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(fetchSetupStatus("https://example.com"))
+      .rejects.toBeInstanceOf(ApiAuthenticationError);
+  });
+
+  it("identifies a Cloudflare Access login page returned for setup status", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("<!DOCTYPE html><html><title>Sign in ・ Cloudflare Access</title></html>", {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+
+    await expect(fetchSetupStatus("https://example.com"))
+      .rejects.toBeInstanceOf(ApiAuthenticationError);
+  });
+
   it("rejects partial setup status payloads", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({
@@ -849,7 +912,11 @@ describe("single-object api helpers", () => {
       });
     expect(fetchMock).toHaveBeenCalledWith(
       "https://demo.preview.workers.dev/api/setup/status",
-      expect.objectContaining({ cache: "no-store" }),
+      expect.objectContaining({
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        redirect: "manual",
+      }),
     );
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
       ...payload,

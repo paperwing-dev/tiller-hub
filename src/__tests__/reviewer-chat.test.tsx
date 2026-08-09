@@ -5,6 +5,30 @@ import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ReviewerChat from "../ReviewerChat";
+import type { AgentSkillDefinition } from "../api";
+
+const planSkills: AgentSkillDefinition[] = [{
+  id: "plan-review",
+  surface: "plan",
+  command: "plan-review",
+  label: "Plan Review",
+  description: "Review the plan from several angles.",
+  sharedInstructions: "Review the plan.",
+  overviewInstructions: "Synthesize the reports.",
+  overviewMode: "auto",
+  agents: [{
+    id: "correctness",
+    label: "Correctness",
+    instructions: "Find correctness gaps.",
+    routeKey: "codex:gpt-5.5",
+    effort: "high",
+    reportMode: "auto",
+  }],
+  origin: "builtin",
+  customized: false,
+  createdAt: null,
+  updatedAt: null,
+}];
 
 const mocks = vi.hoisted(() => ({
   fetchLatestPlannerRun: vi.fn(),
@@ -88,6 +112,149 @@ describe("ReviewerChat", () => {
 
     expect(mocks.fetchReviewerMessages).toHaveBeenCalledTimes(1);
     expect(mocks.sendReviewerMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the reviewer relationship clear and reflects Scribe handoff status", async () => {
+    const onForward = vi.fn().mockResolvedValue(undefined);
+    await act(async () => {
+      root?.render(
+        <ReviewerChat
+          repoId="repo-1"
+          planArtifactId="plan-1"
+          threadId="reviewer-thread-1"
+          provider="codex"
+          model="gpt-5.5"
+          onForward={onForward}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Advises on the plan · conversation retained");
+    const share = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent === "Share with Scribe");
+    expect(share).toBeInstanceOf(HTMLButtonElement);
+    await act(async () => {
+      share?.click();
+      await Promise.resolve();
+    });
+    expect(onForward).toHaveBeenCalledWith("message-1");
+
+    await act(async () => {
+      root?.render(
+        <ReviewerChat
+          repoId="repo-1"
+          planArtifactId="plan-1"
+          threadId="reviewer-thread-1"
+          provider="codex"
+          model="gpt-5.5"
+          handoffStatuses={new Map([["message-1", "waiting"]])}
+          onForward={onForward}
+        />,
+      );
+    });
+    expect(container.textContent).toContain("Waiting for Scribe");
+
+    await act(async () => {
+      root?.render(
+        <ReviewerChat
+          repoId="repo-1"
+          planArtifactId="plan-1"
+          threadId="reviewer-thread-1"
+          provider="codex"
+          model="gpt-5.5"
+          handoffStatuses={new Map([["message-1", "shared"]])}
+          onForward={onForward}
+        />,
+      );
+    });
+    expect(container.textContent).toContain("Shared with Scribe");
+
+    await act(async () => {
+      root?.render(
+        <ReviewerChat
+          repoId="repo-1"
+          planArtifactId="plan-1"
+          threadId="reviewer-thread-1"
+          provider="codex"
+          model="gpt-5.5"
+          handoffStatuses={new Map([["message-1", "removed"]])}
+          onForward={onForward}
+        />,
+      );
+    });
+    expect(container.textContent).toContain("Removed from Scribe");
+  });
+
+  it("returns to and highlights a reviewer message from the Scribe context tray", async () => {
+    await act(async () => {
+      root?.render(
+        <ReviewerChat
+          repoId="repo-1"
+          planArtifactId="plan-1"
+          threadId="reviewer-thread-1"
+          provider="codex"
+          model="gpt-5.5"
+          onForward={vi.fn()}
+        />,
+      );
+    });
+    const message = container.querySelector<HTMLElement>('[data-reviewer-message-id="message-1"]');
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(message!, "scrollIntoView", { configurable: true, value: scrollIntoView });
+
+    await act(async () => {
+      root?.render(
+        <ReviewerChat
+          repoId="repo-1"
+          planArtifactId="plan-1"
+          threadId="reviewer-thread-1"
+          provider="codex"
+          model="gpt-5.5"
+          focusMessage={{ messageId: "message-1", requestId: "focus-1" }}
+          onForward={vi.fn()}
+        />,
+      );
+    });
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "center", behavior: "smooth" });
+    expect(message).toHaveClass("ring-2", "ring-kumo-focus");
+  });
+
+  it("offers Plan skills from the reviewer slash composer", async () => {
+    const onInvokeSkill = vi.fn().mockResolvedValue(true);
+    await act(async () => {
+      root?.render(
+        <ReviewerChat
+          repoId="repo-1"
+          planArtifactId="plan-1"
+          threadId="reviewer-thread-1"
+          provider="fake"
+          model="fake-fast"
+          skills={planSkills}
+          onInvokeSkill={onInvokeSkill}
+          onForward={vi.fn()}
+        />,
+      );
+    });
+
+    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+    await act(async () => {
+      setTextareaValue(textarea, "/");
+    });
+
+    const skillButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("/plan-review"));
+    expect(skillButton).toBeInstanceOf(HTMLButtonElement);
+    expect(skillButton?.textContent).toContain("Review the plan from several angles.");
+
+    await act(async () => {
+      skillButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(onInvokeSkill).toHaveBeenCalledWith(planSkills[0]);
+    expect(mocks.sendReviewerMessage).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("");
   });
 
   it("shows current model activity from an active run", async () => {

@@ -768,9 +768,11 @@ describe("planner routes", () => {
   it("stores repository Plan Writer Settings and rejects unknown route keys", async () => {
     const app = createTestApp();
     const initial = await app.request("/api/repos/repo-1/plan-writer-settings", {}, createEnv() as any);
-    expect(await initial.json()).toMatchObject({
-      settings: { routeKey: "codex:gpt-5.5", effort: "xhigh", fastMode: false, updatedAt: null },
+    const initialBody = await initial.json() as any;
+    expect(initialBody).toMatchObject({
+      settings: { routeKey: "codex:gpt-5.5", effort: "xhigh", updatedAt: null },
     });
+    expect(initialBody.settings).not.toHaveProperty("fastMode");
     const invalid = await app.request("/api/repos/repo-1/plan-writer-settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -789,18 +791,6 @@ describe("planner routes", () => {
       body: JSON.stringify({ routeKey: "codex:gpt-5.5", effort: "ultra", planFormat: "# Format" }),
     }, createEnv() as any);
     expect(invalidEffort.status).toBe(400);
-    const invalidFastMode = await app.request("/api/repos/repo-1/plan-writer-settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ routeKey: "codex:gpt-5.5", fastMode: "yes", planFormat: "# Format" }),
-    }, createEnv() as any);
-    expect(invalidFastMode.status).toBe(400);
-    const unsupportedFastMode = await app.request("/api/repos/repo-1/plan-writer-settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ routeKey: "claude-code:claude-opus-4.8", fastMode: true, planFormat: "# Format" }),
-    }, createEnv() as any);
-    expect(unsupportedFastMode.status).toBe(400);
     const saved = await app.request("/api/repos/repo-1/plan-writer-settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -812,15 +802,16 @@ describe("planner routes", () => {
       }),
     }, createEnv() as any);
     expect(saved.status).toBe(200);
-    expect(await saved.json()).toMatchObject({
+    const savedBody = await saved.json() as any;
+    expect(savedBody).toMatchObject({
       settings: {
         routeKey: "codex:gpt-5.5",
         effort: "low",
-        fastMode: true,
         planFormat: "# Repository Plan Format",
         updatedAt: expect.any(String),
       },
     });
+    expect(savedBody.settings).not.toHaveProperty("fastMode");
   });
 
   it("keeps Plan Writer reads inert and makes Start and Stop explicit and idempotent", async () => {
@@ -897,7 +888,7 @@ describe("planner routes", () => {
       },
     });
     expect(mocks.ensurePlanWriterRuntime).toHaveBeenCalledTimes(1);
-    expect(artifactStore.getPlanWriter("repo-1", plan.id)?.fastMode).toBe(true);
+    expect(artifactStore.getPlanWriter("repo-1", plan.id)?.fastMode).toBeUndefined();
 
     const replayedStart = await app.request(
       `/api/repos/repo-1/plans/${plan.id}/live-writer/start`,

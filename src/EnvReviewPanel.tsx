@@ -45,33 +45,8 @@ import {
   writeEnvReviewViewedRuns,
 } from "./env-review-tab-status";
 
-const DIRECT_DEPLOYMENT_INSTRUCTION = "Commit all code, push, and deploy.";
-const REVIEWERS_HEIGHT_STORAGE_KEY = "tiller:implementor-reviewers-height";
 const DEFAULT_REVIEWERS_HEIGHT = 320;
-const MIN_REVIEWERS_HEIGHT = 220;
-const MAX_REVIEWERS_HEIGHT = 560;
-const MIN_TERMINAL_HEIGHT = 200;
 const TRANSCRIPT_BOTTOM_THRESHOLD = 24;
-
-function readStoredReviewersHeight(): number {
-  if (typeof window === "undefined") return DEFAULT_REVIEWERS_HEIGHT;
-  try {
-    const stored = window.localStorage.getItem(REVIEWERS_HEIGHT_STORAGE_KEY);
-    if (stored === null || stored.trim() === "") return DEFAULT_REVIEWERS_HEIGHT;
-    const parsed = Number(stored);
-    return Number.isFinite(parsed) ? parsed : DEFAULT_REVIEWERS_HEIGHT;
-  } catch {
-    return DEFAULT_REVIEWERS_HEIGHT;
-  }
-}
-
-function storeReviewersHeight(height: number): void {
-  try {
-    window.localStorage.setItem(REVIEWERS_HEIGHT_STORAGE_KEY, String(height));
-  } catch {
-    // Resizing remains available when browser storage is disabled or full.
-  }
-}
 
 function getSessionStorage(): Storage | null {
   try {
@@ -81,15 +56,6 @@ function getSessionStorage(): Storage | null {
   }
 }
 
-function clampReviewersHeight(height: number, containerHeight: number): number {
-  const maximum = Math.max(
-    0,
-    Math.min(MAX_REVIEWERS_HEIGHT, containerHeight - MIN_TERMINAL_HEIGHT),
-  );
-  const minimum = Math.min(MIN_REVIEWERS_HEIGHT, maximum);
-  return Math.min(maximum, Math.max(minimum, height));
-}
-
 interface EnvReviewPanelProps {
   envSlug: string;
   repoId: string;
@@ -97,6 +63,7 @@ interface EnvReviewPanelProps {
   hubUrl: string;
   harnessInputReady: boolean;
   onSendToHarness: (text: string) => Promise<{ ok: boolean; error?: string }>;
+  onLayoutChange?: () => void;
 }
 
 function isActiveStatus(status: string): boolean {
@@ -320,10 +287,9 @@ export default function EnvReviewPanel({
   hubUrl,
   harnessInputReady,
   onSendToHarness,
+  onLayoutChange,
 }: EnvReviewPanelProps) {
   const [collapsed, setCollapsed] = useState(false);
-  const [initialReviewersHeight] = useState(readStoredReviewersHeight);
-  const [height, setHeight] = useState<number | null>(null);
   const [state, setState] = useState<EnvReviewState | null>(null);
   const [providers, setProviders] = useState<PlannerProviderMetadata[]>([]);
   const [skillRoutes, setSkillRoutes] = useState<AgentRoute[]>([]);
@@ -344,13 +310,8 @@ export default function EnvReviewPanel({
   const [loading, setLoading] = useState(false);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [sendingDeployment, setSendingDeployment] = useState(false);
   const [preview, setPreview] = useState<{ feedback: EnvReviewFeedback; text: string; formatted: boolean } | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
-  const panelRef = useRef<HTMLElement | null>(null);
-  const preferredHeightRef = useRef(initialReviewersHeight);
-  const heightRef = useRef(initialReviewersHeight);
-  const dragStartRef = useRef<{ y: number; height: number; containerHeight: number } | null>(null);
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
   const transcriptFollowingRef = useRef(true);
   const transcriptThreadRef = useRef<string | null>(null);
@@ -371,33 +332,9 @@ export default function EnvReviewPanel({
     setViewedRunIds(readEnvReviewViewedRuns(getSessionStorage(), envSlug, sessionId));
   }, [envSlug, sessionId]);
 
-  const updateDisplayedHeight = useCallback((nextHeight: number) => {
-    heightRef.current = nextHeight;
-    setHeight(nextHeight);
-  }, []);
-
-  const reclampHeight = useCallback(() => {
-    const parent = panelRef.current?.parentElement;
-    if (!parent) return;
-    const containerHeight = parent.getBoundingClientRect().height;
-    if (!Number.isFinite(containerHeight) || containerHeight <= 0) return;
-    updateDisplayedHeight(clampReviewersHeight(preferredHeightRef.current, containerHeight));
-  }, [updateDisplayedHeight]);
-
   useLayoutEffect(() => {
-    const parent = panelRef.current?.parentElement;
-    if (!parent) return;
-    reclampHeight();
-    const observer = typeof ResizeObserver === "undefined"
-      ? null
-      : new ResizeObserver(reclampHeight);
-    observer?.observe(parent);
-    window.addEventListener("resize", reclampHeight);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener("resize", reclampHeight);
-    };
-  }, [collapsed, reclampHeight]);
+    onLayoutChange?.();
+  }, [collapsed, onLayoutChange]);
 
   const topLevelTabs = state?.tabs ?? [];
   const nestedTabs = invocationDetail?.tabs ?? [];
@@ -742,52 +679,6 @@ export default function EnvReviewPanel({
     }
   }, [activeRun?.status, activeTab?.threadId, latestActivity, messages.length, unmatchedFeedback.length, visibleRunEvents.length]);
 
-  const handleDrag = useCallback((event: MouseEvent) => {
-    const start = dragStartRef.current;
-    if (!start) return;
-    const nextHeight = clampReviewersHeight(
-      start.height + start.y - event.clientY,
-      start.containerHeight,
-    );
-    preferredHeightRef.current = nextHeight;
-    updateDisplayedHeight(nextHeight);
-  }, [updateDisplayedHeight]);
-
-  const stopDrag = useCallback(() => {
-    if (dragStartRef.current) {
-      preferredHeightRef.current = heightRef.current;
-      storeReviewersHeight(heightRef.current);
-      dragStartRef.current = null;
-    }
-    window.removeEventListener("mousemove", handleDrag);
-    window.removeEventListener("mouseup", stopDrag);
-  }, [handleDrag]);
-
-  useEffect(() => () => {
-    window.removeEventListener("mousemove", handleDrag);
-    window.removeEventListener("mouseup", stopDrag);
-  }, [handleDrag, stopDrag]);
-
-  const startDrag = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    const panel = panelRef.current;
-    const parent = panel?.parentElement;
-    if (!panel || !parent) return;
-    const containerHeight = parent.getBoundingClientRect().height;
-    if (!Number.isFinite(containerHeight) || containerHeight <= 0) return;
-    event.preventDefault();
-    const renderedHeight = panel.getBoundingClientRect().height;
-    const startHeight = renderedHeight > 0 ? renderedHeight : heightRef.current;
-    dragStartRef.current = {
-      y: event.clientY,
-      height: clampReviewersHeight(startHeight, containerHeight),
-      containerHeight,
-    };
-    preferredHeightRef.current = dragStartRef.current.height;
-    updateDisplayedHeight(dragStartRef.current.height);
-    window.addEventListener("mousemove", handleDrag);
-    window.addEventListener("mouseup", stopDrag);
-  }, [handleDrag, stopDrag, updateDisplayedHeight]);
-
   const addReviewer = useCallback(async (input: AddReviewerAction) => {
     if (!input.provider || !input.model) return;
     setLoading(true);
@@ -946,22 +837,6 @@ export default function EnvReviewPanel({
     }
   }, [envSlug, hubUrl, invocationDetail, loadInvocationRows, loadState, overviewGuidance, sessionId]);
 
-  const deployDirectly = useCallback(async () => {
-    if (!harnessInputReady || sendingDeployment) return;
-    setSendingDeployment(true);
-    setSendError(null);
-    try {
-      const result = await onSendToHarness(DIRECT_DEPLOYMENT_INSTRUCTION);
-      if (!result.ok) {
-        setSendError(result.error || "Harness did not acknowledge the instruction");
-      }
-    } catch (error) {
-      setSendError(error instanceof Error ? error.message : "Failed to send harness instruction");
-    } finally {
-      setSendingDeployment(false);
-    }
-  }, [harnessInputReady, onSendToHarness, sendingDeployment]);
-
   const dismissFeedback = useCallback(async (feedback: EnvReviewFeedback) => {
     try {
       await markEnvReviewFeedback(hubUrl, envSlug, feedback.feedbackId, "dismiss", { sessionId });
@@ -1061,7 +936,6 @@ export default function EnvReviewPanel({
   if (collapsed) {
     return (
       <div
-        ref={panelRef as React.RefObject<HTMLDivElement>}
         data-testid="env-review-panel"
         className="shrink-0 border-t border-kumo-line bg-kumo-base px-3 py-2"
       >
@@ -1078,20 +952,11 @@ export default function EnvReviewPanel({
 
   return (
     <section
-      ref={panelRef}
       data-testid="env-review-panel"
       className="flex shrink-0 flex-col border-t border-kumo-line bg-kumo-base"
-      style={{ height: height ?? DEFAULT_REVIEWERS_HEIGHT }}
+      style={{ height: DEFAULT_REVIEWERS_HEIGHT }}
       aria-label="Reviewers"
     >
-      <div
-        role="separator"
-        aria-label="Resize Implementor and Implementor Reviewers"
-        aria-orientation="horizontal"
-        aria-valuenow={height ?? DEFAULT_REVIEWERS_HEIGHT}
-        className="h-1 cursor-row-resize bg-kumo-line/60 hover:bg-kumo-focus"
-        onMouseDown={startDrag}
-      />
       <div className="flex items-start justify-between gap-3 border-b border-kumo-line px-3 py-2">
         <div className="flex min-w-0 flex-1 items-start gap-2">
           <button
@@ -1131,14 +996,6 @@ export default function EnvReviewPanel({
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void deployDirectly()}
-            disabled={!harnessInputReady || sendingDeployment}
-            className="h-8 rounded border border-kumo-line bg-kumo-base px-2 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {sendingDeployment ? "Sending…" : "Deploy Directly"}
-          </button>
           <AddReviewerMenu
             activeReviewerCount={topLevelTabs.length}
             providers={providers}

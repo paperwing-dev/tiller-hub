@@ -131,6 +131,16 @@ describe("harness catalog", () => {
       model: "claude-opus-4.8",
       effort: "high",
       fastMode: true,
+    })).toEqual({ model: "claude-opus-4.8", effort: "high", fastMode: true });
+    expect(validateHarnessSettings("claude-code", {
+      model: "claude-fable-5",
+      effort: "high",
+      fastMode: true,
+    })).toBeNull();
+    expect(validateHarnessSettings("opencode", {
+      model: "gpt-5.5",
+      effort: "high",
+      fastMode: true,
     })).toBeNull();
     expect(validateHarnessSettings("codex", {
       model: "gpt-5.5",

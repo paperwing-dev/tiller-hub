@@ -249,7 +249,7 @@ export default function PlanSkillHistory({
                 <div className="whitespace-pre-wrap">{messageText}</div>
                 {eligible && <label className="mt-1 flex items-center gap-1 text-[10px] text-kumo-subtle">
                   <input type="checkbox" checked={selectedMessageIds.includes(message.id)} onChange={() => setSelectedMessageIds((current) => current.includes(message.id) ? current.filter((id) => id !== message.id) : [...current, message.id])} />
-                  Forward to Plan Writer
+                  Share with Scribe
                 </label>}
               </div>;
             })}
@@ -259,9 +259,9 @@ export default function PlanSkillHistory({
             </div>
           </main>
           <aside className="border-l border-kumo-line p-3">
-            <div className="text-xs font-medium text-kumo-default">Forward selected reports</div>
+            <div className="text-xs font-medium text-kumo-default">Share selected findings</div>
             <textarea value={guidance} onChange={(event) => setGuidance(event.target.value)} placeholder="Optional guidance" className="mt-2 h-24 w-full resize-none rounded border border-kumo-line p-2 text-xs" />
-            <button type="button" disabled={busy || (selectedMessageIds.length === 0 && !guidance.trim())} onClick={() => void forward()} className="mt-2 w-full rounded bg-kumo-brand px-2 py-1.5 text-xs font-medium text-white disabled:opacity-40">Send to Plan Writer</button>
+            <button type="button" disabled={busy || (selectedMessageIds.length === 0 && !guidance.trim())} onClick={() => void forward()} className="mt-2 w-full rounded bg-kumo-brand px-2 py-1.5 text-xs font-medium text-white disabled:opacity-40">Share with Scribe</button>
             {error && <div className="mt-2 text-xs text-kumo-danger">{error}</div>}
           </aside>
         </div>

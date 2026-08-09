@@ -564,6 +564,7 @@ export async function buildContainerLaunchConfig(
     TILLER_CLAUDE_AUTH_RESOLVED_MODE: auth.resolvedAuthMode,
     TILLER_CLAUDE_MODEL: catalogModel.binding.model,
     TILLER_CLAUDE_EFFORT: harnessSettings.effort,
+    ...(harnessSettings.fastMode ? { TILLER_CLAUDE_FAST_MODE: "1" } : {}),
     ...auth.envVars,
   });
 

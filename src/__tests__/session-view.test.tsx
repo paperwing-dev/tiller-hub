@@ -22,9 +22,16 @@ vi.mock("../VoiceAgent", () => ({
 }));
 
 vi.mock("../EnvReviewPanel", () => ({
-  default: ({ harnessInputReady }: { harnessInputReady: boolean }) => React.createElement(
+  default: ({ harnessInputReady, onLayoutChange }: {
+    harnessInputReady: boolean;
+    onLayoutChange?: () => void;
+  }) => React.createElement(
     "div",
-    { "data-testid": "env-review-panel", "data-harness-input-ready": String(harnessInputReady) },
+    {
+      "data-testid": "env-review-panel",
+      "data-harness-input-ready": String(harnessInputReady),
+      "data-has-layout-change": String(Boolean(onLayoutChange)),
+    },
   ),
 }));
 
@@ -86,6 +93,7 @@ describe("SessionView", () => {
 
     expect(render(false)).toContain('data-harness-input-ready="false"');
     expect(render(true)).toContain('data-harness-input-ready="false"');
+    expect(render(true)).toContain('data-has-layout-change="true"');
   });
 
   it("renders the terminal as the session input surface", () => {

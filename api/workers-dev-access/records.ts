@@ -7,7 +7,7 @@ import type {
 } from "./types";
 
 const RENEWAL_WARNING_MS = 30 * 24 * 60 * 60 * 1_000;
-const MAINTAINER_DEV_HOSTNAME = "tiller-dev.personal-infrastructure.workers.dev";
+const MAINTAINER_DEV_HOSTNAME_PREFIX = "tiller-dev.";
 
 export function normalizeOwnerEmail(value: string): string {
   return value.trim().toLowerCase();
@@ -41,7 +41,7 @@ function readBindingAccess(env: Env): {
   let hostnameAllowed: (hostname: string) => boolean;
   if (maintainerDevSchema) {
     if (maintainerDevSchema !== "1" || installerSchema) return null;
-    hostnameAllowed = (hostname) => hostname === MAINTAINER_DEV_HOSTNAME;
+    hostnameAllowed = (hostname) => hostname.startsWith(MAINTAINER_DEV_HOSTNAME_PREFIX);
   } else {
     if (installerSchema !== "1") return null;
     hostnameAllowed = (hostname) => hostname.startsWith("tiller.");

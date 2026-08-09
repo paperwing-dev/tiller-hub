@@ -1,4 +1,4 @@
-import { matchPath } from 'react-router-dom';
+import { matchPath } from 'react-router';
 import type { StoredSession } from '../api/types';
 import { getManagedEnvSlug } from './session-attachment';
 

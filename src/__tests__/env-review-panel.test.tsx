@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import React from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -262,7 +262,11 @@ function makeFanoutDetail(options: { overviewMode?: "auto" | "manual"; overviewR
   };
 }
 
-function renderPanel(options: { connected?: boolean; onSend?: (text: string) => Promise<{ ok: boolean; error?: string }> } = {}) {
+function renderPanel(options: {
+  connected?: boolean;
+  onSend?: (text: string) => Promise<{ ok: boolean; error?: string }>;
+  onLayoutChange?: () => void;
+} = {}) {
   return render(
     <EnvReviewPanel
       envSlug="env-1"
@@ -271,51 +275,9 @@ function renderPanel(options: { connected?: boolean; onSend?: (text: string) => 
       hubUrl="https://hub.test"
       harnessInputReady={options.connected ?? true}
       onSendToHarness={options.onSend ?? vi.fn(async () => ({ ok: true }))}
+      onLayoutChange={options.onLayoutChange}
     />,
   );
-}
-
-function rect(height: number): DOMRect {
-  return {
-    x: 0,
-    y: 0,
-    width: 900,
-    height,
-    top: 0,
-    right: 900,
-    bottom: height,
-    left: 0,
-    toJSON: () => ({}),
-  };
-}
-
-function mockPanelGeometry(getContainerHeight: () => number): void {
-  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
-    const element = this;
-    if (element.dataset.testid === "env-review-panel") {
-      return rect(Number.parseFloat(element.style.height) || 0);
-    }
-    if ((element.firstElementChild as HTMLElement | null)?.dataset.testid === "env-review-panel") {
-      return rect(getContainerHeight());
-    }
-    return rect(0);
-  });
-}
-
-function installResizeObserver(): { notify: () => void } {
-  let callback: ResizeObserverCallback | null = null;
-  vi.stubGlobal("ResizeObserver", class {
-    constructor(nextCallback: ResizeObserverCallback) {
-      callback = nextCallback;
-    }
-
-    observe() {}
-    disconnect() {}
-    unobserve() {}
-  });
-  return {
-    notify: () => callback?.([], {} as ResizeObserver),
-  };
 }
 
 function threadMessage(id: string, text: string) {
@@ -764,108 +726,29 @@ describe("EnvReviewPanel actions", () => {
     expect(reasoningSelect).toHaveTextContent("High");
   });
 
-  it("sends the direct deployment instruction exactly once and waits for acknowledgement", async () => {
-    let acknowledge: (value: { ok: boolean }) => void = () => undefined;
-    const onSend = vi.fn(() => new Promise<{ ok: boolean }>((resolve) => {
-      acknowledge = resolve;
-    }));
-    renderPanel({ onSend });
-
-    const deployButton = await screen.findByRole("button", { name: "Deploy Directly" });
-    fireEvent.click(deployButton);
-
-    expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith("Commit all code, push, and deploy.");
-    expect(await screen.findByRole("button", { name: "Sending…" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Sending…" }));
-    expect(onSend).toHaveBeenCalledTimes(1);
-    expect(mocks.invokeSkill).not.toHaveBeenCalled();
-
-    acknowledge({ ok: true });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Deploy Directly" })).toBeEnabled());
-  });
-
-  it("disables direct deployment while disconnected", async () => {
-    const onSend = vi.fn(async () => ({ ok: true }));
-    renderPanel({ connected: false, onSend });
-
-    expect(await screen.findByRole("button", { name: "Deploy Directly" })).toBeDisabled();
-    expect(onSend).not.toHaveBeenCalled();
-  });
-
-  it("reports a direct deployment acknowledgement failure without claiming completion", async () => {
-    renderPanel({ onSend: vi.fn(async () => ({ ok: false, error: "Terminal rejected input" })) });
-
-    fireEvent.click(await screen.findByRole("button", { name: "Deploy Directly" }));
-    expect(await screen.findByText("Terminal rejected input")).toBeInTheDocument();
-    expect(screen.queryByText(/deploy(?:ed|ment complete)/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Deploy Directly" })).toBeEnabled();
-  });
-
-  it("resizes live, clamps normal bounds, persists on completion, and restores after collapse", () => {
-    mockPanelGeometry(() => 800);
+  it("does not expose a deployment action in the reviewers header", () => {
     renderPanel();
-    const divider = screen.getByRole("separator", {
-      name: "Resize Implementor and Implementor Reviewers",
-    });
-    const panel = screen.getByTestId("env-review-panel");
 
-    expect(panel.style.height).toBe("320px");
-    fireEvent.mouseDown(divider, { clientY: 500 });
-    fireEvent.mouseMove(window, { clientY: 400 });
-    expect(panel.style.height).toBe("420px");
-    expect(window.localStorage.getItem("tiller:implementor-reviewers-height")).toBeNull();
+    expect(screen.queryByRole("button", { name: /deploy/i })).not.toBeInTheDocument();
+  });
 
-    fireEvent.mouseMove(window, { clientY: -500 });
-    expect(panel.style.height).toBe("560px");
-    fireEvent.mouseMove(window, { clientY: 1_000 });
-    expect(panel.style.height).toBe("220px");
-    fireEvent.mouseMove(window, { clientY: 400 });
-    fireEvent.mouseUp(window);
-    expect(window.localStorage.getItem("tiller:implementor-reviewers-height")).toBe("420");
+  it("uses a binary reviewer drawer and announces both layout changes", () => {
+    const onLayoutChange = vi.fn();
+    renderPanel({ onLayoutChange });
+    expect(screen.getByTestId("env-review-panel").style.height).toBe("320px");
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+    onLayoutChange.mockClear();
 
     fireEvent.click(screen.getByRole("button", { name: "Reviewers" }));
     expect(screen.getByTestId("env-review-panel").style.height).toBe("");
-    expect(window.localStorage.getItem("tiller:implementor-reviewers-height")).toBe("420");
+    expect(screen.queryByRole("region", { name: "Reviewers" })).not.toBeInTheDocument();
+    expect(onLayoutChange).toHaveBeenCalledTimes(1);
+
     fireEvent.click(screen.getByRole("button", { name: "Reviewers" }));
-    expect(screen.getByTestId("env-review-panel").style.height).toBe("420px");
-  });
-
-  it("shrinks below the preferred reviewer minimum to preserve terminal space", () => {
-    mockPanelGeometry(() => 350);
-    renderPanel();
-    const panel = screen.getByTestId("env-review-panel");
-
-    expect(panel.style.height).toBe("150px");
-    fireEvent.mouseDown(screen.getByRole("separator"), { clientY: 300 });
-    fireEvent.mouseMove(window, { clientY: 0 });
-    expect(panel.style.height).toBe("150px");
-  });
-
-  it("restores persisted height and re-clamps it when the parent changes size", () => {
-    let containerHeight = 800;
-    mockPanelGeometry(() => containerHeight);
-    const observer = installResizeObserver();
-    window.localStorage.setItem("tiller:implementor-reviewers-height", "500");
-    renderPanel();
-    const panel = screen.getByTestId("env-review-panel");
-    expect(panel.style.height).toBe("500px");
-
-    containerHeight = 600;
-    act(() => observer.notify());
-    expect(panel.style.height).toBe("400px");
-
-    containerHeight = 900;
-    act(() => observer.notify());
-    expect(panel.style.height).toBe("500px");
-  });
-
-  it("ignores a malformed persisted height", () => {
-    mockPanelGeometry(() => 800);
-    window.localStorage.setItem("tiller:implementor-reviewers-height", "not-a-height");
-    renderPanel();
-
     expect(screen.getByTestId("env-review-panel").style.height).toBe("320px");
+    expect(screen.getByRole("region", { name: "Reviewers" })).toBeInTheDocument();
+    expect(onLayoutChange).toHaveBeenCalledTimes(2);
+    expect(window.localStorage.getItem("tiller:implementor-reviewers-height")).toBeNull();
   });
 
   it("only follows transcript updates while already near the bottom", async () => {

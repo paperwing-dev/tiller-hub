@@ -378,7 +378,7 @@ describe("container launch config", () => {
     });
   });
 
-  it("passes Fast mode only for Codex settings that opt in", async () => {
+  it("passes Fast mode to supported implementors that opt in", async () => {
     const fast = await buildContainerLaunchConfig(
       createEnv(),
       "https://hub.example.com/api/envs/demo-env/start",
@@ -410,6 +410,37 @@ describe("container launch config", () => {
       { startAuthClaim: claimedAuth("codex", "api") },
     );
     expect(standard.envVars.TILLER_CODEX_FAST_MODE).toBeUndefined();
+
+    const claudeFast = await buildContainerLaunchConfig(
+      createEnv(),
+      "https://hub.example.com/api/envs/demo-env/start",
+      "demo-env",
+      "https://github.com/test/repo.git",
+      repoMeta,
+      {
+        ...createMeta(),
+        harness: "claude-code",
+        harnessSettings: { model: "claude-opus-4.8", effort: "high", fastMode: true },
+      },
+      { startAuthClaim: claimedAuth("claude-code", "subscription") },
+    );
+    expect(claudeFast.envVars.TILLER_CLAUDE_FAST_MODE).toBe("1");
+    expect(claudeFast.envVars.TILLER_CODEX_FAST_MODE).toBeUndefined();
+
+    const claudeStandard = await buildContainerLaunchConfig(
+      createEnv(),
+      "https://hub.example.com/api/envs/demo-env/start",
+      "demo-env",
+      "https://github.com/test/repo.git",
+      repoMeta,
+      {
+        ...createMeta(),
+        harness: "claude-code",
+        harnessSettings: { model: "claude-opus-4.8", effort: "high" },
+      },
+      { startAuthClaim: claimedAuth("claude-code", "subscription") },
+    );
+    expect(claudeStandard.envVars.TILLER_CLAUDE_FAST_MODE).toBeUndefined();
   });
 
   it("forces Fable through Anthropic API mode and passes model effort", async () => {

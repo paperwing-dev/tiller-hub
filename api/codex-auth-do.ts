@@ -235,12 +235,25 @@ export class CodexAuthDO extends Container<Env> {
     return this.coordinator.status(refresh);
   }
 
-  issueAuthConnectGrants(providers: AuthConnectProvider[]) {
-    return this.coordinator.issueGrants(providers);
+  issueAuthConnectGrants(providers: AuthConnectProvider[], connectionId?: string) {
+    return this.coordinator.issueGrants(providers, connectionId);
   }
 
   consumeAuthConnectGrant(provider: AuthConnectProvider, grant: string) {
     return this.coordinator.consumeGrant(provider, grant);
+  }
+
+  recordAuthConnectResult(
+    provider: AuthConnectProvider,
+    grant: string,
+    result: "success" | "error",
+    error?: string,
+  ) {
+    return this.coordinator.recordGrantResult(provider, grant, result, error);
+  }
+
+  getAuthConnectStatus(connectionId: string) {
+    return this.coordinator.connectionStatus(connectionId);
   }
 
   async refreshScheduled(payload: { expectedRevision?: unknown }): Promise<void> {

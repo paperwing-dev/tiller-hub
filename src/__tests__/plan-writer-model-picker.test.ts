@@ -1,8 +1,9 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import {
+import PlanWriterModelPicker, {
   buildPlanWriterModelOptions,
   planWriterEffortLabel,
-  planWriterRouteSupportsFastMode,
 } from "../PlanWriterModelPicker";
 import type { AgentRoute, PlannerProviderMetadata } from "../api";
 
@@ -52,9 +53,32 @@ describe("Plan Writer model options", () => {
       defaultEffort: "xhigh",
     }]);
     expect(planWriterEffortLabel("xhigh")).toBe("Extra High");
-    expect(planWriterRouteSupportsFastMode(routes, "codex:gpt-5.5")).toBe(true);
-    expect(planWriterRouteSupportsFastMode([
-      { ...routes[0], key: "claude-code:opus", provider: "claude-code", harness: "claude-code" },
-    ], "claude-code:opus")).toBe(false);
+  });
+
+  it("links model access settings without replacing the writer settings dialog", () => {
+    const routes: AgentRoute[] = [{
+      key: "codex:gpt-5.5",
+      label: "GPT 5.5",
+      harness: "codex",
+      provider: "codex",
+      model: "gpt-5.5",
+      modelId: "gpt-5.5",
+      supportedEfforts: ["high"],
+      defaultEffort: "high",
+      available: true,
+    }];
+    const html = renderToStaticMarkup(createElement(PlanWriterModelPicker, {
+      routes,
+      providers: [],
+      value: { routeKey: routes[0].key, effort: "high" },
+      onChange: () => undefined,
+      settingsHref: "/projects/repo-1/global-settings#model-access",
+    }));
+
+    expect(html).toContain("Open model access settings");
+    expect(html).toContain('href="/projects/repo-1/global-settings#model-access"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noreferrer"');
+    expect(html).not.toContain("Fast mode");
   });
 });
