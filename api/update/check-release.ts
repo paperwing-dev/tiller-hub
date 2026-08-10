@@ -46,16 +46,7 @@ export function parseStableReleaseSummary(value: unknown): StableReleaseSummary 
   return { releaseId, version, releaseNotesUrl };
 }
 
-async function readInstallerStableRelease(
-  env: Env,
-  installedReleaseId: string,
-): Promise<StableReleaseSummary> {
-  const cacheKey = `${INSTALLER_STABLE_CACHE_KEY}:${installedReleaseId}`;
-  const cached = parseStableReleaseSummary(
-    await env.ENVS_KV.get(cacheKey, "json"),
-  );
-  if (cached) return cached;
-
+async function fetchInstallerStableRelease(): Promise<StableReleaseSummary> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), INSTALLER_STABLE_TIMEOUT_MS);
   try {
@@ -68,15 +59,34 @@ async function readInstallerStableRelease(
     }
     const summary = parseStableReleaseSummary(await response.json());
     if (!summary) throw new Error("Installer stable release summary is invalid.");
-    await env.ENVS_KV.put(
-      cacheKey,
-      JSON.stringify(summary),
-      { expirationTtl: UPDATE_CACHE_TTL_SECONDS },
-    );
     return summary;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function readInstallerStableRelease(
+  env: Env,
+  installedReleaseId: string,
+): Promise<StableReleaseSummary> {
+  const cacheKey = `${INSTALLER_STABLE_CACHE_KEY}:${installedReleaseId}`;
+  let summary: StableReleaseSummary;
+  try {
+    summary = await fetchInstallerStableRelease();
+  } catch (error) {
+    const cached = parseStableReleaseSummary(
+      await env.ENVS_KV.get(cacheKey, "json"),
+    );
+    if (cached) return cached;
+    throw error;
+  }
+
+  await env.ENVS_KV.put(
+    cacheKey,
+    JSON.stringify(summary),
+    { expirationTtl: UPDATE_CACHE_TTL_SECONDS },
+  );
+  return summary;
 }
 
 function normalizeVersionTag(tagName: string): string {
