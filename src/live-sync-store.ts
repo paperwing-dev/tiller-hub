@@ -15,6 +15,7 @@ export type DashboardSelection =
 
 export interface NewEnvTarget {
   repoId: string;
+  planChoice?: "none" | "specific";
 }
 
 export interface RecoverEntitiesOptions {

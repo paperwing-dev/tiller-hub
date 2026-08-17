@@ -7,6 +7,7 @@ import {
   parseGitHubDeletedPathsJson,
 } from "../github/draft-overlay";
 import { githubRepoUrlFromFullName } from "../github/repo";
+import { bytesToArrayBuffer } from "../bytes";
 
 export interface ManifestEntry {
   path: string;
@@ -157,7 +158,7 @@ function repoMetaFromStored(meta: Record<string, unknown>): RepoMeta | null {
 }
 
 async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const digest = await crypto.subtle.digest("SHA-256", bytesToArrayBuffer(bytes));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -502,7 +503,12 @@ export class WorkspaceDO extends DurableObject<Env> {
 
     chunks.push(new Uint8Array(1024));
 
-    const result = new Uint8Array(await new Blob(chunks).arrayBuffer());
+    const result = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
     console.log(`[workspace-do] downloadTar -> ${result.byteLength} bytes`);
     return result;
   }

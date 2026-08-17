@@ -34,6 +34,61 @@ const absentCommand = {
   desiredState: "absent" as const,
 };
 
+describe("host runner inspection", () => {
+  it.each([
+    ["running", "live"],
+    ["stopped", "stopped"],
+    ["exited", "stopped"],
+  ] as const)("classifies a fresh %s response as %s", async (status, state) => {
+    const requestLocalRunner = vi.fn().mockResolvedValue({
+      machineId: "machine-1",
+      result: { status },
+    });
+    const backend = await createHostRunnerBackend(createEnv(new Error("unused"), requestLocalRunner));
+
+    await expect(backend.inspect!(meta)).resolves.toEqual({ state, status });
+    expect(requestLocalRunner).toHaveBeenCalledWith("machine-1", "status", "demo-env", {});
+  });
+
+  it("accepts only typed runner-not-found as fresh absence proof", async () => {
+    const typed = Object.assign(new Error("Runner is absent"), { code: "runner_not_found" });
+    const absentBackend = await createHostRunnerBackend(createEnv(typed));
+    const unknownBackend = await createHostRunnerBackend(createEnv(new Error("Host route returned 404")));
+
+    await expect(absentBackend.inspect!(meta)).resolves.toEqual({
+      state: "absent",
+      status: "absent",
+    });
+    await expect(unknownBackend.inspect!(meta)).resolves.toEqual({
+      state: "unknown",
+      status: "unknown",
+    });
+  });
+
+  it("preserves exact proof that a stopped Start failed before harness launch", async () => {
+    const requestLocalRunner = vi.fn().mockResolvedValue({
+      machineId: "machine-1",
+      result: {
+        status: "stopped",
+        failedStartBeforeHarness: true,
+        commandGeneration: 7,
+        operationId: "start-op-7",
+      },
+    });
+    const backend = await createHostRunnerBackend(createEnv(new Error("unused"), requestLocalRunner));
+
+    await expect(backend.inspect!(meta)).resolves.toEqual({
+      state: "stopped",
+      status: "stopped",
+      safeReplacement: {
+        reason: "failed_before_harness",
+        commandGeneration: 7,
+        operationId: "start-op-7",
+      },
+    });
+  });
+});
+
 describe("host runner deletion", () => {
   it("accepts only a typed runner-not-found response as confirmed absence", async () => {
     const notFound = Object.assign(new Error("The assigned runner is absent."), {

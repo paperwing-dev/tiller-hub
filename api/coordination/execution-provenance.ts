@@ -2,8 +2,10 @@ import { isExecutionPlacement } from "../types";
 import type {
   PlannerRunLaunchProvenance,
   PlannerRunRuntimeProvenance,
+  PlanWriterLaunchProvenance,
   PlanWriterRuntimeProvenance,
 } from "./types";
+import { isProjectedPlanSkillDefinition } from "./skill-projection";
 
 function parseStoredProvenance(value: string | null, label: string): unknown | null {
   if (!value) return null;
@@ -41,7 +43,8 @@ function isStoredCodexExecution(
       || record.surface === "plan-reviewer"
       || record.surface === "environment-reviewer";
   }
-  return record.kind === "api-key-app-server" && record.surface === "plan-writer";
+  return record.kind === "api-key-app-server"
+    && (record.surface === "implementor" || record.surface === "plan-writer");
 }
 
 export function isCurrentLaunchProvenance(
@@ -76,6 +79,68 @@ export function isCurrentLaunchProvenance(
   );
 }
 
+export function isCurrentPlanWriterLaunchProvenance(
+  value: unknown,
+): value is PlanWriterLaunchProvenance {
+  if (!isExecutionPlacement(value) || Array.isArray(value)) return false;
+  const record = value as unknown as Record<string, unknown>;
+  const projection = record.skillProjection;
+  if (!projection || typeof projection !== "object" || Array.isArray(projection)) return false;
+  const envelope = projection as Record<string, unknown>;
+  const optionalKeys = [
+    ...(record.claudeAuthMode === undefined ? [] : ["claudeAuthMode"]),
+    ...(record.codexExecution === undefined ? [] : ["codexExecution"]),
+  ];
+  return record.schemaVersion === 2
+    && hasExactKeys(record, ["backend", "machineId", "schemaVersion", "skillProjection", ...optionalKeys])
+    && (record.claudeAuthMode === undefined || record.claudeAuthMode === "subscription" || record.claudeAuthMode === "api")
+    && (
+      record.codexExecution === undefined
+      || (
+        isStoredCodexExecution(
+          record.codexExecution,
+          record.backend as "cf" | "host",
+        )
+        && (record.codexExecution as { surface: unknown }).surface === "plan-writer"
+      )
+    )
+    && hasExactKeys(envelope, ["version", "repositoryId", "planId", "generation", "skills"])
+    && envelope.version === 1
+    && typeof envelope.repositoryId === "string" && Boolean(envelope.repositoryId)
+    && typeof envelope.planId === "string" && Boolean(envelope.planId)
+    && Number.isInteger(envelope.generation) && (envelope.generation as number) >= 1
+    && Array.isArray(envelope.skills)
+    && envelope.skills.every(isProjectedPlanSkillDefinition)
+    && new Set((envelope.skills as Array<{ id: string }>).map((skill) => skill.id)).size === envelope.skills.length
+    && new Set((envelope.skills as Array<{ command: string }>).map((skill) => skill.command)).size === envelope.skills.length;
+}
+
+export interface PlanWriterLaunchScope {
+  repositoryId: string;
+  planId: string;
+  generation: number;
+}
+
+export function validatePlanWriterLaunchProvenance(
+  value: unknown,
+  scope: PlanWriterLaunchScope,
+): PlanWriterLaunchProvenance | null {
+  if (
+    !scope.repositoryId ||
+    !scope.planId ||
+    !Number.isInteger(scope.generation) ||
+    scope.generation < 1
+  ) {
+    return null;
+  }
+  if (!isCurrentPlanWriterLaunchProvenance(value)) return null;
+  return value.skillProjection.repositoryId === scope.repositoryId &&
+    value.skillProjection.planId === scope.planId &&
+    value.skillProjection.generation === scope.generation
+    ? value
+    : null;
+}
+
 export function parseStoredLaunchProvenance<
   T extends PlannerRunLaunchProvenance = PlannerRunLaunchProvenance,
 >(
@@ -88,6 +153,20 @@ export function parseStoredLaunchProvenance<
     throw new Error(`Malformed ${label} execution placement.`);
   }
   return parsed as T;
+}
+
+export function parseStoredPlanWriterLaunchProvenance(
+  value: string | null,
+  label: string,
+  scope: PlanWriterLaunchScope,
+): PlanWriterLaunchProvenance | null {
+  const parsed = parseStoredProvenance(value, label);
+  if (parsed === null) return null;
+  const validated = validatePlanWriterLaunchProvenance(parsed, scope);
+  if (!validated) {
+    throw new Error(`Malformed ${label} execution placement.`);
+  }
+  return validated;
 }
 
 export function isCurrentPlannerRuntimeProvenance(

@@ -17,7 +17,6 @@ export const REPO_MCP_MAX_ID_LENGTH = 64;
 export const REPO_MCP_MAX_LABEL_LENGTH = 80;
 export const REPO_MCP_MAX_URL_LENGTH = 512;
 export const TILLER_MCP_SERVERS_ENV_VAR = "TILLER_MCP_SERVERS_JSON";
-export const RESERVED_REPO_MCP_SERVER_IDS = new Set(["tiller_cloudflare_api"]);
 
 const GENERATED_ID_PREFIX = "tiller_";
 const GENERATED_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
@@ -172,9 +171,6 @@ function normalizeKnownId(rawId: unknown, knownIds: Set<string>): string | null 
   if (id.length > REPO_MCP_MAX_ID_LENGTH) {
     throw new McpServersValidationError(`MCP server id must be ${REPO_MCP_MAX_ID_LENGTH} characters or less.`);
   }
-  if (RESERVED_REPO_MCP_SERVER_IDS.has(id)) {
-    throw new McpServersValidationError("MCP server id is reserved by Tiller.");
-  }
   if (!knownIds.has(id)) {
     throw new McpServersValidationError("Unknown MCP server id.");
   }
@@ -214,9 +210,6 @@ export function normalizeRepoMcpServersRequest(
       id = generateId(new Set([...knownIds, ...assignedIds]));
       if (id.length > REPO_MCP_MAX_ID_LENGTH) {
         throw new McpServersValidationError(`MCP server id must be ${REPO_MCP_MAX_ID_LENGTH} characters or less.`);
-      }
-      if (RESERVED_REPO_MCP_SERVER_IDS.has(id)) {
-        throw new McpServersValidationError("MCP server id is reserved by Tiller.");
       }
       if (knownIds.has(id) || assignedIds.has(id)) {
         throw new McpServersValidationError("Could not generate a unique MCP server id.");

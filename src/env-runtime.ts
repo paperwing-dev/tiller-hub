@@ -7,7 +7,7 @@ export function canStopEnvStatus(status?: string | null): boolean {
 }
 
 export function shouldSelectLiveSessionForEnvStatus(status?: string | null): boolean {
-  return isEnvRunningStatus(status);
+  return status === "starting" || isEnvRunningStatus(status);
 }
 
 export function shouldShowEnvWaitingViewForStatus(status?: string | null): boolean {

@@ -153,7 +153,9 @@ describe("Mutable state isolation (regression)", () => {
     expect(state.workspaceDirty).toBe(true);
     expect(state.workspaceLastSyncedAt).toBe("2026-04-01T00:10:00.000Z");
     expect(state.branchStatus).toBe("ready-to-merge");
-    expect(state.error).toBe("persistence error");
+    expect(state.error).toBeNull();
+    expect(state.status).toBe("saving");
+    expect(state.bootMessage).toBe("Retrying workspace save…");
   });
 
   it("setRunnerBinding updates only binding fields, leaves workspace alone", async () => {

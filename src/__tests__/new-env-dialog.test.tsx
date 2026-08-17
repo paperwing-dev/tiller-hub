@@ -607,7 +607,7 @@ describe("NewEnvDialog", () => {
     expect(window.localStorage.getItem(LAST_ENV_HARNESS_STORAGE_KEY)).toBe("opencode");
   });
 
-  it("offers Fast mode for Codex implementors and submits the persisted setting", async () => {
+  it("hides Fast mode for new Codex implementors", async () => {
     const onCreate = vi.fn(async () => undefined);
     renderNewEnvDialog({
       enabledHarnesses: ["codex"],
@@ -616,13 +616,9 @@ describe("NewEnvDialog", () => {
     });
 
     const fastMode = document.body.querySelector<HTMLInputElement>('input[aria-label="Fast mode"]');
-    expect(fastMode).toBeInstanceOf(HTMLInputElement);
-    expect(fastMode?.checked).toBe(false);
-    expect(bodyText()).toContain("Runs the selected model faster at a higher usage rate.");
+    expect(fastMode).toBeNull();
+    expect(bodyText()).not.toContain("Runs the selected model faster at a higher usage rate.");
 
-    await act(async () => {
-      fastMode?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
     await act(async () => {
       findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -630,12 +626,12 @@ describe("NewEnvDialog", () => {
     expect(onCreate).toHaveBeenCalledWith({
       harness: "codex",
       planSelection: { mode: "none" },
-      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh", fastMode: true },
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
       schedule: undefined,
     });
   });
 
-  it("offers Fast mode for Claude Code Opus implementors", async () => {
+  it("hides Fast mode for new Claude Code Opus implementors", async () => {
     const onCreate = vi.fn(async () => undefined);
     renderNewEnvDialog({
       enabledHarnesses: ["claude-code"],
@@ -645,12 +641,8 @@ describe("NewEnvDialog", () => {
     });
 
     const fastMode = document.body.querySelector<HTMLInputElement>('input[aria-label="Fast mode"]');
-    expect(fastMode).toBeInstanceOf(HTMLInputElement);
-    expect(fastMode?.checked).toBe(false);
+    expect(fastMode).toBeNull();
 
-    await act(async () => {
-      fastMode?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
     await act(async () => {
       findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -658,7 +650,7 @@ describe("NewEnvDialog", () => {
     expect(onCreate).toHaveBeenCalledWith({
       harness: "claude-code",
       planSelection: { mode: "none" },
-      harnessSettings: { model: "claude-opus-4.8", effort: "xhigh", fastMode: true },
+      harnessSettings: { model: "claude-opus-4.8", effort: "xhigh" },
       schedule: undefined,
     });
   });
@@ -719,6 +711,49 @@ describe("NewEnvDialog", () => {
     });
   });
 
+  it("removes startup plan selection from Start Fresh", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({ hasOpenAIKey: true, hideStartupPlan: true, onCreate });
+
+    expect(bodyText()).not.toContain("Startup Plan");
+    expect(document.body.querySelector('[aria-label="Startup Plan"]')).toBeNull();
+    expect(apiMocks.fetchRepoArtifacts).not.toHaveBeenCalled();
+
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onCreate).toHaveBeenCalledWith({
+      harness: "opencode",
+      planSelection: { mode: "none" },
+      harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
+      schedule: undefined,
+    });
+  });
+
+  it("removes the no-plan choice from the Start With Plan modal", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    renderNewEnvDialog({
+      hasOpenAIKey: true,
+      initialPlanChoice: "specific",
+      onCreate,
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(bodyText()).not.toContain("No plan");
+    expect(bodyText()).toContain("Plan to implement");
+    expect(document.body.querySelector('input[name="new-env-plan-choice-repo-1"]')).toBeNull();
+
+    await act(async () => {
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
+      planSelection: { mode: "specific", artifactId: "plan-1" },
+    }));
+  });
+
   it("submits a selected saved startup plan", async () => {
     const onCreate = vi.fn(async () => undefined);
     renderNewEnvDialog({ hasOpenAIKey: true, onCreate });
@@ -777,7 +812,7 @@ describe("NewEnvDialog", () => {
     expect(selectedTitle).toHaveTextContent(longTitle);
   });
 
-  it("schedules a selected plan on the Settings-selected backend", async () => {
+  it("hides scheduling for a selected startup plan", async () => {
     const onCreate = vi.fn(async () => undefined);
     apiMocks.fetchExecutionStatus.mockResolvedValue({
       selected: { target: "host", machineId: "machine-1" },
@@ -802,27 +837,20 @@ describe("NewEnvDialog", () => {
     await act(async () => {
       specificRadio?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    const nonFastCheckboxes = Array.from(document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'))
-      .filter((checkbox) => checkbox.getAttribute("aria-label") !== "Fast mode");
-    expect(nonFastCheckboxes).toHaveLength(1);
-    expect(document.body.querySelector('input[aria-label="Fast mode"]')).toBeInstanceOf(HTMLInputElement);
-    expect(bodyText()).toContain("Schedule: run tonight at 3:00 AM");
+    expect(document.body.querySelectorAll('input[type="checkbox"]')).toHaveLength(0);
+    expect(document.body.querySelector('input[aria-label="Fast mode"]')).toBeNull();
+    expect(bodyText()).not.toContain("Schedule: run tonight at 3:00 AM");
+    expect(findButtonByText("Schedule")).toBeUndefined();
 
     await act(async () => {
-      nonFastCheckboxes[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await act(async () => {
-      findButtonByText("Schedule")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      findButtonByText("Create")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
     expect(onCreate).toHaveBeenCalledWith({
       harness: "codex",
       planSelection: { mode: "specific", artifactId: "plan-1" },
       harnessSettings: { model: "gpt-5.6-sol", effort: "xhigh" },
-      schedule: {
-        runAtMs: expect.any(Number),
-        timeZone: expect.any(String),
-      },
+      schedule: undefined,
     });
   });
 

@@ -26,7 +26,7 @@ export interface Env {
   ENVS_KV: KVNamespace;
   CODEX_AUTH: DurableObjectNamespace;
   LOCAL_DEV_ONLY_BACKEND?: string;
-  TILLER_UPDATE_SERVICE_DISABLED?: string;
+  TILLER_LOCAL_DEV_ORIGIN?: string;
   /** Present together only on Hubs created by the fresh OAuth installer. */
   TILLER_INSTALLER_SCHEMA?: string;
   /** Present only on the fixed maintainer-owned tiller-dev deployment. */
@@ -146,7 +146,7 @@ export type CodexExecutionProfile =
       kind: "api-key-direct-cli";
       surface: "implementor" | "plan-reviewer" | "environment-reviewer";
     } & CodexTarget)
-  | ({ kind: "api-key-app-server"; surface: "plan-writer" } & CodexTarget);
+  | ({ kind: "api-key-app-server"; surface: "implementor" | "plan-writer" } & CodexTarget);
 export type CodexExecutionResolution =
   | { kind: "ready"; profile: CodexExecutionProfile }
   | { kind: "unavailable"; reason: CodexUnavailableReason };
@@ -164,6 +164,7 @@ export type EnvHarness = (typeof ENV_HARNESSES)[number];
 export const HARNESS_MODEL_IDS = [
   "gpt-5.6-sol",
   "gpt-5.5",
+  "claude-opus-5",
   "claude-opus-4.8",
   "claude-fable-5",
   "kimi-k2.7-code",
@@ -288,6 +289,8 @@ export interface StartupDiagnosticLogTails {
 export interface StartupDiagnosticsSnapshot {
   opId: string;
   backend: "cf" | "host";
+  /** Whether this start is interactive or executing the environment's saved plan. */
+  implementationMode?: "fresh" | "plan" | null;
   startedAt: string;
   updatedAt: string;
   currentStepId: StartupDiagnosticStepId | null;
@@ -318,6 +321,8 @@ export interface EnvLifecycleState {
 
 export interface EnvDefinition {
   slug: string;
+  /** Immutable user-facing name captured when the environment is created. */
+  displayName?: string;
   /** Immutable identity for a published incarnation of this slug. */
   incarnationId: string;
   /** Stable, repo-wide ordering slot used by the implementor sidebar. */
@@ -363,6 +368,7 @@ export interface EnvMutableState {
   lifecycleInfraState: EnvInfraState;
   lifecycleRuntimeReady: boolean;
   lifecycleUpdatedAt: string | null;
+  implementorAttentionState: ImplementorAttentionState;
   runnerId: string | null;
   bootMessage: string | null;
   bootStepId?: StartupDiagnosticStepId | null;
@@ -400,6 +406,13 @@ export interface EnvMutableState {
   error: string | null;
   errorAt: string | null;
   updatedAt: string;
+}
+
+export interface ImplementorAttentionState {
+  runtimeStartOpId: string | null;
+  lastCompletionSequence: number;
+  lastReviewerCompletionRunId?: string | null;
+  unreadToken: string | null;
 }
 
 // Valid phase/activity values for agent state (Scion pattern)
@@ -484,66 +497,40 @@ export interface RepoMcpServerRow {
   updated_at: string;
 }
 
-export interface RepoCloudflareMcpCredentialRow {
-  repo_id: string;
-  client_id: string;
-  encrypted_access_token: string;
-  access_token_nonce: string;
-  encrypted_refresh_token: string;
-  refresh_token_nonce: string;
-  token_type: string;
-  scopes: string;
-  expires_at: number;
-  account_id: string | null;
-  account_name: string | null;
-  enabled: number;
-  last_auth_error: string | null;
-  last_auth_error_at: string | null;
-  connected_at: string;
-  updated_at: string;
-}
-
-export interface RepoCloudflareMcpPendingOAuthRow {
-  state: string;
-  repo_id: string;
-  redirect_uri: string;
-  pkce_verifier: string;
-  client_id: string;
-  initiating_identity: string | null;
-  expires_at: number;
-  created_at: string;
-}
-
-export interface RepoCloudflareMcpProxyTokenRow {
-  token_hash: string;
-  repo_id: string;
-  env_slug: string;
-  server_id: string;
-  expires_at: number;
-  revoked_at: string | null;
-  created_at: string;
-  incarnation_id: string | null;
-  start_op_id: string | null;
-}
-
-export interface RepoCloudflareMcpAuditEventRow {
-  id: string;
-  repo_id: string;
-  env_slug: string;
-  server_id: string;
-  http_method: string;
-  json_rpc_method: string | null;
-  response_status: number;
-  error_code: string | null;
-  created_at: string;
-}
-
 // ── Hono context variables ──────────────────────────────────────────
+
+export interface ApiRequestTiming {
+  startedAt: number;
+  phases: Array<{ name: string; durationMs: number }>;
+}
 
 export type HonoEnv = {
   Bindings: Env;
-  Variables: {};
+  Variables: {
+    apiRequestTiming: ApiRequestTiming;
+    authorization: RequestAuthorization;
+  };
 };
+
+export type GlobalAuthorizationSource = "owner" | "control" | "local-dev";
+
+export type RequestAuthorization =
+  | { kind: "global"; source: GlobalAuthorizationSource; ownerEmail?: string }
+  | { kind: "environment"; envSlug: string; incarnationId: string; startOperationId: string }
+  | { kind: "specialized" }
+  | { kind: "bootstrap" }
+  | { kind: "public" };
+
+export type WsAuthorization =
+  | { kind: "global"; source: GlobalAuthorizationSource; ownerEmail?: string }
+  | { kind: "environment"; envSlug: string; sessionId: string }
+  | {
+      kind: "planWriter";
+      repoId: string;
+      planArtifactId: string;
+      generation: number;
+      sessionId: string;
+    };
 
 // ── Stored row types ────────────────────────────────────────────────
 
@@ -603,6 +590,8 @@ export interface HostServiceRegistration {
   runnerCommandProtocol?: 1;
   /** Runtime can launch Codex app-server and exchange scoped Hub auth. */
   codexRuntimeAuthProtocol?: 1;
+  /** Runtime protects reviewer checkouts and drops provider children. */
+  reviewerIsolationProtocol?: 1;
   dockerAvailable: boolean;
   runnerAvailable: boolean;
   claudeSubscription: boolean;
@@ -639,6 +628,8 @@ export interface StoredPermission {
 
 export interface EnvMeta {
   slug: string;
+  /** Immutable user-facing name; absent on environments created by older builds. */
+  displayName?: string;
   incarnationId: string;
   /** Stable, repo-wide ordering slot used by the implementor sidebar. */
   sidebarSlot?: number;
@@ -699,6 +690,7 @@ export interface EnvMeta {
   lifecycleInfraState?: EnvInfraState | null;
   lifecycleRuntimeReady?: boolean;
   lifecycleUpdatedAt?: string | null;
+  implementorAttentionToken: string | null;
   leadHarnessStatus?: LeadHarnessStatus | null;
   leadHarnessError?: string | null;
   leadHarnessUpdatedAt?: string | null;
@@ -936,14 +928,15 @@ export type WsClientRole = "cli" | "web";
 export type SessionLifecycle = "owner" | "viewer";
 
 export interface WsConnectionState {
+  authorization?: WsAuthorization;
   role?: WsClientRole;
   sessionId?: string;
   sessionLifecycle?: SessionLifecycle;
-  sessionOwnerSeenAt?: number;
+  /** Exactly one open owner socket per session is active; the rest are standbys. */
+  terminalOwnerActive?: boolean;
   // `${sessionId}:${clientId}` of the last terminal fast-lane send on this
   // connection. ACK routing matches on this composite key because the browser
-  // sends terminal messages over its global socket, which has no session-scoped
-  // sessionId in connection state.
+  // sends terminal messages over its global socket.
   terminalAckRouteKey?: string;
   machineId?: string;
   machineServiceKeys?: MachineServiceKey[];
@@ -951,6 +944,8 @@ export interface WsConnectionState {
   runnerCommandProtocol?: 1;
   /** Codex runtime-auth capability asserted by this live host connection. */
   codexRuntimeAuthProtocol?: 1;
+  /** Reviewer-isolation capability asserted by this live host connection. */
+  reviewerIsolationProtocol?: 1;
   /** Last healthy host advertisement received on this exact socket. */
   hostAdvertisementAt?: number;
   hostDemoted?: boolean;
@@ -969,6 +964,8 @@ export interface TerminalInputMessage {
   clientId: string;
   inputSeq: number;
   data: string;
+  /** Stable semantic delivery key for idempotent system-generated input. */
+  deliveryId?: string;
   cols?: number;
   rows?: number;
   /** Internal Hub-to-harness authorization bit. Clients cannot grant it. */
@@ -983,6 +980,8 @@ export interface TerminalControlMessage {
   action: TerminalControlAction;
   cols?: number;
   rows?: number;
+  /** True activates control, false stays passive, and omission preserves legacy claiming. */
+  claim?: boolean;
 }
 
 export interface TerminalInputAckMessage {
@@ -1079,7 +1078,7 @@ export type WsClientMessage =
 // Hub → Client messages
 export type WsServerMessage =
   | { type: "pong" }
-  | { type: "capabilities"; terminalFastLane: boolean }
+  | { type: "capabilities"; terminalFastLane: boolean; terminalMetrics: boolean }
   | { type: "error"; message: string }
   | TerminalInputMessage
   | TerminalControlMessage

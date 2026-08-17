@@ -17,6 +17,7 @@ function meta(harnessSettings: EnvMeta["harnessSettings"]): EnvMeta {
     createdAt: at,
     updatedAt: at,
     status: "stopped",
+    implementorAttentionToken: null,
     ...createInitialEnvScmState({ slug: "demo", mainCommit: "main-sha" }),
   };
 }
@@ -64,5 +65,23 @@ describe("harness settings projection", () => {
     expect(projected.harnessSettings).toBeNull();
     expect(projected.harnessPresentation).toBeUndefined();
     expect(toStoredEnvMeta(projected)).not.toHaveProperty("harnessPresentation");
+  });
+
+  it("projects only the unread implementor token from private lifecycle state", () => {
+    const input = meta(null);
+    const mutable = buildMutableStateFromMeta(input);
+    mutable.implementorAttentionState = {
+      runtimeStartOpId: "start-op-1",
+      lastCompletionSequence: 3,
+      unreadToken: "attention-token",
+    };
+
+    const projected = buildEnvMetaFromLayers(definition(), mutable, input.repoUrl);
+
+    expect(projected.implementorAttentionToken).toBe("attention-token");
+    expect(projected).not.toHaveProperty("implementorAttentionState");
+    expect(toStoredEnvMeta(projected)).toMatchObject({
+      implementorAttentionToken: "attention-token",
+    });
   });
 });

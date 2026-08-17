@@ -1,4 +1,5 @@
 import { GITHUB_DELETED_PATHS_WORKSPACE_PATH } from "../github/draft-overlay";
+import { bytesToArrayBuffer } from "../bytes";
 import type {
   EnvReviewSnapshot,
   EnvReviewSnapshotMode,
@@ -9,6 +10,7 @@ import type {
 
 export const ENV_REVIEW_SNAPSHOT_FORMAT_VERSION = 1;
 export const ENV_REVIEW_SNAPSHOT_CONTENT_TYPE = "application/x-tar";
+export const ENV_REVIEW_INSPECTION_CONTENT_TYPE = "application/x-tar";
 export const ENV_REVIEW_UPLOAD_TOKEN_HEADER = "X-Tiller-Env-Review-Upload-Token";
 export const ENV_REVIEW_SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024;
 export const ENV_REVIEW_SNAPSHOT_MAX_FILES = 20_000;
@@ -59,6 +61,10 @@ export function buildReviewSnapshotKey(envSlug: string, snapshotId: string): str
   return `envs/${envSlug}/review-snapshots/${snapshotId}.tar`;
 }
 
+export function buildReviewInspectionKey(envSlug: string, snapshotId: string): string {
+  return `envs/${envSlug}/review-snapshots/${snapshotId}.inspection.tar`;
+}
+
 export function buildReviewSnapshotsPrefix(envSlug: string): string {
   return `envs/${envSlug}/review-snapshots/`;
 }
@@ -86,7 +92,7 @@ function isSafeAbsoluteWorkspacePath(path: string): boolean {
 }
 
 function decodeTarString(bytes: Uint8Array): string {
-  return new TextDecoder("utf-8", { fatal: false }).decode(bytes).replace(/\0.*$/, "");
+  return new TextDecoder("utf-8", { fatal: false, ignoreBOM: false }).decode(bytes).replace(/\0.*$/, "");
 }
 
 function parseTarOctal(bytes: Uint8Array, label: string): number {
@@ -135,7 +141,7 @@ function normalizeTarPath(rawName: string, prefix: string): string {
 }
 
 async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const digest = await crypto.subtle.digest("SHA-256", bytesToArrayBuffer(bytes));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 

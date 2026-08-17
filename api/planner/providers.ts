@@ -1,10 +1,11 @@
-import { getBillingSelections } from "../setup/config";
+import { getBillingSelections, getSecret } from "../setup/config";
 import { inspectPlannerExecution } from "./dispatch";
 import type { PlannerExecution } from "./dispatch";
 import { PLANNER_OPENCODE_MODEL } from "./opencode-model";
 import {
   getPlannerModelCredentialRequirement,
   listHarnessModels,
+  resolveHarnessModelAvailability,
 } from "../../shared/harness-catalog";
 import {
   billingSelectionForCredential,
@@ -18,7 +19,9 @@ import type {
   PlannerProviderEffort,
   PlannerProviderMetadata,
   PlannerProviderModel,
+  AgentRoute,
 } from "../coordination";
+import { listWriterAgentRoutes } from "./agent-skills";
 
 const STANDARD_EFFORTS: PlannerProviderEffort[] = [
   { id: "low", displayName: "Low" },
@@ -58,6 +61,11 @@ const REVIEWER_ONLY_PROVIDER_CAPABILITIES: PlannerProviderCapabilities = {
   cancellation: true,
   planDelta: true,
   checklist: true,
+};
+
+const OPENCODE_PROVIDER_CAPABILITIES: PlannerProviderCapabilities = {
+  ...REVIEWER_ONLY_PROVIDER_CAPABILITIES,
+  writer: true,
 };
 
 function isEnabled(value: string | undefined): boolean {
@@ -128,10 +136,11 @@ export async function listPlannerProviders(
   options: { onlyProviderId?: string } = {},
 ): Promise<{
   providers: PlannerProviderMetadata[];
+  writerRoutes: AgentRoute[];
   executions: Record<string, PlannerExecution>;
 }> {
   const onlyProviderId = options.onlyProviderId;
-  const billingSelections = onlyProviderId === "opencode" || onlyProviderId === "fake"
+  const billingSelections = onlyProviderId === "fake"
     ? { claudeBillingMode: null, openaiBillingMode: null }
     : await getBillingSelections(env);
   const showDevelopmentProviders = isFakePlannerProviderEnabled(env);
@@ -141,7 +150,10 @@ export async function listPlannerProviders(
   });
   const resolveIfRequested = (providerId: string) => (
     !onlyProviderId || onlyProviderId === providerId
-      ? inspectPlannerExecution(env, providerId, { billingSelections })
+      // Catalog availability must keep Plan Writer usable while protected
+      // reviewer rollout is gated. Reviewer creation revalidates its own
+      // surface immediately before reservation.
+      ? inspectPlannerExecution(env, providerId, { billingSelections, codexSurface: "plan-writer" })
       : Promise.resolve(notEvaluated(providerId))
   );
   const [codexExecution, claudeExecution, opencodeExecution] = await Promise.all([
@@ -155,6 +167,20 @@ export async function listPlannerProviders(
   const claudeDisabledReason = claudeExecution.kind === "unavailable" ? claudeExecution.reason : undefined;
   const opencodeAvailable = opencodeExecution.kind === "dispatched";
   const opencodeDisabledReason = opencodeExecution.kind === "unavailable" ? opencodeExecution.reason : undefined;
+  const hasSecret = async (name: "ANTHROPIC_API_KEY" | "OPENAI_API_KEY"): Promise<boolean> => {
+    const direct = (env as unknown as Record<string, unknown>)[name];
+    if (typeof direct === "string" && direct.trim()) return true;
+    return Boolean((await getSecret(env, name, { fresh: true }))?.trim());
+  };
+  const [hasAnthropicKey, hasOpenAIKey, workersAiConfigured] = await Promise.all([
+    hasSecret("ANTHROPIC_API_KEY"),
+    hasSecret("OPENAI_API_KEY"),
+    Promise.all([
+      (env as unknown as { AI?: unknown }).AI ? Promise.resolve(true) : Promise.resolve(false),
+      getSecret(env, "TILLER_WORKERS_AI_ACCOUNT_ID", { fresh: true }).then((value) => Boolean(value?.trim())),
+      getSecret(env, "TILLER_WORKERS_AI_API_TOKEN", { fresh: true }).then((value) => Boolean(value?.trim())),
+    ]).then(([binding, accountId, token]) => binding || (accountId && token)),
+  ]);
   const claudeModel = (id: string, displayName: string) => model(id, displayName, {
     available: claudeAvailable,
     authStatus: claudeAvailable ? "available" : "missing",
@@ -191,6 +217,26 @@ export async function listPlannerProviders(
       efforts: entry.efforts,
     });
   };
+  const openCodeWriterModels = listHarnessModels("opencode").map((entry) => {
+    const availability = resolveHarnessModelAvailability(
+      entry,
+      opencodeExecution.kind === "dispatched" ? opencodeExecution.backend : "cf",
+      {
+        hasAnthropicKey,
+        hasOpenAIKey,
+        workersAiConfigured,
+        claudeBillingMode: billingSelections.claudeBillingMode,
+        openaiBillingMode: billingSelections.openaiBillingMode,
+      },
+    );
+    const available = opencodeAvailable && availability.available;
+    return model(entry.binding.model, entry.label, {
+      available,
+      authStatus: available ? "available" : "missing",
+      disabledReason: opencodeDisabledReason ?? availability.message ?? undefined,
+      efforts: entry.efforts,
+    });
+  });
 
   const providers: PlannerProviderMetadata[] = [
     provider({
@@ -229,22 +275,17 @@ export async function listPlannerProviders(
     provider({
       id: "opencode",
       displayName: "OpenCode",
-      // Auth is the hub's own model proxy — always available; only the
-      // runtime backend gates this provider.
+      // Provider-level availability reflects runtime support. Credential
+      // availability remains route-specific on the projected catalog models.
       available: opencodeAvailable,
       authStatus: "available",
       disabledReasons: opencodeDisabledReason ? [opencodeDisabledReason] : [],
-      capabilities: REVIEWER_ONLY_PROVIDER_CAPABILITIES,
+      capabilities: OPENCODE_PROVIDER_CAPABILITIES,
       efforts: STANDARD_EFFORTS,
       defaultEffort: "high",
-      models: [
-        model(PLANNER_OPENCODE_MODEL.binding.model, PLANNER_OPENCODE_MODEL.label, {
-          available: opencodeAvailable,
-          authStatus: "available",
-          disabledReason: opencodeDisabledReason,
-          efforts: PLANNER_OPENCODE_MODEL.efforts,
-        }),
-      ],
+      models: openCodeWriterModels.filter((candidate) => (
+        candidate.id === PLANNER_OPENCODE_MODEL.binding.model
+      )),
     }),
   ];
 
@@ -266,10 +307,20 @@ export async function listPlannerProviders(
     }));
   }
 
+  // Writer projection gets every OpenCode catalog binding. The public provider
+  // models remain Kimi-only so reviewer and Plan Skill model menus do not grow.
+  const writerProviders = providers.map((entry) => entry.id === "opencode"
+    ? { ...entry, models: openCodeWriterModels }
+    : entry);
+  const writerRoutes = listWriterAgentRoutes(writerProviders);
+
   return {
     providers: onlyProviderId
       ? providers.filter((candidate) => candidate.id === onlyProviderId)
       : providers,
+    writerRoutes: onlyProviderId
+      ? writerRoutes.filter((route) => route.provider === onlyProviderId)
+      : writerRoutes,
     executions: {
       codex: codexExecution,
       "claude-code": claudeExecution,

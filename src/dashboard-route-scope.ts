@@ -8,6 +8,7 @@ export type DashboardRouteScope =
   | { type: 'update' }
   | { type: 'project'; repoId: string }
   | { type: 'plan'; repoId: string; planArtifactId: string | null }
+  | { type: 'project-implementations'; repoId: string }
   | { type: 'project-global-settings'; repoId: string }
   | { type: 'repo-settings'; repoId: string }
   | { type: 'env'; envSlug: string }
@@ -75,6 +76,10 @@ export function getDashboardRouteScope(pathname: string): DashboardRouteScope {
   if (plan?.params.repoId) {
     return { type: 'plan', repoId: plan.params.repoId, planArtifactId: null };
   }
+  const implementations = matchPath({ path: '/projects/:repoId/implementations', end: true }, pathname);
+  if (implementations?.params.repoId) {
+    return { type: 'project-implementations', repoId: implementations.params.repoId };
+  }
   const repoSettings = matchPath({ path: '/projects/:repoId/settings', end: true }, pathname);
   if (repoSettings?.params.repoId) {
     return { type: 'repo-settings', repoId: repoSettings.params.repoId };
@@ -102,6 +107,7 @@ export function routeTouchesDeletedRepo(
     (
       scope.type === 'project'
       || scope.type === 'plan'
+      || scope.type === 'project-implementations'
       || scope.type === 'project-global-settings'
       || scope.type === 'repo-settings'
     )

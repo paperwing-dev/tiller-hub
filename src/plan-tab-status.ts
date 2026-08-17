@@ -13,6 +13,7 @@ export interface PlanWriterTabStatusOptions {
   operation?: "starting" | "stopping" | null;
   saving?: boolean;
   connecting?: boolean;
+  connectingDetail?: string | null;
   error?: string | null;
   routeLabel?: string | null;
   effortLabel?: string | null;
@@ -55,7 +56,7 @@ export function planWriterTabStatus(
     return status("error", "Error", withConfiguration(localError, configuration));
   }
   if (options.operation === "stopping") {
-    return status("stopping", "Stopping", withConfiguration("Shutting down the live Scribe.", configuration));
+    return status("stopping", "Abandoning", withConfiguration("Detaching the live Scribe from this plan.", configuration));
   }
   if (options.operation === "starting") {
     return status("starting", "Starting", withConfiguration("Starting the live Scribe.", configuration));
@@ -68,7 +69,9 @@ export function planWriterTabStatus(
       "starting",
       options.connecting ? "Connecting" : "Starting",
       withConfiguration(
-        options.connecting ? "Connecting to the live Scribe." : "Starting the live Scribe.",
+        options.connecting
+          ? options.connectingDetail?.trim() || "Connecting to the live Scribe."
+          : "Starting the live Scribe.",
         configuration,
       ),
     );
@@ -85,11 +88,11 @@ export function planWriterTabStatus(
 export function reviewerTabStatus(input: {
   reviewer: ReviewerRegistryEntry;
   latestRun?: PlannerRun | null;
-  acknowledgedRunId?: string | null;
+  hasUnreadResult?: boolean;
   modelLabel?: string | null;
   effortLabel?: string | null;
 }): PlanTabStatus {
-  const { reviewer, latestRun, acknowledgedRunId } = input;
+  const { reviewer, latestRun, hasUnreadResult = true } = input;
   const hasPolledRun = input.latestRun !== undefined;
   const runId = hasPolledRun ? latestRun?.runId : reviewer.runId;
   const runStatus = hasPolledRun ? latestRun?.status : reviewer.status;
@@ -115,9 +118,9 @@ export function reviewerTabStatus(input: {
     return status("saving", "Saving", withConfiguration("Saving the reviewer response.", configuration), runId);
   }
   if (runStatus === "completed") {
-    return acknowledgedRunId === runId
-      ? status("viewed", "Viewed", withConfiguration("The latest reviewer response has been viewed.", configuration), runId)
-      : status("finished", "New result", withConfiguration("A new reviewer response is ready.", configuration), runId);
+    return hasUnreadResult
+      ? status("finished", "New result", withConfiguration("A new reviewer response is ready.", configuration), runId)
+      : status("viewed", "Viewed", withConfiguration("The latest reviewer response has been viewed.", configuration), runId);
   }
   if (runStatus === "cancelled") {
     return status("stopped", "Stopped", withConfiguration("The reviewer stopped before completion.", configuration), runId);
@@ -155,63 +158,6 @@ export function newestReviewerRun(
     return incomingStartedAt >= currentStartedAt ? incoming : current;
   }
   return incoming;
-}
-
-export const PLAN_REVIEWER_FINISHED_ACK_STORAGE_PREFIX = "tiller:plan-reviewer-finished:v1";
-
-export function planReviewerFinishedAckStorageKey(repoId: string, planArtifactId: string): string {
-  return `${PLAN_REVIEWER_FINISHED_ACK_STORAGE_PREFIX}:${repoId}:${planArtifactId}`;
-}
-
-export function readPlanReviewerFinishedAcks(
-  storage: Pick<Storage, "getItem"> | null,
-  repoId: string,
-  planArtifactId: string,
-): Record<string, string> | null {
-  if (!storage) return null;
-  try {
-    const raw = storage.getItem(planReviewerFinishedAckStorageKey(repoId, planArtifactId));
-    if (!raw) return {};
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => (
-      Boolean(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1])
-    )));
-  } catch {
-    return null;
-  }
-}
-
-export function writePlanReviewerFinishedAcks(
-  storage: Pick<Storage, "setItem"> | null,
-  repoId: string,
-  planArtifactId: string,
-  acknowledgements: Record<string, string>,
-): boolean {
-  if (!storage) return false;
-  try {
-    storage.setItem(
-      planReviewerFinishedAckStorageKey(repoId, planArtifactId),
-      JSON.stringify(acknowledgements),
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function removePlanReviewerFinishedAcks(
-  storage: Pick<Storage, "removeItem"> | null,
-  repoId: string,
-  planArtifactId: string,
-): boolean {
-  if (!storage) return false;
-  try {
-    storage.removeItem(planReviewerFinishedAckStorageKey(repoId, planArtifactId));
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function status(

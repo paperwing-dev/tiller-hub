@@ -21,6 +21,7 @@ import { getGitHubEnvTargetUrl } from "./github-links";
 import { canStopEnvStatus } from "./env-runtime";
 import { envPath } from "./dashboard-paths";
 import { useToast } from "./Toast";
+import { useImplementationWorkspaceContext } from "./ImplementationWorkspaceContext";
 
 interface ShipViewProps {
   env: EnvMeta;
@@ -80,6 +81,7 @@ export default function ShipView({
 }: ShipViewProps) {
   const navigate = useNavigate();
   const addToast = useToast();
+  const implementationWorkspace = useImplementationWorkspaceContext();
   const resolvedTheme = useResolvedTheme();
   const [publishAttempt, setPublishAttempt] = useState<PublishAttempt | null>(null);
   const settledPublishOperationsRef = useRef<Set<string>>(new Set());
@@ -110,7 +112,9 @@ export default function ShipView({
     () => changes?.files.find((file) => file.path === selectedPath) ?? null,
     [changes, selectedPath],
   );
-  const displayName = getEnvDisplayName(env);
+  const displayName = implementationWorkspace?.selectedEnvSlug === env.slug
+    ? implementationWorkspace.implementationName ?? getEnvDisplayName(env)
+    : getEnvDisplayName(env);
   const githubTargetUrl = getGitHubEnvTargetUrl(env, repo);
   const publishFailure = env.githubPublishStatus === "failed"
     ? env.githubPublishError?.trim() || "GitHub publish failed."
@@ -268,7 +272,7 @@ export default function ShipView({
   });
 
   const resetToMain = () => {
-    if (!confirm(`Reset "${displayName}" to the GitHub default branch? This will discard unpublished changes.`)) {
+    if (!confirm(`Reset "${displayName}" (slug: ${env.slug}) to the GitHub default branch? This will discard unpublished changes.`)) {
       return;
     }
     void runAction(async () => {
@@ -329,8 +333,8 @@ export default function ShipView({
   );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-kumo-base">
-      <div className="border-b border-kumo-line bg-kumo-recessed px-4 py-3">
+    <div className="tiller-implementation-ship flex min-h-0 flex-1 flex-col bg-kumo-base">
+      <div className="tiller-implementation-ship-header border-b border-kumo-line bg-kumo-recessed px-4 py-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <div className="text-xs font-medium uppercase tracking-wide text-kumo-subtle">Ship</div>
@@ -400,7 +404,7 @@ export default function ShipView({
         </div>
       ) : (
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(220px,320px)_minmax(0,1fr)] overflow-hidden">
-          <div className="flex min-h-0 flex-col border-r border-kumo-line bg-kumo-recessed">
+          <div className="tiller-implementation-ship-files flex min-h-0 flex-col border-r border-kumo-line bg-kumo-recessed">
             <div className="shrink-0 border-b border-kumo-line px-3 py-2 text-xs text-kumo-subtle">
               {changes ? `${changes.summary.total} changed file${changes.summary.total === 1 ? "" : "s"}` : "Changed files"}
             </div>
@@ -414,7 +418,8 @@ export default function ShipView({
                     <button
                       key={file.path}
                       onClick={() => setSelectedPath(file.path)}
-                      className={`block w-full px-3 py-1.5 text-left text-xs hover:bg-kumo-base ${
+                      aria-current={file.path === selectedPath ? "true" : undefined}
+                      className={`tiller-implementation-ship-file block w-full px-3 py-1.5 text-left text-xs hover:bg-kumo-base ${
                         file.path === selectedPath ? "bg-kumo-base text-kumo-link" : "text-kumo-default"
                       }`}
                     >
@@ -443,8 +448,8 @@ export default function ShipView({
                 </div>
               </div>
             ) : fileDiff ? (
-              <div className="min-w-0">
-                <div className="border-b border-kumo-line bg-kumo-recessed px-3 py-2 font-mono text-xs text-kumo-subtle">
+              <div className="tiller-implementation-ship-diff min-w-0 bg-[var(--tiller-theme-on-action)]">
+                <div className="tiller-implementation-ship-file-header border-b border-kumo-line bg-kumo-recessed px-3 py-2 font-mono text-xs text-kumo-subtle">
                   {fileDiff.path}
                 </div>
                 <ReactDiffViewer
@@ -457,8 +462,14 @@ export default function ShipView({
                   styles={{
                     variables: {
                       light: {
-                        diffViewerBackground: "#ffffff",
-                        diffViewerColor: "#24292f",
+                        diffViewerBackground: "var(--tiller-theme-on-action)",
+                        diffViewerColor: "var(--paperwing-ink)",
+                        gutterBackground: "var(--tiller-theme-on-action)",
+                        gutterBackgroundDark: "var(--tiller-theme-on-action)",
+                        emptyLineBackground: "var(--tiller-theme-on-action)",
+                        codeFoldBackground: "var(--tiller-theme-on-action)",
+                        codeFoldGutterBackground: "var(--tiller-theme-on-action)",
+                        diffViewerTitleBackground: "var(--tiller-theme-on-action)",
                         addedBackground: "#dafbe1",
                         addedColor: "#1a7f37",
                         removedBackground: "#ffebe9",

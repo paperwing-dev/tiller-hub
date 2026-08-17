@@ -1,10 +1,10 @@
 import type { FrozenOverviewPayload, ThreadMessage } from "../coordination";
-import { getThreadStub } from "../helpers";
+import { getEnvLifecycleStub, getThreadStub } from "../helpers";
 import type { Env } from "../types";
-import { buildEnvReviewPrompt } from "./context";
 import type { EnvReviewDO } from "./env-review-do";
 import type { EnvReviewRun, ReviewSkillInvocation } from "./types";
 import { resolveNewEnvReviewLaunchProvenance } from "./dispatch";
+import { buildSkillOverviewPrompt } from "../review-overview";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -43,9 +43,19 @@ export async function finalizeSuccessfulReviewOutput(args: {
   });
   if (
     (result.status === "completed" || (result.status === "terminal" && result.run.status === "ready"))
-    && result.run.skillInvocationId
-    && result.run.skillRunRole === "child_initial"
+    && result.feedback
   ) {
+    const lifecycle = getEnvLifecycleStub(args.env, result.run.envSlug);
+    const attention = await lifecycle.reportReviewerCompletion(result.run.runId);
+    if (attention.accepted) await lifecycle.persistOwnedProjection();
+  }
+  if (
+    (result.status === "completed" || (result.status === "terminal" && result.run.status === "ready"))
+    && result.run.skillInvocationId
+    && (result.run.skillRunRole === "report_initial" || result.run.skillRunRole === "report_followup")
+  ) {
+    const invocation = await args.review.getSkillInvocation(result.run.skillInvocationId);
+    if (invocation?.definitionSnapshot.agents.length === 1) return result;
     try {
       await assignSkillOverview({
         env: args.env,
@@ -67,7 +77,10 @@ export async function readIncludedSkillReports(
   messageIds = invocation.includedMessageIds,
 ): Promise<FrozenOverviewPayload["reports"]> {
   const runs = (await review.listSkillInvocationRuns(invocation.invocationId))
-    .filter((run) => run.skillRunRole === "child_initial" || run.skillRunRole === "child_followup");
+    .filter((run) => (
+      run.preparationOpId === invocation.preparationOpId
+      && (run.skillRunRole === "report_initial" || run.skillRunRole === "report_followup")
+    ));
   const reports: FrozenOverviewPayload["reports"] = [];
   for (const messageId of [...new Set(messageIds)]) {
     let report: FrozenOverviewPayload["reports"][number] | null = null;
@@ -95,50 +108,7 @@ export async function readIncludedSkillReports(
   return reports;
 }
 
-function overviewPrompt(args: {
-  contextRun: EnvReviewRun;
-  payload: FrozenOverviewPayload;
-}): string {
-  const { contextRun, payload } = args;
-  const base = buildEnvReviewPrompt({
-    run: {
-      ...contextRun,
-      roleLabel: "Overview",
-      taskKind: "custom",
-      customTask: "Synthesize only the frozen child reports below into one concise parent review.",
-    },
-    preparation: contextRun.preparation!,
-    changeContext: contextRun.changeContext!,
-    planBasis: contextRun.planBasis,
-    recipeInstructions: payload.overviewInstructions,
-    priorMessages: [],
-  });
-  const reports = payload.reports.map((report) => [
-    `### ${report.agentLabel}`,
-    `Attribution: agent ${report.agentId}, run ${report.runId}, message ${report.messageId}`,
-    report.text,
-  ].join("\n")).join("\n\n");
-  const failures = payload.failureNotices.map((notice) =>
-    `- ${notice.agentLabel} (${notice.agentId}): ${notice.status}${notice.error ? ` — ${notice.error}` : ""}`
-  ).join("\n");
-  return [
-    base,
-    "",
-    "Frozen overview input:",
-    `- mode: ${payload.mode}`,
-    `- frozen at: ${payload.frozenAt}`,
-    "Do not use later child results or follow-up messages. The following payload is authoritative.",
-    "",
-    "Included reports:",
-    reports || "None.",
-    "",
-    "Initial child failure notices:",
-    failures || "None.",
-    "",
-    "User guidance:",
-    payload.guidance ?? "None.",
-  ].join("\n");
-}
+export const buildEnvReviewOverviewPrompt = buildSkillOverviewPrompt;
 
 export async function assignSkillOverview(args: {
   env: Env;
@@ -153,6 +123,9 @@ export async function assignSkillOverview(args: {
 > {
   const invocation = await args.review.getSkillInvocation(args.invocationId);
   if (!invocation) throw new Error("Skill invocation not found.");
+  if (invocation.definitionSnapshot.agents.length === 1) {
+    return { status: "not_active", invocation };
+  }
   if (invocation.overviewRunId) {
     return { status: "existing", invocation, run: await args.review.getRun(invocation.overviewRunId) };
   }
@@ -162,9 +135,25 @@ export async function assignSkillOverview(args: {
     throw new Error("Switch Overview to Manual before sending it explicitly.");
   }
   const initialRuns = (await args.review.listSkillInvocationRuns(invocation.invocationId))
-    .filter((run) => run.skillRunRole === "child_initial");
+    .filter((run) => (
+      run.skillRunRole === "report_initial"
+      && run.preparationOpId === invocation.preparationOpId
+    ));
   if (args.automatic && initialRuns.some((run) => !terminal(run))) {
     return { status: "waiting", invocation };
+  }
+  if (
+    args.automatic
+    && !initialRuns.some((run) => run.status === "ready")
+  ) {
+    await args.review.failSkillInvocation(
+      invocation.invocationId,
+      "No Report succeeded, so an Overview could not be created.",
+    );
+    return {
+      status: "not_active",
+      invocation: await args.review.getSkillInvocation(invocation.invocationId) ?? invocation,
+    };
   }
   const reports = await readIncludedSkillReports(args.env, args.review, invocation);
   if (!args.automatic && reports.length === 0) {
@@ -181,8 +170,15 @@ export async function assignSkillOverview(args: {
         ...(run.error ? { error: run.error } : {}),
       };
     });
-  if (args.automatic && reports.length === 0 && failureNotices.length === 0) {
-    return { status: "waiting", invocation };
+  if (args.automatic && reports.length === 0) {
+    await args.review.failSkillInvocation(
+      invocation.invocationId,
+      "No successful Report was configured for automatic Overview inclusion.",
+    );
+    return {
+      status: "not_active",
+      invocation: await args.review.getSkillInvocation(invocation.invocationId) ?? invocation,
+    };
   }
   const contextRun = initialRuns.find((run) => run.preparation && run.changeContext) ?? null;
   if (!contextRun?.preparation || !contextRun.changeContext) {
@@ -207,9 +203,20 @@ export async function assignSkillOverview(args: {
     overviewInstructions: invocation.definitionSnapshot.overviewInstructions,
     frozenAt: new Date().toISOString(),
   };
+  const route = invocation.overviewRoute;
+  if (!route) {
+    await args.review.failSkillInvocation(
+      invocation.invocationId,
+      "The frozen implementor route is unavailable for Overview.",
+    );
+    return {
+      status: "not_active",
+      invocation: await args.review.getSkillInvocation(invocation.invocationId) ?? invocation,
+    };
+  }
   const launchProvenance = await resolveNewEnvReviewLaunchProvenance(
     args.env,
-    parent.provider,
+    route.provider,
   );
   const assigned = await args.review.assignSkillOverview({
     invocationId: invocation.invocationId,
@@ -217,14 +224,14 @@ export async function assignSkillOverview(args: {
     expectedOverviewMode: invocation.overviewMode,
     expectedIncludedMessageIds: invocation.includedMessageIds,
     payload,
-    provider: parent.provider,
-    model: parent.model,
-    effort: parent.effort,
+    provider: route.provider,
+    model: route.model,
+    effort: route.effort,
     roleLabel: `${invocation.definitionSnapshot.label} Overview`,
     preparation: contextRun.preparation,
     changeContext: contextRun.changeContext,
     planBasis: contextRun.planBasis,
-    prompt: overviewPrompt({ contextRun: { ...contextRun, provider: parent.provider, model: parent.model }, payload }),
+    prompt: buildSkillOverviewPrompt(payload),
     launchProvenance,
   });
   if (!assigned) throw new Error("Skill invocation not found.");

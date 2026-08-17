@@ -42,11 +42,6 @@ import {
   getHarnessModel,
   validateHarnessSettings,
 } from "../../shared/harness-catalog";
-import {
-  CLOUDFLARE_API_MCP_SERVER_ID,
-  CLOUDFLARE_MCP_PROXY_TOKEN_ENV_VAR,
-  CLOUDFLARE_MCP_PROXY_TOKEN_HEADER,
-} from "../cloudflare-mcp";
 import { buildOpenCodeRuntimeEnv } from "../opencode/runtime-env";
 import type {
   ScheduledRunCredentialIds,
@@ -59,7 +54,7 @@ import {
   resolveCodexExecutionForEnv,
 } from "../codex-execution";
 import { getEnvLifecycleStub } from "../helpers";
-import { mintImplementorCodexRuntimeCapability } from "./codex-runtime-capability";
+import { mintEnvironmentRuntimeCapability } from "./runtime-capability";
 import type { CodexExecutionProfile } from "../types";
 import { BillingResolutionError, createBillingResolutionError } from "../billing-resolution";
 import { getDurableObjectStub } from "../durable-object";
@@ -74,6 +69,12 @@ export type RepoWorkspaceHandle = SelectedRepoWorkspace;
 export const ENV_ONLY_CANONICAL_EXCLUDES = workspacePolicy.envOnlyCanonicalExcludes;
 export const TREE_HASH_EXCLUDES = ENV_ONLY_CANONICAL_EXCLUDES;
 export const STARTUP_PLAN_IMPLEMENTATION_PREAMBLE = [
+  "Read the approved startup plan below and execute it immediately.",
+  "",
+  "Work step by step, update files as needed, run relevant checks, and continue until the plan is complete or you hit a real blocker.",
+  "",
+  "Startup plan:",
+  "",
   "A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context.",
   "Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation",
   "and verification.",
@@ -89,9 +90,21 @@ export const SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE = [
 
 export function withStartCausePreamble(document: string | null, cause: EnvStartCause): string | null {
   if (cause === "ordinary") return document;
-  return document
-    ? `${SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE}\n\n${document}`
-    : SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE;
+  if (!document) return SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE;
+
+  const canonicalDocument = buildStartupPlanDocument(document);
+  const plan = canonicalDocument.slice(STARTUP_PLAN_IMPLEMENTATION_PREAMBLE.length).trim();
+  if (
+    plan === SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE
+    || plan.startsWith(`${SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE}\n\n`)
+  ) {
+    return canonicalDocument;
+  }
+  return [
+    STARTUP_PLAN_IMPLEMENTATION_PREAMBLE,
+    SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE,
+    plan,
+  ].filter(Boolean).join("\n\n");
 }
 
 interface RepoPlanSource {
@@ -103,14 +116,11 @@ type RepoLaunchSettingsHub = Pick<
   HubDO,
   | "resolveRepoSessionEnvVars"
   | "listEnabledRepoMcpServers"
-  | "mintCloudflareMcpProxyToken"
-  | "mintCloudflareMcpProxyTokenForStart"
 >;
 
 interface LaunchMcpServer {
   id: string;
   url: string;
-  envHttpHeaders?: Record<string, string>;
 }
 
 function getHub(env: Env): RepoLaunchSettingsHub {
@@ -142,55 +152,7 @@ function serializeLaunchMcpServers(servers: LaunchMcpServer[]): string {
   return JSON.stringify(servers.map((server) => ({
     id: server.id,
     url: server.url,
-    ...(server.envHttpHeaders ? { envHttpHeaders: server.envHttpHeaders } : {}),
   })));
-}
-
-async function resolveCloudflareApiMcpLaunch(args: {
-  env: Env;
-  repoId: string | null | undefined;
-  envSlug: string;
-  hubPublicUrl: string;
-  includeCfAccessHeaders?: boolean;
-  credentialScope?: ScheduledRunCredentialScope;
-}): Promise<{
-  server: LaunchMcpServer | null;
-  envVars: Record<string, string>;
-  credentialId?: string;
-}> {
-  const normalizedRepoId = args.repoId?.trim();
-  if (!normalizedRepoId) return { server: null, envVars: {} };
-  const hub = getHub(args.env);
-  if (typeof hub.mintCloudflareMcpProxyToken !== "function") return { server: null, envVars: {} };
-  const scoped = args.credentialScope
-    ? await hub.mintCloudflareMcpProxyTokenForStart(
-        normalizedRepoId,
-        args.envSlug,
-        args.credentialScope,
-      )
-    : null;
-  const token = scoped?.token
-    ?? (args.credentialScope ? null : await hub.mintCloudflareMcpProxyToken(normalizedRepoId, args.envSlug));
-  if (!token) return { server: null, envVars: {} };
-  return {
-    server: {
-      id: CLOUDFLARE_API_MCP_SERVER_ID,
-      url: `${args.hubPublicUrl.replace(/\/+$/, "")}/api/mcp/cloudflare`,
-      envHttpHeaders: {
-        [CLOUDFLARE_MCP_PROXY_TOKEN_HEADER]: CLOUDFLARE_MCP_PROXY_TOKEN_ENV_VAR,
-        ...(args.includeCfAccessHeaders
-          ? {
-              "CF-Access-Client-Id": "CF_ACCESS_CLIENT_ID",
-              "CF-Access-Client-Secret": "CF_ACCESS_CLIENT_SECRET",
-            }
-          : {}),
-      },
-    },
-    envVars: {
-      [CLOUDFLARE_MCP_PROXY_TOKEN_ENV_VAR]: token,
-    },
-    ...(scoped ? { credentialId: scoped.credentialId } : {}),
-  };
 }
 
 function withLaunchEnvMetadata(
@@ -246,7 +208,7 @@ export async function resolveSpecificStartupPlanArtifact(
   return selectedPlan;
 }
 
-async function resolveSelectedPlanArtifact(
+export async function resolveSelectedPlanArtifact(
   repo: RepoPlanSource,
   artifactStore: StartupArtifactStore,
   meta: EnvMeta,
@@ -312,15 +274,22 @@ export async function materializeResolvedStartupPlan(
   envWorkspace: ReturnType<typeof getWorkspaceStub>,
   selectedPlan: PlanArtifact | null,
 ): Promise<string | null> {
-  if (selectedPlan) {
-    await envWorkspace.writeWorkspaceFile(
-      "/.tiller/plan.md",
-      renderResolvedStartupPlanDocument(selectedPlan)!,
-    );
-  } else {
-    await envWorkspace.clearWorkspacePlanFile();
-  }
+  await materializeStartupPlanDocument(
+    envWorkspace,
+    renderResolvedStartupPlanDocument(selectedPlan),
+  );
   return selectedPlan?.id ?? null;
+}
+
+export async function materializeStartupPlanDocument(
+  envWorkspace: ReturnType<typeof getWorkspaceStub>,
+  document: string | null,
+): Promise<void> {
+  if (document) {
+    await envWorkspace.writeWorkspaceFile("/.tiller/plan.md", document);
+    return;
+  }
+  await envWorkspace.clearWorkspacePlanFile();
 }
 
 export async function materializeStartupPlan(
@@ -375,13 +344,15 @@ export async function buildContainerLaunchConfig(
   if (catalogModel.credential !== "workers-ai") {
     const claim = options?.startAuthClaim;
     if (!claim) throw new Error("Environment start billing claim is missing.");
+    const openCodeUsesApiKey = catalogModel.credential === "openai-api-key"
+      || catalogModel.credential === "anthropic-api-key";
     const claimedMode: BillingMode | null = harness === "claude-code"
       ? claim.claudeAuthMode
       : harness === "codex"
         ? claim.codexAuthPreference === "subscription"
           ? "subscription"
           : claim.codexAuthPreference === "api-key" ? "api" : null
-        : catalogModel.credential === "openai-api-key" ? "api" : null;
+        : openCodeUsesApiKey ? "api" : null;
     const compatibility = resolveBillingCompatibility(
       catalogModel.credential as ProviderControlledCredentialClass,
       claimedMode,
@@ -401,18 +372,10 @@ export async function buildContainerLaunchConfig(
     : null;
   const cfClientId = accessCredential?.clientId ?? "";
   const cfClientSecret = accessCredential?.clientSecret ?? "";
-  const cloudflareApiMcp = await resolveCloudflareApiMcpLaunch({
-    env,
-    repoId: repoMeta?.repoId,
-    envSlug: slug,
-    hubPublicUrl,
-    includeCfAccessHeaders: Boolean(cfClientId && cfClientSecret),
-    credentialScope: options?.credentialScope,
-  });
-  const launchMcpServers: LaunchMcpServer[] = [
-    ...repoMcpServers.map((server) => ({ id: server.id, url: server.url })),
-    ...(cloudflareApiMcp.server ? [cloudflareApiMcp.server] : []),
-  ];
+  const launchMcpServers: LaunchMcpServer[] = repoMcpServers.map((server) => ({
+    id: server.id,
+    url: server.url,
+  }));
   const githubBridge = repoMeta?.githubFullName && await isGitHubAppAllowedForRequest(env, new Request(requestUrl))
     ? await createGitHubBridgeRecord(env, {
         subject: {
@@ -449,19 +412,25 @@ export async function buildContainerLaunchConfig(
       : {}),
     NODE_OPTIONS: "--dns-result-order=ipv4first",
     TILLER_HARNESS: harness,
+    ...(env.TILLER_TERMINAL_METRICS === "1" ? { TILLER_TERMINAL_METRICS: "1" } : {}),
     ...(options?.startCause === "scheduled" ? { TILLER_START_CAUSE: "scheduled" } : {}),
     [TILLER_MCP_SERVERS_ENV_VAR]: serializeLaunchMcpServers(launchMcpServers),
-    ...cloudflareApiMcp.envVars,
     ...buildScmContainerEnvVars(meta),
     ...(cfClientId ? { CF_ACCESS_CLIENT_ID: cfClientId } : {}),
     ...(cfClientSecret ? { CF_ACCESS_CLIENT_SECRET: cfClientSecret } : {}),
+    ...(options?.startOpId && meta.incarnationId
+      ? {
+          TILLER_RUNTIME_CAPABILITY: await mintEnvironmentRuntimeCapability(env, {
+            envSlug: slug,
+            incarnationId: meta.incarnationId,
+            startOperationId: options.startOpId,
+          }),
+        }
+      : {}),
     ...(githubBridge ? bridgeCredentialsToEnvVars(githubBridge) : {}),
   };
   const baseCredentials: ScheduledRunCredentialIds = {
     ...(githubBridge ? { githubBridgeId: githubBridge.id } : {}),
-    ...(cloudflareApiMcp.credentialId
-      ? { cloudflareMcpProxyTokenId: cloudflareApiMcp.credentialId }
-      : {}),
   };
 
   if (harness === "codex") {
@@ -505,11 +474,6 @@ export async function buildContainerLaunchConfig(
       }
       authEnvVars = {
         TILLER_CODEX_RUNTIME_AUTH_URL: `${hubPublicUrl}/api/envs/${encodeURIComponent(slug)}/codex/runtime-auth`,
-        TILLER_CODEX_RUNTIME_CAPABILITY: await mintImplementorCodexRuntimeCapability(env, {
-          envSlug: slug,
-          incarnationId,
-          startOpId,
-        }),
       };
     } else {
       const auth = await resolveCodexContainerAuth(env, { authPreference: "api-key" });

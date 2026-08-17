@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ComponentProps, ReactNode } from 'react';
 import {
   Navigate,
@@ -38,6 +38,7 @@ import {
   resolveActiveEnvironmentSlug,
 } from './dashboard-route-scope';
 import type { DashboardRouteScope } from './dashboard-route-scope';
+import { rememberLastProjectId } from './project-selection-storage';
 
 export function TopLevelPage({ children }: { children: ReactNode }) {
   return (
@@ -45,7 +46,7 @@ export function TopLevelPage({ children }: { children: ReactNode }) {
       <div className="border-b border-kumo-line bg-kumo-recessed px-5 py-3">
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-3">
           <div className="min-w-0">
-            <h1 className="text-sm font-semibold text-kumo-strong">Tiller</h1>
+            <h1 className="tiller-wordmark text-base font-semibold text-kumo-strong">Tiller</h1>
           </div>
           <div className="flex items-center gap-2">
             <AccessRenewalAction />
@@ -58,21 +59,50 @@ export function TopLevelPage({ children }: { children: ReactNode }) {
   );
 }
 
-export function HomeSettingsFrame({ children }: { children: ReactNode }) {
+export function HomeSettingsFrame({
+  children,
+  settingsPath = '/settings',
+  relatedSettingsPath,
+  showUpdate = false,
+}: {
+  children: ReactNode;
+  settingsPath?: string;
+  relatedSettingsPath?: string;
+  showUpdate?: boolean;
+}) {
+  const navigate = useNavigate();
+  const data = useDashboardData();
+
   return (
-    <main className="flex min-h-screen flex-col bg-kumo-base">
-      <div className="border-b border-kumo-line bg-kumo-recessed px-5 py-3">
-        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-3">
+    <main className="flex h-screen min-h-0 flex-col overflow-hidden bg-kumo-base">
+      <div data-testid="settings-top-bar" className="flex h-16 shrink-0 items-center border-b border-kumo-line bg-kumo-recessed px-4">
+        <div className="flex w-full items-center justify-between gap-3">
           <div className="min-w-0">
-            <h1 className="text-sm font-semibold text-kumo-strong">Tiller</h1>
+            <button
+              type="button"
+              onClick={() => navigate('/')}
+              className="tiller-wordmark tiller-plan-brand-wordmark inline-flex h-8 w-fit items-center text-[15px] font-bold leading-none text-kumo-default"
+              aria-label="Tiller"
+            >
+              tiller
+            </button>
           </div>
           <div className="flex items-center gap-2">
+            {showUpdate && (
+              <UpdateButton
+                status={data.updateStatus}
+                issue={data.updateIssue}
+                dismissed={data.updateDismissed}
+                isChecking={data.isCheckingUpdate}
+                onOpen={() => data.setShowUpdate(true)}
+              />
+            )}
             <AccessRenewalAction />
-            <StatusActions />
+            <StatusActions settingsPath={settingsPath} relatedSettingsPath={relatedSettingsPath} />
           </div>
         </div>
       </div>
-      <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-5 py-5">
+      <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col overflow-hidden px-5 py-5">
         <div className="flex min-h-0 flex-1 overflow-hidden border border-kumo-line bg-kumo-recessed">
           {children}
         </div>
@@ -83,6 +113,7 @@ export function HomeSettingsFrame({ children }: { children: ReactNode }) {
 
 export function WorkspaceLayout() {
   const data = useDashboardData();
+  const location = useLocation();
   const navigate = useNavigate();
   const activeRepo = useActiveWorkspaceRepo();
   const isLocalDev = data.setupStatus?.isLocalDev ?? false;
@@ -92,6 +123,21 @@ export function WorkspaceLayout() {
     : [];
   const selected = useWorkspaceSelection();
   const routeScope = useDashboardRouteScope();
+  const projectWorkspace = (
+    routeScope.type === 'plan'
+    || routeScope.type === 'project'
+    || routeScope.type === 'project-implementations'
+  );
+  const implementationWorkspace = (
+    routeScope.type === 'env'
+    || routeScope.type === 'session'
+    || routeScope.type === 'ship'
+  );
+  const integratedWorkspace = projectWorkspace || implementationWorkspace;
+  const settingsWorkspace = (
+    routeScope.type === 'project-global-settings'
+    || routeScope.type === 'repo-settings'
+  );
   const activeEnvironmentSlug = resolveActiveEnvironmentSlug(
     routeScope,
     data.sessions,
@@ -101,8 +147,25 @@ export function WorkspaceLayout() {
     ? data.envs.find((env) => env.slug === activeEnvironmentSlug) ?? null
     : null;
   const workspaceHeaderSummary = workspaceHeaderEnv ? <EnvChromeSummary env={workspaceHeaderEnv} /> : null;
+  const settingsReturnTo = `${location.pathname}${location.search}${location.hash}`;
+
+  useEffect(() => {
+    if (activeRepo) rememberLastProjectId(activeRepo.repoId);
+  }, [activeRepo]);
 
   if (!activeRepo) return <Navigate to="/" replace />;
+
+  if (settingsWorkspace) {
+    return (
+      <HomeSettingsFrame
+        settingsPath={projectGlobalSettingsPath(activeRepo.repoId)}
+        relatedSettingsPath={repoSettingsPath(activeRepo.repoId)}
+        showUpdate
+      >
+        <Outlet />
+      </HomeSettingsFrame>
+    );
+  }
 
   const handleEnvSelect = (slug: string) => {
     const env = data.envs.find((candidate) => candidate.slug === slug) ?? null;
@@ -116,15 +179,33 @@ export function WorkspaceLayout() {
 
   return (
     <Sidebar.Provider
+      key={integratedWorkspace ? 'integrated-workspace' : 'workspace'}
       contained
-      defaultOpen
+      defaultOpen={!integratedWorkspace}
       collapsible="icon"
-      resizable
+      resizable={!projectWorkspace}
       defaultWidth={320}
       minWidth={280}
       maxWidth={420}
-      className="h-screen min-h-0 bg-kumo-base"
+      className={`h-screen min-h-0 bg-kumo-base ${implementationWorkspace ? 'tiller-implementation-workspace' : ''}`}
     >
+      {integratedWorkspace && (
+        <div className="absolute right-4 top-0 z-[1200] flex h-16 items-center gap-1.5">
+          <UpdateButton
+            status={data.updateStatus}
+            issue={data.updateIssue}
+            dismissed={data.updateDismissed}
+            isChecking={data.isCheckingUpdate}
+            onOpen={() => data.setShowUpdate(true)}
+          />
+          <AccessRenewalAction />
+          <StatusActions
+            settingsPath={projectGlobalSettingsPath(activeRepo.repoId)}
+            relatedSettingsPath={repoSettingsPath(activeRepo.repoId)}
+          />
+        </div>
+      )}
+      {!integratedWorkspace && (
       <Sidebar contentClassName="overflow-x-hidden bg-kumo-recessed">
         <Sidebar.Header className="relative z-[900] h-12 overflow-visible border-b border-kumo-line px-3 py-2 group-data-[state=collapsed]/sidebar:px-0">
           <div className="flex min-w-0 flex-1 items-center justify-between gap-3 group-data-[state=collapsed]/sidebar:w-full group-data-[state=collapsed]/sidebar:justify-center">
@@ -136,11 +217,12 @@ export function WorkspaceLayout() {
                 title="Tiller"
                 aria-label="Tiller"
               >
-                <img
-                  src="/jung-rig-rail.svg"
-                  alt=""
-                  className="tiller-rail-logo hidden h-9 w-9 shrink-0 cursor-pointer object-contain group-data-[state=collapsed]/sidebar:block"
-                />
+                <span
+                  aria-hidden="true"
+                  className="hidden size-9 shrink-0 items-center justify-center text-base font-bold normal-case tracking-normal group-data-[state=collapsed]/sidebar:flex"
+                >
+                  T
+                </span>
                 <span className="tiller-sidebar-open-text group-data-[state=collapsed]/sidebar:hidden">Tiller</span>
               </button>
             </div>
@@ -170,7 +252,7 @@ export function WorkspaceLayout() {
             onPlanSelect={(repoId, planArtifactId) => navigate(planPath(repoId, planArtifactId))}
             selectedRepoId={selected.repoId}
             repoSettingsRepoId={selected.repoSettingsRepoId}
-            onStartRequest={(slug) => data.setStartDialogSlug(slug)}
+            onStartRequest={(slug) => navigate(envPath(slug))}
             onAddEnv={(repoId) => data.setNewEnvTarget({ repoId })}
             onRetryRepoMain={(repoId) => {
               void data.handleRetryRepoMain(repoId);
@@ -180,7 +262,7 @@ export function WorkspaceLayout() {
         <div className="hidden border-t border-kumo-line px-2 py-2 group-data-[state=collapsed]/sidebar:flex group-data-[state=collapsed]/sidebar:justify-center group-data-[state=collapsed]/sidebar:px-0">
           <button
             type="button"
-            onClick={() => navigate(repoSettingsPath(activeRepo.repoId))}
+            onClick={() => navigate(repoSettingsPath(activeRepo.repoId), { state: { returnTo: settingsReturnTo } })}
             className={`inline-flex h-8 w-8 items-center justify-center rounded transition-colors group-data-[state=collapsed]/sidebar:h-9 group-data-[state=collapsed]/sidebar:w-9 ${
               selected.repoSettingsRepoId === activeRepo.repoId
                 ? 'bg-kumo-info-tint text-kumo-link'
@@ -197,7 +279,7 @@ export function WorkspaceLayout() {
           <div className="flex w-full items-center justify-between gap-2 group-data-[state=collapsed]/sidebar:hidden">
             <button
               type="button"
-              onClick={() => navigate(repoSettingsPath(activeRepo.repoId))}
+              onClick={() => navigate(repoSettingsPath(activeRepo.repoId), { state: { returnTo: settingsReturnTo } })}
               className={`inline-flex h-8 min-w-0 flex-1 items-center gap-2 rounded px-2 text-xs font-medium transition-colors ${
                 selected.repoSettingsRepoId === activeRepo.repoId
                   ? 'bg-kumo-info-tint text-kumo-link'
@@ -218,15 +300,21 @@ export function WorkspaceLayout() {
         </Sidebar.Footer>
         <Sidebar.ResizeHandle aria-label="Resize navigation" />
       </Sidebar>
+      )}
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {!integratedWorkspace && (
         <div className="flex h-12 items-center justify-between gap-3 border-b border-kumo-line bg-kumo-recessed px-4">
           <div className="flex min-w-0 items-center gap-2">
             <Sidebar.Trigger aria-label="Toggle navigation" />
             <div className="min-w-0">{workspaceHeaderSummary}</div>
           </div>
-          <StatusActions settingsPath={projectGlobalSettingsPath(activeRepo.repoId)} />
+          <StatusActions
+            settingsPath={projectGlobalSettingsPath(activeRepo.repoId)}
+            relatedSettingsPath={repoSettingsPath(activeRepo.repoId)}
+          />
         </div>
+        )}
         {data.reconnectExhausted && !data.connected && (
           <div className="bg-kumo-danger-tint border-b border-kumo-danger/30 px-4 py-2 flex items-center justify-between">
             <span className="text-sm text-kumo-danger">Connection lost</span>
@@ -244,7 +332,7 @@ export function WorkspaceLayout() {
               </p>
             </div>
             <button
-              onClick={() => navigate(projectGlobalSettingsPath(activeRepo.repoId))}
+              onClick={() => navigate(projectGlobalSettingsPath(activeRepo.repoId), { state: { returnTo: settingsReturnTo } })}
               className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-xs font-medium text-kumo-default transition-colors hover:bg-kumo-tint"
             >
               Open settings
@@ -257,9 +345,25 @@ export function WorkspaceLayout() {
   );
 }
 
-export function StatusActions({ settingsPath = '/settings' }: { settingsPath?: string }) {
+export function StatusActions({
+  settingsPath = '/settings',
+  relatedSettingsPath,
+}: {
+  settingsPath?: string;
+  relatedSettingsPath?: string;
+}) {
   const data = useDashboardData();
+  const location = useLocation();
   const [settingsTooltipOpen, setSettingsTooltipOpen] = useState(false);
+  const settingsActive = location.pathname === settingsPath || location.pathname === relatedSettingsPath;
+  const existingReturnTo = location.state && typeof location.state === "object" && "returnTo" in location.state
+    ? (location.state as { returnTo?: unknown }).returnTo
+    : null;
+  const returnTo = typeof existingReturnTo === "string"
+    ? existingReturnTo
+    : settingsActive
+      ? null
+      : `${location.pathname}${location.search}${location.hash}`;
   return (
     <div className="inline-flex items-center gap-1.5">
       <ConnectionsBadge
@@ -277,20 +381,21 @@ export function StatusActions({ settingsPath = '/settings' }: { settingsPath?: s
       >
         <NavLink
           to={settingsPath}
+          state={returnTo ? { returnTo } : undefined}
           end
-          className={({ isActive }) => `inline-flex h-7 w-7 items-center justify-center rounded leading-none transition-colors ${
-            isActive
+          className={({ isActive }) => `inline-flex h-7 w-7 items-center justify-center rounded-none leading-none transition-colors ${
+            isActive || settingsActive
               ? 'bg-kumo-info-tint text-kumo-link'
               : 'text-kumo-subtle hover:bg-kumo-tint hover:text-kumo-default'
           }`}
-          title="Global Settings"
-          aria-label="Global Settings"
+          aria-label="Settings"
+          aria-current={settingsActive ? 'page' : undefined}
         >
           <GearSixIcon className="h-4 w-4" aria-hidden="true" />
         </NavLink>
         {settingsTooltipOpen && (
           <span className="pointer-events-none absolute right-0 top-full z-[1001] mt-1 w-max rounded-md border border-kumo-line bg-kumo-elevated px-2 py-1 text-xs font-medium text-kumo-default shadow-lg">
-            Global Settings
+            Settings
           </span>
         )}
       </span>
@@ -338,6 +443,7 @@ export function useActiveWorkspaceRepo(): RepoMeta | null {
   if (
     scope.type === 'project'
     || scope.type === 'plan'
+    || scope.type === 'project-implementations'
     || scope.type === 'project-global-settings'
     || scope.type === 'repo-settings'
   ) {
@@ -362,7 +468,7 @@ export function useWorkspaceSelection(): {
 } {
   const scope = useDashboardRouteScope();
   return {
-    repoId: scope.type === 'project' || scope.type === 'plan' || scope.type === 'repo-settings'
+    repoId: scope.type === 'project' || scope.type === 'plan' || scope.type === 'project-implementations' || scope.type === 'repo-settings'
       ? scope.repoId
       : null,
     repoSettingsRepoId: scope.type === 'repo-settings' ? scope.repoId : null,

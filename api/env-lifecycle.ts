@@ -86,11 +86,18 @@ export function buildEnvScmMetaPatch(
   };
 }
 
-export const ENV_LIFECYCLE_SAVE_TIMEOUT_MS = 75_000;
+// A manual stop can spend up to 35s quiescing the harness, then 60s running
+// the strict workspace sync, followed by progress/final callbacks and Durable
+// Object scheduling. Keep this alarm comfortably beyond the runner contract.
+export const ENV_LIFECYCLE_SAVE_TIMEOUT_MS = 180_000;
 // Stop completion includes post-sync shutdown work inside the runner, so give
 // the runner more headroom than the cleanup timeout itself before failing.
 export const ENV_LIFECYCLE_STOP_TIMEOUT_MS = 60_000;
-export const ENV_LIFECYCLE_START_TIMEOUT_MS = 90_000;
+// Container allocation can consume up to 25s and the image deliberately gives
+// workspace hydration up to 180s. Leave callback/projection headroom so the
+// lifecycle owner does not fail a valid boot while the container is still
+// within its own startup contract.
+export const ENV_LIFECYCLE_START_TIMEOUT_MS = 240_000;
 export const ENV_LIFECYCLE_RUNNER_EXIT_BEFORE_PERSIST_ERROR =
   "Container exited before workspace persistence completed. Recent workspace changes may not be saved.";
 export const ENV_LIFECYCLE_SAVE_TIMEOUT_ERROR =

@@ -5,27 +5,18 @@ import type {
 } from "../api/types";
 import { getHarnessBadgeLabel } from "./env-harness";
 
-export type SailingMotionVariant =
-  | "preparing"
-  | "saving"
-  | "stopping"
-  | "deleting"
-  | "static";
-
 export type EnvWaitingPresentation =
   | {
       displayState: "preparing";
       heading: "Preparing your environment";
       actionText: string;
-      motionVariant: "preparing";
       elapsedTimeEligible: true;
       primaryAction: "none";
     }
   | {
       displayState: "saving";
       heading: "Saving your work";
-      actionText: "Syncing your latest changes before shutdown…";
-      motionVariant: "saving";
+      actionText: "Saving workspace…";
       elapsedTimeEligible: false;
       primaryAction: "none";
     }
@@ -33,7 +24,6 @@ export type EnvWaitingPresentation =
       displayState: "stopping";
       heading: "Stopping your environment";
       actionText: "Your work is saved. Finishing shutdown…";
-      motionVariant: "stopping";
       elapsedTimeEligible: false;
       primaryAction: "none";
     }
@@ -41,7 +31,6 @@ export type EnvWaitingPresentation =
       displayState: "deleting";
       heading: "Removing your environment";
       actionText: "Deleting the environment and its stored workspace…";
-      motionVariant: "deleting";
       elapsedTimeEligible: false;
       primaryAction: "none";
     }
@@ -49,15 +38,13 @@ export type EnvWaitingPresentation =
       displayState: "stopped";
       heading: "Your environment is stopped";
       actionText: "Start it when you’re ready to continue.";
-      motionVariant: "static";
       elapsedTimeEligible: false;
       primaryAction: "start";
     }
   | {
       displayState: "startup-failure";
       heading: "We couldn’t prepare your environment";
-      actionText: "Try again, or review the technical details below.";
-      motionVariant: "static";
+      actionText: "Try starting it again when you’re ready.";
       elapsedTimeEligible: false;
       primaryAction: "retry";
     }
@@ -65,15 +52,27 @@ export type EnvWaitingPresentation =
       displayState: "failure";
       heading: "This environment needs attention";
       actionText: "Tiller couldn’t complete the last environment action.";
-      motionVariant: "static";
       elapsedTimeEligible: false;
       primaryAction: "none";
+    }
+  | {
+      displayState: "save-failure";
+      heading: "Workspace saving wasn’t confirmed";
+      actionText: "Start again to restore the latest saved workspace. Recent changes may be missing.";
+      elapsedTimeEligible: false;
+      primaryAction: "retry";
+    }
+  | {
+      displayState: "runtime-failure";
+      heading: "Your environment stopped unexpectedly";
+      actionText: "Start it again to restore the latest saved workspace.";
+      elapsedTimeEligible: false;
+      primaryAction: "retry";
     }
   | {
       displayState: "running";
       heading: "Your environment is ready";
       actionText: "Opening your session…";
-      motionVariant: "static";
       elapsedTimeEligible: false;
       primaryAction: "none";
     }
@@ -81,7 +80,6 @@ export type EnvWaitingPresentation =
       displayState: "unknown";
       heading: "Checking your environment";
       actionText: "Waiting for its latest status…";
-      motionVariant: "static";
       elapsedTimeEligible: false;
       primaryAction: "none";
     };
@@ -94,6 +92,7 @@ type PresentationEnv = Pick<
   | "lifecycleOpId"
   | "lifecycleOperation"
   | "lifecycleDesiredState"
+  | "lifecycleInfraState"
 >;
 
 function friendlyStartupAction(
@@ -143,7 +142,6 @@ export function getEnvWaitingPresentation(
       displayState: "deleting",
       heading: "Removing your environment",
       actionText: "Deleting the environment and its stored workspace…",
-      motionVariant: "deleting",
       elapsedTimeEligible: false,
       primaryAction: "none",
     };
@@ -153,8 +151,7 @@ export function getEnvWaitingPresentation(
     return {
       displayState: "saving",
       heading: "Saving your work",
-      actionText: "Syncing your latest changes before shutdown…",
-      motionVariant: "saving",
+      actionText: "Saving workspace…",
       elapsedTimeEligible: false,
       primaryAction: "none",
     };
@@ -165,7 +162,6 @@ export function getEnvWaitingPresentation(
       displayState: "stopping",
       heading: "Stopping your environment",
       actionText: "Your work is saved. Finishing shutdown…",
-      motionVariant: "stopping",
       elapsedTimeEligible: false,
       primaryAction: "none",
     };
@@ -183,7 +179,6 @@ export function getEnvWaitingPresentation(
         matchingDiagnostics?.currentStepId ?? env.bootStepId,
         env,
       ),
-      motionVariant: "preparing",
       elapsedTimeEligible: true,
       primaryAction: "none",
     };
@@ -194,8 +189,34 @@ export function getEnvWaitingPresentation(
       return {
         displayState: "startup-failure",
         heading: "We couldn’t prepare your environment",
-        actionText: "Try again, or review the technical details below.",
-        motionVariant: "static",
+        actionText: "Try starting it again when you’re ready.",
+        elapsedTimeEligible: false,
+        primaryAction: "retry",
+      };
+    }
+    if (
+      env.lifecycleOperation === "start"
+      && env.lifecycleDesiredState === "running"
+      && Boolean(env.lifecycleOpId)
+    ) {
+      return {
+        displayState: "runtime-failure",
+        heading: "Your environment stopped unexpectedly",
+        actionText: "Start it again to restore the latest saved workspace.",
+        elapsedTimeEligible: false,
+        primaryAction: "retry",
+      };
+    }
+    if (
+      env.lifecycleOperation === "stop"
+      && env.lifecycleDesiredState === "stopped"
+      && env.lifecycleInfraState === "stopped"
+      && Boolean(env.lifecycleOpId)
+    ) {
+      return {
+        displayState: "save-failure",
+        heading: "Workspace saving wasn’t confirmed",
+        actionText: "Start again to restore the latest saved workspace. Recent changes may be missing.",
         elapsedTimeEligible: false,
         primaryAction: "retry",
       };
@@ -204,7 +225,6 @@ export function getEnvWaitingPresentation(
       displayState: "failure",
       heading: "This environment needs attention",
       actionText: "Tiller couldn’t complete the last environment action.",
-      motionVariant: "static",
       elapsedTimeEligible: false,
       primaryAction: "none",
     };
@@ -215,7 +235,6 @@ export function getEnvWaitingPresentation(
       displayState: "stopped",
       heading: "Your environment is stopped",
       actionText: "Start it when you’re ready to continue.",
-      motionVariant: "static",
       elapsedTimeEligible: false,
       primaryAction: "start",
     };
@@ -226,7 +245,6 @@ export function getEnvWaitingPresentation(
       displayState: "running",
       heading: "Your environment is ready",
       actionText: "Opening your session…",
-      motionVariant: "static",
       elapsedTimeEligible: false,
       primaryAction: "none",
     };
@@ -236,7 +254,6 @@ export function getEnvWaitingPresentation(
     displayState: "unknown",
     heading: "Checking your environment",
     actionText: "Waiting for its latest status…",
-    motionVariant: "static",
     elapsedTimeEligible: false,
     primaryAction: "none",
   };

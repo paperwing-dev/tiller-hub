@@ -8,6 +8,7 @@ import type { EnvDefinition, EnvLifecycleState, Env, EnvMeta, RunnerCommandClaim
 import { getEnvDefinitionKey } from "../plan/store";
 import { getRunnerBackend } from "./runner-backends";
 import {
+  inspectRunnerBackend,
   runRunnerMutationWithGenerationReconciliation,
   type RebaseRejectedRunnerCommand,
 } from "./runner-backend";
@@ -22,6 +23,7 @@ import { requireExplicitStoredEnvMeta } from "../sync/projectors";
 import { listManagedSessionIdsForEnv } from "../session-attachment";
 import { revokeGitHubBridgesForInteractiveEnv } from "../github/bridge";
 import { getDurableObjectStub } from "../durable-object";
+import { projectRuntimeFailure } from "./runtime-failure";
 
 export { buildEnvMetaFromLayers } from "./state";
 export { envExists, envSlugReserved, listEnvViews, loadEnvView } from "./view";
@@ -34,12 +36,11 @@ export function getHub(
   | "broadcastEnvRemove"
   | "broadcastRepoUpsert"
   | "broadcastRepoMainChange"
+  | "broadcastPlanArtifactUpdated"
   | "addMessage"
   | "getAllSessions"
+  | "getRoutableSessionIds"
   | "deleteSession"
-  | "revokeCloudflareMcpProxyTokensForEnv"
-  | "revokeCloudflareMcpProxyTokenForStart"
-  | "revokeCloudflareMcpProxyTokensForStart"
 > {
   return getDurableObjectStub<Pick<
     HubDO,
@@ -47,63 +48,12 @@ export function getHub(
     | "broadcastEnvRemove"
     | "broadcastRepoUpsert"
     | "broadcastRepoMainChange"
+    | "broadcastPlanArtifactUpdated"
     | "addMessage"
     | "getAllSessions"
+    | "getRoutableSessionIds"
     | "deleteSession"
-    | "revokeCloudflareMcpProxyTokensForEnv"
-    | "revokeCloudflareMcpProxyTokenForStart"
-    | "revokeCloudflareMcpProxyTokensForStart"
   >>(env, env.HUB, "hub");
-}
-
-export async function revokeCloudflareMcpProxyTokensForStartBestEffort(
-  hub: Pick<HubDO, "revokeCloudflareMcpProxyTokensForStart">,
-  input: { envSlug: string; incarnationId: string; startOpId: string },
-): Promise<boolean> {
-  if (typeof hub.revokeCloudflareMcpProxyTokensForStart !== "function") return false;
-  try {
-    await Promise.resolve(hub.revokeCloudflareMcpProxyTokensForStart(input));
-    return true;
-  } catch (err) {
-    console.error(
-      `[envs] Failed to revoke scoped Cloudflare MCP proxy tokens for ${input.envSlug}:`,
-      err instanceof Error ? err.message : String(err),
-    );
-    return false;
-  }
-}
-
-export async function revokeCloudflareMcpProxyTokenForStartBestEffort(
-  hub: Pick<HubDO, "revokeCloudflareMcpProxyTokenForStart">,
-  input: { credentialId: string; envSlug: string; incarnationId: string; startOpId: string },
-): Promise<boolean> {
-  if (typeof hub.revokeCloudflareMcpProxyTokenForStart !== "function") return false;
-  try {
-    return await Promise.resolve(hub.revokeCloudflareMcpProxyTokenForStart(input));
-  } catch (err) {
-    console.error(
-      `[envs] Failed to revoke scoped Cloudflare MCP proxy token for ${input.envSlug}:`,
-      err instanceof Error ? err.message : String(err),
-    );
-    return false;
-  }
-}
-
-export async function revokeCloudflareMcpProxyTokensForEnvBestEffort(
-  hub: Pick<HubDO, "revokeCloudflareMcpProxyTokensForEnv">,
-  envSlug: string,
-  options: { logFailures?: boolean } = {},
-): Promise<boolean> {
-  if (typeof hub.revokeCloudflareMcpProxyTokensForEnv !== "function") return true;
-  try {
-    await Promise.resolve(hub.revokeCloudflareMcpProxyTokensForEnv(envSlug));
-    return true;
-  } catch (err) {
-    if (options.logFailures !== false) {
-      console.error(`[envs] Failed to revoke Cloudflare MCP proxy tokens for ${envSlug}:`, err instanceof Error ? err.message : String(err));
-    }
-    return false;
-  }
 }
 
 export function clearEnvError(meta: EnvMeta): EnvMeta {
@@ -129,6 +79,7 @@ export function buildEnvDefinition(meta: EnvMeta): EnvDefinition {
   }
   return {
     slug: meta.slug,
+    ...(meta.displayName ? { displayName: meta.displayName } : {}),
     incarnationId: meta.incarnationId,
     ...(meta.sidebarSlot ? { sidebarSlot: meta.sidebarSlot } : {}),
     repoId: meta.repoId,
@@ -210,7 +161,8 @@ export async function projectEnvMetaForAction(
   meta: EnvMeta,
   backend: Awaited<ReturnType<typeof getRunnerBackend>>,
 ): Promise<{ meta: EnvMeta; liveStatus: string }> {
-  const liveStatus = normalizeRunnerStatus(await backend.getStatus(meta).catch(() => "unknown"));
+  const inspection = await inspectRunnerBackend(backend, meta);
+  const liveStatus = normalizeRunnerStatus(inspection.status);
   const projectedMeta = await projectEnvMetaWithLifecycle(env, meta);
 
   return {
@@ -223,8 +175,57 @@ export async function projectEnvMetaForRead(
   env: Env,
   meta: EnvMeta,
 ): Promise<EnvMeta> {
-  void env;
-  return meta;
+  // Host runners can retain an unacknowledged writable layer after their
+  // process stops, so ordinary reads must never infer that they are safe to
+  // replace. Cloudflare sandboxes have no such layer: WorkspaceDO is their
+  // durable state, and a non-running container is rehydrated on the next
+  // Start. Reconcile only an already-ready runtime so a concurrent initial
+  // Start cannot be failed while the container is still being dispatched.
+  if (
+    meta.backend !== "cf"
+    || meta.status !== "running"
+    || meta.lifecyclePhase !== "running"
+    || !meta.lifecycleOpId
+  ) {
+    return meta;
+  }
+
+  const inspection = await (async () => {
+    try {
+      const backend = await getRunnerBackend(env, "cf");
+      return await inspectRunnerBackend(backend, meta);
+    } catch {
+      // A transient control-plane failure is not proof that the container is
+      // gone. Leave the lifecycle untouched and try again on a later read.
+      return null;
+    }
+  })();
+  if (!inspection || inspection.state !== "absent") {
+    return meta;
+  }
+
+  const lifecycleStub = getEnvLifecycleStub(env, meta.slug);
+  const lifecycle = await lifecycleStub.getState();
+  if (
+    lifecycle?.phase !== "running"
+    || lifecycle.activeOpId !== meta.lifecycleOpId
+  ) {
+    return (await projectAndPersistEnvSummary(env, getHub(env), meta.slug, {
+      broadcast: false,
+    })) ?? meta;
+  }
+
+  const failure = projectRuntimeFailure(
+    "runtime_stopped_unexpectedly",
+    { runnerState: inspection.state, runnerStatus: inspection.status },
+    {
+      slug: meta.slug,
+      opId: lifecycle.activeOpId,
+      source: "cloudflare-runner-read-reconciliation",
+    },
+  );
+  await lifecycleStub.noteRunnerStopped(lifecycle.activeOpId, failure.message);
+  return (await projectAndPersistEnvSummary(env, getHub(env), meta.slug)) ?? meta;
 }
 
 /**
@@ -235,7 +236,7 @@ export async function projectEnvMetaForRead(
 export async function destroyEnv(
   env: Env,
   meta: EnvMeta,
-  hub: Pick<HubDO, "broadcastEnvRemove" | "getAllSessions" | "deleteSession" | "revokeCloudflareMcpProxyTokensForEnv">,
+  hub: Pick<HubDO, "broadcastEnvRemove" | "getAllSessions" | "deleteSession">,
   options?: {
     broadcast?: boolean;
     runnerCommand?: RunnerCommandClaim;
@@ -246,7 +247,6 @@ export async function destroyEnv(
   await revokeGitHubBridgesForInteractiveEnv(env, meta.slug).catch((err) => {
     console.error(`[envs] Failed to revoke GitHub bridge records for ${meta.slug}:`, err instanceof Error ? err.message : String(err));
   });
-  await revokeCloudflareMcpProxyTokensForEnvBestEffort(hub, meta.slug);
   if (!options?.skipRunnerDestroy) {
     const backend = await getRunnerBackend(env, meta.backend);
     if (meta.backend === "host") {

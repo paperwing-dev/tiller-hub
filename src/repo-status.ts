@@ -18,7 +18,7 @@ export function getRepoMainStatusLabel(
   if (repo.gitStatus === "repair-required") {
     return repo.scmModel === "github" ? "GitHub access needs repair" : "Main needs repair";
   }
-  return repo.scmModel === "github" ? "Reading GitHub default branch" : "Preparing main";
+  return repo.scmModel === "github" ? "Pulling updates from GitHub" : "Preparing main";
 }
 
 export function getRepoMainStatusDetail(

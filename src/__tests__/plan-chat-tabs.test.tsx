@@ -117,6 +117,220 @@ describe("PlanChatTabs", () => {
     expect(container.textContent).not.toContain("Plan Writer");
   });
 
+  it("does not show the pending-item count beside Scribe in the compact agent rail", () => {
+    act(() => {
+      root?.render(
+        <PlanChatTabs
+          reviewers={[]}
+          providers={providers}
+          activeTab="writer"
+          writerTabStatus={writerTabStatus}
+          pendingScribeCount={1}
+          compact
+          onActiveTabChange={vi.fn()}
+          onAddReviewer={vi.fn()}
+          onCloseReviewer={vi.fn()}
+        />,
+      );
+    });
+
+    expect(container.querySelector('button[aria-label="Scribe, Live"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("1");
+    expect(container.textContent).toContain("Edits the plan");
+    expect(container.textContent).toContain("Advises on this plan");
+    expect(container.textContent).toContain("Live");
+    expect(container.querySelector('[data-agent-card-signal][data-agent-tab-status="running"]')).not.toBeNull();
+  });
+
+  it("keeps the active compact reviewer label and status readable", () => {
+    act(() => {
+      root?.render(
+        <PlanChatTabs
+          reviewers={reviewers}
+          providers={providers}
+          activeTab="reviewer-1"
+          writerTabStatus={writerTabStatus}
+          reviewerTabStatuses={reviewerTabStatuses}
+          compact
+          onActiveTabChange={vi.fn()}
+          onAddReviewer={vi.fn()}
+          onCloseReviewer={vi.fn()}
+        />,
+      );
+    });
+
+    const reviewerButton = container.querySelector<HTMLButtonElement>('button[aria-label="GPT-5.5, Working"]');
+    expect(reviewerButton).not.toBeNull();
+    expect(reviewerButton?.textContent).toContain("Reviewer");
+    expect(reviewerButton?.textContent).toContain("Working");
+    expect(reviewerButton).toHaveClass("w-0", "flex-1");
+    const workingSignal = reviewerButton?.querySelector('[data-agent-card-signal][data-agent-tab-status="working"]');
+    expect(workingSignal?.tagName).toBe("SPAN");
+    expect(workingSignal).toHaveClass("animate-spin", "rounded-full", "border-r-transparent");
+
+    act(() => {
+      root?.render(
+        <PlanChatTabs
+          reviewers={reviewers}
+          providers={providers}
+          activeTab="reviewer-1"
+          writerTabStatus={writerTabStatus}
+          reviewerTabStatuses={new Map([[
+            "reviewer-1",
+            {
+              kind: "finished",
+              label: "New result",
+              detail: "The reviewer response is ready.",
+              runId: "run-1",
+            },
+          ]])}
+          compact
+          onActiveTabChange={vi.fn()}
+          onAddReviewer={vi.fn()}
+          onCloseReviewer={vi.fn()}
+        />,
+      );
+    });
+
+    const finishedSignal = container.querySelector('[data-agent-card-signal][data-agent-tab-status="finished"]');
+    expect(finishedSignal?.tagName).toBe("svg");
+    expect(finishedSignal).toHaveClass("text-[var(--paperwing-signal-update)]");
+    expect(container.querySelector('[data-agent-card-signal][data-agent-tab-status="working"]')).toBeNull();
+  });
+
+  it("keeps one tab stop per compact tree row and opens row actions from the keyboard", () => {
+    act(() => {
+      root?.render(
+        <PlanChatTabs
+          reviewers={reviewers}
+          providers={providers}
+          activeTab="reviewer-1"
+          writerTabStatus={writerTabStatus}
+          reviewerTabStatuses={reviewerTabStatuses}
+          compact
+          onActiveTabChange={vi.fn()}
+          onAddReviewer={vi.fn()}
+          onCloseReviewer={vi.fn()}
+          onOpenReviewerSettings={vi.fn()}
+        />,
+      );
+    });
+
+    const tree = container.querySelector<HTMLElement>('[role="tree"]');
+    expect(tree).not.toBeNull();
+    expect(tree?.querySelectorAll('[role="treeitem"][tabindex="0"]')).toHaveLength(1);
+    for (const control of tree?.querySelectorAll<HTMLButtonElement>('button:not([role="treeitem"])') ?? []) {
+      expect(control.tabIndex).toBe(-1);
+    }
+
+    const reviewer = tree?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')[1];
+    act(() => {
+      reviewer?.dispatchEvent(new KeyboardEvent("keydown", {
+        bubbles: true,
+        key: "F10",
+        shiftKey: true,
+      }));
+    });
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label^="Actions for"]')?.getAttribute("aria-expanded"))
+      .toBe("true");
+  });
+
+  it("explains what a reviewer does in the compact add flow", () => {
+    const onOpenPlanSkills = vi.fn();
+    act(() => {
+      root?.render(
+        <PlanChatTabs
+          reviewers={[]}
+          providers={providers}
+          activeTab="writer"
+          writerTabStatus={writerTabStatus}
+          compact
+          onActiveTabChange={vi.fn()}
+          onOpenPlanSkills={onOpenPlanSkills}
+          onAddReviewer={vi.fn()}
+          onCloseReviewer={vi.fn()}
+        />,
+      );
+    });
+
+    const addReviewer = container.querySelector<HTMLButtonElement>('button[aria-label="Add reviewer"]');
+    const planSkillSettings = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reviewer skill settings"]',
+    );
+    const headerButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        ".tiller-agent-switcher-header button",
+      ),
+    );
+    expect(addReviewer).toHaveClass("size-8");
+    expect(addReviewer).not.toHaveClass("size-10");
+    expect(headerButtons.indexOf(planSkillSettings as HTMLButtonElement))
+      .toBeLessThan(headerButtons.indexOf(addReviewer as HTMLButtonElement));
+
+    act(() => {
+      planSkillSettings?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onOpenPlanSkills).toHaveBeenCalledOnce();
+
+    act(() => {
+      addReviewer?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain(
+      "Start a reusable reviewer conversation or launch a saved skill.",
+    );
+  });
+
+  it("keeps plan skills on the settings icon instead of duplicating them in Scribe actions", () => {
+    act(() => {
+      root?.render(
+        <PlanChatTabs
+          reviewers={[]}
+          providers={providers}
+          activeTab="writer"
+          writerTabStatus={writerTabStatus}
+          compact
+          onActiveTabChange={vi.fn()}
+          onOpenPlanSkills={vi.fn()}
+          onWriterSettings={vi.fn()}
+          onAddReviewer={vi.fn()}
+          onCloseReviewer={vi.fn()}
+        />,
+      );
+    });
+
+    const writerActions = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Actions for Scribe"]',
+    );
+    act(() => {
+      writerActions?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(document.body.textContent).toContain("Scribe settings");
+    expect(document.body.textContent).not.toContain("Plan workflows");
+  });
+
+  it("shows Scribe attention without replacing its live lifecycle status", () => {
+    act(() => {
+      root?.render(
+        <PlanChatTabs
+          reviewers={reviewers}
+          providers={providers}
+          activeTab="reviewer-1"
+          writerTabStatus={writerTabStatus}
+          writerNeedsAttention={true}
+          reviewerTabStatuses={reviewerTabStatuses}
+          onActiveTabChange={vi.fn()}
+          onOpenPlanSkills={vi.fn()}
+          onAddReviewer={vi.fn()}
+          onCloseReviewer={vi.fn()}
+        />,
+      );
+    });
+
+    expect(container.querySelector('button[aria-label="Scribe, Live, needs attention"]')).not.toBeNull();
+    expect(container.querySelector('[data-agent-tab-status="running"]')).not.toBeNull();
+  });
+
   it("groups the Scribe as editor and reviewers as advisors", () => {
     const onOpenPlanSkills = vi.fn();
     const onActiveTabChange = vi.fn();
@@ -136,7 +350,7 @@ describe("PlanChatTabs", () => {
     });
 
     const editorGroup = container.querySelector('[role="group"][aria-label="Edits the plan"]');
-    const advisorGroup = container.querySelector('[role="group"][aria-label="Advises on the plan"]');
+    const advisorGroup = container.querySelector('[role="group"][aria-label="Advises on this plan"]');
     expect(editorGroup?.textContent).toContain("Scribe");
     expect(advisorGroup?.textContent).toContain("GPT-5.5");
     expect(advisorGroup?.textContent).toContain("+ Reviewer");
@@ -214,7 +428,7 @@ describe("PlanChatTabs", () => {
       .toContain("text-kumo-danger");
   });
 
-  it("uses a blue notification for new results and keeps a muted check after viewing", () => {
+  it("uses an accent notification for new results without painting a square behind it", () => {
     const renderWithStatus = (status: PlanTabStatus) => {
       act(() => {
         root?.render(
@@ -235,7 +449,9 @@ describe("PlanChatTabs", () => {
 
     renderWithStatus({ kind: "finished", label: "New result", detail: "A new result is ready." });
     expect(container.querySelector('[data-agent-tab-status="finished"]')?.getAttribute("class"))
-      .toContain("bg-kumo-info");
+      .toContain("text-[var(--paperwing-signal-update)]");
+    expect(container.querySelector('[data-agent-tab-status="finished"]')?.getAttribute("class"))
+      .not.toContain("bg-kumo-info");
 
     renderWithStatus({ kind: "viewed", label: "Viewed", detail: "The result was viewed." });
     expect(container.querySelector('[data-agent-tab-status="viewed"]')?.getAttribute("class"))

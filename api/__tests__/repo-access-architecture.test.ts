@@ -105,7 +105,6 @@ describe("repo access architecture", () => {
     for (const route of [
       'repoRoutes.get("/api/repos/:repoId/session-env"',
       'repoRoutes.get("/api/repos/:repoId/mcp-servers"',
-      'repoRoutes.get("/api/repos/:repoId/cloudflare-mcp"',
     ]) {
       const routeStart = repoRoutes.indexOf(route);
       expect(routeStart, route).toBeGreaterThanOrEqual(0);

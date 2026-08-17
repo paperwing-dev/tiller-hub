@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EnvLifecycleState, EnvMeta, EnvMutableState } from "../types";
 import { createGitHubPendingPublishProjection, createInitialEnvScmState, createInitialRepoScmState } from "../scm/model";
-import { ENV_LIFECYCLE_SAVE_TIMEOUT_MS, ENV_LIFECYCLE_STOP_TIMEOUT_MS } from "../env-lifecycle";
+import {
+  ENV_LIFECYCLE_SAVE_TIMEOUT_MS,
+  ENV_LIFECYCLE_START_TIMEOUT_MS,
+  ENV_LIFECYCLE_STOP_TIMEOUT_MS,
+} from "../env-lifecycle";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {},
@@ -110,6 +114,7 @@ function createEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
     workspaceDirty: false,
     workspaceNeedsAttention: false,
     workspaceLastSyncedAt: "2026-04-10T00:00:00.000Z",
+    implementorAttentionToken: null,
     ...overrides,
   };
 }
@@ -170,6 +175,25 @@ function createCodexProjectionSubject() {
 }
 
 describe("EnvLifecycleDO", () => {
+  it("allows the runner's complete quiesce and strict-save contract to finish", () => {
+    const harnessQuiesceTimeoutMs = 35_000;
+    const strictWorkspaceSyncTimeoutMs = 60_000;
+    const containerWakeHeadroomMs = 25_000;
+    const progressRequestTimeoutMs = 2_000;
+    const progressRequestCount = 3;
+    const finalAcknowledgementTimeoutMs = 10_000;
+    const durableObjectSchedulingHeadroomMs = 30_000;
+
+    expect(ENV_LIFECYCLE_SAVE_TIMEOUT_MS).toBeGreaterThanOrEqual(
+      harnessQuiesceTimeoutMs
+      + strictWorkspaceSyncTimeoutMs
+      + containerWakeHeadroomMs
+      + progressRequestTimeoutMs * progressRequestCount
+      + finalAcknowledgementTimeoutMs
+      + durableObjectSchedulingHeadroomMs,
+    );
+  });
+
   beforeEach(() => {
     vi.useRealTimers();
   });
@@ -248,6 +272,57 @@ describe("EnvLifecycleDO", () => {
     expect(state.activeOpId).toMatch(/^stop-/);
   });
 
+  it("durably queues the exact active Stop for immediate alarm dispatch", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-13T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const state = await subject.requestStop();
+
+    await expect(subject.ensureStopDispatchScheduled("stale-stop-op")).resolves.toBe(false);
+    await expect(storage.get("stop-retry-v1")).resolves.toBeNull();
+
+    await expect(subject.ensureStopDispatchScheduled(state.activeOpId)).resolves.toBe(true);
+    await expect(storage.get("stop-retry-v1")).resolves.toEqual({
+      opId: state.activeOpId,
+      attempt: 0,
+      nextAttemptAtMs: Date.now(),
+    });
+    await expect(storage.getAlarm()).resolves.toBe(Date.now());
+    vi.useRealTimers();
+  });
+
+  it("exposes failed Stop finalization only while the exact retry still owns a live runner", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-13T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    await beginStartForTest(subject);
+    await storage.put("env-publication", {
+      incarnationId: "incarnation-1",
+      state: "visible",
+      updatedAt: new Date().toISOString(),
+    });
+    const stop = await subject.requestStop();
+    await subject.ensureStopDispatchScheduled(stop.activeOpId);
+
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1));
+    await subject.getState();
+    await expect(subject.getEnvironmentRuntimeSubject()).resolves.toMatchObject({
+      failedStopFinalizationAuthorized: true,
+      lifecycle: {
+        phase: "failed",
+        activeOpId: stop.activeOpId,
+      },
+    });
+
+    await storage.delete("stop-retry-v1");
+    await expect(subject.getEnvironmentRuntimeSubject()).resolves.toMatchObject({
+      failedStopFinalizationAuthorized: false,
+    });
+    vi.useRealTimers();
+  });
+
   it("creates a starting start operation", async () => {
     const subject = createSubject();
 
@@ -257,6 +332,162 @@ describe("EnvLifecycleDO", () => {
     expect(state.activeOperation).toBe("start");
     expect(state.desiredState).toBe("running");
     expect(state.activeOpId).toMatch(/^start-/);
+  });
+
+  it("fences completion reports by Start and preserves unread attention across stop and restart", async () => {
+    const subject = createSubject();
+    const firstStart = await beginStartForTest(subject);
+    const firstOpId = firstStart.activeOpId!;
+
+    await expect(subject.reportImplementorCompletion("stale-start", 1)).resolves.toEqual({
+      accepted: false,
+      changed: false,
+    });
+    await expect(subject.reportImplementorCompletion(firstOpId, 1)).resolves.toEqual({
+      accepted: true,
+      changed: true,
+    });
+    const firstToken = (await subject.peekMutableState())!
+      .implementorAttentionState.unreadToken;
+    expect(firstToken).toEqual(expect.any(String));
+
+    await expect(subject.reportImplementorCompletion(firstOpId, 1)).resolves.toEqual({
+      accepted: true,
+      changed: false,
+    });
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .toBe(firstToken);
+
+    await expect(subject.acknowledgeImplementorAttention(firstToken!))
+      .resolves.toBe("acknowledged");
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .toBeNull();
+    await expect(subject.reportImplementorCompletion(firstOpId, 1)).resolves.toEqual({
+      accepted: true,
+      changed: false,
+    });
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .toBeNull();
+
+    await subject.reportImplementorCompletion(firstOpId, 2);
+    const unreadBeforeStop = (await subject.peekMutableState())!
+      .implementorAttentionState.unreadToken;
+    expect(unreadBeforeStop).toEqual(expect.any(String));
+    await subject.setStatus("stopped", { clearLifecycle: true });
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .toBe(unreadBeforeStop);
+
+    const secondStart = await beginStartForTest(subject);
+    const secondOpId = secondStart.activeOpId!;
+    expect(secondOpId).not.toBe(firstOpId);
+    expect((await subject.peekMutableState())!.implementorAttentionState).toEqual({
+      runtimeStartOpId: secondOpId,
+      lastCompletionSequence: 0,
+      unreadToken: unreadBeforeStop,
+    });
+    await expect(subject.reportImplementorCompletion(firstOpId, 3)).resolves.toEqual({
+      accepted: false,
+      changed: false,
+    });
+    await expect(subject.reportImplementorCompletion(secondOpId, 1)).resolves.toEqual({
+      accepted: true,
+      changed: true,
+    });
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .not.toBe(unreadBeforeStop);
+  });
+
+  it("serializes completion and acknowledgement races without clearing a newer token", async () => {
+    const subject = createSubject();
+    const start = await beginStartForTest(subject);
+    await subject.reportImplementorCompletion(start.activeOpId!, 1);
+    const firstToken = (await subject.peekMutableState())!
+      .implementorAttentionState.unreadToken!;
+
+    const [completion, acknowledgement] = await Promise.all([
+      subject.reportImplementorCompletion(start.activeOpId!, 2),
+      subject.acknowledgeImplementorAttention(firstToken),
+    ]);
+    const finalToken = (await subject.peekMutableState())!
+      .implementorAttentionState.unreadToken;
+
+    expect(completion).toEqual({ accepted: true, changed: true });
+    expect(["acknowledged", "conflict"]).toContain(acknowledgement);
+    expect(finalToken).toEqual(expect.any(String));
+    expect(finalToken).not.toBe(firstToken);
+  });
+
+  it("records reviewer completion without allowing a callback retry to replace newer attention", async () => {
+    const subject = createSubject();
+    const start = await beginStartForTest(subject);
+
+    await expect(subject.reportReviewerCompletion("review-run-1")).resolves.toEqual({
+      accepted: true,
+      changed: true,
+    });
+    const reviewToken = (await subject.peekMutableState())!
+      .implementorAttentionState.unreadToken;
+    expect(reviewToken).toEqual(expect.any(String));
+
+    await expect(subject.reportReviewerCompletion("review-run-1")).resolves.toEqual({
+      accepted: true,
+      changed: false,
+    });
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .toBe(reviewToken);
+
+    await subject.reportImplementorCompletion(start.activeOpId!, 1);
+    const implementorToken = (await subject.peekMutableState())!
+      .implementorAttentionState.unreadToken;
+    expect(implementorToken).not.toBe(reviewToken);
+
+    await expect(subject.reportReviewerCompletion("review-run-1")).resolves.toEqual({
+      accepted: true,
+      changed: false,
+    });
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .toBe(implementorToken);
+
+    await expect(subject.reportReviewerCompletion("review-run-2")).resolves.toEqual({
+      accepted: true,
+      changed: true,
+    });
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .not.toBe(implementorToken);
+  });
+
+  it("does not reconcile lifecycle alarms for an idempotent acknowledgement", async () => {
+    const subject = createSubject();
+    await beginStartForTest(subject);
+    const scheduleNextAlarm = vi.spyOn(
+      subject as unknown as { scheduleNextAlarm: (...args: unknown[]) => Promise<void> },
+      "scheduleNextAlarm",
+    );
+
+    await expect(subject.acknowledgeImplementorAttention("already-cleared-token"))
+      .resolves.toBe("acknowledged");
+    expect(scheduleNextAlarm).not.toHaveBeenCalled();
+  });
+
+  it("drops unread attention when an environment is deleted and recreated", async () => {
+    const subject = createSubject();
+    const start = await beginStartForTest(subject);
+    await subject.reportImplementorCompletion(start.activeOpId!, 1);
+    expect((await subject.peekMutableState())!.implementorAttentionState.unreadToken)
+      .toEqual(expect.any(String));
+
+    await subject.clearMutableState();
+    await subject.initializeMutableStateFromMeta(createEnvMeta({
+      incarnationId: "incarnation-2",
+      status: "stopped",
+      implementorAttentionToken: null,
+    }));
+
+    expect((await subject.peekMutableState())!.implementorAttentionState).toEqual({
+      runtimeStartOpId: null,
+      lastCompletionSequence: 0,
+      unreadToken: null,
+    });
   });
 
   it("atomically rebases an active runner command above the machine high-water", async () => {
@@ -336,7 +567,7 @@ describe("EnvLifecycleDO", () => {
     })).rejects.toThrow(/superseded/i);
   });
 
-  it("freezes the implementor profile per Start and invalidates its capability subject on Stop", async () => {
+  it("freezes the implementor profile per Start and retains its capability through Stop quiescence", async () => {
     const subject = createSubject();
     const storage = (subject as unknown as { ctx: { storage: MemoryStorage } }).ctx.storage;
     const firstStart = await beginStartForTest(subject);
@@ -373,13 +604,37 @@ describe("EnvLifecycleDO", () => {
     await expect(subject.acceptImplementorCodexRuntimeAuth(firstOpId, "account-2"))
       .resolves.toBe("account_changed");
 
-    await subject.requestStop();
+    const stop = await subject.requestStop();
     await expect(subject.getCodexExecutionProfile(firstOpId)).resolves.toEqual(subscriptionProfile);
+    await expect(subject.getActiveImplementorCodexRuntimeSubject()).resolves.toEqual({
+      envSlug: "demo-env",
+      incarnationId: "incarnation-1",
+      startOpId: firstOpId,
+      profile: subscriptionProfile,
+    });
+    await expect(subject.acceptImplementorCodexRuntimeAuth(firstOpId, "account-1"))
+      .resolves.toBe("accepted");
+
+    await expect(subject.acceptStopWorkspaceSynced(stop.activeOpId)).resolves.toMatchObject({
+      accepted: true,
+      state: { phase: "stopping" },
+    });
+    await expect(subject.getActiveImplementorCodexRuntimeSubject()).resolves.toEqual({
+      envSlug: "demo-env",
+      incarnationId: "incarnation-1",
+      startOpId: firstOpId,
+      profile: subscriptionProfile,
+    });
+    await expect(subject.acceptImplementorCodexRuntimeAuth(firstOpId, "account-1"))
+      .resolves.toBe("accepted");
+
+    await expect(subject.noteRunnerStopped(stop.activeOpId, "exit")).resolves.toMatchObject({
+      phase: "stopped",
+      desiredState: "stopped",
+    });
     await expect(subject.getActiveImplementorCodexRuntimeSubject()).resolves.toBeNull();
     await expect(subject.acceptImplementorCodexRuntimeAuth(firstOpId, "account-1"))
       .resolves.toBe("inactive");
-
-    await subject.setStatus("stopped", { clearLifecycle: true });
     const secondStart = await beginStartForTest(subject);
     const secondOpId = secondStart.activeOpId!;
     expect(secondOpId).not.toBe(firstOpId);
@@ -1058,6 +1313,25 @@ describe("EnvLifecycleDO", () => {
     });
   });
 
+  it("accepts only the exact Stop acknowledgement and its idempotent replay", async () => {
+    const subject = createSubject();
+    const initial = await subject.requestStop();
+
+    await expect(subject.acceptStopWorkspaceSynced("stale-stop-op")).resolves.toMatchObject({
+      accepted: false,
+      opId: null,
+    });
+    await expect(subject.acceptStopWorkspaceSynced(initial.activeOpId)).resolves.toMatchObject({
+      accepted: true,
+      opId: initial.activeOpId,
+      state: { phase: "stopping" },
+    });
+    await expect(subject.acceptStopWorkspaceSynced(initial.activeOpId)).resolves.toMatchObject({
+      accepted: true,
+      opId: initial.activeOpId,
+    });
+  });
+
   it("ignores stale workspace-synced acks", async () => {
     const subject = createSubject();
     await subject.initializeMutableStateFromMeta(createEnvMeta({
@@ -1125,6 +1399,7 @@ describe("EnvLifecycleDO", () => {
     await subject.beginStartupDiagnostics({
       opId: startOpId,
       backend: "host",
+      implementationMode: "fresh",
       stepId: "workspace-sync",
       message: "Owned startup",
     });
@@ -1174,6 +1449,7 @@ describe("EnvLifecycleDO", () => {
     await expect(subject.getStartupDiagnostics()).resolves.toMatchObject({
       active: {
         opId: startOpId,
+        implementationMode: "fresh",
         currentStepMessage: "Owned startup",
       },
     });
@@ -1371,6 +1647,89 @@ describe("EnvLifecycleDO", () => {
     });
   });
 
+  it("keeps the exact save retry after runner shutdown and preserves the save deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const initial = await subject.requestStop();
+    await subject.ensureStopDispatchScheduled(initial.activeOpId);
+
+    vi.setSystemTime(new Date("2026-04-10T00:00:30.000Z"));
+    const waitingForWorkspace = await subject.noteRunnerStopped(initial.activeOpId, "exit");
+
+    expect(waitingForWorkspace).toMatchObject({
+      phase: "saving",
+      activeOpId: initial.activeOpId,
+      lastRunnerState: "stopped",
+      infraState: "stopped",
+      updatedAt: initial.updatedAt,
+    });
+    await expect(storage.get("stop-retry-v1")).resolves.toMatchObject({
+      opId: initial.activeOpId,
+      attempt: 0,
+    });
+
+    vi.setSystemTime(new Date(
+      new Date(initial.updatedAt).getTime() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000,
+    ));
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "failed",
+      activeOpId: initial.activeOpId,
+      lastRunnerState: "stopped",
+    });
+    vi.useRealTimers();
+  });
+
+  it("retains a legacy Stop retry so a persisted receipt can still be acknowledged", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const initial = await subject.requestStop();
+    await subject.noteRunnerStopped(initial.activeOpId, "exit");
+    await storage.put("stop-retry-v1", {
+      opId: initial.activeOpId,
+      attempt: 8,
+      nextAttemptAtMs: Date.now(),
+    });
+    const getOwnedEnvView = vi.spyOn(subject, "getOwnedEnvView");
+    const runStopRetryEffect = (
+      subject as unknown as { runStopRetryEffect: () => Promise<boolean> }
+    ).runStopRetryEffect.bind(subject);
+
+    await expect(runStopRetryEffect()).resolves.toBe(true);
+    await expect(storage.get("stop-retry-v1")).resolves.toMatchObject({
+      opId: initial.activeOpId,
+      attempt: 9,
+    });
+    expect(getOwnedEnvView).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it("does not move the save deadline while rearming an in-progress Stop retry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const initial = await subject.requestStop();
+    await subject.ensureStopDispatchScheduled(initial.activeOpId);
+
+    vi.setSystemTime(new Date("2026-04-10T00:00:30.000Z"));
+    await expect(subject.resumeStopRetry(initial.activeOpId)).resolves.toMatchObject({
+      phase: "saving",
+      activeOpId: initial.activeOpId,
+      updatedAt: initial.updatedAt,
+    });
+
+    await expect(subject.peekMutableState()).resolves.toMatchObject({
+      lifecyclePhase: "saving",
+      lifecycleUpdatedAt: initial.updatedAt,
+      updatedAt: "2026-04-10T00:00:30.000Z",
+    });
+    vi.useRealTimers();
+  });
+
   it("transitions stopping to stopped when the runner exits after persistence", async () => {
     const subject = createSubject();
     const initial = await subject.requestStop();
@@ -1434,7 +1793,7 @@ describe("EnvLifecycleDO", () => {
     vi.useRealTimers();
   });
 
-  it("ignores stale runner-stop callbacks after a retried stop", async () => {
+  it("retains the same Stop operation across automatic persistence retries", async () => {
     const subject = createSubject();
     const initial = await subject.requestStop();
     await subject.noteWorkspaceSyncFailed(initial.activeOpId, "save failed");
@@ -1446,7 +1805,7 @@ describe("EnvLifecycleDO", () => {
     );
     const next = await subject.noteRunnerStopped(initial.activeOpId, "exit");
 
-    expect(retried.activeOpId).not.toBe(initial.activeOpId);
+    expect(retried.activeOpId).toBe(initial.activeOpId);
     expect(afterStaleFailure).toMatchObject({
       phase: "saving",
       activeOpId: retried.activeOpId,
@@ -1456,7 +1815,247 @@ describe("EnvLifecycleDO", () => {
       phase: "saving",
       activeOpId: retried.activeOpId,
       desiredState: "stopped",
+      lastRunnerState: "stopped",
     });
+  });
+
+  it("schedules capped same-operation retry state until the exact save ack succeeds", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const initial = await subject.requestStop();
+
+    await subject.noteWorkspaceSyncFailed(initial.activeOpId, "raw upload detail");
+
+    const retry = await storage.get<{ opId: string; attempt: number; nextAttemptAtMs: number }>("stop-retry-v1");
+    expect(retry).toEqual({
+      opId: initial.activeOpId,
+      attempt: 0,
+      nextAttemptAtMs: Date.now() + 2_000,
+    });
+    await expect(storage.getAlarm()).resolves.toBe(Date.now() + 2_000);
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "saving",
+      activeOpId: initial.activeOpId,
+      lastError: null,
+    });
+    await expect(subject.getMutableState()).resolves.toMatchObject({
+      bootMessage: "Retrying workspace save…",
+    });
+
+    const accepted = await subject.acceptStopWorkspaceSynced(initial.activeOpId);
+    expect(accepted).toMatchObject({ accepted: true, opId: initial.activeOpId });
+    await expect(storage.get("stop-retry-v1")).resolves.toMatchObject({
+      opId: initial.activeOpId,
+      attempt: 0,
+    });
+    await subject.noteRunnerStopped(initial.activeOpId, "exit");
+    await expect(storage.get("stop-retry-v1")).resolves.toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("explains when safe saving is waiting for the active agent turn", async () => {
+    const subject = createSubject();
+    const initial = await subject.requestStop();
+
+    await subject.noteWorkspaceSyncFailed(
+      initial.activeOpId,
+      "Timed out waiting for the active agent turn to become idle.",
+    );
+
+    await expect(subject.getMutableState()).resolves.toMatchObject({
+      status: "saving",
+      bootStepId: "workspace-sync",
+      bootMessage: "Waiting for the active agent turn to finish safely…",
+    });
+  });
+
+  it("re-arms only the exact persisted Stop retry after its save deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const initial = await subject.requestStop();
+    await subject.noteWorkspaceSyncFailed(initial.activeOpId, "save failed");
+
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "failed",
+      activeOpId: initial.activeOpId,
+    });
+
+    await expect(subject.resumeStopRetry("stale-stop-op")).resolves.toBeNull();
+    await expect(subject.resumeStopRetry(initial.activeOpId)).resolves.toMatchObject({
+      phase: "saving",
+      activeOpId: initial.activeOpId,
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastError: null,
+    });
+    await expect(storage.get<{ opId: string }>("stop-retry-v1")).resolves.toMatchObject({
+      opId: initial.activeOpId,
+    });
+    vi.useRealTimers();
+  });
+
+  it("reuses a timed-out Stop ID even when no retry timer was recorded", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const initial = await subject.requestStop();
+
+    expect(await storage.get("stop-retry-v1")).toBeNull();
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "failed",
+      activeOpId: initial.activeOpId,
+    });
+
+    const retried = await subject.requestStop();
+
+    expect(retried).toMatchObject({
+      phase: "saving",
+      activeOpId: initial.activeOpId,
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastError: null,
+    });
+    await expect(storage.get<{ opId: string }>("stop-retry-v1")).resolves.toMatchObject({
+      opId: initial.activeOpId,
+    });
+    vi.useRealTimers();
+  });
+
+  it("repairs a stale retry timer from the authoritative active Stop", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    const initial = await subject.requestStop();
+    await storage.put("stop-retry-v1", {
+      opId: "stale-stop-op",
+      attempt: 7,
+      nextAttemptAtMs: Date.now(),
+    });
+
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
+    await subject.getState();
+    const retried = await subject.requestStop();
+
+    expect(retried.activeOpId).toBe(initial.activeOpId);
+    await expect(storage.get<{ opId: string; attempt: number }>("stop-retry-v1")).resolves.toMatchObject({
+      opId: initial.activeOpId,
+      attempt: 0,
+    });
+    vi.useRealTimers();
+  });
+
+  it("keeps the same Stop fence when a delayed lifecycle alarm retries offline host persistence", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));
+    const hub = {
+      isHostRoutable: vi.fn().mockResolvedValue(false),
+      broadcastEnvUpsert: vi.fn().mockResolvedValue(undefined),
+    };
+    const env = {
+      ENVS_KV: {
+        get: vi.fn().mockResolvedValue(null),
+        put: vi.fn().mockResolvedValue(undefined),
+        list: vi.fn().mockResolvedValue({ keys: [], list_complete: true }),
+      },
+      HUB: {
+        idFromName: vi.fn(() => "hub-id"),
+        get: vi.fn(() => hub),
+      },
+      ENV_REVIEW: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => ({
+          listWorkloadStateForPredeploy: vi.fn().mockResolvedValue([]),
+        })),
+      },
+    };
+    const storage = createMemoryStorage();
+    const subject = createSubject(env, storage);
+    await subject.initializeMutableStateFromMeta(createEnvMeta({
+      backend: "host",
+      executionPlacement: { backend: "host", machineId: "machine-1" },
+      status: "running",
+      lifecyclePhase: "running",
+      lifecycleOpId: "start-op-1",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
+      lifecycleInfraState: "ready",
+      lifecycleRuntimeReady: true,
+    }));
+    const stop = await subject.requestStop();
+    await subject.noteWorkspaceSyncFailed(stop.activeOpId, "initial save failure");
+    vi.spyOn(subject, "getOwnedEnvView").mockResolvedValue(createEnvMeta({
+      backend: "host",
+      executionPlacement: { backend: "host", machineId: "machine-1" },
+      status: "failed",
+      lifecyclePhase: "failed",
+      lifecycleOpId: stop.activeOpId,
+      lifecycleOperation: "stop",
+      lifecycleDesiredState: "stopped",
+      lifecycleInfraState: "ready",
+      lifecycleRuntimeReady: false,
+    }));
+    const resume = vi.spyOn(subject, "resumeStopRetry");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
+    try {
+      await subject.alarm();
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(resume).toHaveBeenCalledWith(stop.activeOpId);
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "saving",
+      activeOpId: stop.activeOpId,
+      activeOperation: "stop",
+    });
+    await expect(storage.get<{ opId: string; attempt: number }>("stop-retry-v1"))
+      .resolves.toMatchObject({ opId: stop.activeOpId, attempt: 1 });
+    expect(hub.isHostRoutable).toHaveBeenCalledWith("machine-1");
+    vi.useRealTimers();
+  });
+
+  it("allows restart only after exact fresh runner-absence reconciliation", async () => {
+    const storage = createMemoryStorage();
+    const subject = createSubject({}, storage);
+    await subject.initializeMutableStateFromMeta(createEnvMeta({
+      status: "running",
+      lifecyclePhase: "running",
+      lifecycleOpId: "start-op-old",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
+      lifecycleInfraState: "ready",
+      lifecycleRuntimeReady: true,
+    }));
+    const stop = await subject.requestStop();
+    await subject.noteWorkspaceSyncFailed(stop.activeOpId, "upload failed");
+
+    await expect(subject.confirmRunnerAbsentForRestart("stale-stop-op")).resolves.toBe(false);
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "saving",
+      activeOpId: stop.activeOpId,
+    });
+
+    await expect(subject.confirmRunnerAbsentForRestart(stop.activeOpId)).resolves.toBe(true);
+    await expect(subject.getState()).resolves.toMatchObject({
+      phase: "stopped",
+      activeOpId: stop.activeOpId,
+      lastRunnerState: "stopped",
+    });
+    await expect(storage.get("stop-retry-v1")).resolves.toBeNull();
+
+    const restart = await subject.beginStart({ model: "claude-opus-4.8", effort: "xhigh" });
+    expect(restart.dispatchGranted).toBe(true);
+    expect(restart.lifecycle).toMatchObject({ phase: "starting", desiredState: "running" });
   });
 
   it("applies a partial workspace patch from the stop-finalize ack", async () => {
@@ -1477,32 +2076,19 @@ describe("EnvLifecycleDO", () => {
     });
   });
 
-  it("treats a stop-finalize workspace sync from a running env as a graceful self-stop", async () => {
+  it("rejects a workspace acknowledgement that belongs to Start instead of an exact Stop", async () => {
     const subject = createSubject();
     const initial = await beginStartForTest(subject);
     await subject.noteRunnerStarted(initial.activeOpId);
 
-    const stopping = await subject.noteStopWorkspaceSynced(initial.activeOpId);
-    const stopped = await subject.noteRunnerStopped(initial.activeOpId, "exit");
+    const acknowledgement = await subject.acceptStopWorkspaceSynced(initial.activeOpId);
     const mutable = await subject.getMutableState();
 
-    expect(stopping).toMatchObject({
-      phase: "stopping",
-      desiredState: "stopped",
-      activeOperation: "stop",
-    });
-    expect(stopped).toMatchObject({
-      phase: "stopped",
-      desiredState: "stopped",
-      lastRunnerState: "stopped",
-    });
+    expect(acknowledgement).toMatchObject({ accepted: false, opId: null });
     expect(mutable).toMatchObject({
-      workspaceDirty: null,
-      workspaceNeedsAttention: null,
-      workspaceLastSyncedAt: null,
-      baseMainCommit: null,
-      lastKnownMainCommit: null,
-      branchStatus: null,
+      lifecyclePhase: "running",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
     });
   });
 
@@ -1528,7 +2114,7 @@ describe("EnvLifecycleDO", () => {
     const subject = createSubject();
     await subject.requestStop();
 
-    vi.setSystemTime(new Date("2026-04-10T00:01:20.000Z"));
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
     const next = await subject.getState();
 
     expect(next).toMatchObject({
@@ -1550,7 +2136,7 @@ describe("EnvLifecycleDO", () => {
       const replacement = await beginStartForTest(subject);
       expect(replacement.activeOpId).not.toBe(initial.activeOpId);
 
-      vi.setSystemTime(new Date("2026-04-10T00:02:00.000Z"));
+      vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_START_TIMEOUT_MS + 1_000));
       const resolveTimeoutState = (
         subject as unknown as {
           resolveTimeoutState: (state: EnvMutableState | null, now: number) => Promise<EnvMutableState | null>;
@@ -1576,7 +2162,7 @@ describe("EnvLifecycleDO", () => {
     const subject = createSubject();
     await subject.requestStop();
 
-    vi.setSystemTime(new Date("2026-04-10T00:01:20.000Z"));
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
     await expect(subject.peekMutableState()).resolves.toMatchObject({
       status: "saving",
       lifecyclePhase: "saving",
@@ -1683,7 +2269,7 @@ describe("EnvLifecycleDO", () => {
     const subject = createSubject();
     await beginStartForTest(subject);
 
-    vi.setSystemTime(new Date("2026-04-10T00:01:40.000Z"));
+    vi.setSystemTime(new Date(Date.now() + ENV_LIFECYCLE_START_TIMEOUT_MS + 1_000));
     const next = await subject.getState();
 
     expect(next).toMatchObject({
@@ -1945,6 +2531,64 @@ describe("EnvLifecycleDO", () => {
         cleanupPending: {
           terminalError: expect.stringContaining("result processing was interrupted"),
         },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out and cleans up a GitHub publish that never reports a result", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-17T00:00:00.000Z"));
+    try {
+      const destroyJob = vi.fn().mockResolvedValue(undefined);
+      const subject = createSubject({
+        GITHUB_JOB: {
+          idFromName: vi.fn((name: string) => name),
+          get: vi.fn(() => ({ destroyJob })),
+        },
+        ENVS_KV: {
+          list: vi.fn().mockResolvedValue({ keys: [], list_complete: true }),
+        },
+      });
+      await subject.initializeMutableStateFromMeta(createEnvMeta());
+      await subject.beginGitHubPublishOperation({
+        operationId: "publish-1",
+        envSlug: "demo-env",
+        repoId: "repo-1",
+        repoUrl: "https://github.com/example/repo.git",
+        jobSlug: "github-publish-demo-env-publish-1",
+        executionPlacement: { backend: "cf", machineId: null },
+        branch: "tiller/demo-env",
+        baseCommitSha: "base-sha",
+        workspaceHash: "workspace-hash",
+        expectedPriorHead: null,
+        hmacKey: "hmac-key",
+        callbackToken: "callback-token",
+        pullRequestContent: {
+          title: "Publish changes",
+          featureMarkdown: "## Summary",
+        },
+        startedAt: "2026-07-17T00:00:00.000Z",
+        projection: createGitHubPendingPublishProjection({
+          operationId: "publish-1",
+          branch: "tiller/demo-env",
+          baseCommitSha: "base-sha",
+          workspaceHash: "workspace-hash",
+          expectedPriorHead: null,
+          startedAt: "2026-07-17T00:00:00.000Z",
+        }),
+      });
+
+      vi.advanceTimersByTime(10 * 60_000);
+      await subject.alarm();
+
+      expect(destroyJob).toHaveBeenCalledOnce();
+      await expect(subject.getGitHubPublishOperation()).resolves.toBeNull();
+      await expect(subject.peekMutableState()).resolves.toMatchObject({
+        githubPublishStatus: "failed",
+        githubPublishOperationId: null,
+        githubPublishError: "GitHub publish timed out before reporting a result. Retry publishing.",
       });
     } finally {
       vi.useRealTimers();

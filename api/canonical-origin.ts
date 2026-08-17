@@ -33,8 +33,32 @@ export async function resolveCanonicalRequestOrigin(
   env: Env,
   request: Request,
 ): Promise<string> {
-  if (isLocalDevRequest(env, request)) return new URL(request.url).origin;
+  if (isLocalDevRequest(env, request)) return resolveLocalDevOrigin(env, request);
   return resolveCanonicalHubOrigin(env);
+}
+
+function resolveLocalDevOrigin(env: Env, request?: Request): string {
+  const configured = env.TILLER_LOCAL_DEV_ORIGIN?.trim()
+    || (request ? new URL(request.url).origin : "");
+  let parsed: URL;
+  try {
+    parsed = new URL(configured);
+  } catch {
+    throw new Error("Local development requires an exact HTTP origin.");
+  }
+  if (
+    parsed.protocol !== "http:"
+    || parsed.origin !== configured
+    || parsed.pathname !== "/"
+    || parsed.search
+    || parsed.hash
+    || parsed.username
+    || parsed.password
+    || !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
+  ) {
+    throw new Error("Local development requires an exact loopback HTTP origin.");
+  }
+  return configured;
 }
 
 export async function canonicalIngressResponse(

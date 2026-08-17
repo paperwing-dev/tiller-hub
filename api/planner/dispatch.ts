@@ -11,21 +11,22 @@ import { mintPlanWriterRuntimeToken, mintPlannerRunToken } from "./runtime-token
 import type {
   Env,
   ExecutionPlacement,
-  RunnerCommandClaim,
   RunnerControlAction,
 } from "../types";
 import type {
   ArtifactStoreDO,
   PlannerRun,
+  PlannerRunLaunchProvenance,
   PlannerRunRuntimeProvenance,
+  PlanWriterLaunchProvenance,
   PlanWriterRuntimeProvenance,
   ReviewerRegistryEntry,
 } from "../coordination";
 import { bridgeCredentialsToEnvVars, createGitHubBridgeRecord } from "../github/bridge";
 import { canonicalizeGitHubRepo } from "../github/repo";
-import { PLANNER_OPENCODE_MODEL } from "./opencode-model";
 import { buildOpenCodeRuntimeEnv } from "../opencode/runtime-env";
 import { planWriterTerminalId } from "./plan-writer-contract";
+import { plannerJobSlug } from "./runtime-identity";
 import {
   codexExecutionAuthMode,
   codexExecutionRuntimeMode,
@@ -37,6 +38,7 @@ import { classifyHostRuntimeCompatibility } from "../setup/runtime-compatibility
 import { BillingResolutionError } from "../billing-resolution";
 import {
   getPlannerModelCredentialRequirement,
+  listHarnessModels,
 } from "../../shared/harness-catalog";
 import {
   resolveBillingCompatibility,
@@ -51,6 +53,23 @@ import {
   selectionToPlacement,
 } from "../execution";
 import { getDurableObjectStub } from "../durable-object";
+import { broadcastPlanArtifactUpdatedHint } from "../plan-artifact-hints";
+import { completeReviewerOutput, finalizeReviewerRunFailure, isActiveRun } from "./runtime";
+import {
+  cleanupPlannerRunRuntime,
+  destroyPlannerJob,
+  destroyPlanWriterRuntime,
+  runnerJobCommand,
+} from "./runtime-cleanup";
+
+export {
+  cleanupPlanRuntimeTarget,
+  cleanupPlannerRunRuntime,
+  destroyPlannerJob,
+  destroyPlanWriterRuntime,
+  inspectPlanWriterRuntime,
+  runnerJobCommand,
+} from "./runtime-cleanup";
 
 // Dispatches one-shot reviewer runs to disposable containers. The run row is the
 // complete job record before dispatch; the container reports back through the
@@ -70,6 +89,40 @@ export type PlannerDispatchTarget = ExecutionPlacement & {
   codexExecutionProfile?: CodexExecutionProfile;
 };
 
+export function plannerDispatchTargetFromLaunch(
+  launch: PlannerRunLaunchProvenance | PlanWriterLaunchProvenance,
+): PlannerDispatchTarget {
+  const details = {
+    ...(launch.claudeAuthMode ? { claudeAuthMode: launch.claudeAuthMode } : {}),
+    ...(launch.codexExecution ? { codexExecutionProfile: launch.codexExecution } : {}),
+  };
+  return launch.backend === "host"
+    ? { backend: "host", machineId: launch.machineId, ...details }
+    : { backend: "cf", machineId: null, ...details };
+}
+
+export function plannerLaunchProvenanceFromExecution(
+  execution: Extract<PlannerExecution, { kind: "dispatched" }>,
+): PlannerRunLaunchProvenance {
+  const details = {
+    schemaVersion: 1 as const,
+    ...(execution.claudeAuthMode ? { claudeAuthMode: execution.claudeAuthMode } : {}),
+    ...(execution.codexExecutionProfile ? { codexExecution: execution.codexExecutionProfile } : {}),
+  };
+  return execution.backend === "host"
+    ? { backend: "host", machineId: execution.machineId, ...details }
+    : { backend: "cf", machineId: null, ...details };
+}
+
+export function plannerExecutionFromLaunch(
+  launch: PlannerRunLaunchProvenance,
+): Extract<PlannerExecution, { kind: "dispatched" }> {
+  const target = plannerDispatchTargetFromLaunch(launch);
+  return target.backend === "host"
+    ? { kind: "dispatched", ...target }
+    : { kind: "dispatched", ...target };
+}
+
 interface HubRunnerControl {
   requestLocalRunner(
     machineId: string | null,
@@ -80,53 +133,28 @@ interface HubRunnerControl {
       envVars?: Record<string, string>;
       commandGeneration?: number;
       operationId?: string;
-      desiredState?: RunnerCommandClaim["desiredState"];
+      desiredState?: "running" | "stopped" | "absent";
     },
   ): Promise<{ machineId: string; result: unknown }>;
-}
-
-function runtimeStatus(value: unknown): string | null {
-  if (!value || typeof value !== "object") return null;
-  const status = (value as { status?: unknown }).status;
-  return typeof status === "string" ? status : null;
+  revokePlanWriterTerminal(
+    sessionId: string,
+    repoId: string,
+    planArtifactId: string,
+    generation: number,
+  ): void | Promise<void>;
+  broadcastPlanWriterState(repoId: string, planArtifactId: string): void | Promise<void>;
 }
 
 function getHub(env: Env): HubRunnerControl {
   return getDurableObjectStub<HubRunnerControl>(env, env.HUB, "hub");
 }
 
-export function plannerJobSlug(runId: string): string {
-  // Full sanitized run id — a truncated tail could collide, and the machine
-  // runner removes any same-slug container before creating a new one.
-  const sanitized = runId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return `planner-${sanitized}`;
-}
-
-export function runnerJobCommand(
-  jobSlug: string,
-  desiredState: "running" | "absent",
-): RunnerCommandClaim {
-  const commandGeneration = desiredState === "running" ? 1 : 2;
-  return {
-    commandGeneration,
-    operationId: `runner-job:${jobSlug}:${commandGeneration}:${desiredState}`,
-    desiredState,
-  };
-}
+export { plannerJobSlug } from "./runtime-identity";
 
 async function hasSecret(env: Env, key: string): Promise<boolean> {
   const direct = (env as unknown as Record<string, unknown>)[key];
   if (typeof direct === "string" && direct.trim()) return true;
   return Boolean((await getSecret(env, key, { fresh: true }))?.trim());
-}
-
-async function hasWorkersAiCredentials(env: Env): Promise<boolean> {
-  if (env.AI) return true;
-  const [accountId, token] = await Promise.all([
-    hasSecret(env, "TILLER_WORKERS_AI_ACCOUNT_ID"),
-    hasSecret(env, "TILLER_WORKERS_AI_API_TOKEN"),
-  ]);
-  return accountId && token;
 }
 
 function developmentInProcessEnabled(env: Env): boolean {
@@ -144,6 +172,24 @@ async function providerTargetCompatibility(
   | { compatible: true; claudeAuthMode?: BillingMode; codexExecutionProfile?: CodexExecutionProfile }
   | { compatible: false; reason: string }
 > {
+  if (
+    codexSurface !== "plan-writer"
+    && target.backend === "host"
+    && !isLocalOnlyRunnerBackendMode(env)
+  ) {
+    const host = await readRoutableHostService(env, target.machineId).catch(() => null);
+    if (!host) return { compatible: false, reason: NEW_EXECUTION_UNAVAILABLE_MESSAGE };
+    if (
+      host.reviewerIsolationProtocol !== 1
+      || host.runnerCommandProtocol !== 1
+      || !classifyHostRuntimeCompatibility(host).compatible
+    ) {
+      return {
+        compatible: false,
+        reason: "The execution image does not support protected reviewer isolation. Run `tiller host update`, then recreate or restart existing environment containers before retrying Review.",
+      };
+    }
+  }
   if (providerId === "codex") {
     const selectedMode = billingSelections.openaiBillingMode;
     if (!selectedMode) {
@@ -193,9 +239,9 @@ async function providerTargetCompatibility(
   }
 
   if (providerId === "opencode") {
-    return await hasWorkersAiCredentials(env)
-      ? { compatible: true }
-      : { compatible: false, reason: "OpenCode requires Workers AI credentials." };
+    // Route-specific credential checks happen in the writer/reviewer catalog.
+    // Execution placement itself is shared by every OpenCode binding.
+    return { compatible: true };
   }
 
   return { compatible: false, reason: `Planner provider ${providerId} is not dispatchable.` };
@@ -244,16 +290,14 @@ async function resolvePlannerExecutionUsing(
   if (!compatibility.compatible) {
     return { kind: "unavailable", reason: compatibility.reason };
   }
-  return {
-    kind: "dispatched",
-    ...target,
-    ...(compatibility.claudeAuthMode
-      ? { claudeAuthMode: compatibility.claudeAuthMode }
-      : {}),
-    ...(compatibility.codexExecutionProfile
-      ? { codexExecutionProfile: compatibility.codexExecutionProfile }
-      : {}),
+  const details = {
+    kind: "dispatched" as const,
+    ...(compatibility.claudeAuthMode ? { claudeAuthMode: compatibility.claudeAuthMode } : {}),
+    ...(compatibility.codexExecutionProfile ? { codexExecutionProfile: compatibility.codexExecutionProfile } : {}),
   };
+  return target.backend === "host"
+    ? { backend: "host", machineId: target.machineId, ...details }
+    : { backend: "cf", machineId: null, ...details };
 }
 
 // This is a read-only projection for provider catalogs. It deliberately avoids
@@ -309,12 +353,21 @@ export async function buildProviderAuthEnvVars(
   target: PlannerDispatchTarget,
   hubUrl: string,
 ): Promise<Record<string, string>> {
-  if (selection.provider === "opencode" && selection.model !== PLANNER_OPENCODE_MODEL.binding.model) {
-    throw new Error(`Unsupported planner OpenCode model: ${selection.model}`);
-  }
   const requirement = getPlannerModelCredentialRequirement(selection.provider, selection.model);
   if (!requirement) {
     throw new Error(`Unknown ${selection.provider} planner model: ${selection.model}`);
+  }
+  if (selection.provider === "opencode") {
+    const model = listHarnessModels("opencode").find((entry) => entry.binding.model === selection.model);
+    if (!model || model.binding.kind !== "opencode") {
+      throw new Error(`Unsupported planner OpenCode model: ${selection.model}`);
+    }
+    const auth = await resolveOpenCodeContainerAuth(env, model);
+    return buildOpenCodeRuntimeEnv({
+      model,
+      auth,
+      proxyBaseUrl: `${hubUrl}/api/opencode/v1`,
+    });
   }
   let resolvedMode: BillingMode | null = null;
   if (requirement !== "workers-ai") {
@@ -374,18 +427,6 @@ export async function buildProviderAuthEnvVars(
       TILLER_CLAUDE_AUTH_RESOLVED_MODE: auth.resolvedAuthMode,
     };
   }
-  if (selection.provider === "opencode") {
-    // OpenCode authenticates through the hub's model proxy; the container
-    // builds its provider config from these (entrypoint's interactive block
-    // does not run for planner containers).
-    const model = PLANNER_OPENCODE_MODEL;
-    const auth = await resolveOpenCodeContainerAuth(env, model);
-    return buildOpenCodeRuntimeEnv({
-      model,
-      auth,
-      proxyBaseUrl: `${hubUrl}/api/opencode/v1`,
-    });
-  }
   throw new Error(`Planner provider is not dispatchable yet: ${selection.provider}`);
 }
 
@@ -437,16 +478,12 @@ export async function dispatchPlannerRun(options: DispatchPlannerRunOptions): Pr
   const { env, artifactStore, run } = options;
   const jobSlug = plannerJobSlug(run.runId);
   let runtime: PlannerRunRuntimeProvenance | null = null;
+  let runtimeClaimedByThisDispatch = false;
   let launchEnvVars: Record<string, string> = {};
   try {
     const launch = run.launchProvenance;
     if (!launch) throw new Error("Planner run launch provenance is missing.");
-    const target: PlannerDispatchTarget = {
-      backend: launch.backend,
-      machineId: launch.machineId,
-      ...(launch.claudeAuthMode ? { claudeAuthMode: launch.claudeAuthMode } : {}),
-      ...(launch.codexExecution ? { codexExecutionProfile: launch.codexExecution } : {}),
-    };
+    const target = plannerDispatchTargetFromLaunch(launch);
     runtime = { jobSlug };
     if (run.role !== "reviewer") {
       throw new Error("Only one-shot reviewer runs use the planner-run dispatcher.");
@@ -469,7 +506,9 @@ export async function dispatchPlannerRun(options: DispatchPlannerRunOptions): Pr
     );
     launchEnvVars = {
       TILLER_BOOTSTRAP_MODE: "planner-run",
+      TILLER_REVIEWER_ISOLATION_PROTOCOL: "1",
       TILLER_HARNESS: run.provider,
+      RUNNER_BACKEND: target.backend,
       HUB_URL: hubUrl,
       TILLER_PLANNER_CALLBACK_BASE:
         `${hubUrl}/api/planner-runtime/repos/${encodeURIComponent(run.repoId)}/runs/${encodeURIComponent(run.runId)}`,
@@ -480,9 +519,34 @@ export async function dispatchPlannerRun(options: DispatchPlannerRunOptions): Pr
     };
 
     const claimed = await artifactStore.claimPlannerRunRuntime(run.runId, runtime);
+    runtimeClaimedByThisDispatch = Boolean(claimed);
+    let launchable = claimed;
     if (!claimed) {
       const current = await artifactStore.getPlannerRun(run.runId);
-      if (!current || (current.status !== "queued" && current.status !== "running" && current.status !== "saving")) {
+      const sameRuntime = current?.runtime?.jobSlug === runtime.jobSlug;
+      // Persisting runtime ownership and starting the external workload cannot
+      // be one transaction. An exact retry therefore replays the backend's
+      // deterministic, fenced "ensure running" operation for the same active
+      // run instead of assuming that the first dispatch reached the backend.
+      if (!current || !sameRuntime) {
+        await destroyPlannerJob(env, runtime, launch).catch(() => undefined);
+        return;
+      }
+      if (current.status === "saving") return;
+      if (current.status !== "queued" && current.status !== "running") {
+        await cleanupPlannerRunRuntime(env, artifactStore, current).catch(() => undefined);
+        return;
+      }
+      launchable = current;
+    }
+    if (
+      !launchable
+      || (launchable.status !== "queued" && launchable.status !== "running")
+      || launchable.runtime?.jobSlug !== runtime.jobSlug
+    ) {
+      if (launchable?.runtime?.jobSlug === runtime.jobSlug) {
+        await cleanupPlannerRunRuntime(env, artifactStore, launchable).catch(() => undefined);
+      } else {
         await destroyPlannerJob(env, runtime, launch).catch(() => undefined);
       }
       return;
@@ -513,43 +577,40 @@ export async function dispatchPlannerRun(options: DispatchPlannerRunOptions): Pr
       launchEnvVars,
     );
     console.error(`[planner] dispatch failed for run ${run.runId}: ${message}`);
+    if (!runtimeClaimedByThisDispatch && runtime) {
+      try {
+        const current = await artifactStore.getPlannerRun(run.runId);
+        if (
+          current
+          && isActiveRun(current)
+          && current.runtime?.jobSlug === runtime.jobSlug
+        ) {
+          // Another exact reconciliation owns this deterministic runtime. A
+          // losing replay may fail while preparing credentials or while
+          // reissuing the backend ensure, but it must not fail or destroy the
+          // launch that won runtime ownership.
+          return;
+        }
+      } catch {
+        // Unknown durable state is not authority to terminalize a run owned by
+        // another dispatch. Its callbacks and watchdog remain the backstop.
+        return;
+      }
+    }
     let failed: PlannerRun | null = null;
     try {
-      failed = await artifactStore.updateActivePlannerRun({
-        runId: run.runId,
-        status: "failed",
-        completedAt: new Date().toISOString(),
-        error: message,
+      const result = await completeReviewerOutput({
+        artifactStore,
+        run,
+        output: { status: "failed", error: message },
+        expectedRuntime: runtimeClaimedByThisDispatch ? runtime : null,
       });
+      failed = result.run;
     } catch {
       // Best effort: the watchdog remains the backstop.
     }
-    if (failed?.status === "failed") {
-      try {
-        await artifactStore.appendPlannerRunEvent({
-          runId: run.runId,
-          repoId: run.repoId,
-          planArtifactId: run.planArtifactId,
-          type: "run_failed",
-          message,
-        });
-      } catch {
-        // The failed run row is authoritative.
-      }
-    }
-    if (run.threadId && failed?.status === "failed") {
-      try {
-        await artifactStore.updateReviewerRunStateIfCurrent({
-          repoId: run.repoId,
-          planArtifactId: run.planArtifactId,
-          threadId: run.threadId,
-          runId: run.runId,
-          status: "failed",
-          error: message,
-        });
-      } catch {
-        // Best effort: the reviewer tab may have been removed.
-      }
+    if (failed) {
+      await broadcastPlanArtifactUpdatedHint(env, run.repoId, run.planArtifactId);
     }
     if (runtime) {
       let cleanupRun = failed;
@@ -557,9 +618,16 @@ export async function dispatchPlannerRun(options: DispatchPlannerRunOptions): Pr
         try {
           cleanupRun = await artifactStore.getPlannerRun(run.runId);
         } catch {
-          cleanupRun = null;
+          // Unknown ArtifactStore state is not proof that cleanup is safe. A
+          // concurrent result may own the persisted runtime in saving.
+          return;
         }
       }
+      // After an ambiguous finalization, every active snapshot can advance via
+      // heartbeat or result callback before external cleanup completes. Keep
+      // its exact runtime and let terminal callbacks or the fenced watchdog
+      // become the authoritative cleanup owner.
+      if (cleanupRun && isActiveRun(cleanupRun)) return;
       if (cleanupRun?.runtime) {
         await cleanupPlannerRunRuntime(env, artifactStore, cleanupRun).catch(() => undefined);
       } else {
@@ -567,104 +635,6 @@ export async function dispatchPlannerRun(options: DispatchPlannerRunOptions): Pr
       }
     }
   }
-}
-
-export async function destroyPlannerJob(
-  env: Env,
-  runtime: PlannerRunRuntimeProvenance,
-  placement: ExecutionPlacement,
-): Promise<void> {
-  try {
-    if (placement.backend === "host") {
-      await getHub(env).requestLocalRunner(placement.machineId, "destroy", runtime.jobSlug, {
-        ...runnerJobCommand(runtime.jobSlug, "absent"),
-      });
-    } else {
-      await getPlannerRunStub(env, runtime.jobSlug).destroyPlannerJob();
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/404|not found/i.test(message)) throw error;
-  }
-}
-
-/** Destroys only the exact retained generation-scoped Plan Writer runtime. */
-export async function destroyPlanWriterRuntime(
-  env: Env,
-  runtime: PlanWriterRuntimeProvenance,
-  placement: ExecutionPlacement,
-): Promise<void> {
-  try {
-    if (placement.backend === "host") {
-      await getHub(env).requestLocalRunner(placement.machineId, "destroy", runtime.jobSlug, {
-        ...runnerJobCommand(runtime.jobSlug, "absent"),
-      });
-    } else {
-      await getPlannerRunStub(env, runtime.jobSlug).destroyPlanWriterRuntime(runtime.jobSlug);
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/404|not found/i.test(message)) throw error;
-  }
-}
-
-/** Read-only exact-generation liveness check used only by explicit Start. */
-export async function inspectPlanWriterRuntime(
-  env: Env,
-  runtime: PlanWriterRuntimeProvenance,
-  placement: ExecutionPlacement,
-): Promise<boolean> {
-  if (placement.backend === "cf") {
-    const inspected = await getPlannerRunStub(env, runtime.jobSlug).inspectPlanWriterRuntime(runtime.jobSlug);
-    return inspected.registered === true && inspected.live === true && inspected.jobSlug === runtime.jobSlug;
-  }
-  try {
-    const inspected = await getHub(env).requestLocalRunner(
-      placement.machineId,
-      "status",
-      runtime.jobSlug,
-      {},
-    );
-    return runtimeStatus(inspected.result) === "running";
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (/404|not found|runner_not_found/i.test(message)) return false;
-    throw error;
-  }
-}
-
-export async function cleanupPlanWriterRuntime(
-  env: Env,
-  artifactStore: ArtifactStoreDO,
-  writer: ReviewerRegistryEntry,
-): Promise<ReviewerRegistryEntry | null> {
-  if (!writer.runtime) return writer;
-  if (writer.provider !== "claude-code" && writer.provider !== "codex") {
-    throw new Error(`Invalid Plan Writer provider: ${writer.provider}`);
-  }
-  if (!writer.launchProvenance) {
-    throw new Error("Plan Writer launch provenance is missing.");
-  }
-  await destroyPlanWriterRuntime(env, writer.runtime, writer.launchProvenance);
-  return await artifactStore.clearPlanWriterRuntimeIfCurrent(writer.threadId, writer.runtime);
-}
-
-// Cleanup for cancel, terminal results, and the watchdog. Best-effort: a
-// missing container is success, and `docker run` without --rm means success
-// paths must call this too or exited containers accumulate on the runner.
-// One-shot reviewer runs only. Plan Writer runtime cleanup has its own path.
-export async function cleanupPlannerRunRuntime(
-  env: Env,
-  artifactStore: ArtifactStoreDO,
-  run: PlannerRun,
-): Promise<PlannerRun | null> {
-  const runtime = run.runtime;
-  if (!runtime) return run;
-  if (!run.launchProvenance) {
-    throw new Error("Planner run launch provenance is missing.");
-  }
-  await destroyPlannerJob(env, runtime, run.launchProvenance);
-  return await artifactStore.clearPlannerRunRuntimeIfCurrent(run.runId, runtime);
 }
 
 export interface EnsurePlanWriterRuntimeOptions {
@@ -694,20 +664,15 @@ export async function ensurePlanWriterRuntime(
   if (writer.role !== "writer" || writer.stoppedAt || !writer.generation || !writer.basisCommit) {
     throw new Error("The plan writer generation is not startable.");
   }
-  if (writer.provider !== "claude-code" && writer.provider !== "codex") {
-    throw new Error("Plan Writer supports only the Claude Code and Codex native TUI adapters.");
+  if (writer.provider !== "claude-code" && writer.provider !== "codex" && writer.provider !== "opencode") {
+    throw new Error("Plan Writer supports only the Claude Code, Codex, and OpenCode native TUI adapters.");
   }
   if (writer.runtime) return writer;
   const launch = writer.launchProvenance;
   if (!launch) {
     throw new Error("Plan Writer launch provenance is missing.");
   }
-  const execution: PlannerDispatchTarget = {
-    backend: launch.backend,
-    machineId: launch.machineId,
-    ...(launch.claudeAuthMode ? { claudeAuthMode: launch.claudeAuthMode } : {}),
-    ...(launch.codexExecution ? { codexExecutionProfile: launch.codexExecution } : {}),
-  };
+  const execution = plannerDispatchTargetFromLaunch(launch);
   const generation = writer.generation;
   const terminalId = planWriterTerminalId(writer.repoId, writer.planArtifactId, generation);
   const jobSlug = terminalId;

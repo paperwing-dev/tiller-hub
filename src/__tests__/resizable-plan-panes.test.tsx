@@ -65,6 +65,9 @@ describe("ResizablePlanPanes", () => {
 
     expect(screen.getByTestId("plan-artifact-pane"))
       .toHaveClass("flex", "min-h-0", "flex-col", "overflow-hidden");
+    expect(screen.queryByRole("button", { name: "Minimize agent terminal" }))
+      .not.toBeInTheDocument();
+    expect(screen.getByTestId("plan-reviewers-pane")).not.toHaveAttribute("hidden");
   });
 
   it("resizes the Plan artifact and Plan Reviewers panes by dragging the divider", () => {
@@ -84,15 +87,21 @@ describe("ResizablePlanPanes", () => {
     vi.spyOn(reviewers, "getBoundingClientRect").mockReturnValue(rect(320));
 
     expect(divider).toHaveAttribute("aria-orientation", "horizontal");
-    fireEvent.mouseDown(divider, { clientY: 500 });
-    fireEvent.mouseMove(window, { clientY: 400 });
+    fireEvent.pointerDown(divider, { button: 0, clientY: 500, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientY: 400, pointerId: 1 });
 
     expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 420px");
 
-    fireEvent.mouseUp(window);
+    fireEvent.pointerUp(window, { pointerId: 1 });
     expect(window.localStorage.getItem("tiller:plan-reviewers-height")).toBe("420");
-    fireEvent.mouseMove(window, { clientY: 300 });
+    fireEvent.pointerMove(window, { clientY: 300, pointerId: 1 });
     expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 420px");
+
+    fireEvent.pointerDown(divider, { button: 0, clientY: 500, pointerId: 2 });
+    fireEvent.pointerMove(window, { clientY: 1_000, pointerId: 2 });
+    expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 160px");
+    fireEvent.pointerUp(window, { pointerId: 2 });
+    expect(window.localStorage.getItem("tiller:plan-reviewers-height")).toBe("160");
   });
 
   it("supports keyboard resizing and keeps both panes usable", () => {
@@ -115,9 +124,10 @@ describe("ResizablePlanPanes", () => {
     expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 344px");
     expect(window.localStorage.getItem("tiller:plan-reviewers-height")).toBe("344");
 
-    fireEvent.mouseDown(divider, { clientY: 500 });
-    fireEvent.mouseMove(window, { clientY: -500 });
-    expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 616px");
+    fireEvent.pointerDown(divider, { button: 0, clientY: 500, pointerId: 2 });
+    fireEvent.pointerMove(window, { clientY: -500, pointerId: 2 });
+    expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 668px");
+    fireEvent.pointerUp(window, { pointerId: 2 });
   });
 
   it("restores and clamps a persisted reviewer height", () => {
@@ -132,7 +142,7 @@ describe("ResizablePlanPanes", () => {
     );
 
     expect(screen.getByTestId("plan-pane-layout").style.gridTemplateRows)
-      .toBe("minmax(0, 1fr) 4px 616px");
+      .toBe("minmax(0, 1fr) 4px 668px");
   });
 
   it("ignores malformed persisted heights", () => {
@@ -147,7 +157,7 @@ describe("ResizablePlanPanes", () => {
     );
 
     expect(screen.getByTestId("plan-pane-layout").style.gridTemplateRows)
-      .toBe("minmax(0, 1fr) 4px minmax(220px, 0.9fr)");
+      .toBe("minmax(0, 1fr) 4px minmax(160px, 0.9fr)");
   });
 
   it("re-clamps the preferred height when its container changes size", () => {
@@ -167,7 +177,7 @@ describe("ResizablePlanPanes", () => {
 
     containerHeight = 500;
     act(() => observer.notify());
-    expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 316px");
+    expect(layout.style.gridTemplateRows).toBe("minmax(0, 1fr) 4px 368px");
 
     containerHeight = 900;
     act(() => observer.notify());

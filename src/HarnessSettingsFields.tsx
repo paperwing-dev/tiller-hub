@@ -88,6 +88,7 @@ interface HarnessSettingsFieldsProps {
   value: HarnessSettings;
   credentialStatus: HarnessCredentialStatus;
   disabled?: boolean;
+  showFastMode?: boolean;
   className?: string;
   settingsPath?: string;
   onRefreshSettings?: () => Promise<void>;
@@ -100,6 +101,7 @@ export default function HarnessSettingsFields({
   value,
   credentialStatus,
   disabled = false,
+  showFastMode = true,
   className,
   settingsPath,
   onRefreshSettings,
@@ -170,7 +172,7 @@ export default function HarnessSettingsFields({
         }}
       />
 
-      {selectedModelSupportsFastMode && (
+      {showFastMode && selectedModelSupportsFastMode && (
         <FastModeField
           className="mt-3"
           checked={Boolean(value.fastMode)}

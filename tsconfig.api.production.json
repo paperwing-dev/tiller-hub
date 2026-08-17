@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["api/**/*.ts", "shared/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "api/**/__tests__/**",
+    "api/**/*.test.ts",
+    "test/**",
+    "test-support/**"
+  ]
+}

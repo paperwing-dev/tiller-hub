@@ -43,10 +43,12 @@ vi.mock("../api/env/container-auth", () => ({
 }));
 
 const {
+  SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE,
   STARTUP_PLAN_IMPLEMENTATION_PREAMBLE,
   buildContainerLaunchConfig,
   buildStartupPlanDocument,
   materializeStartupPlan,
+  withStartCausePreamble,
 } = await import("../api/env/launch-config");
 
 function createLaunchEnv(repoSessionEnvVars: Record<string, string> = {}) {
@@ -164,6 +166,20 @@ describe("buildContainerLaunchConfig", () => {
 });
 
 describe("startup plan materialization", () => {
+  it("uses the concise canonical preamble for ordinary and scheduled runs", () => {
+    const plan = "## Steps\n\n- Update the launch config.";
+    const document = buildStartupPlanDocument(plan);
+
+    expect(withStartCausePreamble(document, "ordinary")).toBe(document);
+    const scheduledDocument = [
+      STARTUP_PLAN_IMPLEMENTATION_PREAMBLE,
+      SCHEDULED_RUN_IMPLEMENTATION_PREAMBLE,
+      plan,
+    ].join("\n\n");
+    expect(withStartCausePreamble(document, "scheduled")).toBe(scheduledDocument);
+    expect(withStartCausePreamble(scheduledDocument, "scheduled")).toBe(scheduledDocument);
+  });
+
   it("writes selected plans with the implementation preamble before the plan body", async () => {
     const planBody = "## Steps\n\n- Update the launch config.";
     const writeWorkspaceFile = vi.fn();

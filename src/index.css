@@ -5,34 +5,4409 @@
 @source "../../../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
 
 @theme {
-  --font-sans:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --font-mono: "SF Mono", SFMono-Regular, ui-monospace, monospace;
+  --font-sans: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-serif: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono:
+    "SF Mono", "Fira Code", "Fira Mono", "Roboto Mono", "Courier New", monospace;
 }
 
 :root {
+  color-scheme: light;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* Palette primitives let the current visual language and the previous light
+     colors share the exact same component geometry and interaction styling. */
+  --tiller-theme-surface: #fbf4ed;
+  --tiller-theme-foreground: #152c49;
+  --tiller-theme-action: #152c49;
+  --tiller-theme-action-hover: #0f223a;
+  --tiller-theme-on-action: #fbf4ed;
+  --tiller-theme-strong-border: #152c49;
+  --tiller-theme-fixed-ink: #152c49;
+  --tiller-theme-fixed-action: #152c49;
+  --tiller-theme-fixed-paper: #fbf4ed;
+  --tiller-theme-structure: var(--tiller-theme-fixed-ink);
+  --tiller-theme-highlight: #eff4d2;
+  --tiller-theme-code-surface: #eef5fb;
+  --tiller-theme-live: #00a878;
+
+  /* Paperwing day-watch palette. Keep Tiller's semantic token structure while
+     using the same warm paper and navy ink as paperwing.dev. */
+  --paperwing-background: var(--tiller-theme-surface);
+  --paperwing-ink: var(--tiller-theme-foreground);
+  --paperwing-ink-dim: var(--paperwing-ink);
+  --paperwing-ink-faint: var(--paperwing-ink);
+  --paperwing-ink-ghost: rgb(21 44 73 / 18%);
+  --paperwing-ink-subtle: rgb(21 44 73 / 8%);
+  --paperwing-plan-paper: #fefffe;
+  --paperwing-signal-danger: #e73121;
+  --paperwing-signal-update: #1f6feb;
+  --paperwing-signal-live: #00d6b6;
+  --paperwing-signal-warning: var(--paperwing-ink);
+  --paperwing-signal-churning: #9a6700;
+
+  --color-kumo-canvas: var(--paperwing-background);
+  --color-kumo-elevated: var(--paperwing-background);
+  --color-kumo-recessed: var(--paperwing-background);
+  --color-kumo-base: var(--paperwing-background);
+  --color-kumo-tint: var(--paperwing-ink-subtle);
+  --color-kumo-contrast: var(--paperwing-ink);
+  --color-kumo-overlay: var(--paperwing-background);
+  --color-kumo-control: var(--paperwing-background);
+  --color-kumo-interact: var(--paperwing-ink-ghost);
+  --color-kumo-fill: rgb(21 44 73 / 12%);
+  --color-kumo-fill-hover: rgb(21 44 73 / 16%);
+  --color-kumo-brand: var(--paperwing-ink);
+  --color-kumo-brand-hover: color-mix(in srgb, var(--paperwing-ink) 86%, black);
+  --color-kumo-line: var(--paperwing-ink);
+  --color-kumo-hairline: var(--paperwing-ink);
+  --color-kumo-focus: var(--paperwing-ink);
+  --color-kumo-shadow-edge: rgb(21 44 73 / 16%);
+  --color-kumo-shadow-drop: rgb(21 44 73 / 12%);
+  --color-kumo-tip-shadow: rgb(21 44 73 / 12%);
+  --color-kumo-tip-stroke: transparent;
+  --color-kumo-info-tint: var(--paperwing-ink-subtle);
+  --color-kumo-info: var(--paperwing-ink);
+  --color-kumo-banner-info: var(--paperwing-ink-subtle);
+
+  --text-color-kumo-default: var(--paperwing-ink);
+  --text-color-kumo-inverse: var(--paperwing-ink);
+  --text-color-kumo-strong: var(--paperwing-ink);
+  --text-color-kumo-subtle: var(--paperwing-ink);
+  --text-color-kumo-inactive: var(--paperwing-ink);
+  --text-color-kumo-placeholder: var(--paperwing-ink);
+  --text-color-kumo-brand: var(--paperwing-ink);
+  --text-color-kumo-link: var(--paperwing-ink);
+  --text-color-kumo-info: var(--paperwing-ink);
+  --text-color-kumo-danger: var(--paperwing-ink);
+  --text-color-kumo-success: var(--paperwing-ink);
+  --text-color-kumo-warning: var(--paperwing-ink);
+  --text-color-kumo-badge-inverted: var(--paperwing-ink);
+  --text-color-kumo-badge-neutral-subtle: var(--paperwing-ink);
+  --text-color-kumo-badge-orange-subtle: var(--paperwing-ink);
+  --text-color-kumo-badge-teal-subtle: var(--paperwing-ink);
+  --color-kumo-badge-inverted: var(--paperwing-ink-subtle);
+}
+
+:root[data-mode="dark"] {
+  color-scheme: dark;
+
+  --tiller-theme-surface: #000f1f;
+  --tiller-theme-foreground: #fbf4ed;
+  --tiller-theme-action: #fbf4ed;
+  --tiller-theme-action-hover: #0f223a;
+  --tiller-theme-on-action: #000f1f;
+  --tiller-theme-strong-border: #152c49;
+  --tiller-theme-structure: var(--tiller-theme-action);
+  --tiller-theme-highlight: #eff4d2;
+  --tiller-theme-code-surface: #eef5fb;
+  --tiller-theme-live: #00a878;
+
+  /* Paperwing night-watch palette. */
+  --paperwing-background: var(--tiller-theme-surface);
+  --paperwing-ink: var(--tiller-theme-foreground);
+  --paperwing-ink-dim: rgb(253 254 252 / 58%);
+  --paperwing-ink-faint: rgb(253 254 252 / 40%);
+  --paperwing-ink-ghost: rgb(253 254 252 / 15%);
+  --paperwing-ink-subtle: rgb(253 254 252 / 6%);
+  --paperwing-plan-paper: color-mix(
+    in srgb,
+    var(--paperwing-background) 94%,
+    var(--paperwing-ink)
+  );
+  --paperwing-signal-danger: #e73121;
+  --paperwing-signal-update: #58a6ff;
+  --paperwing-signal-live: #00d6b6;
+  --paperwing-signal-warning: var(--paperwing-ink);
+  --paperwing-signal-churning: #d29922;
+
+  --color-kumo-canvas: color-mix(
+    in srgb,
+    var(--paperwing-background) 82%,
+    black
+  );
+  --color-kumo-elevated: color-mix(
+    in srgb,
+    var(--paperwing-background) 94%,
+    var(--paperwing-ink)
+  );
+  --color-kumo-recessed: color-mix(
+    in srgb,
+    var(--paperwing-background) 90%,
+    black
+  );
+  --color-kumo-base: var(--paperwing-background);
+  --color-kumo-tint: var(--paperwing-ink-subtle);
+  --color-kumo-contrast: var(--paperwing-ink);
+  --color-kumo-overlay: rgb(253 254 252 / 8%);
+  --color-kumo-control: rgb(253 254 252 / 6%);
+  --color-kumo-interact: var(--paperwing-ink-ghost);
+  --color-kumo-fill: rgb(253 254 252 / 12%);
+  --color-kumo-fill-hover: rgb(253 254 252 / 16%);
+  --color-kumo-brand: var(--paperwing-ink);
+  --color-kumo-brand-hover: color-mix(
+    in srgb,
+    var(--paperwing-ink) 88%,
+    var(--paperwing-background)
+  );
+  --color-kumo-line: var(--paperwing-ink-ghost);
+  --color-kumo-hairline: rgb(253 254 252 / 9%);
+  --color-kumo-focus: var(--paperwing-ink);
+  --color-kumo-shadow-edge: rgb(0 0 0 / 38%);
+  --color-kumo-shadow-drop: rgb(0 0 0 / 46%);
+  --color-kumo-tip-shadow: transparent;
+  --color-kumo-tip-stroke: rgb(253 254 252 / 12%);
+  --color-kumo-info-tint: var(--paperwing-ink-subtle);
+  --color-kumo-info: var(--paperwing-ink);
+  --color-kumo-banner-info: var(--paperwing-ink-subtle);
+
+  --text-color-kumo-default: var(--paperwing-ink);
+  --text-color-kumo-inverse: var(--paperwing-background);
+  --text-color-kumo-strong: var(--paperwing-ink);
+  --text-color-kumo-subtle: var(--paperwing-ink-dim);
+  --text-color-kumo-inactive: var(--paperwing-ink-faint);
+  --text-color-kumo-placeholder: var(--paperwing-ink-faint);
+  --text-color-kumo-brand: var(--paperwing-ink);
+  --text-color-kumo-link: var(--paperwing-ink);
+  --text-color-kumo-info: var(--paperwing-ink);
+  --text-color-kumo-badge-inverted: var(--paperwing-background);
+  --color-kumo-badge-inverted: var(--paperwing-ink);
+}
+
+/* The pre-redesign light palette. Only color tokens change here; typography,
+   spacing, borders, component placement, and interactions remain shared with
+   the current interface. */
+:root[data-theme="classic-light"] {
+  color-scheme: light;
+
+  --tiller-theme-surface: #ffffff;
+  --tiller-theme-foreground: #24292f;
+  --tiller-theme-action: #0969da;
+  --tiller-theme-action-hover: #0550ae;
+  --tiller-theme-on-action: #ffffff;
+  --tiller-theme-strong-border: #d0d7de;
+  --tiller-theme-fixed-ink: #24292f;
+  --tiller-theme-fixed-action: #0969da;
+  --tiller-theme-fixed-paper: #ffffff;
+  --tiller-theme-structure: var(--tiller-theme-fixed-ink);
+  --tiller-theme-highlight: #f6f8fa;
+  --tiller-theme-code-surface: #f6f8fa;
+  --tiller-theme-live: #1a7f37;
+
+  --paperwing-background: var(--tiller-theme-surface);
+  --paperwing-ink: var(--tiller-theme-foreground);
+  --paperwing-ink-dim: #57606a;
+  --paperwing-ink-faint: #8c959f;
+  --paperwing-ink-ghost: rgb(36 41 47 / 15%);
+  --paperwing-ink-subtle: #f6f8fa;
+  --paperwing-plan-paper: #ffffff;
+  --paperwing-signal-danger: #cf222e;
+  --paperwing-signal-update: var(--tiller-theme-action);
+  --paperwing-signal-live: var(--tiller-theme-live);
+  --paperwing-signal-warning: #9a6700;
+  --paperwing-signal-churning: #9a6700;
+
+  --color-kumo-canvas: var(--color-kumo-neutral-25, oklch(98.75% 0 0));
+  --color-kumo-elevated: var(--color-kumo-neutral-75, oklch(98% 0 0));
+  --color-kumo-recessed: var(--color-kumo-neutral-125, oklch(96% 0 0));
+  --color-kumo-base: var(--color-white, #fff);
+  --color-kumo-tint: var(--color-neutral-100, oklch(97% 0 0));
+  --color-kumo-contrast: var(--color-kumo-neutral-975, oklch(8.5% 0 0));
+  --color-kumo-overlay: var(--color-kumo-neutral-50, oklch(97.5% 0 0));
+  --color-kumo-control: var(--color-white, #fff);
+  --color-kumo-interact: var(--color-neutral-300, oklch(87% 0 0));
+  --color-kumo-fill: var(--color-neutral-200, oklch(92.2% 0 0));
+  --color-kumo-fill-hover: var(--color-kumo-neutral-125, oklch(96.5% 0 0));
+  --color-kumo-brand: oklch(0.5772 0.2324 260);
+  --color-kumo-brand-hover: var(--color-blue-700, oklch(48.8% 0.243 264.376));
+  --color-kumo-line: oklch(14.5% 0 0 / 0.1);
+  --color-kumo-hairline: var(--color-kumo-neutral-150, oklch(93.5% 0 0));
+  --color-kumo-focus: var(--color-kumo-neutral-950, oklch(15% 0 0));
+  --color-kumo-shadow-edge: oklch(0% 0 0 / 0.12);
+  --color-kumo-shadow-drop: oklch(0% 0 0 / 0.08);
+  --color-kumo-tip-shadow: var(--color-gray-200, oklch(92.8% 0.006 264.531));
+  --color-kumo-tip-stroke: transparent;
+  --color-kumo-info-tint: oklch(93.2% 0.032 255.6 / 0.45);
+  --color-kumo-info: var(--color-blue-500, oklch(68.5% 0.169 237.323));
+  --color-kumo-success: var(--tiller-theme-live);
+
+  --text-color-kumo-default: var(--color-neutral-900, oklch(21% 0.006 285.885));
+  --text-color-kumo-inverse: var(--color-neutral-100, oklch(97% 0 0));
+  --text-color-kumo-strong: var(--color-neutral-950, oklch(14.5% 0 0));
+  --text-color-kumo-subtle: var(--color-neutral-500, oklch(55.6% 0 0));
+  --text-color-kumo-inactive: var(--color-neutral-300, oklch(87% 0 0));
+  --text-color-kumo-placeholder: var(--color-neutral-400, oklch(70.8% 0 0));
+  --text-color-kumo-brand: #f6821f;
+  --text-color-kumo-link: var(--color-blue-800, oklch(42.4% 0.199 265.638));
+  --text-color-kumo-info: var(--color-blue-800, oklch(42.4% 0.199 265.638));
+  --text-color-kumo-success: var(--color-emerald-800, oklch(43.2% 0.095 166.913));
+  --text-color-kumo-danger: var(--color-red-700, oklch(50.5% 0.213 27.518));
+  --text-color-kumo-warning: oklch(59.7% 0.144 57.5);
+  --text-color-kumo-badge-inverted: var(--color-white, #fff);
+  --text-color-kumo-badge-neutral-subtle: var(--color-neutral-800, oklch(26.9% 0 0));
+  --text-color-kumo-badge-orange-subtle: var(--color-orange-800, oklch(47% 0.157 37.304));
+  --text-color-kumo-badge-teal-subtle: var(--color-teal-800, oklch(43.7% 0.078 188.216));
+  --color-kumo-badge-inverted: var(--color-neutral-950, oklch(14.5% 0 0));
 }
 
 body {
   @apply bg-kumo-base text-kumo-default font-sans min-h-screen;
 }
 
+/* Canonical square controls for the plan-agent workspace. Text controls use a
+   32px row, 12px type, and 12px horizontal padding; icon-only controls use the
+   same 32px square so mixed control rows stay optically aligned. */
+.tiller-square-button {
+  display: inline-flex;
+  height: 2rem;
+  min-width: 2rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border: 1px solid var(--color-kumo-line);
+  border-radius: 0;
+  background: var(--color-kumo-base);
+  padding-inline: 0.75rem;
+  color: var(--text-color-kumo-default);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1rem;
+}
+
+.tiller-square-button--icon {
+  width: 2rem;
+  padding-inline: 0;
+}
+
+.tiller-square-button--icon-label {
+  padding-left: 0.625rem;
+  padding-right: 0.75rem;
+}
+
+.tiller-square-button--primary {
+  border-color: var(--tiller-theme-action);
+  background: var(--tiller-theme-action);
+  color: var(--tiller-theme-on-action);
+}
+
+.tiller-square-button--secondary {
+  background: var(--color-kumo-base);
+  color: var(--text-color-kumo-default);
+}
+
+.tiller-first-plan-button {
+  height: 2.5rem;
+}
+
+.tiller-plan-toolbar-button {
+  width: 2.5rem !important;
+  min-width: 2.5rem !important;
+  height: 2.5rem !important;
+  min-height: 2.5rem !important;
+  border-radius: 0 !important;
+  transition-property: color, background-color, transform;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.tiller-plan-toolbar-button:active {
+  transform: scale(0.96);
+}
+
+.tiller-reviewer-send-button--disabled:disabled {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 32%,
+    transparent
+  ) !important;
+  background: transparent !important;
+  color: color-mix(in srgb, var(--paperwing-ink) 42%, transparent) !important;
+  opacity: 1 !important;
+}
+
+/* Polished agent composers expose slash-command skills as a persistent secondary
+   action. The composer itself is the size container so the label collapses
+   based on the terminal width instead of the browser viewport. */
+.tiller-skill-composer {
+  container-type: inline-size;
+}
+
+.tiller-skill-trigger {
+  display: inline-flex;
+  width: auto;
+  min-width: 4.75rem;
+  height: 2.5rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border: 1px solid var(--color-kumo-line);
+  border-radius: 0;
+  background: transparent;
+  padding-inline: 0.75rem;
+  color: var(--text-color-kumo-default);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1rem;
+  transition-property: background-color, border-color, color, transform;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.tiller-skill-trigger:not(:disabled):hover,
+.tiller-skill-trigger:focus-visible,
+.tiller-skill-trigger[aria-expanded="true"] {
+  border-color: var(--paperwing-ink);
+  background: var(--color-kumo-tint);
+}
+
+.tiller-skill-trigger:focus-visible {
+  outline: 2px solid var(--paperwing-ink);
+  outline-offset: 1px;
+}
+
+.tiller-skill-trigger:not(:disabled):active {
+  transform: scale(0.96);
+}
+
+.tiller-skill-trigger:disabled {
+  border-color: color-mix(in srgb, var(--paperwing-ink) 32%, transparent);
+  background: transparent;
+  color: color-mix(in srgb, var(--paperwing-ink) 45%, transparent);
+  opacity: 1;
+}
+
+.tiller-composer-send-button {
+  width: 2.5rem;
+  min-width: 2.5rem;
+  height: 2.5rem;
+}
+
+.tiller-composer-send-button:disabled {
+  border-color: transparent !important;
+}
+
+@container (max-width: 32rem) {
+  .tiller-skill-trigger {
+    width: 2.5rem;
+    min-width: 2.5rem;
+    padding-inline: 0;
+  }
+
+  .tiller-skill-trigger-label {
+    display: none;
+  }
+}
+
+/* Reviewer output is conversational Markdown, not a second full plan page.
+   Keep its hierarchy readable without letting generated headings overpower the
+   surrounding agent workspace. */
+.tiller-reviewer-markdown {
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+}
+
+.tiller-reviewer-markdown h1,
+.tiller-reviewer-markdown h2,
+.tiller-reviewer-markdown h3,
+.tiller-reviewer-markdown h4 {
+  text-wrap: balance;
+}
+
+.tiller-reviewer-markdown h1 {
+  margin-top: 1rem;
+  padding-bottom: 0.375rem;
+  font-size: 1rem;
+}
+
+.tiller-reviewer-markdown h2 {
+  margin-top: 0.875rem;
+  padding-bottom: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.tiller-reviewer-markdown h3,
+.tiller-reviewer-markdown h4 {
+  margin-top: 0.75rem;
+  font-size: 0.8125rem;
+}
+
+.tiller-reviewer-markdown p,
+.tiller-reviewer-markdown li {
+  text-wrap: pretty;
+}
+
+/* The UI-only design prototype is flat by default. Semantic cards and overlays
+   opt into the shared elevated surface below; keep both rules scoped to design
+   mode so the prototype does not alter the shipped interface. */
+:root body *,
+:root body *::before,
+:root body *::after {
+  box-shadow: none !important;
+}
+
+:root body button,
+:root body button::before,
+:root body button::after {
+  border-radius: var(--tiller-button-radius, 0) !important;
+  box-shadow: none !important;
+}
+
+:root {
+  --tiller-card-fill: var(--tiller-theme-fixed-paper);
+  --tiller-card-stroke: var(--tiller-theme-strong-border);
+  --tiller-card-stroke-soft: color-mix(
+    in srgb,
+    var(--tiller-theme-strong-border) 78%,
+    var(--tiller-theme-fixed-paper)
+  );
+  --tiller-floating-shadow: 0 2px 8px 0 color-mix(in srgb, var(--tiller-theme-fixed-ink) 12%, transparent);
+  --tiller-modal-shadow: 0 8px 24px 0 color-mix(in srgb, var(--tiller-theme-fixed-ink) 14%, transparent);
+}
+
+:root:not([data-theme="classic-light"]):not([data-mode="dark"]) body *,
+:root:not([data-theme="classic-light"]):not([data-mode="dark"]) body *::before,
+:root:not([data-theme="classic-light"]):not([data-mode="dark"]) body *::after {
+  color: var(--paperwing-ink) !important;
+}
+
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  body
+  ::placeholder {
+  color: var(--paperwing-ink) !important;
+  opacity: 1;
+}
+
+:root:not([data-mode="dark"]) body [data-kumo-component="Button"].bg-kumo-brand,
+:root:not([data-mode="dark"]) body [data-kumo-component="Button"].bg-kumo-brand * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root body button[data-kumo-component="Button"][class*="!text-white"],
+:root body button[data-kumo-component="Button"][class*="!text-white"] * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"]) body .tiller-settings-scope-active,
+:root:not([data-mode="dark"]) body .tiller-settings-scope-active *,
+:root[data-mode="dark"] body .tiller-settings-scope-active,
+:root[data-mode="dark"] body .tiller-settings-scope-active * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+/* Settings use spacing and low-contrast rules for hierarchy. Interactive rows
+   carry their own hover state so actions stay discoverable without outlining
+   every nested group. */
+:root .tiller-settings-intro,
+:root .tiller-settings-section,
+:root .tiller-settings-nav-link {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 18%,
+    transparent
+  ) !important;
+}
+
+.tiller-settings-nav-link {
+  min-height: 3.5rem;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root .tiller-settings-panel {
+  border: 0 !important;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--paperwing-ink) 16%, transparent) !important;
+  background-color: transparent !important;
+  transition-duration: 120ms;
+  transition-property: background-color;
+  transition-timing-function: ease-out;
+  padding-inline: 0 !important;
+}
+
+:root .tiller-settings-panel:hover,
+:root .tiller-settings-panel:focus-within {
+  background-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 3.5%,
+    transparent
+  ) !important;
+}
+
+:root .tiller-settings-panel:last-child {
+  border-bottom-color: transparent !important;
+}
+
+:root body .tiller-settings-field {
+  display: block;
+  min-width: 0;
+}
+
+:root body .tiller-settings-field-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--paperwing-ink) !important;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 15px;
+}
+
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"] {
+  width: 100% !important;
+  min-height: 40px !important;
+  height: 40px !important;
+  border: 0 !important;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--paperwing-ink) 28%, transparent) !important;
+  border-radius: 0 !important;
+  background-color: transparent !important;
+  padding-inline: 0 !important;
+  box-shadow: none !important;
+  color: var(--paperwing-ink) !important;
+  font-size: 12px !important;
+  line-height: 18px !important;
+  transition-duration: 120ms;
+  transition-property: border-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover,
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible,
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"] {
+  border-bottom-color: var(--paperwing-ink) !important;
+  background-color: transparent !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible,
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"] {
+  border-bottom-width: 2px !important;
+  outline: none !important;
+}
+
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover
+  *,
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible
+  *,
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  * {
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover
+  > span[aria-hidden="true"]::before,
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible
+  > span[aria-hidden="true"]::before,
+:root
+  body
+  button.tiller-settings-select[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  > span[aria-hidden="true"]::before {
+  border-right-color: var(--paperwing-ink) !important;
+  border-bottom-color: var(--paperwing-ink) !important;
+}
+
+:root body .tiller-settings-subsection-title {
+  color: var(--paperwing-ink) !important;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+}
+
+:root body .tiller-settings-helper {
+  max-width: 60ch;
+  color: color-mix(in srgb, var(--paperwing-ink) 68%, transparent) !important;
+  font-size: 11px;
+  line-height: 16px;
+  text-wrap: pretty;
+}
+
+:root body .tiller-settings-row-list {
+  border-top: 1px solid
+    color-mix(in srgb, var(--paperwing-ink) 16%, transparent);
+}
+
+:root .tiller-settings-subpanel {
+  border: 0 !important;
+  background-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 4%,
+    transparent
+  ) !important;
+}
+
+:root .tiller-settings-data-list {
+  border: 0 !important;
+  border-top: 1px solid
+    color-mix(in srgb, var(--paperwing-ink) 22%, transparent) !important;
+  background-color: transparent !important;
+}
+
+:root .tiller-settings-data-header {
+  min-height: 2.5rem;
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 16%,
+    transparent
+  ) !important;
+}
+
+:root .tiller-settings-data-row {
+  min-height: 3.5rem;
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 11%,
+    transparent
+  ) !important;
+  transition-duration: 120ms;
+  transition-property: background-color;
+  transition-timing-function: ease-out;
+}
+
+:root .tiller-settings-data-row:last-child {
+  border-bottom-color: transparent !important;
+}
+
+:root .tiller-settings-data-row:hover,
+:root .tiller-settings-data-row:focus-within {
+  background-color: color-mix(in srgb, var(--paperwing-ink) 5%, transparent);
+}
+
+.tiller-settings-checkbox-cell {
+  display: flex;
+  min-width: 2.5rem;
+  min-height: 2.5rem;
+  align-items: center;
+  justify-content: center;
+}
+
+:root
+  body
+  .tiller-settings-checkbox[role="checkbox"] {
+  margin: 0 !important;
+}
+
+/* Paperwing's ink is both its checked fill and its default icon color. Use the
+   theme highlight for this compact boolean so the enabled state stays legible. */
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  body
+  .tiller-mcp-enabled-checkbox[role="checkbox"] {
+  background-color: var(--paperwing-background);
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 42%, transparent);
+}
+
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  body
+  .tiller-mcp-enabled-checkbox[role="checkbox"][data-checked] {
+  background-color: var(--tiller-theme-highlight);
+  border-color: var(--tiller-theme-action);
+}
+
+:root body button.tiller-settings-row-action {
+  min-height: 2rem;
+  border-color: transparent !important;
+  background-color: transparent !important;
+  opacity: 0;
+  transition-duration: 120ms;
+  transition-property: background-color, color, opacity;
+  transition-timing-function: ease-out;
+}
+
+:root
+  .tiller-settings-data-row:hover
+  button.tiller-settings-row-action,
+:root
+  .tiller-settings-data-row:focus-within
+  button.tiller-settings-row-action {
+  opacity: 1;
+}
+
+:root
+  body
+  button.tiller-settings-row-action:not(:disabled):hover,
+:root
+  body
+  button.tiller-settings-row-action:not(:disabled):focus-visible {
+  background-color: var(--color-kumo-danger-tint) !important;
+}
+
+:root .tiller-settings-add-row {
+  background-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 3.5%,
+    transparent
+  ) !important;
+}
+
+@media (hover: none) {
+  :root body button.tiller-settings-row-action {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiller-settings-nav-link,
+  :root .tiller-settings-panel,
+  :root .tiller-settings-data-row,
+  :root body button.tiller-settings-row-action {
+    transition: none;
+  }
+}
+
+::selection {
+  color: var(--tiller-theme-on-action);
+  background: color-mix(
+    in srgb,
+    var(--tiller-theme-action) 72%,
+    transparent
+  );
+}
+
+/* All interface copy stays navy, so filled actions use a pale navy tint rather
+   than reversing their labels to cream or white. */
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  .bg-kumo-brand {
+  background-color: var(--paperwing-ink-subtle) !important;
+}
+
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  .bg-kumo-brand:hover {
+  background-color: color-mix(in srgb, var(--tiller-theme-fixed-ink) 14%, transparent) !important;
+}
+
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  .bg-kumo-danger {
+  background-color: var(--color-kumo-danger-tint) !important;
+}
+
+.tiller-create-plan-button {
+  border-color: transparent;
+  background-color: transparent;
+}
+
+.tiller-create-plan-button:hover {
+  border-color: var(--tiller-theme-action-hover);
+  background-color: var(--tiller-theme-action-hover);
+}
+
+:root:not([data-mode="dark"]) body button.tiller-create-plan-submit-ready {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-create-plan-submit-ready:hover {
+  background-color: var(--tiller-theme-action-hover) !important;
+}
+
+:root:not([data-mode="dark"]) body button.tiller-create-plan-submit-ready *,
+:root[data-mode="dark"] body button.tiller-create-plan-submit-ready,
+:root[data-mode="dark"] body button.tiller-create-plan-submit-ready * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+.tiller-plan-blueprint {
+  background-color: var(--paperwing-plan-paper);
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--tiller-theme-fixed-ink) 4%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--tiller-theme-fixed-ink) 4%, transparent) 1px, transparent 1px);
+  background-position: -1px -1px;
+  background-size: 10px 10px;
+}
+
+.tiller-plan-page {
+  padding-inline: clamp(2rem, 7%, 6rem);
+}
+
+.tiller-blueprint-empty-state {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: clamp(3rem, 10vh, 5.5rem) clamp(2rem, 7%, 6rem);
+}
+
+.tiller-agent-empty-state {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 1.5rem 1.75rem;
+}
+
+.tiller-workspace-sidebar,
+.tiller-workspace-sidebar-shell {
+  --color-kumo-hairline: color-mix(
+    in srgb,
+    var(--paperwing-ink) 10%,
+    transparent
+  );
+}
+
+.tiller-workspace-sidebar {
+  --color-kumo-line: color-mix(in srgb, var(--paperwing-ink) 18%, transparent);
+}
+
+.tiller-workspace-sidebar-shell {
+  --color-kumo-line: var(--tiller-theme-structure);
+}
+
+.tiller-workspace-sidebar-header {
+  border-bottom-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 14%,
+    transparent
+  );
+}
+
+/* Workspace counts are persistent navigation metadata. */
+.tiller-hover-count-metadata [data-workspace-count] {
+  opacity: 1;
+}
+
+.tiller-hover-count-metadata [data-workspace-signal] {
+  order: -1;
+}
+
+.tiller-workspace-sidebar-action {
+  border: 0;
+  background: transparent;
+}
+
+.tiller-workspace-sidebar-action::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 40px;
+  height: 40px;
+  content: "";
+  transform: translate(-50%, -50%);
+}
+
+.tiller-workspace-sidebar-section .tiller-workspace-sidebar-action::after {
+  height: 32px;
+}
+
+/* Polished notifications use the same paper card language as the surrounding
+   workspace. Status lives in the small shared diamond; the surface itself
+   stays neutral so the message and action remain easy to scan. */
+:root body [role="dialog"][style*="--toast-index"] {
+  width: min(22rem, calc(100vw - 32px)) !important;
+  height: auto !important;
+  min-height: 0 !important;
+  border: 1px solid var(--tiller-theme-strong-border) !important;
+  border-radius: 1px !important;
+  background-color: var(--tiller-theme-fixed-paper) !important;
+  box-shadow: var(--tiller-floating-shadow) !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+  padding: 12px 14px !important;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  > div:first-child {
+  display: none;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  *,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  *::before,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  *::after {
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  [data-toast-icon] {
+  display: none;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  div:has(> [data-toast-icon])::before {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  background-color: var(--tiller-theme-fixed-action);
+  clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+  content: "";
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"].ring-kumo-success
+  div:has(> [data-toast-icon])::before {
+  background-color: var(--tiller-theme-live);
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  [data-toast-title] {
+  color: var(--tiller-theme-fixed-ink) !important;
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  line-height: 18px !important;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  [data-toast-title]
+  + p {
+  margin-top: 1px;
+  color: color-mix(in srgb, var(--tiller-theme-fixed-ink) 76%, transparent) !important;
+  font-size: 12px !important;
+  line-height: 17px !important;
+  text-wrap: pretty;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  div:has(> [data-toast-title]) {
+  gap: 0 !important;
+  padding-right: 24px;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  [data-toast-title]
+  ~ div {
+  margin-top: 8px !important;
+  padding: 0 !important;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"] {
+  min-height: 32px;
+  border: 1px solid var(--tiller-theme-strong-border) !important;
+  border-radius: 1px !important;
+  background-color: var(--tiller-theme-fixed-action) !important;
+  box-shadow: none !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+  padding-inline: 10px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]
+  *,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]::before,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]::after {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]:not(:disabled):hover,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-paper) !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+  outline: 1px solid var(--tiller-theme-fixed-action);
+  outline-offset: 2px;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]:not(:disabled):hover
+  *,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-part="close"] {
+  top: 7px !important;
+  right: 7px !important;
+  width: 28px !important;
+  height: 28px !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background-color: transparent !important;
+  color: color-mix(in srgb, var(--tiller-theme-fixed-ink) 70%, transparent) !important;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-part="close"]::after {
+  position: absolute;
+  inset: -6px;
+  content: "";
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-part="close"]:not(:disabled):hover,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-part="close"]:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+  outline: 1px solid var(--tiller-theme-fixed-action);
+  outline-offset: 1px;
+}
+
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-part="close"]:not(:disabled):hover
+  *,
+:root
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-part="close"]:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+.tiller-plan-resize-rule {
+  height: 4px;
+  background-color: var(--tiller-theme-structure);
+}
+
+.tiller-workspace-sidebar-section + .tiller-workspace-sidebar-section {
+  margin-top: 2px;
+}
+
+.tiller-workspace-sidebar-section-caret::before {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: "";
+  transform: translateY(-1px) rotate(45deg);
+  transform-origin: center;
+}
+
+.tiller-workspace-sidebar-section-caret[data-collapsed="true"]::before {
+  transform: translateX(-1px) rotate(-45deg);
+}
+
+.tiller-plan-tree-connector {
+  pointer-events: none;
+}
+
+.tiller-plan-tree-connector::before,
+.tiller-plan-tree-connector::after {
+  position: absolute;
+  background-color: currentColor;
+  content: "";
+}
+
+.tiller-plan-tree-connector::before {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+}
+
+.tiller-plan-tree-connector[data-last-child="true"]::before {
+  bottom: 50%;
+}
+
+.tiller-plan-tree-connector::after {
+  top: 50%;
+  left: 0;
+  width: 14px;
+  height: 1px;
+}
+
+.tiller-plan-index-row:hover,
+.tiller-plan-index-row:focus-within,
+.tiller-plan-index-row-selected,
+.tiller-implementation-index-row-related,
+.tiller-implementation-index-row-selected {
+  background-color: color-mix(in srgb, var(--paperwing-ink) 7%, transparent);
+}
+
+.tiller-plan-index-row-selected,
+.tiller-implementation-index-row-selected {
+  background-color: color-mix(in srgb, var(--paperwing-ink) 10%, transparent);
+}
+
+.tiller-plan-index-row-selected::before {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 32px;
+  width: 2px;
+  background-color: currentColor;
+  content: "";
+}
+
+.tiller-plan-index-row-selected:has(> .tiller-plan-tree-connector)::before {
+  display: none;
+}
+
+/* Light-mode workspace semantics for the UI-only design prototype. */
+:root:not([data-mode="dark"])
+  .tiller-implementation-workspace {
+  --color-kumo-base: var(--paperwing-background);
+  --color-kumo-elevated: var(--paperwing-background);
+  --color-kumo-recessed: var(--paperwing-background);
+  --color-kumo-control: var(--paperwing-background);
+  background-color: var(--tiller-theme-on-action);
+}
+
+:root:not([data-mode="dark"])
+  .tiller-plan-active-work-surface {
+  --color-kumo-base: var(--paperwing-background);
+  --color-kumo-elevated: var(--paperwing-background);
+  --color-kumo-recessed: var(--paperwing-background);
+  --color-kumo-control: var(--paperwing-background);
+  background-color: var(--tiller-theme-on-action);
+}
+
+:root:not([data-mode="dark"])
+  .tiller-implementation-review-surface {
+  --color-kumo-base: var(--tiller-theme-highlight);
+  --color-kumo-elevated: var(--tiller-theme-highlight);
+  --color-kumo-recessed: var(--tiller-theme-highlight);
+  --color-kumo-control: var(--tiller-theme-highlight);
+  background-color: var(--tiller-theme-highlight) !important;
+}
+
+:root:not([data-mode="dark"])
+  .tiller-plan-agent-surface {
+  --color-kumo-base: var(--tiller-theme-fixed-paper);
+  --color-kumo-elevated: var(--tiller-theme-fixed-paper);
+  --color-kumo-recessed: var(--tiller-theme-fixed-paper);
+  --color-kumo-control: var(--tiller-theme-fixed-paper);
+  background-color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root:not([data-mode="dark"])
+  .tiller-implementation-agent-surface,
+:root:not([data-mode="dark"])
+  .tiller-plan-implementation-surface {
+  --color-kumo-base: var(--paperwing-background);
+  --color-kumo-elevated: var(--paperwing-background);
+  --color-kumo-recessed: var(--paperwing-background);
+  --color-kumo-control: var(--paperwing-background);
+  background-color: var(--tiller-theme-on-action) !important;
+}
+
+/* Shipping stays inside the implementation workspace and uses the same quiet
+   structural lines, warm paper, and terminal navy as the rest of the design. */
+:root body .tiller-implementation-ship {
+  --color-kumo-line: var(--tiller-theme-structure);
+  background-color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-implementation-ship-header,
+:root body .tiller-implementation-ship-files,
+:root body .tiller-implementation-ship-file-header {
+  background-color: var(--tiller-theme-on-action) !important;
+}
+
+:root body button.tiller-implementation-icon-button {
+  border: 1px solid var(--tiller-theme-structure) !important;
+  border-radius: 1px !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  .tiller-implementation-workspace-header
+  button.tiller-dialog-button {
+  border-color: var(--tiller-theme-structure) !important;
+}
+
+:root body .tiller-implementation-ship-file {
+  color: var(--paperwing-ink) !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-implementation-ship-file[aria-current="true"],
+:root:not([data-mode="dark"])
+  body
+  button.tiller-implementation-ship-file:not(:disabled):hover,
+:root:not([data-mode="dark"])
+  body
+  button.tiller-implementation-ship-file:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-implementation-ship-file[aria-current="true"]
+  *,
+:root:not([data-mode="dark"])
+  body
+  button.tiller-implementation-ship-file:not(:disabled):hover
+  *,
+:root:not([data-mode="dark"])
+  body
+  button.tiller-implementation-ship-file:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root
+  body
+  button.tiller-implementation-ship-file:focus-visible {
+  outline: 1px solid var(--paperwing-background) !important;
+  outline-offset: -3px;
+}
+
+:root body .tiller-implementation-ship-open {
+  min-height: 36px;
+  border-radius: 1px;
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root body .tiller-implementation-ship-open * {
+  color: inherit !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root body .tiller-implementation-ship .animate-spin {
+    animation: none;
+  }
+}
+
+.tiller-implementation-workspace-sidebar-shell {
+  transition: width 250ms cubic-bezier(0.77, 0, 0.175, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiller-implementation-workspace-sidebar-shell {
+    transition: none;
+  }
+}
+
+:root:not([data-mode="dark"])
+  .tiller-plan-review-surface {
+  --color-kumo-base: var(--paperwing-background);
+  --color-kumo-elevated: var(--paperwing-background);
+  --color-kumo-recessed: var(--paperwing-background);
+  --color-kumo-control: var(--paperwing-background);
+  background-color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"]) body code,
+:root:not([data-mode="dark"]) body pre:has(> code) {
+  background-color: var(--tiller-theme-code-surface) !important;
+}
+
+.tiller-plan-title {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 1rem;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.tiller-wordmark {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  letter-spacing: 0.08em;
+}
+
+.tiller-plan-brand-wordmark {
+  letter-spacing: -0.015em;
+}
+
+:root body button.tiller-wordmark {
+  height: 18px;
+  min-height: 18px;
+  margin-left: 0;
+  border-radius: 0;
+  padding: 0 !important;
+}
+
+:root body button.tiller-plan-brand-wordmark {
+  height: 32px;
+  min-height: 32px;
+}
+
+.tiller-plan-document {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.875rem;
+}
+
+.tiller-plan-document h1 {
+  font-size: 1rem;
+}
+
+.tiller-plan-document h2 {
+  font-size: 1rem;
+}
+
+.tiller-plan-document h3 {
+  font-size: 1rem;
+}
+
+:root body .tiller-plan-document .tiller-markdown-pre {
+  border-color: var(--tiller-theme-fixed-action);
+  background: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  padding: 0.875rem 1rem;
+  tab-size: 2;
+}
+
+:root
+  body
+  .tiller-plan-document
+  .tiller-markdown-pre
+  > .tiller-markdown-code {
+  display: block;
+  border: 0;
+  border-radius: 0;
+  background: transparent !important;
+  color: inherit !important;
+  font-size: inherit;
+  line-height: inherit;
+  padding: 0;
+}
+
+:root[data-mode="dark"] body .tiller-plan-document .tiller-markdown-pre {
+  border-color: rgb(253 254 252 / 22%);
+  background: #071a2d !important;
+}
+
+.tiller-launch-illustration {
+  display: flex;
+  min-height: 18rem;
+  width: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: var(--paperwing-ink);
+}
+
+.tiller-launch-illustration--compact {
+  min-height: 0;
+  flex: 1;
+}
+
+.tiller-launch-waves {
+  margin: 0;
+  max-width: 100%;
+  overflow: hidden;
+  border: 0;
+  background: transparent !important;
+  font-family: var(--font-mono);
+  font-size: clamp(0.36rem, 1vw, 0.68rem);
+  font-weight: 600;
+  line-height: 0.86;
+  letter-spacing: 0.045em;
+  opacity: 0.88;
+  user-select: none;
+  white-space: pre;
+  -webkit-mask-image: radial-gradient(
+    ellipse 72% 82% at center,
+    black 55%,
+    transparent 100%
+  );
+  mask-image: radial-gradient(
+    ellipse 72% 82% at center,
+    black 55%,
+    transparent 100%
+  );
+}
+
+.tiller-scribe-launch-surface {
+  background: var(--color-kumo-base);
+}
+
+/* The Scribe's native TUI is the input surface. Remove TerminalView's default
+   inset so its light canvas does not appear as a border around xterm. */
+:root body .tiller-scribe-terminal-surface,
+:root body .tiller-scribe-terminal-surface .tiller-terminal,
+:root body .tiller-scribe-terminal-surface .tiller-terminal-canvas,
+:root body .tiller-scribe-terminal-surface .xterm,
+:root body .tiller-scribe-terminal-surface .xterm-viewport,
+:root body .tiller-scribe-terminal-surface .xterm-screen,
+:root body .tiller-scribe-terminal-surface .xterm-scrollable-element,
+:root body .tiller-scribe-terminal-surface .composition-view {
+  background-color: var(--color-kumo-base) !important;
+}
+
+:root body .tiller-scribe-terminal-surface .tiller-terminal-canvas {
+  padding: 0 !important;
+}
+
+.tiller-launch-runtime-viewport {
+  width: min(52rem, 100%);
+  height: 2.25rem;
+  margin-top: 1rem;
+  overflow: hidden;
+  border-block: 1px solid
+    color-mix(in srgb, var(--paperwing-ink) 52%, transparent);
+}
+
+.tiller-launch-runtime-line {
+  display: flex;
+  height: 100%;
+  align-items: center;
+  padding-inline: 0.25rem;
+  font-family: var(--font-mono);
+  overflow: hidden;
+  color: var(--paperwing-ink);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.015em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tiller-launch-runtime-caret {
+  width: 1px;
+  height: 0.9rem;
+  margin-left: 2px;
+  flex: 0 0 auto;
+  background: currentColor;
+  animation: tiller-launch-runtime-caret 0.8s steps(1, end) infinite;
+}
+
+.tiller-launch-current-step-label {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.tiller-launch-current-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.tiller-launch-current-step--action {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.tiller-launch-current-step-action {
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.tiller-launch-current-step-label {
+  color: var(--paperwing-ink);
+}
+
+@keyframes tiller-launch-runtime-caret {
+  0%,
+  48% {
+    opacity: 1;
+  }
+  49%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .tiller-launch-illustration {
+    min-height: 14rem;
+  }
+
+  .tiller-launch-waves {
+    font-size: clamp(0.31rem, 1.45vw, 0.48rem);
+  }
+
+  .tiller-launch-runtime-viewport {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiller-launch-runtime-caret {
+    animation: none;
+    opacity: 0.55;
+  }
+}
+
+:root body .tiller-create-plan-button:hover,
+:root body .tiller-create-plan-button:hover * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* Preserve the update control's original outlined/filled states while letting
+   each theme supply its own Kumo colors. */
+:root body button.tiller-update-button {
+  --tiller-button-border-color: var(--color-kumo-line);
+  --tiller-button-background: var(--color-kumo-base);
+  --tiller-button-hover-background: var(--color-kumo-tint);
+  --tiller-button-hover-color: var(--text-color-kumo-subtle);
+}
+
+:root body button.tiller-update-button[data-highlighted="true"] {
+  --tiller-button-border-color: var(--color-kumo-focus);
+  --tiller-button-background: var(--color-kumo-info-tint);
+  --tiller-button-hover-background: var(--color-kumo-tint);
+  --tiller-button-hover-color: var(--text-color-kumo-link);
+}
+
+:root:not([data-mode="dark"]) body button.border {
+  border-color: var(--tiller-button-border-color, transparent) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled) {
+  background-color: var(--tiller-button-background, transparent) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):hover,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):focus-visible {
+  background-color: var(
+    --tiller-button-hover-background,
+    var(--tiller-theme-fixed-action)
+  ) !important;
+  color: var(
+    --tiller-button-hover-color,
+    var(--tiller-theme-fixed-paper)
+  ) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):hover
+  *,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):focus-visible
+  * {
+  color: var(
+    --tiller-button-hover-color,
+    var(--tiller-theme-fixed-paper)
+  ) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):hover::before,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):hover::after,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):hover
+  *::before,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):hover
+  *::after,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):focus-visible::before,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):focus-visible::after,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):focus-visible
+  *::before,
+:root:not([data-mode="dark"])
+  body
+  button:not(:disabled):focus-visible
+  *::after {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  .tiller-connections-trigger:not(:disabled):hover
+  .tiller-connection-marker,
+:root
+  body
+  .tiller-connections-trigger:not(:disabled):focus-visible
+  .tiller-connection-marker {
+  background-color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* Project navigation uses one unmistakable hover language across the header,
+   tabs, and both left-hand indexes. */
+:root
+  body
+  .tiller-workspace-sidebar
+  button:not(:disabled):hover,
+:root
+  body
+  .tiller-workspace-sidebar
+  button:not(:disabled):focus-visible,
+:root
+  body
+  .tiller-workspace-sidebar-shell
+  button:not(:disabled):hover,
+:root
+  body
+  .tiller-workspace-sidebar-shell
+  button:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  .tiller-workspace-sidebar
+  button:not(:disabled):hover
+  *,
+:root
+  body
+  .tiller-workspace-sidebar
+  button:not(:disabled):focus-visible
+  *,
+:root
+  body
+  .tiller-workspace-sidebar-shell
+  button:not(:disabled):hover
+  *,
+:root
+  body
+  .tiller-workspace-sidebar-shell
+  button:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root body .tiller-plan-index-row:hover,
+:root body .tiller-plan-index-row:focus-within {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-plan-index-row-selected {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-plan-index-row:hover *,
+:root body .tiller-plan-index-row:focus-within * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-plan-index-row-selected * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+/* Paperwing's light-theme ink reset is deliberately broad and specific. Keep
+   a selected plan row inverted after hover/focus moves into the agent pane. */
+:root[data-theme="paperwing"]:not([data-mode="dark"])
+  body
+  .tiller-plan-index-row-selected,
+:root[data-theme="paperwing"]:not([data-mode="dark"])
+  body
+  .tiller-plan-index-row-selected
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-plan-index-row:hover::before,
+:root
+  body
+  .tiller-plan-index-row:focus-within::before,
+:root body .tiller-plan-index-row:hover *::before,
+:root body .tiller-plan-index-row:hover *::after,
+:root
+  body
+  .tiller-plan-index-row:focus-within
+  *::before,
+:root
+  body
+  .tiller-plan-index-row:focus-within
+  *::after {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-plan-index-row-selected::before,
+:root
+  body
+  .tiller-plan-index-row-selected
+  *::before,
+:root
+  body
+  .tiller-plan-index-row-selected
+  *::after {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root[data-theme="paperwing"]:not([data-mode="dark"])
+  body
+  .tiller-plan-index-row-selected::before,
+:root[data-theme="paperwing"]:not([data-mode="dark"])
+  body
+  .tiller-plan-index-row-selected
+  *::before,
+:root[data-theme="paperwing"]:not([data-mode="dark"])
+  body
+  .tiller-plan-index-row-selected
+  *::after {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row
+  button:not(:disabled):hover,
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row
+  button:not(:disabled):focus-visible {
+  background-color: transparent !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row
+  button:not(:disabled):hover
+  *,
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row
+  button:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row-selected
+  button:not(:disabled):hover,
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row-selected
+  button:not(:disabled):focus-visible {
+  background-color: transparent !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row-selected
+  button:not(:disabled):hover
+  *,
+:root:not([data-mode="dark"])
+  body
+  .tiller-workspace-sidebar
+  .tiller-plan-index-row-selected
+  button:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+.tiller-workspace-sidebar button:focus-visible {
+  outline: 1px solid currentColor;
+  outline-offset: -2px;
+}
+
+/* The status square is filled with the theme action color. Use its paired
+   foreground explicitly so Classic Light keeps the check visible. */
+:root body .tiller-plan-status-check {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-project-tab:not(:disabled) {
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-project-tab[aria-current="page"] {
+  border-color: transparent !important;
+  background-color: color-mix(
+    in srgb,
+    var(--tiller-theme-fixed-ink) 8%,
+    var(--tiller-theme-fixed-paper)
+  ) !important;
+}
+
+:root
+  body
+  button.tiller-project-tab:not(:disabled):hover,
+:root
+  body
+  button.tiller-project-tab:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-project-tab:not(:disabled):hover
+  *,
+:root
+  body
+  button.tiller-project-tab:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-project-tab[aria-current="page"]:focus-visible {
+  outline: none !important;
+}
+
+/* The compact plan-agent switcher is one peer-level vertical tab list. Its
+   44px card tabs reuse the implementation-card rhythm without implying that
+   reviewers are children of Scribe. */
+:root body .tiller-agent-switcher {
+  background: var(--paperwing-background) !important;
+}
+
+/* Implementation reviewers use the Plan-agent header language while remaining
+   a horizontal bottom dock. The persistent label makes the collapsed surface
+   legible; the adjacent plus stays in the same position as Plan agents. */
+:root body .tiller-implementation-reviewer-header {
+  background: var(--paperwing-background) !important;
+}
+
+/* The implementation chrome is a title line, not a row of badges. Keep the
+   environment name primary, show lifecycle as a compact signal, and collapse
+   auth/model into quiet metadata using the same flat rhythm as Plan headers. */
+:root body .tiller-env-chrome-summary {
+  gap: 10px !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root body .tiller-env-chrome-name {
+  max-width: min(18rem, 34vw) !important;
+  color: var(--paperwing-ink) !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.006em;
+  line-height: 18px !important;
+}
+
+:root body .tiller-env-chrome-status,
+:root body .tiller-env-chrome-meta {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background-color: transparent !important;
+  padding: 0 !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+
+:root body .tiller-env-chrome-status {
+  gap: 6px;
+  color: var(--paperwing-ink) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  line-height: 16px !important;
+}
+
+:root body .tiller-env-chrome-status-marker {
+  display: block !important;
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 56%, transparent);
+  border-radius: 999px !important;
+  background-color: transparent;
+}
+
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="running"]
+  .tiller-env-chrome-status-marker {
+  border-color: var(--paperwing-signal-live);
+  background-color: var(--paperwing-signal-live);
+}
+
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="failed"]
+  .tiller-env-chrome-status-marker {
+  border-color: var(--paperwing-signal-danger);
+  background-color: var(--paperwing-signal-danger);
+}
+
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="creating"]
+  .tiller-env-chrome-status-marker,
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="starting"]
+  .tiller-env-chrome-status-marker,
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="saving"]
+  .tiller-env-chrome-status-marker,
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="stopping"]
+  .tiller-env-chrome-status-marker,
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="deleting"]
+  .tiller-env-chrome-status-marker,
+:root
+  body
+  .tiller-env-chrome-status[data-implementation-status="stopped"]
+  .tiller-env-chrome-status-marker {
+  border-color: var(--tiller-theme-action);
+  background-color: var(--tiller-theme-action);
+}
+
+:root body .tiller-env-chrome-meta {
+  color: color-mix(in srgb, var(--paperwing-ink) 66%, transparent) !important;
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  line-height: 16px !important;
+  white-space: nowrap;
+}
+
+:root body .tiller-env-chrome-meta::before {
+  margin-right: 10px;
+  color: color-mix(in srgb, var(--paperwing-ink) 38%, transparent);
+  content: "·";
+}
+
+:root
+  body
+  .tiller-implementation-reviewer-header
+  button.tiller-agent-tab[aria-current="page"] {
+  border-color: var(--tiller-theme-action) !important;
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root
+  body
+  .tiller-implementation-reviewer-header
+  button.tiller-agent-tab[aria-current="page"]
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+/* Plan and Implementation reviewers share one conversation grammar: bounded
+   reviewer and user bubbles, with system context kept outside the transcript. */
+:root
+  body
+  .tiller-implementation-reviewer-switcher {
+  background: var(--paperwing-background) !important;
+}
+
+/* Reviewer terminals are one continuous warm-paper instrument, even when the
+   surrounding implementation workspace uses the whiter plan-paper surface. */
+:root body .tiller-reviewer-surface,
+:root:not([data-mode="dark"])
+  body
+  .tiller-implementation-agent-surface.tiller-reviewer-surface {
+  --color-kumo-base: var(--paperwing-background);
+  --color-kumo-elevated: var(--paperwing-background);
+  --color-kumo-recessed: var(--paperwing-background);
+  --color-kumo-control: var(--paperwing-background);
+  background-color: var(--tiller-theme-on-action) !important;
+}
+
+:root
+  body
+  .tiller-implementation-reviewer-switcher
+  button.tiller-plan-agent-row-selected {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-reviewer-transcript {
+  background: var(--paperwing-background) !important;
+}
+
+:root body [data-reviewer-message-role] {
+  text-wrap: pretty;
+}
+
+:root body .tiller-reviewer-message-byline {
+  color: color-mix(in srgb, currentColor 68%, transparent) !important;
+  font-variant-numeric: tabular-nums;
+}
+
+:root body .tiller-implementation-chat-system-note {
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 20%, transparent);
+  background: color-mix(in srgb, var(--paperwing-background) 72%, white);
+  font-variant-numeric: tabular-nums;
+}
+
+:root
+  body
+  .tiller-reviewer-response-actions
+  button {
+  width: auto !important;
+  min-width: 0 !important;
+  height: 1.75rem !important;
+  min-height: 1.75rem !important;
+  padding: 0 !important;
+  background: transparent !important;
+}
+
+/* Xterm owns several nested paint layers and can retain its previous theme
+   through a live palette update. Keep Scribe and reviewer terminals visually
+   continuous with their surrounding paper surface. */
+:root
+  body
+  .tiller-plan-agent-surface
+  .xterm-viewport,
+:root
+  body
+  .tiller-plan-agent-surface
+  .xterm-scrollable-element,
+:root
+  body
+  .tiller-plan-agent-surface
+  .composition-view {
+  background-color: var(--color-kumo-base) !important;
+}
+
+/* Implementation terminals are work surfaces, not cards. Keep xterm continuous
+   with the warm workspace, with consistent inset spacing and a 14px rhythm. */
+:root body .tiller-implementation-session,
+:root body .tiller-terminal--implementation,
+:root body .tiller-terminal--implementation .xterm,
+:root
+  body
+  .tiller-terminal--implementation
+  .xterm-viewport,
+:root
+  body
+  .tiller-terminal--implementation
+  .xterm-screen,
+:root
+  body
+  .tiller-terminal--implementation
+  .xterm-scrollable-element,
+:root
+  body
+  .tiller-terminal--implementation
+  .composition-view {
+  background-color: var(--tiller-theme-on-action) !important;
+}
+
+:root body .tiller-terminal-canvas--implementation {
+  background-color: var(--tiller-theme-on-action) !important;
+}
+
+/* FitAddon measures the canvas, then subtracts padding from .xterm itself.
+   Keep the visual inset on .xterm so the reported PTY rows always fit inside
+   the clipped canvas instead of leaving a partially hidden final row. */
+:root body .tiller-terminal--default .xterm {
+  padding: 0.25rem 0.5rem;
+}
+
+:root body .tiller-terminal--implementation .xterm {
+  padding: 0.875rem 1rem;
+}
+
+:root body .tiller-terminal .xterm {
+  -webkit-font-smoothing: antialiased;
+}
+
+:root
+  body
+  .tiller-terminal
+  .xterm-helper-textarea:focus-visible {
+  outline: none;
+}
+
+:root body button.tiller-agent-tab:not(:disabled) {
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab[aria-current="page"] {
+  border-color: var(--tiller-theme-action) !important;
+  border-bottom-color: var(--tiller-theme-fixed-paper) !important;
+  background-color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab--vertical[aria-selected="true"] {
+  border-color: var(--tiller-theme-action) !important;
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab--vertical[aria-selected="true"]
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):hover,
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):hover
+  *,
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+  border-color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):hover
+  [data-agent-tab-status],
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):focus-visible
+  [data-agent-tab-status] {
+  border-color: var(--tiller-theme-fixed-paper) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+  fill: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):hover
+  span[data-agent-tab-status="idle"],
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):hover
+  span[data-agent-tab-status="finished"],
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):focus-visible
+  span[data-agent-tab-status="idle"],
+:root
+  body
+  button.tiller-agent-tab:not(:disabled):focus-visible
+  span[data-agent-tab-status="finished"] {
+  background-color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab[aria-current="page"]:focus-visible {
+  outline: 1px solid var(--tiller-theme-fixed-paper);
+  outline-offset: -3px;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-square-button--primary:not(:disabled) {
+  border-color: var(--tiller-theme-fixed-action) !important;
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-square-button--primary:not(:disabled)
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog {
+  border: 1px solid var(--tiller-theme-strong-border) !important;
+  background-color: var(--tiller-theme-fixed-paper) !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  *,
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  *::before,
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  *::after {
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  button:not(:disabled):hover,
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  button:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  button:not(:disabled):hover
+  *,
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  button:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+.tiller-effort-status-bar {
+  overflow: hidden;
+  border: 1px solid var(--tiller-theme-strong-border);
+  background-color: var(--tiller-theme-fixed-paper);
+}
+
+.tiller-effort-status-segment {
+  position: relative;
+  border-right: 1px solid var(--tiller-theme-strong-border);
+  border-radius: 0;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--tiller-theme-fixed-ink);
+}
+
+.tiller-effort-status-segment:last-child {
+  border-right: 0;
+}
+
+:root:not([data-mode="dark"])
+  body
+  .tiller-reviewer-dialog
+  .tiller-effort-status-segment[aria-pressed="true"] {
+  background-color: color-mix(in srgb, var(--tiller-theme-fixed-ink) 12%, transparent) !important;
+  box-shadow: inset 0 -3px 0 var(--tiller-theme-fixed-action) !important;
+  font-weight: 700;
+}
+
+/* Dropdowns use one quiet, flat menu language throughout the UI design. Kumo
+   Select portals and Tiller's hand-built action menus intentionally share the
+   same surface, spacing, type scale, and selected-state treatment. */
+:root body [role="menu"],
+:root
+  body
+  [role="presentation"]:has(> [role="listbox"]),
+:root body .tiller-dropdown-panel {
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 14%, transparent) !important;
+  border-radius: 0 !important;
+  background-color: var(--tiller-theme-on-action) !important;
+  box-shadow: none !important;
+  color: var(--paperwing-ink) !important;
+  padding: 2px !important;
+}
+
+/* Kumo positions the select surface inside a second presentation wrapper.
+   Give that fixed wrapper an explicit layer so reviewer menus do not render
+   behind the expanded workflow row or its controls. */
+:root
+  body
+  [role="presentation"]:has(> [role="presentation"] > [role="listbox"]) {
+  z-index: 70 !important;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"] {
+  color: var(--paperwing-ink) !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover,
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):focus-visible,
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"] {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover
+  *,
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):focus-visible
+  *,
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]
+  > span[aria-hidden="true"] {
+  display: flex;
+  width: 14px;
+  height: 14px;
+  align-items: center;
+  justify-content: center;
+  color: var(--paperwing-ink);
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover
+  > span[aria-hidden="true"],
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):focus-visible
+  > span[aria-hidden="true"],
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  > span[aria-hidden="true"] {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]
+  > span[aria-hidden="true"]
+  svg {
+  display: none;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]
+  > span[aria-hidden="true"]::before {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: "";
+  transform: translateY(-1px) rotate(45deg);
+  transform-origin: center;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover
+  > span[aria-hidden="true"]::before,
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):focus-visible
+  > span[aria-hidden="true"]::before,
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  > span[aria-hidden="true"]::before {
+  border-right-color: var(--tiller-theme-fixed-paper) !important;
+  border-bottom-color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  > span[aria-hidden="true"]::before {
+  transform: translateY(1px) rotate(225deg);
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher {
+  height: 32px;
+  min-height: 32px;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+  width: calc(100% + 16px) !important;
+  margin-left: -8px;
+  padding: 0 8px !important;
+  font-size: 12px;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher:not(
+    :disabled
+  ):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+  outline: 1px solid var(--tiller-theme-fixed-paper);
+  outline-offset: -1px;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher:not(
+    :disabled
+  ):hover,
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher[aria-expanded="true"] {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root body [role="menuitem"],
+:root body [role="menuitemradio"],
+:root
+  body
+  [data-kumo-component="Select"][data-kumo-part="option"] {
+  min-height: 28px !important;
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background-color: transparent !important;
+  color: var(--paperwing-ink) !important;
+  padding: 4px 8px !important;
+  font-size: 12px !important;
+  line-height: 16px !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root
+  body
+  [role="menuitemradio"][aria-checked="true"],
+:root
+  body
+  [data-kumo-component="Select"][data-kumo-part="option"][aria-selected="true"] {
+  font-weight: 500 !important;
+}
+
+:root
+  body
+  [data-kumo-component="Select"][data-kumo-part="option"][data-highlighted],
+:root
+  body
+  button[role="menuitem"]:not(:disabled):hover,
+:root
+  body
+  button[role="menuitem"]:not(:disabled):focus-visible,
+:root
+  body
+  button[role="menuitemradio"]:not(:disabled):hover,
+:root
+  body
+  button[role="menuitemradio"]:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  [data-kumo-component="Select"][data-kumo-part="option"][data-highlighted]
+  *,
+:root
+  body
+  button[role="menuitem"]:not(:disabled):hover
+  *,
+:root
+  body
+  button[role="menuitem"]:not(:disabled):focus-visible
+  *,
+:root
+  body
+  button[role="menuitemradio"]:not(:disabled):hover
+  *,
+:root
+  body
+  button[role="menuitemradio"]:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button[role="menuitem"]:not(:disabled):focus-visible,
+:root
+  body
+  button[role="menuitemradio"]:not(:disabled):focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--tiller-theme-action) 48%, transparent);
+  outline-offset: -2px;
+}
+
+:root body [role="menuitemradio"] svg,
+:root
+  body
+  [data-kumo-component="Select"][data-kumo-part="option"]
+  [aria-hidden="true"]
+  svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* Dialogs use one compact application shell throughout the UI design. The
+   header and footer establish hierarchy; the body remains a single quiet
+   surface so forms do not read as stacks of cards inside another card. */
+:root body .tiller-dialog-shell {
+  z-index: 50;
+  max-height: calc(100dvh - 32px);
+  border-radius: 1px !important;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+:root
+  body
+  [role="presentation"]:has(> .kumo-tooltip-popup) {
+  z-index: 70;
+}
+
+:root
+  body
+  [data-base-ui-portal]
+  > [role="presentation"][data-open].fixed.inset-0 {
+  z-index: 40;
+  background-color: color-mix(in srgb, var(--tiller-theme-fixed-ink) 16%, transparent) !important;
+  opacity: 1 !important;
+}
+
+:root body .tiller-dialog-header,
+:root body .tiller-dialog-footer {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 24%,
+    transparent
+  ) !important;
+  background-color: var(--tiller-card-fill) !important;
+}
+
+:root body .tiller-dialog-header {
+  padding: 14px 20px !important;
+}
+
+:root body .tiller-dialog-footer {
+  padding: 12px 20px !important;
+}
+
+:root body .tiller-dialog-title {
+  color: var(--paperwing-ink) !important;
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+}
+
+:root body .tiller-dialog-description {
+  color: color-mix(in srgb, var(--paperwing-ink) 72%, transparent) !important;
+  text-wrap: pretty;
+}
+
+:root body .tiller-dialog-body {
+  background-color: var(--tiller-card-fill) !important;
+  padding: 16px 20px !important;
+  scrollbar-gutter: stable;
+}
+
+:root
+  body
+  .tiller-scribe-settings-dialog
+  .tiller-scribe-format {
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 72%, transparent) !important;
+  border-radius: 1px !important;
+  background-color: color-mix(
+    in srgb,
+    var(--tiller-card-fill) 84%,
+    white
+  ) !important;
+  color: var(--paperwing-ink) !important;
+  font-size: 11px !important;
+  letter-spacing: 0;
+  line-height: 18px !important;
+}
+
+:root
+  body
+  .tiller-scribe-settings-dialog
+  .tiller-scribe-format:focus-visible {
+  outline: 2px solid var(--tiller-theme-action) !important;
+  outline-offset: 1px;
+}
+
+:root body .tiller-scribe-dialog-title {
+  font-size: 16px !important;
+  line-height: 20px !important;
+}
+
+:root body .tiller-scribe-dialog-description {
+  max-width: 34ch;
+  font-size: 11px !important;
+  line-height: 17px !important;
+}
+
+:root body .tiller-scribe-model-picker > div,
+:root body .tiller-scribe-section-label {
+  color: var(--paperwing-ink) !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  line-height: 15px !important;
+}
+
+:root
+  body
+  .tiller-scribe-model-picker
+  > div
+  > span {
+  margin-bottom: 6px !important;
+}
+
+:root body .tiller-scribe-helper {
+  max-width: 54ch;
+  color: color-mix(in srgb, var(--paperwing-ink) 68%, transparent) !important;
+  font-size: 11px !important;
+  line-height: 17px !important;
+}
+
+/* Plan workflows are advanced planning configuration, but they should still
+   read as an active paper workspace. Structural dividers carry the hierarchy;
+   a restrained recessed tint and persistent field edges keep editable regions
+   recognizable without changing either theme's palette or flat geometry. */
+:root body .tiller-workflow-dialog,
+:root
+  body
+  .tiller-workflow-dialog
+  .tiller-dialog-body,
+:root body .tiller-workflow-sidebar,
+:root body .tiller-workflow-sidebar-header {
+  background-color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  .tiller-workflow-dialog
+  .border-kumo-line {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 22%,
+    transparent
+  ) !important;
+}
+
+:root body .tiller-workflow-eyebrow {
+  color: color-mix(in srgb, var(--paperwing-ink) 58%, transparent) !important;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  line-height: 14px;
+  text-transform: none;
+}
+
+:root body .tiller-workflow-sidebar-title {
+  color: var(--paperwing-ink) !important;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+}
+
+:root body .tiller-workflow-header-link,
+:root body .tiller-workflow-add-reviewer,
+:root body .tiller-workflow-remove {
+  min-height: 36px;
+  border: 1px solid transparent !important;
+  background-color: transparent !important;
+  color: var(--paperwing-ink) !important;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+  text-underline-offset: 3px;
+  transition-duration: 120ms;
+  transition-property: background-color, border-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root body .tiller-workflow-header-link,
+:root body .tiller-workflow-add-reviewer {
+  padding-inline: 8px;
+}
+
+:root body .tiller-workflow-add {
+  min-height: 32px;
+  --tiller-button-border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 42%,
+    transparent
+  );
+  --tiller-button-background: var(--tiller-theme-highlight);
+  --tiller-button-hover-background: var(--tiller-theme-action);
+  --tiller-button-hover-color: var(--tiller-card-fill);
+  border: 1px solid var(--tiller-button-border-color);
+  background-color: var(--tiller-theme-highlight);
+  color: var(--paperwing-ink);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  padding-inline: 6px;
+  transition-duration: 120ms;
+  transition-property: background-color, border-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root
+  body
+  .tiller-workflow-header-link:not(:disabled):hover,
+:root
+  body
+  .tiller-workflow-header-link:not(:disabled):focus-visible,
+:root
+  body
+  .tiller-workflow-add:not(:disabled):hover,
+:root
+  body
+  .tiller-workflow-add:not(:disabled):focus-visible,
+:root
+  body
+  .tiller-workflow-add-reviewer:not(:disabled):hover,
+:root
+  body
+  .tiller-workflow-add-reviewer:not(:disabled):focus-visible {
+  border-color: var(--tiller-theme-action) !important;
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-card-fill) !important;
+}
+
+:root body .tiller-workflow-list-item {
+  min-height: 60px;
+  border-radius: 0 !important;
+  background-color: transparent !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root body .tiller-workflow-count {
+  font-variant-numeric: tabular-nums;
+}
+
+:root
+  body
+  button.tiller-workflow-header-link:not(:disabled):hover,
+:root
+  body
+  button.tiller-workflow-header-link:not(:disabled):focus-visible {
+  border-color: transparent !important;
+  background-color: transparent !important;
+  color: var(--paperwing-ink) !important;
+  text-decoration: underline;
+}
+
+:root
+  body
+  button.tiller-workflow-header-link:not(:disabled):focus-visible {
+  outline: none !important;
+  text-decoration-thickness: 2px;
+}
+
+:root
+  body
+  button.tiller-workflow-list-item[data-selected="true"],
+:root
+  body
+  button.tiller-workflow-list-item:not(:disabled):hover,
+:root
+  body
+  button.tiller-workflow-list-item:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  .tiller-workflow-list-item[data-selected="true"]
+  *,
+:root
+  body
+  .tiller-workflow-list-item:not(:disabled):hover
+  *,
+:root
+  body
+  .tiller-workflow-list-item:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  .tiller-workflow-list-item:focus-visible {
+  outline: 1px solid var(--tiller-card-fill);
+  outline-offset: -3px;
+}
+
+:root body .tiller-workflow-field {
+  display: block;
+  min-width: 0;
+}
+
+:root body .tiller-workflow-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--paperwing-ink) !important;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 15px;
+}
+
+:root body .tiller-workflow-hint {
+  display: block;
+  margin-top: -2px;
+  margin-bottom: 8px;
+  color: color-mix(in srgb, var(--paperwing-ink) 68%, transparent) !important;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+}
+
+:root body .tiller-card-surface.tiller-workflow-section,
+:root body .tiller-card-surface.tiller-workflow-reviewer {
+  --tiller-card-surface-fill: color-mix(
+    in srgb,
+    var(--tiller-card-fill) 97%,
+    var(--paperwing-ink)
+  );
+}
+
+:root body input.tiller-workflow-editable,
+:root body textarea.tiller-workflow-editable,
+:root body .tiller-workflow-input-group {
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 42%, transparent);
+  border-radius: 1px;
+  background-color: var(--tiller-card-fill);
+  transition-duration: 120ms;
+  transition-property: background-color, border-color, outline-color;
+  transition-timing-function: ease-out;
+}
+
+:root body input.tiller-workflow-tab-label {
+  min-height: 40px;
+  height: 40px;
+  padding-inline: 12px;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+:root body input.tiller-workflow-editable:not(:disabled):hover,
+:root body textarea.tiller-workflow-editable:not(:disabled):hover,
+:root body .tiller-workflow-input-group:not([data-disabled]):hover {
+  border-color: color-mix(in srgb, var(--paperwing-ink) 62%, transparent);
+  background-color: color-mix(
+    in srgb,
+    var(--tiller-card-fill) 96%,
+    var(--paperwing-ink)
+  );
+}
+
+:root body input.tiller-workflow-editable:focus-visible,
+:root body textarea.tiller-workflow-editable:focus-visible,
+:root body .tiller-workflow-input-group:focus-within {
+  border-color: var(--tiller-theme-action);
+  outline: 2px solid var(--tiller-theme-action);
+  outline-offset: 1px;
+}
+
+:root body .tiller-workflow-control,
+:root body .tiller-workflow-command-control {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 68%, transparent) !important;
+  border-radius: 1px !important;
+  background-color: color-mix(
+    in srgb,
+    var(--tiller-card-fill) 84%,
+    white
+  ) !important;
+  color: var(--paperwing-ink) !important;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+:root body .tiller-workflow-control {
+  display: block;
+  padding: 8px 10px;
+}
+
+:root body .tiller-workflow-command-control {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  padding-inline: 10px;
+  font-family: var(--font-mono);
+}
+
+:root body .tiller-workflow-command-control input {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  outline: 0;
+}
+
+:root body .tiller-workflow-control:focus-visible,
+:root
+  body
+  .tiller-workflow-command-control:focus-within {
+  outline: 2px solid var(--tiller-theme-action) !important;
+  outline-offset: 1px;
+}
+
+:root body .tiller-workflow-textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+
+:root body .tiller-workflow-static-control {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  color: var(--paperwing-ink) !important;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+:root body .tiller-workflow-static-control code {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 6px 2px;
+  background-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 7%,
+    var(--tiller-card-fill)
+  ) !important;
+  color: var(--paperwing-ink) !important;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: slashed-zero;
+  letter-spacing: 0.01em;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+:root
+  body
+  .tiller-workflow-static-control
+  code
+  > span {
+  color: var(--paperwing-signal-danger) !important;
+  font-weight: 600;
+}
+
+:root body .tiller-workflow-static-control > span {
+  color: color-mix(in srgb, var(--paperwing-ink) 58%, transparent) !important;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 14px;
+}
+
+:root body .tiller-workflow-section-title {
+  color: var(--paperwing-ink) !important;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+}
+
+:root body .tiller-workflow-section-description {
+  max-width: 48ch;
+  color: color-mix(in srgb, var(--paperwing-ink) 68%, transparent) !important;
+  font-size: 11px;
+  line-height: 16px;
+  text-wrap: pretty;
+}
+
+:root body .tiller-workflow-reviewer-index {
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+
+:root body .tiller-skill-automation-label {
+  opacity: 0.68;
+}
+
+:root body .tiller-skill-automation-label[data-selected="true"] {
+  opacity: 1;
+}
+
+:root body button.tiller-skill-automation-switch {
+  --tiller-button-radius: 5px;
+  --tiller-button-border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 58%,
+    transparent
+  );
+  --tiller-button-background: color-mix(
+    in srgb,
+    var(--paperwing-ink) 12%,
+    var(--tiller-card-fill)
+  );
+  --tiller-button-hover-background: color-mix(
+    in srgb,
+    var(--paperwing-ink) 18%,
+    var(--tiller-card-fill)
+  );
+  --tiller-button-hover-color: var(--paperwing-ink);
+  border: 1px solid var(--tiller-button-border-color);
+  background-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 12%,
+    var(--tiller-card-fill)
+  );
+}
+
+:root body button.tiller-skill-automation-switch[aria-checked="true"] {
+  --tiller-button-border-color: var(--tiller-theme-action);
+  --tiller-button-background: var(--tiller-theme-action);
+  --tiller-button-hover-background: var(--tiller-theme-action-hover);
+  --tiller-button-hover-color: var(--tiller-theme-on-action);
+  border-color: var(--tiller-theme-action);
+  background-color: var(--tiller-theme-action);
+}
+
+:root body button.tiller-skill-automation-switch:not(:disabled):hover {
+  background-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 18%,
+    var(--tiller-card-fill)
+  );
+}
+
+:root
+  body
+  button.tiller-skill-automation-switch[aria-checked="true"]:not(:disabled):hover {
+  background-color: var(--tiller-theme-action-hover);
+}
+
+:root body button.tiller-skill-automation-switch:focus-visible {
+  outline: 2px solid var(--color-kumo-focus);
+  outline-offset: 2px;
+}
+
+:root body button.tiller-skill-automation-switch > div {
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 28%, transparent);
+  background-color: var(--tiller-card-fill);
+}
+
+:root body .tiller-workflow-reviewer-summary {
+  border-radius: 0 !important;
+  background-color: transparent !important;
+  color: var(--paperwing-ink) !important;
+  transition-duration: 120ms;
+  transition-property: background-color;
+  transition-timing-function: ease-out;
+}
+
+:root
+  body
+  button.tiller-workflow-reviewer-summary:not(:disabled):hover,
+:root
+  body
+  button.tiller-workflow-reviewer-summary:not(:disabled):focus-visible,
+:root
+  body
+  button.tiller-workflow-reviewer-summary[aria-expanded="true"] {
+  background-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 6%,
+    transparent
+  ) !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  button.tiller-workflow-reviewer-summary:not(:disabled):hover
+  *,
+:root
+  body
+  button.tiller-workflow-reviewer-summary:not(:disabled):focus-visible
+  *,
+:root
+  body
+  button.tiller-workflow-reviewer-summary[aria-expanded="true"]
+  * {
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  .tiller-workflow-reviewer-summary:focus-visible {
+  outline: 2px solid var(--tiller-theme-action);
+  outline-offset: -2px;
+}
+
+:root
+  body
+  .tiller-workflow-reviewer-summary
+  span:last-of-type,
+:root
+  body
+  .tiller-workflow-reviewer-summary
+  > span:first-child {
+  color: color-mix(in srgb, var(--paperwing-ink) 66%, transparent) !important;
+}
+
+:root body .tiller-workflow-reviewer-details {
+  background-color: color-mix(
+    in srgb,
+    var(--tiller-card-fill) 86%,
+    white
+  ) !important;
+}
+
+:root
+  body
+  .tiller-workflow-reviewer-details
+  input.tiller-workflow-control,
+:root
+  body
+  .tiller-workflow-reviewer-details
+  button.tiller-workflow-select[data-kumo-component="Select"][data-kumo-part="trigger"] {
+  min-height: 40px !important;
+  padding-inline: 12px !important;
+  font-size: 12px !important;
+}
+
+:root
+  body
+  .tiller-workflow-reviewer-details
+  button.tiller-workflow-select[data-kumo-component="Select"][data-kumo-part="trigger"] {
+  width: 100% !important;
+}
+
+:root body .tiller-workflow-remove {
+  color: var(--paperwing-signal-danger) !important;
+}
+
+:root
+  body
+  .tiller-workflow-remove:not(:disabled):hover,
+:root
+  body
+  .tiller-workflow-remove:not(:disabled):focus-visible {
+  text-decoration: underline;
+}
+
+:root body .tiller-workflow-dialog button:disabled,
+:root body .tiller-workflow-dialog input:disabled,
+:root
+  body
+  .tiller-workflow-dialog
+  textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+:root body .tiller-workflow-command[data-disabled],
+:root body .tiller-workflow-command input:disabled {
+  opacity: 1;
+}
+
+:root body .tiller-project-search,
+:root body .tiller-project-repository-list {
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 72%, transparent) !important;
+  border-radius: 1px !important;
+  background-color: var(--tiller-card-fill) !important;
+}
+
+:root body .tiller-project-search::placeholder {
+  color: color-mix(in srgb, var(--paperwing-ink) 54%, transparent) !important;
+}
+
+:root body .tiller-project-search:focus-visible {
+  outline: 2px solid var(--tiller-theme-action) !important;
+  outline-offset: 1px;
+}
+
+:root body .tiller-project-repository-option {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 22%,
+    transparent
+  ) !important;
+}
+
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):hover,
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):focus-within,
+:root
+  body
+  .tiller-project-repository-option[data-selected="true"] {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):hover
+  .tiller-project-repository-name,
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):hover
+  .tiller-project-repository-meta,
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):focus-within
+  .tiller-project-repository-name,
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):focus-within
+  .tiller-project-repository-meta,
+:root
+  body
+  .tiller-project-repository-option[data-selected="true"]
+  .tiller-project-repository-name,
+:root
+  body
+  .tiller-project-repository-option[data-selected="true"]
+  .tiller-project-repository-meta {
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):hover
+  .tiller-project-repository-radio,
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):focus-within
+  .tiller-project-repository-radio,
+:root
+  body
+  .tiller-project-repository-option[data-selected="true"]
+  .tiller-project-repository-radio,
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):hover
+  .tiller-project-repository-radio
+  *,
+:root
+  body
+  .tiller-project-repository-option:not([data-disabled="true"]):focus-within
+  .tiller-project-repository-radio
+  *,
+:root
+  body
+  .tiller-project-repository-option[data-selected="true"]
+  .tiller-project-repository-radio
+  * {
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  .tiller-project-repository-option:focus-within {
+  outline: 1px solid var(--tiller-card-fill);
+  outline-offset: -3px;
+}
+
+:root
+  body
+  .tiller-dialog-section
+  + .tiller-dialog-section {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 20%,
+    transparent
+  ) !important;
+}
+
+:root
+  body
+  .tiller-dialog-shell
+  button[data-kumo-component="Select"][data-kumo-part="trigger"],
+:root body .tiller-dialog-static-control,
+:root body .tiller-dialog-plan-summary {
+  border: 1px solid color-mix(in srgb, var(--paperwing-ink) 72%, transparent) !important;
+  border-radius: 1px !important;
+  background-color: color-mix(
+    in srgb,
+    var(--tiller-card-fill) 84%,
+    white
+  ) !important;
+}
+
+:root
+  body
+  .tiller-dialog-shell
+  button[data-kumo-component="Select"][data-kumo-part="trigger"] {
+  min-height: 40px !important;
+  padding-inline: 12px !important;
+  font-size: 13px !important;
+  line-height: 18px !important;
+}
+
+:root
+  body
+  .tiller-dialog-shell
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible:not(
+    [aria-expanded="true"]
+  ) {
+  outline: 2px solid var(--tiller-theme-action) !important;
+  outline-offset: 1px !important;
+  background-color: color-mix(
+    in srgb,
+    var(--tiller-card-fill) 84%,
+    white
+  ) !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  .tiller-dialog-shell
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible:not(
+    [aria-expanded="true"]
+  )
+  * {
+  color: var(--paperwing-ink) !important;
+}
+
+:root body .tiller-dialog-plan-summary > * + * {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 20%,
+    transparent
+  ) !important;
+}
+
+:root body button.tiller-dialog-disclosure {
+  border: 1px solid transparent !important;
+  color: var(--paperwing-ink) !important;
+  transition-duration: 120ms;
+  transition-property: background-color, border-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root
+  body
+  button.tiller-dialog-disclosure:not(:disabled):hover,
+:root
+  body
+  button.tiller-dialog-disclosure:not(:disabled):focus-visible {
+  border-color: var(--tiller-theme-action) !important;
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  button.tiller-dialog-disclosure:not(:disabled):hover
+  *,
+:root
+  body
+  button.tiller-dialog-disclosure:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-card-fill) !important;
+}
+
+:root body button.tiller-dialog-button {
+  min-height: 36px !important;
+  border: 1px solid var(--tiller-theme-action) !important;
+  border-radius: 1px !important;
+  padding-inline: 14px !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root body button.tiller-dialog-button--secondary {
+  background-color: transparent !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root[data-theme="classic-light"]
+  body
+  button.tiller-dialog-button--secondary {
+  border-color: var(--tiller-theme-strong-border) !important;
+}
+
+:root[data-theme="classic-light"]
+  body
+  button.tiller-dialog-button--secondary:not(:disabled):hover,
+:root[data-theme="classic-light"]
+  body
+  button.tiller-dialog-button--secondary:not(:disabled):focus-visible {
+  border-color: var(--tiller-theme-strong-border) !important;
+  background-color: var(--color-kumo-tint) !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root[data-theme="classic-light"]
+  body
+  button.tiller-dialog-button--secondary:not(:disabled):focus-visible {
+  outline-color: var(--color-kumo-focus) !important;
+}
+
+:root[data-theme="classic-light"]
+  body
+  button.tiller-dialog-button--secondary:not(:disabled):hover
+  *,
+:root[data-theme="classic-light"]
+  body
+  button.tiller-dialog-button--secondary:not(:disabled):focus-visible
+  * {
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  button.tiller-dialog-button--primary:not(:disabled) {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  button.tiller-dialog-button--primary:not(:disabled)
+  * {
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  button.tiller-dialog-button:not(:disabled):hover,
+:root
+  body
+  button.tiller-dialog-button:not(:disabled):focus-visible {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-card-fill) !important;
+}
+
+:root
+  body
+  button.tiller-dialog-button:not(:disabled):focus-visible {
+  outline: 2px solid var(--tiller-theme-action) !important;
+  outline-offset: 2px;
+}
+
+:root
+  body
+  button.tiller-dialog-button:not(:disabled):hover
+  *,
+:root
+  body
+  button.tiller-dialog-button:not(:disabled):focus-visible
+  * {
+  color: var(--tiller-card-fill) !important;
+}
+
+:root body button.tiller-dialog-button:disabled {
+  border-color: color-mix(
+    in srgb,
+    var(--paperwing-ink) 30%,
+    transparent
+  ) !important;
+  background-color: transparent !important;
+  color: color-mix(in srgb, var(--paperwing-ink) 45%, transparent) !important;
+}
+
+/* All cards share the same material and nearly square geometry. In-flow cards
+   stay flat; floating controls and modal dialogs add progressively stronger,
+   downward shadows so elevation always communicates hierarchy. Toasts retain
+   their notification treatment and are excluded from the dialog selectors. */
+:root body .tiller-card-surface,
+:root
+  body
+  [role="dialog"]:not([style*="--toast-index"]),
+:root body [role="alertdialog"],
+:root body [role="menu"],
+:root
+  body
+  [role="presentation"]:has(> [role="listbox"]),
+:root body .tiller-dropdown-panel,
+:root body .kumo-popover-popup {
+  border: 1px solid var(--tiller-card-stroke) !important;
+  border-radius: 1px !important;
+  outline: 0 !important;
+  background-color: var(--tiller-card-surface-fill, var(--tiller-card-fill)) !important;
+  box-shadow: none !important;
+}
+
+:root body .tiller-card-surface {
+  border-color: var(--tiller-card-stroke-soft) !important;
+}
+
+:root body .tiller-card-surface:hover,
+:root body .tiller-card-surface:focus-visible,
+:root body .tiller-floating-surface {
+  border-color: var(--tiller-card-stroke) !important;
+}
+
+:root
+  body
+  button.tiller-card-surface.tiller-implementation-index-row-selected {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root
+  body
+  button.tiller-card-surface.tiller-implementation-index-row-selected
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
+/* Project rows use the same inverted field as implementation cards while the
+   operational markers keep their semantic shapes and colors. */
+:root body .tiller-project-card:hover,
+:root
+  body
+  .tiller-project-card:has(.tiller-project-card-open:focus-visible) {
+  background-color: var(--tiller-theme-fixed-action) !important;
+}
+
+:root
+  body
+  .tiller-project-card:hover
+  .tiller-project-card-copy,
+:root
+  body
+  .tiller-project-card:has(.tiller-project-card-open:focus-visible)
+  .tiller-project-card-copy {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  .tiller-project-card:hover
+  [data-project-signal="changed"],
+:root
+  body
+  .tiller-project-card:has(.tiller-project-card-open:focus-visible)
+  [data-project-signal="changed"] {
+  --tiller-workspace-signal-color: var(--tiller-theme-fixed-paper);
+}
+
+.tiller-project-actions-trigger {
+  transition: opacity 100ms ease-out;
+}
+
+@media (hover: hover) {
+  .tiller-project-card .tiller-project-actions-trigger {
+    opacity: 0;
+  }
+
+  .tiller-project-card:hover .tiller-project-actions-trigger,
+  .tiller-project-card:focus-within .tiller-project-actions-trigger,
+  .tiller-project-card details[open] .tiller-project-actions-trigger {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiller-project-actions-trigger {
+    transition: none;
+  }
+}
+
+:root body .tiller-floating-surface,
+:root
+  body
+  [role="dialog"]:not([aria-modal="true"]):not([style*="--toast-index"]),
+:root body [role="menu"],
+:root
+  body
+  [role="presentation"]:has(> [role="listbox"]),
+:root body .tiller-dropdown-panel,
+:root body .kumo-popover-popup {
+  box-shadow: var(--tiller-floating-shadow) !important;
+}
+
+:root
+  body
+  [role="dialog"][aria-modal="true"]:not([style*="--toast-index"]),
+:root body [role="alertdialog"] {
+  box-shadow: var(--tiller-modal-shadow) !important;
+}
+
+/* Neutral lifecycle copy is secondary to the implementation name. The fixed
+   8px trailing offset lands each label's right edge on the header + centerline;
+   attention states retain full contrast. */
+:root body .tiller-implementation-card-status {
+  color: color-mix(in srgb, var(--paperwing-ink) 78%, transparent) !important;
+}
+
+:root
+  body
+  .tiller-implementation-card-status[data-implementation-card-status="attention"] {
+  color: var(--paperwing-ink) !important;
+}
+
+/* Every interactive surface in the UI design uses the same terminal hover:
+   navy field, warm paper text, and no elevation change. */
+:root body a[href]:hover,
+:root body a[href]:focus-visible,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):hover,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):focus-visible,
+:root body summary:hover,
+:root body summary:focus-visible {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root body a[href]:hover *,
+:root body a[href]:focus-visible *,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):hover
+  *,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):focus-visible
+  *,
+:root body summary:hover *,
+:root body summary:focus-visible * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root body a[href]:hover::before,
+:root body a[href]:hover::after,
+:root body a[href]:hover *::before,
+:root body a[href]:hover *::after,
+:root body a[href]:focus-visible::before,
+:root body a[href]:focus-visible::after,
+:root body a[href]:focus-visible *::before,
+:root body a[href]:focus-visible *::after,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):hover::before,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):hover::after,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):hover
+  *::before,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):hover
+  *::after,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):focus-visible::before,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):focus-visible::after,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):focus-visible
+  *::before,
+:root
+  body
+  [role="button"]:not([aria-disabled="true"]):focus-visible
+  *::after,
+:root body summary:hover::before,
+:root body summary:hover::after,
+:root body summary:hover *::before,
+:root body summary:hover *::after,
+:root body summary:focus-visible::before,
+:root body summary:focus-visible::after,
+:root body summary:focus-visible *::before,
+:root body summary:focus-visible *::after {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* The wordmark is identity, not an operational control. Keep it visually
+   stable while retaining a clear hover and keyboard-focus affordance. */
+:root:not([data-mode="dark"])
+  body
+  button.tiller-wordmark:not(:disabled):hover,
+:root:not([data-mode="dark"])
+  body
+  button.tiller-wordmark:not(:disabled):focus-visible {
+  background-color: transparent !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-wordmark:not(:disabled):hover {
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+:root:not([data-mode="dark"])
+  body
+  button.tiller-wordmark:not(:disabled):focus-visible {
+  outline: 1px solid var(--tiller-theme-fixed-action);
+  outline-offset: 1px;
+}
+
+/* Workspace metadata has one grammar everywhere: a neutral item count, a red
+   warning, and a navy diamond for an unseen result. Green is reserved for a
+   service that is actively live. */
+.tiller-workspace-metadata {
+  color: var(--paperwing-ink) !important;
+}
+
+:root .tiller-workspace-metadata {
+  font-family: var(--font-mono);
+}
+
+/* Red marks work that needs a human look. Green is reserved exclusively for a
+   service that is live right now; blue diamonds mark unseen updates. */
+:root
+  body
+  span[data-implementation-status="failed"] {
+  color: var(--paperwing-signal-danger) !important;
+  fill: currentColor;
+}
+
+:root
+  body
+  span[data-implementation-status="running"] {
+  color: var(--paperwing-signal-live) !important;
+}
+
+:root
+  body
+  [data-workspace-metadata]
+  .tiller-workspace-signal[data-workspace-signal="warning"],
+:root
+  body
+  .tiller-implementation-state-option
+  .tiller-workspace-signal[data-workspace-signal="warning"] {
+  --tiller-workspace-signal-color: var(--paperwing-signal-danger);
+}
+
+:root body [data-project-signal="attention"] {
+  --tiller-workspace-signal-color: var(--paperwing-signal-danger);
+}
+
+:root body [data-env-attention-status],
+:root body [data-env-attention-status] * {
+  color: var(--paperwing-signal-danger) !important;
+  fill: var(--paperwing-signal-danger) !important;
+}
+
+:root
+  body
+  [data-workspace-metadata]
+  .tiller-workspace-signal[data-workspace-signal="update"],
+:root
+  body
+  .tiller-implementation-state-option
+  .tiller-workspace-signal[data-workspace-signal="update"] {
+  --tiller-workspace-signal-color: var(--paperwing-signal-update);
+}
+
+/* The global design palette colors every descendant navy, including Phosphor's
+   nested path. Re-apply the semantic color through the full painted SVG tree. */
+:root body .tiller-workspace-signal,
+:root body .tiller-workspace-signal > svg,
+:root body .tiller-workspace-signal > svg * {
+  color: var(--tiller-workspace-signal-color, var(--paperwing-ink)) !important;
+  fill: var(--tiller-workspace-signal-color, var(--paperwing-ink)) !important;
+}
+
+:root body .tiller-workspace-signal > svg {
+  width: 7px;
+  height: 7px;
+}
+
+:root body [data-agent-card-signal] {
+  color: var(--paperwing-ink) !important;
+  fill: currentColor !important;
+}
+
+:root
+  body
+  [data-agent-card-signal][data-agent-tab-status="starting"],
+:root
+  body
+  [data-agent-card-signal][data-agent-tab-status="working"],
+:root
+  body
+  [data-agent-card-signal][data-agent-tab-status="saving"],
+:root
+  body
+  [data-agent-card-signal][data-agent-tab-status="stopping"] {
+  color: var(--paperwing-signal-churning) !important;
+}
+
+:root
+  body
+  [data-agent-card-signal][data-agent-tab-status="error"] {
+  color: var(--paperwing-signal-danger) !important;
+}
+
+:root
+  body
+  [data-agent-card-signal][data-agent-tab-status="finished"] {
+  color: var(--paperwing-signal-update) !important;
+}
+
+:root
+  body
+  [data-agent-card-signal][data-agent-tab-status="viewed"] {
+  color: var(--paperwing-ink) !important;
+}
+
+[data-agent-tab-status="running"] {
+  color: var(--paperwing-signal-live) !important;
+  fill: currentColor;
+}
+
+[data-agent-tab-status="working"] {
+  color: var(--paperwing-signal-live) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab
+  [data-agent-tab-status="finished"] {
+  color: var(--paperwing-signal-update) !important;
+  fill: var(--paperwing-signal-update) !important;
+}
+
+:root
+  body
+  button.tiller-agent-tab
+  [data-agent-tab-status="finished"]
+  * {
+  color: var(--paperwing-signal-update) !important;
+  fill: var(--paperwing-signal-update) !important;
+}
+
+[data-implementation-status="running"] {
+  color: var(--paperwing-signal-live) !important;
+}
+
+[data-implementation-status="failed"] {
+  color: var(--paperwing-signal-danger) !important;
+}
+
+[data-implementation-status="creating"],
+[data-implementation-status="starting"],
+[data-implementation-status="saving"],
+[data-implementation-status="stopping"],
+[data-implementation-status="deleting"] {
+  color: var(--paperwing-signal-warning) !important;
+}
+
+/* Paperwing Light deliberately pins ordinary interface copy to ink with a
+   high-specificity rule. Implementation markers are semantic signals, so
+   restore their card tone at a still-higher specificity. */
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  body
+  [data-implementation-card-tone="live"] {
+  color: var(--paperwing-signal-live) !important;
+  fill: currentColor !important;
+}
+
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  body
+  [data-implementation-card-tone="attention"] {
+  color: var(--paperwing-signal-danger) !important;
+  fill: currentColor !important;
+}
+
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  body
+  [data-implementation-card-tone="update"],
+:root:not([data-theme="classic-light"]):not([data-mode="dark"])
+  body
+  [data-implementation-card-tone="update"]
+  * {
+  color: var(--paperwing-signal-update) !important;
+  fill: var(--paperwing-signal-update) !important;
+}
+
+:root
+  body
+  button.tiller-implementation-state-option[aria-checked="true"] {
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-implementation-state-option[aria-checked="true"]
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  button.tiller-implementation-state-option[aria-checked="true"]
+  .tiller-workspace-signal[data-workspace-signal],
+:root
+  body
+  button.tiller-implementation-state-option:not(:disabled):hover
+  .tiller-workspace-signal[data-workspace-signal],
+:root
+  body
+  button.tiller-implementation-state-option:not(:disabled):focus-visible
+  .tiller-workspace-signal[data-workspace-signal] {
+  --tiller-workspace-signal-color: var(--tiller-theme-fixed-paper);
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* Hover, keyboard focus, and selected rows use one terminal treatment. Every
+   nested label, count, symbol, and icon becomes paper beige while inverted. */
+:root
+  body
+  button:not(:disabled):hover
+  [data-workspace-metadata]
+  .tiller-workspace-signal[data-workspace-signal],
+:root
+  body
+  button:not(:disabled):focus-visible
+  [data-workspace-metadata]
+  .tiller-workspace-signal[data-workspace-signal],
+:root
+  body
+  .tiller-plan-index-row:hover
+  [data-workspace-metadata]
+  .tiller-workspace-signal[data-workspace-signal],
+:root
+  body
+  .tiller-plan-index-row:focus-within
+  [data-workspace-metadata]
+  .tiller-workspace-signal[data-workspace-signal],
+:root
+  body
+  .tiller-plan-index-row-selected
+  [data-workspace-metadata]
+  .tiller-workspace-signal[data-workspace-signal] {
+  --tiller-workspace-signal-color: var(--tiller-theme-fixed-paper);
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  .tiller-connection-marker.bg-kumo-success {
+  background-color: var(--paperwing-signal-live) !important;
+}
+
+:root body .tiller-connection-issue-icon,
+:root body .tiller-connection-issue-icon * {
+  color: var(
+    --tiller-connection-issue-color,
+    var(--paperwing-signal-danger)
+  ) !important;
+  fill: var(
+    --tiller-connection-issue-color,
+    var(--paperwing-signal-danger)
+  ) !important;
+}
+
+:root
+  body
+  .tiller-connections-trigger:not(:disabled):hover
+  .tiller-connection-issue-icon,
+:root
+  body
+  .tiller-connections-trigger:not(:disabled):focus-visible
+  .tiller-connection-issue-icon {
+  --tiller-connection-issue-color: var(--tiller-theme-fixed-paper);
+}
+
+:root
+  body
+  button:not(:disabled):hover
+  [data-agent-tab-status="running"],
+:root
+  body
+  button:not(:disabled):hover
+  [data-agent-tab-status="working"],
+:root
+  body
+  button:not(:disabled):focus-visible
+  [data-agent-tab-status="running"],
+:root
+  body
+  button:not(:disabled):focus-visible
+  [data-agent-tab-status="working"] {
+  color: var(--tiller-theme-fixed-paper) !important;
+  fill: currentColor;
+}
+
+/* Plan agents keep the implementation row's 44px rhythm without repeating a
+   full card outline. A single inset hairline separates resting rows; the navy
+   field is enough structure for the selected row. */
+:root
+  body
+  .tiller-agent-card-stack
+  > .tiller-plan-agent-list-item
+  + .tiller-plan-agent-list-item:not(.tiller-plan-agent-row-selected) {
+  box-shadow: inset 0 1px 0 var(--tiller-card-stroke-soft);
+}
+
+/* Report rows reserve space for nesting but do not have a disclosure control.
+   Paint their hover/focus on the outer row so the indent is included just like
+   it is in the selected state. Skill roots keep their arrow gutter separate. */
+:root
+  body
+  .tiller-agent-card-stack
+  > .tiller-plan-agent-list-item--report:not(.tiller-plan-agent-row-selected):hover,
+:root
+  body
+  .tiller-agent-card-stack
+  > .tiller-plan-agent-list-item--report:not(.tiller-plan-agent-row-selected):focus-within {
+  background-color: var(--color-kumo-tint);
+}
+
+:root
+  body
+  .tiller-agent-card-stack
+  > .tiller-plan-agent-list-item--report:not(.tiller-plan-agent-row-selected):hover
+  > button.tiller-plan-agent-row,
+:root
+  body
+  .tiller-agent-card-stack
+  > .tiller-plan-agent-list-item--report:not(.tiller-plan-agent-row-selected):focus-within
+  > button.tiller-plan-agent-row {
+  background-color: transparent;
+}
+
+:root body .tiller-plan-agent-row-selected {
+  background: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+.tiller-plan-agent-action {
+  opacity: 0;
+  transition: opacity 100ms ease-out;
+}
+
+.tiller-plan-agent-row-selected:hover .tiller-plan-agent-action,
+.tiller-plan-agent-row-selected:focus-within .tiller-plan-agent-action,
+.tiller-plan-agent-action[aria-expanded="true"] {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .tiller-plan-agent-action {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiller-plan-agent-action {
+    transition: none;
+  }
+}
+
+/* Resting design buttons are globally transparent. Scribe and implementation
+   reviewers put selection on the tab button itself, so give selected agent
+   buttons a deliberately stronger rule instead of relying on hover. */
+:root
+  body
+  button.tiller-plan-agent-row-selected[aria-selected="true"] {
+  background: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root body .tiller-plan-agent-row-selected * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* Paperwing's global ink rule intentionally has enough specificity to keep
+   utility colors from leaking into the palette. Selected agent rows invert
+   their copy, so match that specificity here to keep their labels legible. */
+:root[data-theme="paperwing"]
+  body
+  .tiller-plan-agent-row-selected,
+:root[data-theme="paperwing"]
+  body
+  .tiller-plan-agent-row-selected
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root
+  body
+  .tiller-plan-agent-row-selected
+  [data-agent-tab-status="running"],
+:root
+  body
+  .tiller-plan-agent-row-selected
+  [data-agent-tab-status="working"] {
+  color: var(--paperwing-signal-live) !important;
+  fill: currentColor !important;
+}
+
+:root
+  body
+  .tiller-plan-agent-row-selected
+  [data-agent-tab-status="error"] {
+  color: var(--paperwing-signal-danger) !important;
+  fill: currentColor !important;
+}
+
+:root
+  body
+  .tiller-plan-agent-row-selected
+  [data-agent-tab-status="finished"] {
+  color: var(--paperwing-signal-update) !important;
+  fill: currentColor !important;
+}
+
+:root
+  body
+  .tiller-plan-agent-row-selected
+  [data-agent-card-signal][data-agent-tab-status="viewed"] {
+  color: var(--tiller-theme-fixed-paper) !important;
+  fill: currentColor !important;
+}
+
+/* The popover already provides the menu boundary. Strip the global menu frame
+   from its semantic child so the reviewer menu has only one visible border. */
+:root
+  body
+  .tiller-plan-agent-actions-menu[role="menu"] {
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
+/* The compact reviewer form uses one shared inset and aligns each label with
+   its selected value. The chevrons carry the dropdown affordance, so the
+   controls do not need another pair of boxed surfaces inside the popover. */
+:root body .tiller-add-reviewer-popover {
+  padding: 16px !important;
+}
+
+:root body .tiller-add-reviewer-picker {
+  grid-template-columns: minmax(0, 1fr) 7rem !important;
+  column-gap: 24px !important;
+}
+
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"] {
+  min-height: 40px !important;
+  height: 40px !important;
+  border: 0 !important;
+  padding-inline: 0 !important;
+  box-shadow: none !important;
+  transition-property: color, box-shadow;
+}
+
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover,
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible,
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"] {
+  background-color: transparent !important;
+  box-shadow: inset 0 -1px 0 var(--tiller-theme-action) !important;
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible,
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"] {
+  box-shadow: inset 0 -2px 0 var(--tiller-theme-action) !important;
+}
+
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover
+  *,
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible
+  *,
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  * {
+  color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):hover
+  > span[aria-hidden="true"]::before,
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:focus-visible
+  > span[aria-hidden="true"]::before,
+:root
+  body
+  .tiller-add-reviewer-picker
+  button[data-kumo-component="Select"][data-kumo-part="trigger"][aria-expanded="true"]
+  > span[aria-hidden="true"]::before {
+  border-right-color: var(--paperwing-ink) !important;
+  border-bottom-color: var(--paperwing-ink) !important;
+}
+
+:root
+  body
+  button.tiller-add-reviewer-primary:not(:disabled) {
+  background-color: var(--tiller-theme-action) !important;
+  color: var(--tiller-theme-on-action) !important;
+}
+
+:root
+  body
+  button.tiller-add-reviewer-primary:not(:disabled)
+  * {
+  color: var(--tiller-theme-on-action) !important;
+}
+
 a[href],
 button:not(:disabled),
 [role="button"]:not([aria-disabled="true"]) {
   cursor: pointer;
-}
-
-.tiller-rail-logo {
-  filter: brightness(0);
-}
-
-:root[data-mode="dark"] .tiller-rail-logo {
-  filter: brightness(0) invert(1);
 }
 
 .tiller-sidebar-wrap {
@@ -63,8 +4438,13 @@ button:not(:disabled),
 }
 
 @keyframes waveform {
-  0%, 100% { transform: scaleY(0.4); }
-  50%       { transform: scaleY(1); }
+  0%,
+  100% {
+    transform: scaleY(0.4);
+  }
+  50% {
+    transform: scaleY(1);
+  }
 }
 
 .animate-waveform {

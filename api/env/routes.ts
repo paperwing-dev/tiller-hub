@@ -3,6 +3,7 @@
 
 import { Hono, type Context } from "hono";
 import { getEnvLifecycleStub, getWorkspaceStub } from "../helpers";
+import { recordApiTimingPhase } from "../request-timing";
 import {
   STARTUP_DIAGNOSTIC_STEP_IDS,
 } from "../types";
@@ -14,12 +15,13 @@ import type {
   StartupDiagnosticLogTails,
   StartupDiagnosticSeverity,
   StartupDiagnosticStepId,
+  StartupDiagnosticsSnapshot,
+  StartupDiagnosticsState,
 } from "../types";
 import { isGitHubAppAllowedForRequest, mintGitHubInstallationToken } from "../github/app";
 import {
   githubAppPublicHubDisabledBody,
   loadRepoForRequest,
-  type RepoAccessFailure,
   type RepoAccessResult,
   type RepoWorkspace,
 } from "../repo/access";
@@ -30,7 +32,6 @@ import {
 import { isEnvHarness } from "./harness";
 import { getRunnerBackend } from "./runner-backends";
 import {
-  deriveBranchBackedEnvStatus,
   deriveGitHubEnvBranchStatus,
   hasCurrentMainBase,
   withDerivedBranchBackedEnvStatus,
@@ -53,6 +54,11 @@ import {
   projectEnvMetaForRead,
   deleteEnvSnapshotArtifacts,
 } from "./service";
+import {
+  isProjectedRuntimeFailure,
+  projectRuntimeFailure,
+  runtimeFailureCodeForStartupStep,
+} from "./runtime-failure";
 import {
   handleGitHubDraftPrPublishResult,
   startGitHubDraftPrPublish,
@@ -86,10 +92,12 @@ import {
   exchangeCodexRuntimeAuth,
   parseCodexRuntimeAuthRequest,
 } from "../codex-runtime-auth";
-import { verifyImplementorCodexRuntimeCapability } from "./codex-runtime-capability";
 import { ensureEnvironmentSidebarSlots } from "./sidebar-slots";
-
-const CODEX_RUNTIME_CAPABILITY_HEADER = "X-Tiller-Codex-Runtime-Capability";
+import { buildWorkspaceSyncedPatch } from "./workspace-synced";
+import {
+  readManagedEnvSlugFromStoredSession,
+  readManagedRoleFromStoredSession,
+} from "../session-attachment";
 
 const MAX_CHANGE_PREVIEW_BYTES = 400_000;
 
@@ -211,6 +219,64 @@ function formatLifecycleDebug(lifecycle: EnvLifecycleState | null): Record<strin
   };
 }
 
+function publicStartupDiagnostics(
+  diagnostics: StartupDiagnosticsState,
+  slug: string,
+): StartupDiagnosticsState {
+  const sanitize = (snapshot: StartupDiagnosticsSnapshot | null): StartupDiagnosticsSnapshot | null => {
+    if (!snapshot) return null;
+    let failureMessage = snapshot.failure?.message ?? null;
+    if (failureMessage && !isProjectedRuntimeFailure(failureMessage)) {
+      failureMessage = projectRuntimeFailure(
+        runtimeFailureCodeForStartupStep(snapshot.failure?.lastStepId ?? snapshot.currentStepId),
+        failureMessage,
+        { slug, opId: snapshot.opId, source: "legacy-startup-diagnostics" },
+      ).message;
+    }
+    const exposesHarnessOutput = (message?: string | null): boolean =>
+      Boolean(message && /tiller-harness last output:/i.test(message));
+    const rawHarnessOutputEvent = snapshot.events.find((event) => exposesHarnessOutput(event.message));
+    const rawHarnessOutputMessage = rawHarnessOutputEvent?.message
+      ?? (exposesHarnessOutput(snapshot.currentStepMessage) ? snapshot.currentStepMessage : null);
+    const harnessOutputFailureMessage = rawHarnessOutputMessage
+      ? failureMessage ?? projectRuntimeFailure(
+          runtimeFailureCodeForStartupStep(rawHarnessOutputEvent?.stepId ?? snapshot.currentStepId),
+          rawHarnessOutputMessage,
+          { slug, opId: snapshot.opId, source: "legacy-startup-output" },
+        ).message
+      : null;
+    return {
+      ...snapshot,
+      events: snapshot.events.map((event) => ({
+        ...event,
+        message: event.severity === "error" && failureMessage
+          ? failureMessage
+          : exposesHarnessOutput(event.message) && harnessOutputFailureMessage
+            ? harnessOutputFailureMessage
+            : event.message,
+        detail: null,
+      })),
+      currentStepMessage: failureMessage
+        ?? (exposesHarnessOutput(snapshot.currentStepMessage)
+          ? harnessOutputFailureMessage
+          : snapshot.currentStepMessage),
+      failure: snapshot.failure
+        ? {
+            ...snapshot.failure,
+            message: failureMessage!,
+            exitCode: null,
+            signal: null,
+          }
+        : null,
+      logTails: { harness: null, stopControl: null, bootstrap: null },
+    };
+  };
+  return {
+    active: sanitize(diagnostics.active),
+    lastFailed: sanitize(diagnostics.lastFailed),
+  };
+}
+
 async function readProjectedEnvMeta(
   env: Env,
   slug: string,
@@ -302,7 +368,10 @@ async function finalizeRunnerStoppedCallback(args: {
   slug: string;
   opId: string;
   detail: string;
-}): Promise<EnvMeta | null> {
+}): Promise<{
+  projected: EnvMeta | null;
+  failure: ReturnType<typeof projectRuntimeFailure> | null;
+}> {
   const lifecycleStub = getEnvLifecycleStub(args.env, args.slug);
   const lifecycleBefore = await lifecycleStub.getState();
   console.info(
@@ -312,9 +381,16 @@ async function finalizeRunnerStoppedCallback(args: {
       lifecycleBefore: formatLifecycleDebug(lifecycleBefore),
     })}`,
   );
+  const failure = lifecycleBefore?.phase === "starting" || lifecycleBefore?.phase === "running"
+    ? projectRuntimeFailure(
+        "runtime_stopped_unexpectedly",
+        args.detail || "Runner stopped without a detail.",
+        { slug: args.slug, opId: args.opId, source: "runner-stopped-callback" },
+      )
+    : null;
   const lifecycleAfter = await lifecycleStub.noteRunnerStopped(
     args.opId,
-    args.detail || null,
+    failure?.message ?? null,
   );
   console.info(
     `[envs] runner-stopped applied for ${args.slug}: ${JSON.stringify({
@@ -329,7 +405,7 @@ async function finalizeRunnerStoppedCallback(args: {
     await revokeGitHubBridgesForInteractiveEnv(args.env, args.slug);
     await lifecycleStub.clearStopWorkspaceSyncedMeta().catch(() => {});
   }
-  return projected;
+  return { projected, failure };
 }
 
 async function applyWorkspaceSyncedCallback(args: {
@@ -337,7 +413,7 @@ async function applyWorkspaceSyncedCallback(args: {
   slug: string;
   opId: string;
   workspacePatch: Partial<StopWorkspaceSyncedMetaPatch>;
-}): Promise<EnvMeta | null> {
+}): Promise<{ accepted: boolean; projected: EnvMeta | null }> {
   const lifecycleStub = getEnvLifecycleStub(args.env, args.slug);
   const lifecycleBefore = await lifecycleStub.getState();
   console.info(
@@ -348,8 +424,8 @@ async function applyWorkspaceSyncedCallback(args: {
     })}`,
   );
 
-  await lifecycleStub.noteStopWorkspaceSynced(args.opId, args.workspacePatch);
-  const lifecycleAfter = await lifecycleStub.getState();
+  const acknowledgement = await lifecycleStub.acceptStopWorkspaceSynced(args.opId, args.workspacePatch);
+  const lifecycleAfter = acknowledgement.state;
   console.info(
     `[envs] workspace-synced ack applied for ${args.slug}: ${JSON.stringify({
       opId: args.opId,
@@ -357,7 +433,13 @@ async function applyWorkspaceSyncedCallback(args: {
     })}`,
   );
 
-  return await projectAndPersistEnvSummary(args.env, getHub(args.env), args.slug).catch(() => null);
+  if (!acknowledgement.accepted) {
+    return { accepted: false, projected: null };
+  }
+  return {
+    accepted: true,
+    projected: await projectAndPersistEnvSummary(args.env, getHub(args.env), args.slug).catch(() => null),
+  };
 }
 
 async function recordStopFailedCallback(args: {
@@ -437,10 +519,6 @@ type StoppedEnvRepoContext =
       repo: RepoWorkspaceHandle;
       branchStatus: NonNullable<EnvMeta["branchStatus"]>;
     };
-type WorkspaceSyncedPatchResult =
-  | { ok: true; patch: Partial<StopWorkspaceSyncedMetaPatch> }
-  | RepoAccessFailure;
-
 function getRepoGitMetadataNotReadyBody(): { error: string; code: string } & Record<string, unknown> {
   return {
     error: "GitHub default branch metadata is not ready yet for this repository.",
@@ -936,81 +1014,6 @@ function readWorkspaceSyncedPatchFromHeaders(request: Request): {
   return patch;
 }
 
-async function buildWorkspaceSyncedPatch(
-  env: Env,
-  meta: EnvMeta,
-  request: Request,
-): Promise<WorkspaceSyncedPatchResult> {
-  const headerPatch = readWorkspaceSyncedPatchFromHeaders(request);
-  try {
-    const loadedRepo = await loadRepoForRequest(env, request, meta.repoId);
-    if (!loadedRepo.ok) {
-      if (loadedRepo.body.code === "github_app_public_hub_disabled") {
-        return loadedRepo;
-      }
-      throw new Error(typeof loadedRepo.body.error === "string" ? loadedRepo.body.error : "Repository metadata is not available.");
-    }
-    const repo = loadedRepo.repo;
-
-    const envWorkspace = getWorkspaceStub(env, meta.slug);
-    const workspaceDirty = meta.scmModel === "github"
-      ? await (async () => {
-          const [draftManifest, deletedPaths] = await Promise.all([
-            envWorkspace.getHashedManifest({ excludePrefixes: TREE_HASH_EXCLUDES }),
-            envWorkspace.readGitHubDeletedWorkspacePaths(),
-          ]);
-          return draftManifest.length > 0 || deletedPaths.length > 0;
-        })()
-      : await (async () => {
-          const [repoTreeHash, envTreeHash] = await Promise.all([
-            repo.workspace.computeWorkspaceTreeHash({ excludePrefixes: TREE_HASH_EXCLUDES }),
-            envWorkspace.computeWorkspaceTreeHash({ excludePrefixes: TREE_HASH_EXCLUDES }),
-          ]);
-          return repoTreeHash !== envTreeHash;
-        })();
-    const currentMainCommit = meta.scmModel === "github"
-      ? repo.meta.githubDefaultBranchHeadSha ?? null
-      : repo.meta.mainCommit ?? null;
-    const baseMainCommit = workspaceDirty
-      ? (meta.scmModel === "github" ? null : meta.baseMainCommit ?? meta.lastKnownMainCommit ?? null)
-      : currentMainCommit;
-    const nextMeta = {
-      ...meta,
-      workspaceDirty,
-      workspaceNeedsAttention: false,
-      baseMainCommit,
-      lastKnownMainCommit: currentMainCommit,
-    };
-
-    return {
-      ok: true,
-      patch: {
-        ...headerPatch,
-        workspaceDirty,
-        workspaceNeedsAttention: false,
-        baseMainCommit,
-        lastKnownMainCommit: currentMainCommit,
-        branchStatus: meta.scmModel === "github"
-          ? deriveGitHubEnvBranchStatus(nextMeta, repo.meta)
-          : deriveBranchBackedEnvStatus(nextMeta, repo.meta),
-      },
-    };
-  } catch (error) {
-    console.warn(
-      `[envs] Failed to classify saved workspace for ${meta.slug}:`,
-      error instanceof Error ? error.message : String(error),
-    );
-    return {
-      ok: true,
-      patch: {
-        ...headerPatch,
-        workspaceNeedsAttention: true,
-        branchStatus: "needs-attention",
-      },
-    };
-  }
-}
-
 function isStartupDiagnosticStepId(value: unknown): value is StartupDiagnosticStepId {
   return typeof value === "string" && STARTUP_DIAGNOSTIC_STEP_IDS.includes(value as StartupDiagnosticStepId);
 }
@@ -1043,25 +1046,32 @@ function readStartupDiagnosticLogTails(value: unknown): Partial<StartupDiagnosti
 const envRoutes = new Hono<HonoEnv>();
 
 envRoutes.get("/api/envs", async (c) => {
+  let phaseStartedAt = performance.now();
   await ensureEnvironmentSidebarSlots(c.env).catch((error) => {
     console.warn(
       "[envs] Failed to reconcile implementor sidebar slots:",
       error instanceof Error ? error.message : String(error),
     );
   });
-  const projected = await Promise.all(
-    (await listEnvViews(c.env)).map(async (meta) => {
-      try {
-        return await projectEnvMetaForRead(c.env, meta);
-      } catch (error) {
-        console.warn(
-          `[envs] Skipping env ${meta.slug} during projection:`,
-          error instanceof Error ? error.message : String(error),
-        );
-        return null;
-      }
-    }),
-  );
+  recordApiTimingPhase(c, "envs_reconcile", phaseStartedAt);
+
+  phaseStartedAt = performance.now();
+  const envViews = await listEnvViews(c.env);
+  recordApiTimingPhase(c, "envs_list", phaseStartedAt);
+
+  phaseStartedAt = performance.now();
+  const projected = await Promise.all(envViews.map(async (meta) => {
+    try {
+      return await projectEnvMetaForRead(c.env, meta);
+    } catch (error) {
+      console.warn(
+        `[envs] Skipping env ${meta.slug} during projection:`,
+        error instanceof Error ? error.message : String(error),
+      );
+      return null;
+    }
+  }));
+  recordApiTimingPhase(c, "envs_project", phaseStartedAt);
   return c.json(
     projected
       .filter((meta): meta is EnvMeta => meta !== null)
@@ -1090,6 +1100,12 @@ envRoutes.post("/api/envs", async (c) => {
   }
   if (body.authMode !== undefined || body.codexAuthPreference !== undefined) {
     return c.json({ error: "Environment auth preferences are no longer accepted; use Global Settings billing modes." }, 400);
+  }
+  if (body.displayName !== undefined) {
+    return c.json({
+      error: "Environment display names are assigned by the server.",
+      code: "display_name_server_generated",
+    }, 400);
   }
   if (body.slug !== undefined && typeof body.slug !== "string") {
     return c.json({ error: "slug must be a string", code: "invalid_slug" }, 400);
@@ -1138,15 +1154,20 @@ envRoutes.get("/api/envs/:slug", async (c) => {
 
 envRoutes.post("/api/envs/:slug/codex/runtime-auth", async (c) => {
   const slug = c.req.param("slug") ?? "";
+  const authorization = c.get("authorization");
+  if (authorization.kind !== "environment" || authorization.envSlug !== slug) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
   const lifecycle = getEnvLifecycleStub(c.env, slug);
   const subject = await lifecycle.getActiveImplementorCodexRuntimeSubject();
-  if (!subject || subject.envSlug !== slug) {
+  if (
+    !subject
+    || subject.envSlug !== slug
+    || subject.incarnationId !== authorization.incarnationId
+    || subject.startOpId !== authorization.startOperationId
+  ) {
     return codexRuntimeAuthInactiveResponse();
   }
-  const authorized = await verifyImplementorCodexRuntimeCapability(c.env, subject, c.req.header(
-    CODEX_RUNTIME_CAPABILITY_HEADER,
-  ));
-  if (!authorized) return c.json({ error: "Unauthorized" }, 401);
   if (
     subject.profile.kind !== "subscription-app-server"
     || subject.profile.surface !== "implementor"
@@ -1186,6 +1207,16 @@ envRoutes.post("/api/envs/:slug/start", async (c) => {
       code: "startup_plan_selection_removed",
     }, 400);
   }
+  if (
+    body.implementationMode !== undefined
+    && body.implementationMode !== "fresh"
+    && body.implementationMode !== "plan"
+  ) {
+    return c.json({
+      error: "implementationMode must be fresh or plan.",
+      code: "invalid_implementation_mode",
+    }, 400);
+  }
   const result = await startEnvAction({
     env: c.env,
     get executionCtx() {
@@ -1195,6 +1226,7 @@ envRoutes.post("/api/envs/:slug/start", async (c) => {
     requestUrl: c.req.url,
     slug,
     harnessSettings: body.harnessSettings,
+    implementationMode: body.implementationMode,
   });
   return c.json(result.body, result.status as any);
 });
@@ -1208,6 +1240,49 @@ envRoutes.post("/api/envs/:slug/stop", async (c) => {
     slug: c.req.param("slug"),
   });
   return c.json(result.body, result.status as any);
+});
+
+envRoutes.post("/api/envs/:slug/implementor-attention/completions", async (c) => {
+  const slug = c.req.param("slug") ?? "";
+  const opId = readLifecycleOpIdHeader(c.req.raw);
+  if (!opId) return c.json({ error: "Missing X-Tiller-Lifecycle-Op-Id header" }, 400);
+  const parsedBody = await readOptionalJsonObjectBody(c.req.raw);
+  if (!parsedBody.ok) {
+    return c.json({ error: "Request body must be a valid JSON object." }, 400);
+  }
+  const sequence = parsedBody.body.sequence;
+  if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence <= 0) {
+    return c.json({ error: "sequence must be a positive safe integer" }, 400);
+  }
+
+  const lifecycle = getEnvLifecycleStub(c.env, slug);
+  const result = await lifecycle.reportImplementorCompletion(opId, sequence);
+  if (!result.accepted) {
+    return c.json({ error: "Completion belongs to a stale environment runtime." }, 409);
+  }
+  await lifecycle.persistOwnedProjection();
+  return c.body(null, 204);
+});
+
+envRoutes.post("/api/envs/:slug/implementor-attention/acknowledge", async (c) => {
+  const slug = c.req.param("slug") ?? "";
+  const parsedBody = await readOptionalJsonObjectBody(c.req.raw);
+  if (!parsedBody.ok) {
+    return c.json({ error: "Request body must be a valid JSON object." }, 400);
+  }
+  const token = typeof parsedBody.body.token === "string"
+    ? parsedBody.body.token.trim()
+    : "";
+  if (!token) return c.json({ error: "token is required" }, 400);
+
+  const lifecycle = getEnvLifecycleStub(c.env, slug);
+  const result = await lifecycle.acknowledgeImplementorAttention(token);
+  if (result === "missing") return c.json({ error: "Not found" }, 404);
+  if (result === "conflict") {
+    return c.json({ error: "A newer implementor completion needs attention." }, 409);
+  }
+  await lifecycle.persistOwnedProjection();
+  return c.body(null, 204);
 });
 
 envRoutes.post("/api/envs/:slug/scheduled-run/cancel", async (c) => {
@@ -1254,7 +1329,7 @@ envRoutes.get("/api/envs/:slug/startup-diagnostics", async (c) => {
   if (!meta) return c.json({ error: "Not found" }, 404);
 
   const diagnostics = await getEnvLifecycleStub(c.env, slug).getStartupDiagnostics();
-  return c.json(diagnostics);
+  return c.json(publicStartupDiagnostics(diagnostics, slug));
 });
 
 envRoutes.post("/api/envs/:slug/startup-diagnostics", async (c) => {
@@ -1295,37 +1370,58 @@ envRoutes.post("/api/envs/:slug/startup-diagnostics", async (c) => {
     if (body.stepId !== undefined && !isStartupDiagnosticStepId(body.stepId)) {
       return c.json({ error: "Invalid stepId" }, 400);
     }
+    const failure = projectRuntimeFailure(
+      runtimeFailureCodeForStartupStep(isStartupDiagnosticStepId(body.stepId) ? body.stepId : null),
+      {
+        message: body.message,
+        detail: body.detail,
+        exitCode: body.exitCode,
+        signal: body.signal,
+        logTails,
+      },
+      { slug, opId, source: "startup-diagnostics-callback" },
+    );
     const result = await recordStartupDiagnosticFailure({
       env: c.env,
       slug,
       opId,
       stepId: isStartupDiagnosticStepId(body.stepId) ? body.stepId : undefined,
-      message: body.message,
+      message: failure.message,
       detail: typeof body.detail === "string" ? body.detail : null,
       at: typeof body.at === "string" ? body.at : null,
       exitCode: typeof body.exitCode === "number" ? body.exitCode : null,
       signal: typeof body.signal === "string" ? body.signal : null,
       logTails,
     });
-    return c.json(result);
+    return c.json({ ...result, code: failure.code, referenceId: failure.referenceId });
   }
 
   if (!isStartupDiagnosticStepId(body.stepId)) {
     return c.json({ error: "stepId is required" }, 400);
   }
 
+  const severity = readStartupDiagnosticSeverity(body.severity);
+  const eventFailure = severity === "error"
+    ? projectRuntimeFailure(
+        runtimeFailureCodeForStartupStep(body.stepId),
+        { message: body.message, detail: body.detail, logTails },
+        { slug, opId, source: "startup-diagnostics-event" },
+      )
+    : null;
   const result = await recordStartupDiagnosticEvent({
     env: c.env,
     slug,
     opId,
     stepId: body.stepId,
-    severity: readStartupDiagnosticSeverity(body.severity),
-    message: body.message,
+    severity,
+    message: eventFailure?.message ?? body.message,
     detail: typeof body.detail === "string" ? body.detail : null,
     at: typeof body.at === "string" ? body.at : null,
     logTails,
   });
-  return c.json(result);
+  return c.json(eventFailure
+    ? { ...result, code: eventFailure.code, referenceId: eventFailure.referenceId }
+    : result);
 });
 
 envRoutes.post("/api/envs/:slug/boot-progress", async (c) => {
@@ -1341,12 +1437,19 @@ envRoutes.post("/api/envs/:slug/boot-progress", async (c) => {
     return c.json({ error: "Not found" }, 404);
   }
   const hub = getHub(c.env);
-  await lifecycleStub.setBootProgress(
-    body.message,
-    isStartupDiagnosticStepId(body.stepId) ? body.stepId : undefined,
-  );
+  const stepId = isStartupDiagnosticStepId(body.stepId) ? body.stepId : undefined;
+  const failure = /\b(?:failed|fatal|error)\b/i.test(body.message)
+    ? projectRuntimeFailure(
+        runtimeFailureCodeForStartupStep(stepId),
+        body.message,
+        { slug, source: "boot-progress-callback" },
+      )
+    : null;
+  await lifecycleStub.setBootProgress(failure?.message ?? body.message, stepId);
   await projectAndPersistEnvSummary(c.env, hub, slug).catch(() => null);
-  return c.json({ ok: true });
+  return c.json(failure
+    ? { ok: true, code: failure.code, referenceId: failure.referenceId }
+    : { ok: true });
 });
 
 envRoutes.post("/api/envs/:slug/infra-ready", async (c) => {
@@ -1389,12 +1492,15 @@ envRoutes.post("/api/envs/:slug/runner-stopped", async (c) => {
   if (!opId) return c.json({ error: "Missing X-Tiller-Lifecycle-Op-Id header" }, 400);
 
   const detail = (await c.req.text().catch(() => "")).trim();
-  const projected = await finalizeRunnerStoppedCallback({ env: c.env, slug, opId, detail });
+  const result = await finalizeRunnerStoppedCallback({ env: c.env, slug, opId, detail });
   return c.json({
     ok: true,
     slug,
-    status: projected?.status ?? (await getEnvLifecycleStub(c.env, slug).getState())?.phase ?? null,
-    error: projected?.error ?? (detail || null),
+    status: result.projected?.status ?? (await getEnvLifecycleStub(c.env, slug).getState())?.phase ?? null,
+    error: result.projected?.error ?? result.failure?.message ?? null,
+    ...(result.failure
+      ? { code: result.failure.code, referenceId: result.failure.referenceId }
+      : {}),
   });
 });
 
@@ -1406,44 +1512,63 @@ envRoutes.post("/api/envs/:slug/workspace-synced", async (c) => {
   // Persist the exact operation acknowledgement before consulting the KV/repo
   // read model. The container does not durably retry this callback, so a
   // transient projection failure must not discard the lifecycle fact.
-  let projected = await applyWorkspaceSyncedCallback({
+  let acknowledgement = await applyWorkspaceSyncedCallback({
     env: c.env,
     slug,
     opId,
     workspacePatch: readWorkspaceSyncedPatchFromHeaders(c.req.raw),
   });
+  if (!acknowledgement.accepted) {
+    return c.json({ error: "Workspace acknowledgement does not match the active Stop operation." }, 409);
+  }
   const meta = await readProjectedEnvMeta(c.env, slug).catch(() => null);
   if (meta) {
-    const workspacePatchResult = await buildWorkspaceSyncedPatch(c.env, meta, c.req.raw);
+    const workspacePatchResult = await buildWorkspaceSyncedPatch(
+      c.env,
+      meta,
+      readWorkspaceSyncedPatchFromHeaders(c.req.raw),
+      () => loadRepoForRequest(c.env, c.req.raw, meta.repoId),
+    );
     if (workspacePatchResult.ok) {
-      projected = await applyWorkspaceSyncedCallback({
+      acknowledgement = await applyWorkspaceSyncedCallback({
         env: c.env,
         slug,
         opId,
         workspacePatch: workspacePatchResult.patch,
       });
+      if (!acknowledgement.accepted) {
+        return c.json({ error: "Workspace acknowledgement does not match the active Stop operation." }, 409);
+      }
     }
   }
-  return c.json({
-    ok: true,
-    slug,
-    status: projected?.status ?? (await getEnvLifecycleStub(c.env, slug).getState())?.phase ?? null,
-  });
+  return c.json({ accepted: true, opId });
 });
 
 envRoutes.post("/api/envs/:slug/stop-failed", async (c) => {
   const slug = c.req.param("slug");
   const bodyText = (await c.req.text().catch(() => "")).trim();
-  const message = bodyText || "Stop failed before workspace persistence completed; recent workspace changes were not saved.";
+  const message = bodyText || "Stop failed before workspace persistence completed.";
   const stopOpId = readLifecycleOpIdHeader(c.req.raw);
   if (!stopOpId) return c.json({ error: "Missing X-Tiller-Lifecycle-Op-Id header" }, 400);
 
-  const projected = await recordStopFailedCallback({ env: c.env, slug, opId: stopOpId, message });
+  const failure = projectRuntimeFailure(
+    "workspace_persistence_failed",
+    message,
+    { slug, opId: stopOpId, source: "stop-failed-callback" },
+  );
+  const projected = await recordStopFailedCallback({
+    env: c.env,
+    slug,
+    opId: stopOpId,
+    message: failure.message,
+  });
   return c.json({
     ok: true,
     slug,
     status: projected?.status ?? (await getEnvLifecycleStub(c.env, slug).getState())?.phase ?? null,
-    error: message,
+    error: failure.message,
+    code: failure.code,
+    referenceId: failure.referenceId,
   });
 });
 
@@ -1454,12 +1579,21 @@ envRoutes.post("/api/envs/:slug/harness-failed", async (c) => {
   const opId = readLifecycleOpIdHeader(c.req.raw);
   if (!opId) return c.json({ error: "Missing X-Tiller-Lifecycle-Op-Id header" }, 400);
 
+  const failure = projectRuntimeFailure(
+    "runtime_start_failed",
+    errorMessage,
+    { slug, opId, source: "harness-failed-callback" },
+  );
   const result = await applyHarnessFailedCallback({
     env: c.env,
     slug,
     opId,
-    errorMessage,
+    errorMessage: failure.message,
   });
+  if (result.accepted) {
+    result.body.code = failure.code;
+    result.body.referenceId = failure.referenceId;
+  }
   return result.accepted
     ? c.json(result.body)
     : c.json(result.body, 409);
@@ -1782,12 +1916,34 @@ envRoutes.post("/api/envs/:slug/github/publish-draft-pr", async (c) => {
 
 envRoutes.post("/api/envs/:slug/github/publish-draft-pr/:operationId/result", async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
-  const result = await handleGitHubDraftPrPublishResult({
+  const slug = c.req.param("slug");
+  const operationId = c.req.param("operationId");
+  const resultTask = handleGitHubDraftPrPublishResult({
     env: c.env,
-    slug: c.req.param("slug"),
-    operationId: c.req.param("operationId"),
+    slug,
+    operationId,
     body,
   });
+
+  if (c.executionCtx?.waitUntil) {
+    c.executionCtx.waitUntil(resultTask.then((result) => {
+      if (result.status >= 400) {
+        console.warn(`[github-publish] Result callback was rejected: ${JSON.stringify({
+          slug,
+          operationId,
+          status: result.status,
+          code: typeof result.body.code === "string" ? result.body.code : null,
+        })}`);
+      }
+    }).catch((error) => {
+      console.error(`[github-publish] Result callback processing failed for ${slug}:`, error);
+    }));
+    // The publishing runtime is the caller and result processing destroys it.
+    // Acknowledge first so cleanup cannot cancel its own request mid-handler.
+    return c.json({ ok: true, accepted: true }, 202);
+  }
+
+  const result = await resultTask;
   return c.json(result.body, result.status as any);
 });
 
@@ -1895,8 +2051,33 @@ envRoutes.post("/api/envs/:slug/sync", async (c) => {
   if (!(await readProjectedEnvMeta(c.env, slug))) return c.json({ error: "Not found" }, 404);
 
   const hub = getHub(c.env);
-  await hub.addMessage(crypto.randomUUID(), slug, { type: "sync" }, null);
-  return c.json({ ok: true, slug, message: "Sync triggered" });
+  const [sessions, routableSessionIds] = await Promise.all([
+    hub.getAllSessions(),
+    hub.getRoutableSessionIds(),
+  ]);
+  const routable = new Set(routableSessionIds);
+  const leadSessionIds = sessions
+    .filter((session) => (
+      session.active === 1
+      && session.ended_at === null
+      && routable.has(session.id)
+      && readManagedEnvSlugFromStoredSession(session) === slug
+      && readManagedRoleFromStoredSession(session) === "lead"
+    ))
+    .map((session) => session.id);
+  if (leadSessionIds.length === 0) {
+    return c.json({ error: "No active implementor session is connected." }, 409);
+  }
+
+  await Promise.all(leadSessionIds.map((sessionId) => (
+    hub.addMessage(crypto.randomUUID(), sessionId, { type: "sync" }, null)
+  )));
+  return c.json({
+    ok: true,
+    slug,
+    message: "Sync triggered",
+    sessionCount: leadSessionIds.length,
+  });
 });
 
 envRoutes.delete("/api/envs/:slug", async (c) => {

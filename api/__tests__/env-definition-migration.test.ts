@@ -15,6 +15,7 @@ vi.mock("../helpers", async (importOriginal) => {
 });
 
 const { buildEnvDefinition, projectAndPersistEnvSummary } = await import("../env/service");
+const { buildEnvMetaFromLayers, buildMutableStateFromMeta } = await import("../env/state");
 const {
   getEnvDefinitionKey,
   persistEnvDefinition,
@@ -77,6 +78,7 @@ describe("env definition storage", () => {
 
   it("builds definitions from stable env fields only", () => {
     const definition = buildEnvDefinition(baseEnvMeta({
+      displayName: "Implement settings page",
       startupPlanId: "plan-1",
       branchName: "env-test-branch",
       resolvedAuthMode: "subscription",
@@ -84,6 +86,7 @@ describe("env definition storage", () => {
 
     expect(definition).toEqual({
       slug: "env-test",
+      displayName: "Implement settings page",
       incarnationId: "incarnation-1",
       repoId: "repo-1",
       scmModel: "github",
@@ -106,6 +109,7 @@ describe("env definition storage", () => {
 
     await persistEnvDefinition(env, {
       slug: "env-test",
+      displayName: "Scratch #1",
       incarnationId: "incarnation-1",
       repoId: "repo-1",
       scmModel: "github",
@@ -118,11 +122,50 @@ describe("env definition storage", () => {
 
     await expect(readEnvDefinition(env, "env-test")).resolves.toMatchObject({
       slug: "env-test",
+      displayName: "Scratch #1",
       repoId: "repo-1",
       branchName: "env/env-test",
     });
     expect(kv.data.has("envdef:env-test")).toBe(true);
     expect(kv.data.get("envdef:env-test")).not.toContain("repoUrl");
+  });
+
+  it("accepts legacy definitions without display names", async () => {
+    const kv = createMemoryKV();
+    const legacyDefinition = buildEnvDefinition(baseEnvMeta());
+    const env = { ENVS_KV: kv as any } as any;
+
+    await persistEnvDefinition(env, legacyDefinition);
+
+    await expect(readEnvDefinition(env, "env-test")).resolves.not.toHaveProperty("displayName");
+    expect(buildEnvMetaFromLayers(
+      legacyDefinition,
+      buildMutableStateFromMeta(baseEnvMeta()),
+      "https://github.com/example/repo",
+    )).not.toHaveProperty("displayName");
+  });
+
+  it("projects immutable display names through the shared environment summary", () => {
+    const meta = baseEnvMeta({ displayName: "Implement settings page" });
+    const projected = buildEnvMetaFromLayers(
+      buildEnvDefinition(meta),
+      buildMutableStateFromMeta(meta),
+      meta.repoUrl,
+    );
+
+    expect(projected.displayName).toBe("Implement settings page");
+  });
+
+  it("rejects non-canonical display names in definitions", async () => {
+    const kv = createMemoryKV();
+    kv.data.set("envdef:env-test", JSON.stringify({
+      ...buildEnvDefinition(baseEnvMeta()),
+      displayName: "unsafe\nname",
+    }));
+    const env = { ENVS_KV: kv as any } as any;
+
+    await expect(readEnvDefinition(env, "env-test"))
+      .rejects.toThrow("missing explicit environment schema fields");
   });
 
   it("rejects definitions that omit explicit environment schema fields", async () => {

@@ -31,6 +31,16 @@ describe("regional Durable Object access", () => {
       .toThrow(/invalid/);
     expect(() => durableObjectOptions({ DO_LOCATION_HINT: "unknown" }))
       .toThrow(/invalid/);
+    expect(() => durableObjectOptions({ TILLER_INSTALLER_SCHEMA: "1" }))
+      .toThrow(/requires DO_LOCATION_HINT/);
+    expect(() => durableObjectOptions({
+      TILLER_INSTALLER_SCHEMA: "1",
+      DO_LOCATION_HINT: "WNAM",
+    })).toThrow(/invalid/);
+    expect(durableObjectOptions({
+      TILLER_INSTALLER_SCHEMA: "1",
+      DO_LOCATION_HINT: "wnam",
+    })).toEqual({ locationHint: "wnam" });
   });
 
   it("constructs named stubs with the shared options", () => {

@@ -108,6 +108,44 @@ describe("GitHub webhook service", () => {
     mocks.compareAndSetConfig.mockResolvedValue(true);
   });
 
+  it.each([
+    ["missing", undefined],
+    ["invalid", "sha256=00"],
+  ] as const)(
+    "rejects a %s signature before delivery or repository side effects",
+    async (_label, signature) => {
+      const bytes = new TextEncoder().encode(JSON.stringify({
+        ref: "refs/heads/main",
+        repository: { id: 42, full_name: "owner/old" },
+      }));
+      const rawBody = bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      ) as ArrayBuffer;
+      const headers = new Headers({
+        "X-GitHub-Delivery": "unsigned-delivery",
+        "X-GitHub-Event": "push",
+      });
+      if (signature) headers.set("X-Hub-Signature-256", signature);
+      const request = new Request(
+        "https://hub.example.com/api/github/webhook",
+        { method: "POST", headers },
+      );
+
+      await expect(
+        handleGitHubWebhook(makeEnv(), request, rawBody),
+      ).resolves.toMatchObject({
+        status: 401,
+        body: { code: "github_webhook_signature_invalid" },
+      });
+      expect(mocks.compareAndSetConfig).not.toHaveBeenCalled();
+      expect(mocks.loadTrackedRepo).not.toHaveBeenCalled();
+      expect(mocks.patchRepoDefaultHeadIfCurrent).not.toHaveBeenCalled();
+      expect(mocks.broadcastRepoUpsert).not.toHaveBeenCalled();
+      expect(mocks.broadcastRepoMainChange).not.toHaveBeenCalled();
+    },
+  );
+
   it("updates default head from delivered payload after repo and default branch rename without fetching GitHub", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

@@ -16,11 +16,25 @@ function plannerContainerBlock(): string {
   return match![0];
 }
 
+function sandboxContainerBlock(): string {
+  const match = WRANGLER_SOURCE.match(/\{[^{}]*"class_name":\s*"SandboxDO"[^{}]*\}/);
+  expect(match, "SandboxDO container entry missing from wrangler.jsonc").not.toBeNull();
+  return match![0];
+}
+
 function codexAuthContainerBlock(): string {
   const match = WRANGLER_SOURCE.match(/\{[^{}]*"class_name":\s*"CodexAuthDO"[^{}]*\}/);
   expect(match, "CodexAuthDO container entry missing from wrangler.jsonc").not.toBeNull();
   return match![0];
 }
+
+describe("wrangler implementor container config", () => {
+  it("allows the agreed number of concurrent implementation environments", () => {
+    const block = sandboxContainerBlock();
+    expect(block).toMatch(/"max_instances":\s*30/);
+    expect(block).toMatch(/"instance_type":\s*"standard-1"/);
+  });
+});
 
 describe("wrangler planner container config", () => {
   it("pins the planner container to the sandbox image, never the GitHub job image", () => {

@@ -12,7 +12,7 @@ import {
 import { pickPrimaryEnvSession } from './session-attachment';
 import {
   envPath,
-  projectPath,
+  projectImplementationsPath,
   sessionPath,
 } from './dashboard-paths';
 
@@ -47,7 +47,7 @@ export function EnvGuard({ children }: { children: ReactNode }) {
   const env = data.envs.find((candidate) => candidate.slug === envSlug) ?? null;
   if (!env) {
     const repoId = data.getKnownEnvRepoId(envSlug);
-    return <Navigate to={repoId ? projectPath(repoId) : '/'} replace />;
+    return <Navigate to={repoId ? projectImplementationsPath(repoId) : '/'} replace />;
   }
   const repoGate = workspaceRepoGate(data, env.repoId);
   if (repoGate) return <>{repoGate}</>;
@@ -75,6 +75,7 @@ function EnvLiveSessionGate({
   const shouldOpenLiveSession = scope.type === 'env' && shouldSelectLiveSessionForEnvStatus(env.status);
   const lookupKey = `${env.slug}:${env.status ?? ''}:${env.updatedAt ?? ''}`;
   const refreshSessions = data.refreshSessions;
+  const refreshEnvs = data.refreshEnvs;
   const sessionsLoadState = data.sessionsLoadState;
 
   useEffect(() => {
@@ -87,13 +88,22 @@ function EnvLiveSessionGate({
 
     const timer = window.setTimeout(() => {
       setLookupAttempts((attempts) => attempts + 1);
-      void refreshSessions();
+      if (lookupAttempts === maxLookupAttempts - 1) {
+        // A running lifecycle with no lead session can mean Cloudflare
+        // replaced the container without delivering its final status hook.
+        // The authoritative env refresh performs a fresh runner inspection
+        // and turns that stale running state into a restartable failure.
+        void Promise.all([refreshSessions(), refreshEnvs()]);
+      } else {
+        void refreshSessions();
+      }
     }, lookupAttempts === 0 ? 0 : 1000);
 
     return () => window.clearTimeout(timer);
   }, [
     lookupAttempts,
     primarySession,
+    refreshEnvs,
     refreshSessions,
     sessionsLoadState,
     shouldOpenLiveSession,
@@ -107,9 +117,10 @@ function EnvLiveSessionGate({
     if (sessionsLoadState === 'error') {
       return <RouteLoadError label="Harness load failed" onRetry={() => void refreshSessions()} />;
     }
-    if (sessionsLoadState !== 'loaded' || lookupAttempts < maxLookupAttempts) {
-      return <RouteLoading label="Finding harness" />;
-    }
+    // Keep the implementation workspace and its detailed startup progress on
+    // screen while the lead session connects. Replacing it with a route-wide
+    // spinner makes the normal creating -> starting transition look like a
+    // full page reload.
   }
 
   return <>{children}</>;

@@ -205,6 +205,38 @@ describe("TerminalRecoveryController", () => {
     controller.dispose();
   });
 
+  it("retries through the bounded cold tail when no checkpoint has completed", async () => {
+    const fetchPage = vi.fn(async (
+      _options: TerminalRecoveryFetchOptions,
+    ): Promise<DurableTerminalMessage[]> => [message(900)]);
+    fetchPage.mockRejectedValueOnce(new TerminalRecoveryOverflowError());
+    const controller = new TerminalRecoveryController({
+      sessionId: "session-1",
+      fetchPage,
+      write: (_event, callback) => callback(),
+      onSequenceComplete: vi.fn(),
+      onStateChange: vi.fn(),
+      onSettled: vi.fn(),
+      getStableSequence: () => undefined,
+      restoreStableScreen: (callback) => callback(),
+    });
+
+    await controller.startCold();
+    expect(controller.recoveryState).toEqual({ status: "fault", code: "overflow" });
+
+    controller.retry();
+    await flushAsync();
+
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(fetchPage.mock.calls[1]?.[0]).toEqual(expect.objectContaining({
+      limit: COLD_MOUNT_PAGE_SIZE,
+    }));
+    expect(fetchPage.mock.calls[1]?.[0]).not.toHaveProperty("afterSeq");
+    expect(controller.lastSeq).toBe(900);
+    expect(controller.recoveryState).toEqual({ status: "ready" });
+    controller.dispose();
+  });
+
   it("counts pending writes and steady-state backpressure against both limits", async () => {
     const states: TerminalRecoveryState[] = [];
     const controller = new TerminalRecoveryController({
@@ -468,6 +500,7 @@ describe("TerminalRecoveryController", () => {
     let completeCacheWrite!: () => void;
     let screen = "";
     let stableScreen = "";
+    let stableSeq = 10;
     let restoreCount = 0;
     const completed: number[] = [];
     const fetchPage = vi.fn(async () => [] as DurableTerminalMessage[]);
@@ -478,7 +511,7 @@ describe("TerminalRecoveryController", () => {
       onSequenceComplete: (seq) => completed.push(seq),
       onStateChange: vi.fn(),
       onSettled: vi.fn(),
-      onStableWriteComplete: () => { stableScreen = screen; },
+      getStableSequence: () => stableSeq,
       restoreStableScreen: (callback) => {
         restoreCount += 1;
         screen = stableScreen;
@@ -488,6 +521,8 @@ describe("TerminalRecoveryController", () => {
 
     controller.startCacheRestore(10, 100, (callback) => {
       screen = "cached-screen-10";
+      stableScreen = screen;
+      stableSeq = 10;
       completeCacheWrite = callback;
     });
     controller.acceptLive(message(11));
@@ -496,7 +531,7 @@ describe("TerminalRecoveryController", () => {
     }));
 
     expect(controller.recoveryState).toEqual({ status: "fault", code: "collision" });
-    expect(controller.lastSeq).toBe(0);
+    expect(controller.lastSeq).toBe(10);
     expect(restoreCount).toBe(0);
 
     completeCacheWrite();
@@ -512,6 +547,54 @@ describe("TerminalRecoveryController", () => {
 
     expect(fetchPage).toHaveBeenCalledWith(expect.objectContaining({ afterSeq: 10 }));
     expect(controller.recoveryState).toEqual({ status: "ready" });
+    controller.dispose();
+  });
+
+  it("rolls back to the checkpoint sequence and refetches canonical records after it", async () => {
+    let heldWrite!: () => void;
+    let stableSeq = 10;
+    const restored: number[] = [];
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([message(11), message(12)]);
+    const controller = new TerminalRecoveryController({
+      sessionId: "session-1",
+      fetchPage,
+      write: (event, callback) => {
+        if (event.seq === 12 && !heldWrite) {
+          heldWrite = callback;
+          return;
+        }
+        callback();
+      },
+      onSequenceComplete: vi.fn(),
+      onStateChange: vi.fn(),
+      onSettled: vi.fn(),
+      getStableSequence: () => stableSeq,
+      restoreStableScreen: (callback) => {
+        restored.push(stableSeq);
+        callback();
+      },
+    });
+
+    controller.startCacheRestore(10, 100, (callback) => callback());
+    await flushAsync();
+    controller.acceptLive(message(11));
+    controller.acceptLive(message(12));
+    controller.acceptLive(message(12, {
+      content: { type: "terminal-output", data: "collision" },
+    }));
+
+    expect(controller.recoveryState).toEqual({ status: "fault", code: "collision" });
+    expect(controller.lastSeq).toBe(10);
+    expect(restored).toEqual([]);
+    heldWrite();
+    expect(restored).toEqual([10]);
+
+    controller.retry();
+    await flushAsync();
+    expect(fetchPage).toHaveBeenLastCalledWith(expect.objectContaining({ afterSeq: 10 }));
+    expect(controller.lastSeq).toBe(12);
     controller.dispose();
   });
 });

@@ -139,6 +139,11 @@ describe("WorkspaceLayout maintenance actions", () => {
     );
 
     expect(screen.getByRole("button", { name: "Update" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Update" }).parentElement).toHaveClass("h-16", "top-0");
+    expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute(
+      "href",
+      "/projects/repo-1/global-settings",
+    );
     expect(mocks.updateProps).toMatchObject({
       status: null,
       issue: "Stable release check unavailable",
@@ -182,6 +187,9 @@ describe("WorkspaceLayout maintenance actions", () => {
       "href",
       "https://install.paperwing.dev/maintenance?intent=renew",
     );
+    expect(screen.getByTestId("settings-top-bar")).toHaveClass("h-16");
+    expect(screen.getByRole("link", { name: "Settings" })).not.toHaveAttribute("title");
+    expect(screen.getByRole("button", { name: "Tiller" })).not.toHaveAttribute("title");
   });
 
   it("shows machine status only after an execution machine has been added", () => {

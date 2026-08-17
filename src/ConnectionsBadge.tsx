@@ -1,5 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { fetchExecutionStatus, type ExecutionStatus } from './api';
+import {
+  EXECUTION_STATUS_CHANGED_EVENT,
+  fetchExecutionStatus,
+  type ExecutionStatus,
+} from './api';
 
 interface ConnectionsBadgeProps {
   hubUrl: string;
@@ -15,7 +19,7 @@ function truncateMid(value: string, max = 16): string {
   return `${value.slice(0, head)}…${value.slice(-tail)}`;
 }
 
-function describeHostStatus(execution: ExecutionStatus | null, hostError: string | null): {
+export function describeHostStatus(execution: ExecutionStatus | null, hostError: string | null): {
   title: string;
   detail: string;
   dotClassName: string;
@@ -39,12 +43,24 @@ function describeHostStatus(execution: ExecutionStatus | null, hostError: string
     };
   }
   switch (hostStatus.state) {
-    case 'offline':
+    case 'offline': {
+      const candidate = execution?.candidate;
+      const candidateDetail = candidate
+        && candidate.state !== 'not_connected'
+        && candidate.machineId !== hostStatus.machineId
+        ? candidate.state === 'ready'
+          ? `${candidate.displayName} is connected but not selected.`
+          : `${candidate.displayName} is connected but needs an update (${candidate.code.replaceAll('_', ' ')}).`
+        : null;
       return {
         title: 'Machine: selected, offline',
-        detail: 'The selected execution machine is offline.',
+        detail: [
+          'The selected execution machine is offline.',
+          candidateDetail,
+        ].filter(Boolean).join(' '),
         dotClassName: 'bg-kumo-danger',
       };
+    }
     case 'incompatible':
       return {
         title: 'Machine: update required',
@@ -77,6 +93,7 @@ export default function ConnectionsBadge({
   const [execution, setExecution] = useState<ExecutionStatus | null>(null);
   const [hostError, setHostError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const executionRevisionRef = useRef(0);
 
   useEffect(() => {
     if (!showHost) {
@@ -85,20 +102,35 @@ export default function ConnectionsBadge({
       return undefined;
     }
     let cancelled = false;
+    const executionRevision = executionRevisionRef.current;
     fetchExecutionStatus(hubUrl)
       .then((status) => {
-        if (cancelled) return;
+        if (cancelled || executionRevision !== executionRevisionRef.current) return;
         setExecution(status);
         setHostError(null);
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
+        if (cancelled || executionRevision !== executionRevisionRef.current) return;
         setHostError(err instanceof Error ? err.message : String(err));
       });
     return () => {
       cancelled = true;
     };
   }, [hubUrl, hostRefreshNonce, showHost]);
+
+  useEffect(() => {
+    const handleExecutionStatusChanged = (event: Event) => {
+      const status = (event as CustomEvent<ExecutionStatus>).detail;
+      if (!status) return;
+      executionRevisionRef.current += 1;
+      setExecution(status);
+      setHostError(null);
+    };
+    window.addEventListener(EXECUTION_STATUS_CHANGED_EVENT, handleExecutionStatusChanged);
+    return () => {
+      window.removeEventListener(EXECUTION_STATUS_CHANGED_EVENT, handleExecutionStatusChanged);
+    };
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -112,13 +144,14 @@ export default function ConnectionsBadge({
   }, [open]);
 
   const hostState = describeHostStatus(execution, hostError);
+  const showMachine = showHost && execution?.selected.target === 'host';
 
   const title = useMemo(() => {
     const hubText = hubConnected ? 'Hub: connected' : 'Hub: offline';
-    if (!showHost) return hubText;
+    if (!showMachine) return hubText;
     const hostText = hostState.title;
     return `${hubText} · ${hostText}`;
-  }, [hubConnected, hostState.title, showHost]);
+  }, [hubConnected, hostState.title, showMachine]);
 
   return (
     <div
@@ -133,10 +166,9 @@ export default function ConnectionsBadge({
     >
       <button
         type="button"
-        title={title}
         aria-label={title}
         aria-expanded={open}
-        className="inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-kumo-subtle hover:bg-kumo-tint"
+        className="tiller-connections-trigger inline-flex h-7 items-center gap-1.5 rounded px-1 text-[10px] font-medium uppercase tracking-wide text-kumo-subtle hover:bg-kumo-tint"
       >
         <span className="inline-flex items-center gap-1">
           <span
@@ -144,7 +176,7 @@ export default function ConnectionsBadge({
           />
           <span>Hub</span>
         </span>
-        {showHost && (
+        {showMachine && (
           <span className="inline-flex items-center gap-1">
             <span
               className={`inline-block h-2 w-2 rounded-full ${hostState.dotClassName}`}
@@ -155,8 +187,12 @@ export default function ConnectionsBadge({
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-72 rounded-md border border-kumo-line bg-kumo-elevated shadow-lg text-left">
-          <div className="px-3 py-2 border-b border-kumo-hairline">
+        <div
+          className={`absolute right-0 top-full mt-1 z-20 rounded-md border border-kumo-line bg-kumo-elevated shadow-lg text-left ${showMachine ? 'w-72' : 'w-max min-w-36'}`}
+        >
+          <div
+            className={`px-3 py-2 ${showMachine ? 'border-b border-kumo-hairline' : ''}`}
+          >
             <div className="flex items-center gap-2">
               <span
                 className={`inline-block h-2 w-2 rounded-full ${hubConnected ? 'bg-kumo-success' : 'bg-kumo-danger'}`}
@@ -168,7 +204,7 @@ export default function ConnectionsBadge({
             </div>
           </div>
 
-          {showHost && (
+          {showMachine && (
             <div className="px-3 py-2">
               <div className="flex items-center gap-2">
                 <span

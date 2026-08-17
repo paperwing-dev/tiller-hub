@@ -176,6 +176,14 @@ describe("Dashboard", () => {
     expect(refreshSetupStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an accepted dashboard snapshot visible after a background read failure", async () => {
+    const { settleDashboardReadState } = await import("../DashboardDataProvider");
+
+    expect(settleDashboardReadState("loaded", false)).toBe("loaded");
+    expect(settleDashboardReadState("loading", false)).toBe("error");
+    expect(settleDashboardReadState("idle", true)).toBe("loaded");
+  });
+
   it("reloads once to renew expired browser authentication", async () => {
     const { recoverBrowserAuthentication } = await import("../App");
     const { ApiAuthenticationError } = await import("../api");
@@ -204,41 +212,26 @@ describe("Dashboard", () => {
   it("surfaces update-check failures returned as typed update issues", async () => {
     const { getTopLevelUpdateIssue } = await import("../App");
     expect(getTopLevelUpdateIssue({
-      kind: "legacy",
+      kind: "unmanaged",
       updateAvailable: false,
-      currentUpdate: {
+      currentRelease: {
         schemaVersion: 1,
-        channel: "deploy-button",
-        updateMode: "full-source",
-        sourceRepo: "paperwing-dev/tiller-hub",
-        sourceId: "current-source",
-        version: "0.2.27",
-        label: "Current",
-        managedFiles: ["package.json"],
+        channel: "release",
+        hubVersion: "0.2.54",
+        releaseId: "a".repeat(40),
       },
-      latestUpdate: {
-        schemaVersion: 1,
-        channel: "deploy-button",
-        updateMode: "full-source",
-        sourceRepo: "paperwing-dev/tiller-hub",
-        sourceId: "current-source",
-        version: "0.2.27",
-        label: "Current",
-        managedFiles: ["package.json"],
-      },
+      stableRelease: null,
       buildDiagnostics: {
         channel: "release",
-        version: "0.1.0",
+        version: "0.2.54",
         workersCiCommitSha: null,
         workersCiBranch: null,
       },
-      hubRepo: { status: "not_checked", lastDetectedAt: null },
-      updateMethod: "advanced_repair",
-      issue: {
-        code: "update_check_failed",
+      errors: [{
+        code: "stable_release_unavailable",
         message: "Self-update check failed",
-      },
-      releaseNotesUrl: "https://github.com/paperwing-dev/tiller-hub",
+        retryable: true,
+      }],
     })).toBe("Self-update check failed");
   });
 

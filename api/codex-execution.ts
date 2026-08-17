@@ -65,7 +65,7 @@ function apiKeyProfile(
   target: CodexTarget,
   surface: CodexSurface,
 ): CodexExecutionProfile {
-  return surface === "plan-writer"
+  return surface === "implementor" || surface === "plan-writer"
     ? { ...target, kind: "api-key-app-server", surface }
     : { ...target, kind: "api-key-direct-cli", surface };
 }

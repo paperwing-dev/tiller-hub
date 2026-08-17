@@ -46,7 +46,6 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
       workersCiCommitSha: null,
       workersCiBranch: null,
     },
-    selfUpdateRepo: { status: "not_checked", lastDetectedAt: null },
     dashboardOnboarding: {
       dismissed: false,
       executionReady: true,

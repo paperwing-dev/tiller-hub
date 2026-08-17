@@ -108,26 +108,36 @@ export async function resolveOpenCodeContainerAuth(
     throw new Error(`Model ${model.id} is not an OpenCode model.`);
   }
 
-  if (model.binding.provider === "openai") {
-    const apiKey = (await getSecret(env, "OPENAI_API_KEY", { fresh: true }))?.trim();
-    if (!apiKey) {
-      throw new BillingResolutionError(
-        "credential-not-configured",
-        `OpenCode ${model.label} requires OPENAI_API_KEY.`,
-      );
+  switch (model.binding.provider) {
+    case "openai":
+    case "anthropic": {
+      const secretName = model.binding.provider === "openai"
+        ? "OPENAI_API_KEY"
+        : "ANTHROPIC_API_KEY";
+      const apiKey = (await getSecret(env, secretName, { fresh: true }))?.trim();
+      if (!apiKey) {
+        throw new BillingResolutionError(
+          "credential-not-configured",
+          `OpenCode ${model.label} requires ${secretName}.`,
+        );
+      }
+      return {
+        model: model.binding.model,
+        baseUrl: model.binding.baseUrl,
+        token: apiKey,
+      };
     }
-    return {
-      model: model.binding.model,
-      baseUrl: model.binding.baseUrl,
-      token: apiKey,
-    };
+    case "cloudflare-workers-ai": {
+      const proxyToken = await getOrCreateSecret(env, OPENCODE_PROXY_TOKEN_KEY, createProxyToken);
+      return {
+        model: model.binding.model,
+        baseUrl: model.binding.baseUrl,
+        token: proxyToken,
+      };
+    }
+    default: {
+      const unsupportedProvider: never = model.binding.provider;
+      throw new Error(`Unsupported OpenCode provider: ${unsupportedProvider}`);
+    }
   }
-
-  const proxyToken = await getOrCreateSecret(env, OPENCODE_PROXY_TOKEN_KEY, createProxyToken);
-
-  return {
-    model: model.binding.model,
-    baseUrl: model.binding.baseUrl,
-    token: proxyToken,
-  };
 }

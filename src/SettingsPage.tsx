@@ -21,9 +21,10 @@ import {
   type ThemePreference,
 } from './theme';
 import type {
-  AuthConnectProvider,
   ExecutionStatus,
   SetupStatus,
+  AuthConnectProvider,
+  VerifiableModelAuthKey,
   VerifyModelAuthResult,
 } from './api';
 import {
@@ -43,7 +44,13 @@ import {
   CLOUDFLARE_IDLE_TIMEOUT_MIN_MINUTES,
   isCloudflareIdleTimeoutMinutes,
 } from '../shared/cloudflare-timeout';
-import { placementRegionDefinition } from '../shared/placement';
+import {
+  placementRegionDefinition,
+  type PlacementRegion,
+} from '../shared/placement';
+import type { AuthConnectIntent, AuthConnectRequest } from './settings-intent';
+export { parseAuthConnectIntent } from './settings-intent';
+export type { AuthConnectIntent, AuthConnectRequest } from './settings-intent';
 
 const HUB_URL = window.location.origin;
 const TILLER_CLI_PACKAGE = '@paperwing-dev/tiller@latest';
@@ -62,80 +69,19 @@ interface SettingsPageProps {
   onDone: () => void;
   onRefresh: () => Promise<void>;
   authConnectIntent?: AuthConnectIntent;
-}
-
-export interface AuthConnectRequest {
-  port: number;
-  state: string;
-  publicKeyJwk: Record<string, unknown>;
-  providers: AuthConnectProvider[];
-}
-
-export type AuthConnectIntent =
-  { kind: 'request'; request: AuthConnectRequest } | { kind: 'invalid' } | null;
-
-function decodeBase64UrlJson(value: string): unknown {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
-  const bytes = Uint8Array.from(
-    globalThis.atob(normalized + '='.repeat((4 - (normalized.length % 4)) % 4)),
-    (character) => character.charCodeAt(0),
-  );
-  return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-}
-
-export function parseAuthConnectIntent(search: string): AuthConnectIntent {
-  const params = new URLSearchParams(search);
-  if (params.get('auth_connect') !== '1') return null;
-  const portValue = params.get('port') ?? '';
-  const state = params.get('state')?.trim() ?? '';
-  const key = params.get('key') ?? '';
-  const providerValues = (params.get('providers') ?? '')
-    .split(',')
-    .filter(Boolean);
-  if (
-    !/^\d{1,5}$/.test(portValue) ||
-    !state ||
-    state.length > 512 ||
-    !key ||
-    key.length > 4_096 ||
-    providerValues.length < 1 ||
-    providerValues.length > 2 ||
-    new Set(providerValues).size !== providerValues.length ||
-    providerValues.some(
-      (provider) => provider !== 'codex' && provider !== 'claude',
-    )
-  )
-    return { kind: 'invalid' };
-  const port = Number(portValue);
-  if (!Number.isInteger(port) || port < 1 || port > 65_535)
-    return { kind: 'invalid' };
-  try {
-    const publicKeyJwk = decodeBase64UrlJson(key);
-    if (
-      !publicKeyJwk ||
-      typeof publicKeyJwk !== 'object' ||
-      Array.isArray(publicKeyJwk)
-    ) {
-      return { kind: 'invalid' };
-    }
-    return {
-      kind: 'request',
-      request: {
-        port,
-        state,
-        publicKeyJwk: publicKeyJwk as Record<string, unknown>,
-        providers: providerValues as AuthConnectProvider[],
-      },
-    };
-  } catch {
-    return { kind: 'invalid' };
-  }
+  embedded?: boolean;
 }
 
 export function shouldShowInstallationRegion(
-  status: Pick<SetupStatus, 'installerManaged' | 'isLocalDev'>,
-): boolean {
-  return status.installerManaged && !status.isLocalDev;
+  status: Pick<
+    SetupStatus,
+    'isLocalDev' | 'installationRegion'
+  >,
+): status is Pick<
+  SetupStatus,
+  'isLocalDev' | 'installationRegion'
+> & { installationRegion: PlacementRegion } {
+  return !status.isLocalDev && status.installationRegion !== null;
 }
 
 function Card({
@@ -157,11 +103,13 @@ function Card({
         : '';
 
   return (
-    <LayerCard render={<section />} className={`p-5 ${toneClasses}`}>
-      <h3 className="text-base font-semibold text-kumo-strong">{title}</h3>
-      <p className="mt-1 text-sm text-kumo-subtle">{description}</p>
-      <div className="mt-4">{children}</div>
-    </LayerCard>
+    <section className={`tiller-settings-section grid gap-5 border-b border-kumo-line px-6 py-6 lg:grid-cols-[12rem_minmax(0,1fr)] lg:gap-8 ${toneClasses}`}>
+      <div>
+        <h3 className="text-sm font-semibold text-kumo-strong">{title}</h3>
+        <p className="mt-1 text-xs leading-5 text-kumo-subtle">{description}</p>
+      </div>
+      <div className="min-w-0">{children}</div>
+    </section>
   );
 }
 
@@ -347,6 +295,7 @@ export function AuthConnectPanel({
 
   useEffect(() => {
     if (!request) return;
+    const activeRequest = request;
     let cancelled = false;
     let callbackController: AbortController | null = null;
     let approvalCreated = false;
@@ -359,7 +308,7 @@ export function AuthConnectPanel({
 
     async function run() {
       try {
-        const approval = await cachedAuthConnectApproval(request);
+        const approval = await cachedAuthConnectApproval(activeRequest);
         if (cancelled) return;
         approvalCreated = true;
         setView({
@@ -377,7 +326,7 @@ export function AuthConnectPanel({
         );
         try {
           const callback = await fetch(
-            `http://127.0.0.1:${request.port}/auth-connect-callback`,
+            `http://127.0.0.1:${activeRequest.port}/auth-connect-callback`,
             {
               method: 'POST',
               mode: 'cors',
@@ -583,14 +532,17 @@ function AppearanceRow() {
   return (
     <Select
       label="Theme"
-      className="w-[200px]"
+      className="tiller-settings-select"
       value={preference}
       onValueChange={(value) => {
-        const next = (value ?? 'system') as ThemePreference;
+        const next = (value ?? 'paperwing-light') as ThemePreference;
         setPreference(next);
         setThemePreference(next);
       }}
-      items={{ system: 'System', light: 'Light', dark: 'Dark' }}
+      items={{
+        'paperwing-light': 'Paperwing Light',
+        'classic-light': 'Classic Light',
+      }}
     />
   );
 }
@@ -766,7 +718,7 @@ function codexSubscriptionStatus(status: SetupStatus): {
 interface CredentialDef {
   label: string;
   description?: string;
-  secretKey: string;
+  secretKey: VerifiableModelAuthKey;
   configured: boolean;
   active: boolean;
   testable: boolean;
@@ -775,29 +727,42 @@ interface CredentialDef {
   settingsTarget: SettingsTargetId;
 }
 
-function getCredentialStatusChip(
+export function getCredentialStatusChip(
   state: 'configured' | 'partial' | 'missing',
   active: boolean,
+  testResult: VerifyModelAuthResult | null = null,
 ): {
   label: string;
-  variant: 'success' | 'warning' | 'neutral';
+  variant: 'success' | 'warning' | 'error' | 'neutral';
 } {
   if (state === 'configured') {
+    if (testResult && !testResult.ok) {
+      return {
+        label: `Verification failed · ${active ? 'active' : 'not selected'}`,
+        variant: 'error',
+      };
+    }
+    if (testResult?.ok) {
+      return {
+        label: `Verified · ${active ? 'active' : 'not selected'}`,
+        variant: 'success',
+      };
+    }
     return {
-      label: `Configured · ${active ? 'active' : 'inactive'}`,
+      label: `Configured · ${active ? 'active' : 'not selected'}`,
       variant: active ? 'success' : 'neutral',
     };
   }
 
   if (state === 'partial') {
     return {
-      label: `Incomplete · ${active ? 'active' : 'inactive'}`,
+      label: `Incomplete · ${active ? 'active' : 'not selected'}`,
       variant: 'warning',
     };
   }
 
   return {
-    label: `Not configured · ${active ? 'active' : 'inactive'}`,
+    label: `Not configured · ${active ? 'active' : 'not selected'}`,
     variant: active ? 'warning' : 'neutral',
   };
 }
@@ -864,7 +829,7 @@ function CredentialRowFrame({
   error: string | null;
   children?: ReactNode;
 }) {
-  const statusChip = getCredentialStatusChip(status, active);
+  const statusChip = getCredentialStatusChip(status, active, testResult);
   const testResultText = getCredentialTestResultText(testResult, okText);
 
   return (
@@ -895,8 +860,9 @@ function CredentialRowFrame({
               size="sm"
               onClick={() => void onTest()}
               loading={testing}
+              aria-label={`Test ${label}`}
             >
-              {testing ? 'Testing...' : 'Test'}
+              {testing ? 'Testing...' : 'Test API key'}
             </Button>
           )}
           {!editing && (
@@ -1310,9 +1276,9 @@ function OpenCodeInfoRow() {
             Built-in OpenCode model
           </p>
           <p className="mt-0.5 text-xs text-kumo-subtle">
-            {KIMI_K2_7_CODE.label} uses Tiller&apos;s built-in Workers AI
-            binding through the hub proxy. OpenAI-backed OpenCode models use the
-            OpenAI API key below.
+            {KIMI_K2_7_CODE.label} runs through Tiller&apos;s built-in Workers AI
+            binding, using the Workers AI usage included with your Cloudflare
+            account.
           </p>
           <div className="mt-2 flex items-center gap-2">
             <Badge variant="success" appearance="dot">
@@ -1441,23 +1407,19 @@ export function IdleTimeoutRow({
 export function InstallationRegionRow({
   region,
 }: {
-  region: SetupStatus['installationRegion'];
+  region: PlacementRegion;
 }) {
-  const definition = region ? placementRegionDefinition(region) : null;
+  const definition = placementRegionDefinition(region);
   return (
     <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
       <p className="text-sm font-semibold text-kumo-default">
-        Installation region
+        Cloudflare placement region
       </p>
       <p className="mt-2 text-sm text-kumo-strong">
-        {definition
-          ? `${definition.label} (${definition.code})`
-          : 'Automatic (Cloudflare-managed)'}
+        {`${definition.label} (${definition.code})`}
       </p>
       <p className="mt-1 text-xs text-kumo-subtle">
-        {definition
-          ? 'Chosen during installation. Reinstall Tiller to change it.'
-          : 'This legacy installation uses Cloudflare-managed placement. Reinstall Tiller to select a region.'}
+        Used for Durable Object and Cloudflare Container placement in this deployment.
       </p>
     </div>
   );
@@ -1612,7 +1574,8 @@ function ExecutionBackendCard({
             {selectedHostCopy ?? candidateCopy}
           </p>
           {selectedHostCopy &&
-            execution?.candidate.state === 'ready' &&
+            execution &&
+            execution.candidate.state !== 'not_connected' &&
             execution.candidate.machineId !== selectedMachineId && (
               <p className="mt-1 text-xs text-kumo-subtle">{candidateCopy}</p>
             )}
@@ -1636,7 +1599,7 @@ function ExecutionBackendCard({
           Connect a machine
         </p>
         <p className="mt-1 text-xs text-kumo-subtle">
-          Run this in a terminal on that machine. It installs Tiller only if
+          Run this in a terminal on that machine. It installs Tiller CLI only if
           needed, then connects it.
         </p>
         <CopyableTerminalCommand
@@ -1668,6 +1631,7 @@ export default function SettingsPage({
   onDone,
   onRefresh,
   authConnectIntent = null,
+  embedded = false,
 }: SettingsPageProps) {
   const [testResults, setTestResults] = useState<
     Map<string, VerifyModelAuthResult>
@@ -1687,10 +1651,11 @@ export default function SettingsPage({
   const apiCredentials: CredentialDef[] = [
     {
       label: 'Claude API key',
+      description: 'Use Anthropic-backed models with Claude Code or OpenCode.',
       secretKey: 'ANTHROPIC_API_KEY',
       configured: status.hasAnthropicKey,
       active: status.claudeBillingMode === 'api',
-      testable: false,
+      testable: true,
       settingsTarget: SETTINGS_TARGET_IDS.claudeApiKey,
     },
     {
@@ -1699,7 +1664,7 @@ export default function SettingsPage({
       secretKey: 'OPENAI_API_KEY',
       configured: status.hasOpenAIKey,
       active: status.openaiBillingMode === 'api',
-      testable: false,
+      testable: true,
       settingsTarget: SETTINGS_TARGET_IDS.openaiApiKey,
     },
   ];
@@ -1741,31 +1706,44 @@ export default function SettingsPage({
     }
   }
 
-  async function handleTest() {
-    const response = await verifyModelAuth(HUB_URL);
-    const next = new Map<string, VerifyModelAuthResult>();
-    for (const result of response.results) {
+  async function handleTest(def: CredentialDef) {
+    setTestResults((current) => {
+      const next = new Map(current);
+      next.delete(def.secretKey);
+      return next;
+    });
+    const response = await verifyModelAuth(HUB_URL, def.secretKey);
+    const result = response.results.find((candidate) => candidate.key === def.secretKey) ?? {
+      key: def.secretKey,
+      mode: 'api',
+      ok: false,
+      error: response.error ?? 'Verification failed',
+    };
+    setTestResults((current) => {
+      const next = new Map(current);
       next.set(result.key, result);
-    }
-    setTestResults(next);
+      return next;
+    });
 
-    if (response.ok) {
-      addToast({ title: 'All credentials valid', variant: 'success' });
-    } else {
-      const failed = response.results.filter((r) => !r.ok);
+    if (result?.ok) {
       addToast({
-        title:
-          failed.length > 0
-            ? `${failed.length} credential(s) failed verification`
-            : 'Verification failed',
-        variant: 'error',
+        title: `${def.label} is valid`,
+        variant: 'success',
+        ...(result.warning ? { body: result.warning } : {}),
       });
+      return;
     }
+
+    addToast({
+      title: `${def.label} verification failed`,
+      body: result.error ?? response.error ?? 'Verification failed',
+      variant: 'error',
+    });
   }
 
   return (
     <div className="flex-1 overflow-y-auto bg-kumo-recessed">
-      <div className="border-b border-kumo-line bg-kumo-base px-6 py-4">
+      {!embedded && <div className="border-b border-kumo-line bg-kumo-base px-6 py-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold text-kumo-strong">
@@ -1781,20 +1759,28 @@ export default function SettingsPage({
             Done
           </Button>
         </div>
-      </div>
+      </div>}
 
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 px-6 py-8">
+      {embedded && (
+        <div className="tiller-settings-intro border-b border-kumo-line px-6 py-5">
+          <h2 className="text-base font-semibold text-kumo-strong">Global settings</h2>
+          <p className="mt-1 text-sm text-kumo-subtle">
+            {status.isLocalDev
+              ? 'Manage models, hosting, and access for this localhost Hub.'
+              : 'Manage models, hosting, and access for new workloads.'}
+          </p>
+        </div>
+      )}
+      <div className="mx-auto flex w-full max-w-5xl flex-col">
         {authConnectIntent && (
           <AuthConnectPanel intent={authConnectIntent} onRefresh={onRefresh} />
         )}
-        {/*
         <Card
           title="Appearance"
-          description="Choose how Tiller looks on this device. System follows your OS preference."
+          description="Choose Tiller's light color palette on this device. Classic Light restores the previous high-contrast palette."
         >
           <AppearanceRow />
         </Card>
-        */}
 
         <SettingsTargetRegion
           target={SETTINGS_TARGET_IDS.executionBackend}
@@ -1819,8 +1805,8 @@ export default function SettingsPage({
             title="Model access"
             description={
               status.modelAuthConfigured
-                ? 'Manage model credentials. OpenCode includes Kimi through Workers AI and can also use OpenAI-backed models.'
-                : 'Add credentials for Claude, Codex, or OpenAI-backed OpenCode models. Kimi uses the built-in Workers AI proxy.'
+                ? 'Manage model credentials. OpenCode includes Kimi through Workers AI and can also use OpenAI- or Anthropic-backed models.'
+                : 'Add credentials for Claude, Codex, or API-backed OpenCode models. Kimi uses the built-in Workers AI proxy.'
             }
             tone={status.modelAuthConfigured ? 'success' : 'warning'}
           >
@@ -1875,7 +1861,7 @@ export default function SettingsPage({
                         def={def}
                         testResult={testResults.get(def.secretKey) ?? null}
                         onSave={handleSave}
-                        onTest={handleTest}
+                        onTest={() => handleTest(def)}
                       />
                     </SettingsTargetRegion>
                   ))}

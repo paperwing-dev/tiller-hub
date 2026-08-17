@@ -30,7 +30,7 @@ vi.mock("../setup/config", () => ({
   getSecret: async (env: Record<string, unknown>, key: string) => (
     typeof env[key] === "string" ? env[key] : undefined
   ),
-  getOrCreateSecret: vi.fn(async () => "codex-runtime-capability-secret"),
+  getOrCreateSecret: vi.fn(async () => "environment-runtime-capability-secret"),
 }));
 
 vi.mock("../protection", () => ({
@@ -47,15 +47,10 @@ vi.mock("../env/container-auth", () => ({
   resolveCodexContainerAuth: mocks.resolveCodexContainerAuth,
 }));
 
-function createEnv() {
+function createEnv(mcpServers: Array<{ id: string; label: string; url: string; enabled: boolean }> = []) {
   const hub = {
     resolveRepoSessionEnvVars: vi.fn(async () => ({})),
-    listEnabledRepoMcpServers: vi.fn(async () => []),
-    mintCloudflareMcpProxyToken: vi.fn(async () => null),
-    mintCloudflareMcpProxyTokenForStart: vi.fn(async () => ({
-      token: "cloudflare-token",
-      credentialId: "cloudflare-credential",
-    })),
+    listEnabledRepoMcpServers: vi.fn(async () => mcpServers.filter((server) => server.enabled)),
     getOpenAIAuthStatus: vi.fn(async () => ({ authenticated: true, status: "connected" })),
   };
   return {
@@ -67,6 +62,12 @@ function createEnv() {
     HUB: {
       idFromName: vi.fn(() => "hub-id"),
       get: vi.fn(() => hub),
+    },
+    ENV_LIFECYCLE: {
+      getByName: vi.fn(() => ({
+        getCodexExecutionProfile: vi.fn(async () => null),
+        claimCodexExecutionProfile: vi.fn(async (_startOpId: string, profile: unknown) => profile),
+      })),
     },
   } as any;
 }
@@ -118,8 +119,41 @@ describe("container launch config", () => {
     mocks.resolveOpenCodeContainerAuth.mockImplementation(async (_env, entry) => ({
       model: entry.binding.model,
       baseUrl: entry.binding.baseUrl,
-      token: entry.binding.provider === "openai" ? "openai-token" : "workers-token",
+      token: entry.binding.provider === "openai"
+        ? "openai-token"
+        : entry.binding.provider === "anthropic" ? "anthropic-token" : "workers-token",
     }));
+  });
+
+  it.each([
+    ["claude-code", { model: "claude-opus-4.8", effort: "high" }, "subscription"],
+    ["codex", { model: "gpt-5.6-sol", effort: "high" }, "api"],
+    ["opencode", { model: "kimi-k2.7-code", effort: "high" }, "api"],
+  ] as const)("emits only the generic environment capability for %s", async (harness, harnessSettings, mode) => {
+    const env = {
+      ...createEnv(),
+      TILLER_CONTROL_SECRET: "must-not-cross-container-boundary",
+    };
+    const config = await buildContainerLaunchConfig(
+      env,
+      "https://hub.example.com/api/envs/demo-env/start",
+      "demo-env",
+      "https://github.com/test/repo.git",
+      repoMeta,
+      {
+        ...createMeta(),
+        incarnationId: "incarnation-1",
+        harness,
+        harnessSettings,
+      },
+      {
+        startOpId: "start-op-1",
+        startAuthClaim: claimedAuth(harness, mode),
+      },
+    );
+
+    expect(config.envVars.TILLER_RUNTIME_CAPABILITY).toMatch(/^[a-f0-9]{64}$/u);
+    expect(JSON.stringify(config)).not.toContain("must-not-cross-container-boundary");
   });
 
   it("refuses to re-default an incomplete committed settings handoff", async () => {
@@ -165,6 +199,44 @@ describe("container launch config", () => {
     expect(config.envVars.TILLER_GITHUB_BASE_COMMIT_SHA).toBeUndefined();
     expect(config.envVars.TILLER_GITHUB_BRIDGE_ID).toBeUndefined();
     expect(config.envVars.TILLER_GITHUB_ALLOWED_REPO).toBeUndefined();
+  });
+
+  it("launches only enabled public MCP servers without proxy credentials", async () => {
+    const config = await buildContainerLaunchConfig(
+      createEnv([
+        {
+          id: "tiller_docs",
+          label: "Documentation",
+          url: "https://docs.example.com/mcp",
+          enabled: true,
+        },
+        {
+          id: "tiller_disabled",
+          label: "Disabled",
+          url: "https://disabled.example.com/mcp",
+          enabled: false,
+        },
+      ]),
+      "https://hub.example.com/api/envs/demo-env/start",
+      "demo-env",
+      "https://github.com/test/repo.git",
+      repoMeta,
+      createMeta(),
+      {
+        startCause: "scheduled",
+        credentialScope: { incarnationId: "incarnation-1", startOpId: "start-1" },
+      },
+    );
+
+    expect(JSON.parse(config.envVars.TILLER_MCP_SERVERS_JSON)).toEqual([
+      { id: "tiller_docs", url: "https://docs.example.com/mcp" },
+    ]);
+    expect(config.credentials).toEqual({});
+    const serialized = JSON.stringify(config);
+    expect(serialized).not.toContain("/api/mcp/cloudflare");
+    expect(serialized).not.toContain("TILLER_CLOUDFLARE_MCP_PROXY_TOKEN");
+    expect(serialized).not.toContain("envHttpHeaders");
+    expect(serialized).not.toContain("cloudflareMcpProxyTokenId");
   });
 
   it("enables GitHub base checkout with matching bridge credentials", async () => {
@@ -263,7 +335,7 @@ describe("container launch config", () => {
       TILLER_CODEX_MODEL: "gpt-5.6-sol",
       TILLER_CODEX_REASONING_EFFORT: "xhigh",
     });
-    expect(config.envVars.TILLER_CODEX_RUNTIME_CAPABILITY).toMatch(/^[a-f0-9]{64}$/u);
+    expect(config.envVars.TILLER_RUNTIME_CAPABILITY).toMatch(/^[a-f0-9]{64}$/u);
     expect(config.envVars.OPENAI_API_KEY).toBeUndefined();
     expect(config.meta).toMatchObject({ codexAuthMode: "subscription" });
   });
@@ -303,16 +375,16 @@ describe("container launch config", () => {
     expect(lifecycle.claimCodexExecutionProfile).toHaveBeenCalledWith(
       "start-op-api",
       expect.objectContaining({
-        kind: "api-key-direct-cli",
+        kind: "api-key-app-server",
         backend: "cf",
       }),
     );
     expect(config.envVars).toMatchObject({
       TILLER_CODEX_AUTH_MODE: "api-key",
-      TILLER_CODEX_RUNTIME_MODE: "direct-cli",
+      TILLER_CODEX_RUNTIME_MODE: "app-server",
       OPENAI_API_KEY: "openai-key",
     });
-    expect(config.envVars.TILLER_CODEX_RUNTIME_CAPABILITY).toBeUndefined();
+    expect(config.envVars.TILLER_RUNTIME_CAPABILITY).toMatch(/^[a-f0-9]{64}$/u);
   });
 
   it("reuses a claimed profile without rereading global billing", async () => {
@@ -551,9 +623,16 @@ describe("container launch config", () => {
         } else {
           expect(config.envVars, `${entry.harness}/${entry.id}/${effort}`).toMatchObject({
             TILLER_OPENCODE_BASE_URL: entry.binding.baseUrl ?? "https://tiller.preview.workers.dev/api/opencode/v1",
-            TILLER_OPENCODE_AUTH_TOKEN: entry.binding.provider === "openai" ? "openai-token" : "workers-token",
+            TILLER_OPENCODE_AUTH_TOKEN: entry.binding.provider === "openai"
+              ? "openai-token"
+              : entry.binding.provider === "anthropic" ? "anthropic-token" : "workers-token",
             TILLER_OPENCODE_MODEL_ID: entry.binding.model,
             TILLER_OPENCODE_MODEL_ALIAS: entry.binding.modelAlias,
+            TILLER_OPENCODE_MODEL_CONTEXT_LIMIT: String(entry.limits.context),
+            ...(entry.limits.input
+              ? { TILLER_OPENCODE_MODEL_INPUT_LIMIT: String(entry.limits.input) }
+              : {}),
+            TILLER_OPENCODE_MODEL_OUTPUT_LIMIT: String(entry.limits.output),
             TILLER_OPENCODE_PROVIDER_KIND: entry.binding.provider,
             TILLER_OPENCODE_PROVIDER_ALIAS: entry.binding.providerAlias,
             TILLER_OPENCODE_REASONING_EFFORT: effort,

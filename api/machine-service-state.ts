@@ -27,6 +27,7 @@ function parseHostServiceState(value: Record<string, unknown>): MachineServiceSt
     connectedAt: typeof value.connectedAt === "string" ? value.connectedAt : "",
     ...(value.runnerCommandProtocol === 1 ? { runnerCommandProtocol: 1 as const } : {}),
     ...(value.codexRuntimeAuthProtocol === 1 ? { codexRuntimeAuthProtocol: 1 as const } : {}),
+    ...(value.reviewerIsolationProtocol === 1 ? { reviewerIsolationProtocol: 1 as const } : {}),
     dockerAvailable: value.dockerAvailable === true,
     runnerAvailable: value.runnerAvailable === true,
     claudeSubscription: value.claudeSubscription === true,

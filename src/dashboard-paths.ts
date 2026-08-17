@@ -18,6 +18,12 @@ export function planPath(repoId: string, planArtifactId?: string | null): string
   });
 }
 
+export function projectImplementationsPath(repoId: string): string {
+  return generatePath("/projects/:repoId/implementations", {
+    repoId,
+  });
+}
+
 export function repoSettingsPath(repoId: string): string {
   return generatePath("/projects/:repoId/settings", {
     repoId,

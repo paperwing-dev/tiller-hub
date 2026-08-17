@@ -1,0 +1,15 @@
+export const WORKSPACE_CARD_ROW_CLASS = [
+  "tiller-card-surface",
+  "tiller-workspace-card-row",
+  "tiller-implementation-index-row",
+  "group",
+  "block",
+  "min-h-11",
+  "w-full",
+  "min-w-0",
+  "overflow-hidden",
+  "px-3",
+  "py-2.5",
+  "text-left",
+  "hover:bg-kumo-tint",
+].join(" ");

@@ -16,10 +16,13 @@ import {
   readManagedRoleFromStoredSession,
 } from "../session-attachment";
 import {
+  reviewSkillRerunMessageId,
+  reviewSkillRerunRunId,
   type EnvReviewPreparationOperation,
   type EnvReviewRun,
   type EnvReviewSnapshotMode,
   type EnvReviewState,
+  type EnvReviewTab,
   type EnvReviewTaskKind,
 } from "./types";
 import type { StoredSession } from "../types";
@@ -40,14 +43,21 @@ import {
   validateReviewSnapshotTar,
 } from "./snapshots";
 import {
-  listCanonicalAgentRoutes,
   mergeStoredAgentSkills,
   resolveSkillAgentRoutes,
 } from "../planner/agent-skills";
 import { assignSkillOverview, readIncludedSkillReports } from "./skill-orchestration";
-import { buildEnvReviewPrompt } from "./context";
+import { buildEnvReviewPrompt, normalizeEnvReviewPlanBasis } from "./context";
+import { REVIEW_SKILL_RERUN_INSTRUCTION } from "./active-instructions";
 import { backendSelectionRemovedError } from "../execution";
 import { getDurableObjectStub } from "../durable-object";
+import { getHarnessModel, validateHarnessSettings } from "../../shared/harness-catalog";
+import {
+  buildThreadMessageHistory,
+  composeReviewerInstructions,
+  ENV_REVIEW_THREAD_CONTEXT_MESSAGE_LIMIT,
+  listAllThreadMessages,
+} from "../planner/context-window";
 
 const PREPARATION_WAIT_MS = 130_000;
 const MAX_UPLOAD_METADATA_BYTES = 200_000;
@@ -183,6 +193,65 @@ async function createReviewerThread(env: Env, envSlug: string, title: string): P
     title,
   });
   return threadId;
+}
+
+async function ensurePrimaryReviewer(
+  env: Env,
+  review: ReturnType<typeof getEnvReviewStub>,
+  input: {
+    envSlug: string;
+    repoId: string;
+    mainSessionId: string;
+    harness: EnvMeta["harness"];
+    harnessSettings: EnvMeta["harnessSettings"];
+  },
+): Promise<EnvReviewTab> {
+  const selection = await resolveImplementorReviewer(env, input);
+  const ensured = await review.ensurePrimaryReviewerTab({
+    envSlug: input.envSlug,
+    repoId: input.repoId,
+    mainSessionId: input.mainSessionId,
+    provider: selection.provider,
+    model: selection.model,
+    effort: selection.effort,
+  });
+  return ensured.tab;
+}
+
+async function resolveImplementorReviewer(
+  env: Env,
+  input: {
+    envSlug: string;
+    repoId: string;
+    mainSessionId: string;
+    harness: EnvMeta["harness"];
+    harnessSettings: EnvMeta["harnessSettings"];
+  },
+): Promise<{ provider: string; model: string; effort: PlannerEffort }> {
+  const settings = validateHarnessSettings(input.harness, input.harnessSettings);
+  const implementorModel = settings ? getHarnessModel(input.harness, settings.model) : null;
+  if (!settings || !implementorModel) {
+    throw new Error("The implementor model is unavailable. Add a reviewer explicitly or restart the environment.");
+  }
+  const providers = (await listPlannerProviders(env)).providers;
+  const provider = input.harness;
+  const model = implementorModel.binding.model;
+  const selection = await requireReviewerSelection(env, provider, model, settings.effort, providers);
+  return { provider, model, effort: selection.effort };
+}
+
+async function ensureReviewerThread(
+  env: Env,
+  tab: EnvReviewTab,
+): Promise<ReturnType<typeof getThreadStub>> {
+  const thread = getThreadStub(env, tab.threadId);
+  await thread.createThread({
+    id: tab.threadId,
+    scope: { type: "env", envSlug: tab.envSlug },
+    kind: "chat",
+    title: tab.roleLabel,
+  });
+  return thread;
 }
 
 function normalizeTaskKind(value: unknown): EnvReviewTaskKind {
@@ -357,7 +426,21 @@ async function failStaleReviewSkillInvocations(review: ReturnType<typeof getEnvR
 envReviewRoutes.get("/api/envs/:slug/review", async (c) => {
   const loaded = await loadEnvReviewRequest(c);
   if (!loaded.ok) return loaded.response;
-  return c.json(await stateFor(c, loaded.meta, loaded.sessionId));
+  const review = getEnvReviewStub(c.env, loaded.meta.slug);
+  const inherited = await review.inheritReviewerTabsFromLatestSession({
+    envSlug: loaded.meta.slug,
+    repoId: loaded.meta.repoId,
+    mainSessionId: loaded.sessionId,
+  });
+  const state = await review.getState({
+    envSlug: loaded.meta.slug,
+    repoId: loaded.meta.repoId,
+    mainSessionId: loaded.sessionId,
+  });
+  if (inherited.status === "inherited") {
+    for (const tab of inherited.tabs) await ensureReviewerThread(c.env, tab);
+  }
+  return c.json(state);
 });
 
 envReviewRoutes.post("/api/envs/:slug/review/tabs", async (c) => {
@@ -485,9 +568,16 @@ async function setupReviewSkillInvocation(
   if (!invocation) return c.json({ error: "Skill invocation not found" }, 404);
   if (invocation.status !== "setting_up") return null;
   try {
+    const runs = await review.listSkillInvocationRuns(invocationId);
+    const root = await review.getTab(invocation.parentThreadId);
+    if (!root) throw new Error("Reserved skill root is missing.");
+    await ensureReviewerThread(c.env, root);
     for (const tab of await review.listSkillInvocationTabs(invocationId)) {
       const agent = invocation.definitionSnapshot.agents.find((candidate) => candidate.id === tab.skillAgentId);
       if (!agent) throw new Error(`Reserved skill agent is missing: ${tab.skillAgentId ?? "unknown"}`);
+      const run = runs.find((candidate) => candidate.skillAgentId === agent.id
+        && (candidate.skillRunRole === "root_initial" || candidate.skillRunRole === "report_initial"));
+      if (!run) throw new Error(`Reserved skill run is missing: ${agent.id}`);
       const thread = getThreadStub(c.env, tab.threadId);
       await thread.createThread({
         id: tab.threadId,
@@ -502,7 +592,11 @@ async function setupReviewSkillInvocation(
         kind: "chat",
         body: {
           role: "user",
-          text: `/${invocation.definitionSnapshot.command}\n\n${invocation.definitionSnapshot.sharedInstructions}\n\nRole: ${agent.instructions}`,
+          text: `/${invocation.definitionSnapshot.command}\n\n${composeReviewerInstructions(
+            invocation.definitionSnapshot.sharedInstructions,
+            `Role: ${agent.instructions}`,
+          )}`,
+          runId: run.runId,
         },
       });
     }
@@ -520,56 +614,15 @@ async function setupReviewSkillInvocation(
   }
 }
 
-async function setupReviewPresetRun(
-  c: any,
-  loaded: Extract<Awaited<ReturnType<typeof loadEnvReviewRequestWithBody>>, { ok: true }>,
-  run: EnvReviewRun,
-): Promise<Response | null> {
-  if (run.status === "ready" || run.status === "failed" || run.status === "cancelled") return null;
-  const skill = run.skillDefinitionSnapshot;
-  if (!skill) {
-    return c.json({
-      error: "Preset skill snapshot is unavailable.",
-      code: "skill_setup_incomplete",
-      retryable: true,
-    }, 502);
-  }
-  try {
-    const thread = getThreadStub(c.env, run.threadId);
-    await thread.createThread({
-      id: run.threadId,
-      scope: { type: "env", envSlug: loaded.meta.slug },
-      kind: "chat",
-      title: run.roleLabel,
-    });
-    const latest = (await thread.listMessages({ limit: 1 }))[0];
-    await thread.appendMessage({
-      id: `skill-preset:${run.runId}`,
-      senderSessionId: "user",
-      seq: (latest?.seq ?? 0) + 1,
-      kind: "chat",
-      body: { role: "user", text: `/${skill.command}`, runId: run.runId },
-    });
-    await getEnvReviewStub(c.env, loaded.meta.slug).scheduleOrchestration();
-    return null;
-  } catch (error) {
-    return c.json({
-      error: error instanceof Error ? error.message : String(error),
-      code: "skill_setup_incomplete",
-      retryable: true,
-    }, 502);
-  }
-}
-
-envReviewRoutes.post("/api/envs/:slug/review/tabs/:parentThreadId/skills/:skillId/invoke", async (c) => {
+async function invokeReviewSkillRoute(c: any) {
   const loaded = await loadEnvReviewRequestWithBody(c, { createsWorkload: true });
   if (!loaded.ok) return loaded.response;
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   await failStaleReviewSkillInvocations(review, loaded.meta.slug, loaded.sessionId);
   const requestId = readString(loaded.body.requestId);
   if (!requestId) return c.json({ error: "requestId is required" }, 400);
-  const parentThreadId = c.req.param("parentThreadId");
   const skillId = c.req.param("skillId");
+  const rootThreadId = `env-review-skill-root:${requestId}`;
   if (loaded.body.overviewMode !== undefined && loaded.body.overviewMode !== "auto" && loaded.body.overviewMode !== "manual") {
     return c.json({ error: "overviewMode must be auto or manual" }, 400);
   }
@@ -582,7 +635,7 @@ envReviewRoutes.post("/api/envs/:slug/review/tabs/:parentThreadId/skills/:skillI
       existingInvocation.envSlug !== loaded.meta.slug
       || existingInvocation.repoId !== loaded.meta.repoId
       || existingInvocation.mainSessionId !== loaded.sessionId
-      || existingInvocation.parentThreadId !== parentThreadId
+      || existingInvocation.parentThreadId !== rootThreadId
       || existingInvocation.definitionSnapshot.id !== skillId
     ) {
       return c.json({ error: "requestId is already used by a different launch" }, 409);
@@ -601,93 +654,27 @@ envReviewRoutes.post("/api/envs/:slug/review/tabs/:parentThreadId/skills/:skillI
     }
     const existingRuns = await review.listSkillInvocationRuns(requestId);
     if (existingInvocation.status === "active" && existingRuns.some((run) =>
-      run.skillRunRole === "child_initial"
-      && (run.status === "syncing" || run.status === "queued" || run.status === "running")
+      (run.skillRunRole === "root_initial" || run.skillRunRole === "report_initial")
+      && (run.status === "preparing" || run.status === "queued" || run.status === "running")
     )) {
       await review.scheduleOrchestration();
     }
     return c.json({
-      kind: "fanout",
+      kind: "skill_root",
       invocation: existingInvocation,
       tabs: await review.listSkillInvocationTabs(requestId),
       runs: existingRuns,
     });
   }
-  const existingRun = await review.getRun(requestId);
-  if (existingRun) {
-    if (
-      existingRun.envSlug !== loaded.meta.slug
-      || existingRun.repoId !== loaded.meta.repoId
-      || existingRun.mainSessionId !== loaded.sessionId
-      || existingRun.threadId !== parentThreadId
-      || existingRun.skillDefinitionSnapshot?.id !== skillId
-    ) {
-      return c.json({ error: "requestId is already used by a different launch" }, 409);
-    }
-    const failed = await setupReviewPresetRun(c, loaded, existingRun);
-    if (failed) return failed;
-    return c.json({ kind: "preset", run: existingRun });
-  }
-  const parent = await review.getTab(parentThreadId);
-  if (
-    !parent
-    || parent.envSlug !== loaded.meta.slug
-    || parent.mainSessionId !== loaded.sessionId
-    || parent.removedAt
-    || parent.skillInvocationId
-  ) {
-    return c.json({ error: "Parent reviewer tab not found" }, 404);
-  }
   const skill = await resolveReviewSkill(c.env, loaded.repo, skillId);
   if (!skill) return c.json({ error: "Review skill not found" }, 404);
-  try {
-    await requireReviewerSelection(c.env, parent.provider, parent.model, parent.effort);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
-  }
-  const overviewMode: SkillAutomationMode = requestedOverviewMode ?? skill.overviewMode;
-
-  if (skill.agents.length === 1) {
-    const agent = skill.agents[0]!;
-    let launchProvenance: Awaited<ReturnType<typeof resolveNewEnvReviewLaunchProvenance>>;
-    try {
-      launchProvenance = await resolveNewEnvReviewLaunchProvenance(c.env, parent.provider);
-    } catch (error) {
-      return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
-    }
-    const reserved = await review.reserveTopLevelRun({
-      runId: requestId,
-      threadId: parent.threadId,
-      envSlug: loaded.meta.slug,
-      repoId: loaded.meta.repoId,
-      mainSessionId: loaded.sessionId,
-      provider: parent.provider,
-      model: parent.model,
-      effort: parent.effort,
-      roleLabel: parent.roleLabel,
-      taskKind: "custom",
-      customTask: agent.instructions,
-      recipeInstructions: [skill.sharedInstructions, agent.instructions].filter(Boolean).join("\n\n"),
-      preparationOpId: crypto.randomUUID(),
-      skillDefinitionSnapshot: skill,
-      preparationTimeoutMs: PREPARATION_WAIT_MS,
-      requestUrl: c.req.url,
-      launchProvenance,
-    });
-    if (reserved.status === "conflict") return c.json({ error: "requestId is already used by a different launch" }, 409);
-    if (reserved.status === "not_found") return c.json({ error: "Parent reviewer tab not found" }, 404);
-    if (reserved.status === "parent_locked") return c.json({ error: "The selected reviewer is not idle." }, 409);
-    const failed = await setupReviewPresetRun(c, loaded, reserved.run);
-    if (failed) return failed;
-    return c.json({ kind: "preset", run: reserved.run }, reserved.status === "created" ? 202 : 200);
-  }
-
   let agents: Awaited<ReturnType<typeof resolveReviewSkillAgents>>;
   try {
     agents = await resolveReviewSkillAgents(c.env, skill);
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
   }
+  const overviewMode: SkillAutomationMode = requestedOverviewMode ?? skill.overviewMode;
   let agentLaunchProvenance: Array<
     Awaited<ReturnType<typeof resolveNewEnvReviewLaunchProvenance>>
   >;
@@ -701,14 +688,30 @@ envReviewRoutes.post("/api/envs/:slug/review/tabs/:parentThreadId/skills/:skillI
     return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
   }
 
+  let overviewRoute: { provider: string; model: string; effort: PlannerEffort } | null = null;
+  if (skill.agents.length > 1) {
+    try {
+      overviewRoute = await resolveImplementorReviewer(c.env, {
+        envSlug: loaded.meta.slug,
+        repoId: loaded.meta.repoId,
+        mainSessionId: loaded.sessionId,
+        harness: loaded.meta.harness,
+        harnessSettings: loaded.meta.harnessSettings,
+      });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+  }
+
   const reserved = await review.reserveSkillInvocation({
     invocationId: requestId,
     envSlug: loaded.meta.slug,
     repoId: loaded.meta.repoId,
     mainSessionId: loaded.sessionId,
-    parentThreadId: parent.threadId,
+    parentThreadId: rootThreadId,
     definitionSnapshot: skill,
     overviewMode,
+    overviewRoute,
     preparationOpId: crypto.randomUUID(),
     requestUrl: c.req.url,
     agents: agents.map(({ definition, route }, index) => ({
@@ -729,8 +732,149 @@ envReviewRoutes.post("/api/envs/:slug/review/tabs/:parentThreadId/skills/:skillI
   }
   const invocation = await review.getSkillInvocation(requestId);
   return c.json({
-    kind: "fanout",
+    kind: "skill_root",
     invocation,
+    tabs: await review.listSkillInvocationTabs(requestId),
+    runs: await review.listSkillInvocationRuns(requestId),
+  }, reserved.status === "created" ? 202 : 200);
+}
+
+envReviewRoutes.post("/api/envs/:slug/review/skills/:skillId/invoke", invokeReviewSkillRoute);
+
+async function setupReviewSkillRerun(
+  c: any,
+  loaded: Extract<Awaited<ReturnType<typeof loadEnvReviewRequestWithBody>>, { ok: true }>,
+  invocation: NonNullable<Awaited<ReturnType<ReturnType<typeof getEnvReviewStub>["getSkillInvocation"]>>>,
+  requestId: string,
+  runs: EnvReviewRun[],
+): Promise<Response | null> {
+  if (
+    (invocation.status !== "setting_up" && invocation.status !== "active")
+    || runs.some((run) => run.preparationOpId !== invocation.preparationOpId)
+  ) return null;
+  try {
+    for (const agent of invocation.definitionSnapshot.agents) {
+      const run = runs.find((candidate) => candidate.runId === reviewSkillRerunRunId(requestId, agent.id));
+      if (!run) throw new Error(`Re-review run is missing for ${agent.label}.`);
+      const thread = getThreadStub(c.env, run.threadId);
+      await thread.createThread({
+        id: run.threadId,
+        scope: { type: "env", envSlug: loaded.meta.slug },
+        kind: "chat",
+        title: agent.label,
+      });
+      await appendThreadMessage(
+        thread,
+        "user",
+        [
+          `/${invocation.definitionSnapshot.command} — Re-review changes`,
+          "",
+          REVIEW_SKILL_RERUN_INSTRUCTION,
+        ].join("\n"),
+        [],
+        { id: reviewSkillRerunMessageId(requestId, agent.id), runId: run.runId },
+      );
+    }
+    await getEnvReviewStub(c.env, loaded.meta.slug).activateSkillInvocation(invocation.invocationId);
+    await getEnvReviewStub(c.env, loaded.meta.slug).scheduleOrchestration();
+    return null;
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : String(error),
+      code: "skill_setup_incomplete",
+      retryable: true,
+    }, 502);
+  }
+}
+
+envReviewRoutes.post("/api/envs/:slug/review/skill-invocations/:invocationId/rerun", async (c) => {
+  const loaded = await loadEnvReviewRequestWithBody(c, { createsWorkload: true });
+  if (!loaded.ok) return loaded.response;
+  const requestId = readString(loaded.body.requestId);
+  if (!requestId) return c.json({ error: "requestId is required" }, 400);
+  const review = getEnvReviewStub(c.env, loaded.meta.slug);
+  await failStaleReviewSkillInvocations(review, loaded.meta.slug, loaded.sessionId);
+  const invocationId = c.req.param("invocationId");
+  const invocation = await review.getSkillInvocation(invocationId);
+  if (
+    !invocation
+    || invocation.envSlug !== loaded.meta.slug
+    || invocation.repoId !== loaded.meta.repoId
+  ) {
+    return c.json({ error: "Review skill invocation not found" }, 404);
+  }
+  const expectedRoundId = readString(loaded.body.expectedRoundId);
+  if (expectedRoundId !== invocation.invocationId) {
+    return c.json({ error: "The selected review round is stale." }, 409);
+  }
+  const tabs = await review.listSkillInvocationTabs(invocationId);
+  const tabByAgentId = new Map(tabs.map((tab) => [tab.skillAgentId, tab]));
+  if (invocation.definitionSnapshot.agents.some((agent) => !tabByAgentId.get(agent.id))) {
+    return c.json({ error: "The existing reviewer conversations are incomplete." }, 409);
+  }
+
+  const firstAgent = invocation.definitionSnapshot.agents[0]!;
+  const existingMarker = await review.getRun(reviewSkillRerunRunId(requestId, firstAgent.id));
+  let agentLaunchProvenance = new Map<string, Awaited<ReturnType<typeof resolveNewEnvReviewLaunchProvenance>>>();
+  if (!existingMarker) {
+    try {
+      for (const agent of invocation.definitionSnapshot.agents) {
+        const tab = tabByAgentId.get(agent.id)!;
+        await requireReviewerSelection(c.env, tab.provider, tab.model, tab.effort);
+        agentLaunchProvenance.set(
+          agent.id,
+          await resolveNewEnvReviewLaunchProvenance(c.env, tab.provider),
+        );
+      }
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+  }
+
+  let overviewRoute: { provider: string; model: string; effort: PlannerEffort } | null = null;
+  if (invocation.definitionSnapshot.agents.length > 1) {
+    try {
+      overviewRoute = await resolveImplementorReviewer(c.env, {
+        envSlug: loaded.meta.slug,
+        repoId: loaded.meta.repoId,
+        mainSessionId: loaded.sessionId,
+        harness: loaded.meta.harness,
+        harnessSettings: loaded.meta.harnessSettings,
+      });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+  }
+
+  const reserved = await review.restartSkillInvocation({
+    invocationId,
+    requestId,
+    envSlug: loaded.meta.slug,
+    repoId: loaded.meta.repoId,
+    mainSessionId: loaded.sessionId,
+    requestUrl: c.req.url,
+    overviewRoute,
+    agents: invocation.definitionSnapshot.agents.map((agent) => ({
+      id: agent.id,
+      ...(agentLaunchProvenance.get(agent.id)
+        ? { launchProvenance: agentLaunchProvenance.get(agent.id)! }
+        : {}),
+    })),
+  });
+  if (reserved.status === "not_found") return c.json({ error: "Review skill invocation not found" }, 404);
+  if (reserved.status === "conflict") return c.json({ error: "requestId is already used by a different re-review" }, 409);
+  if (reserved.status === "parent_locked") {
+    return c.json({ error: "The reviewer is already working.", ...(reserved.invocation ? { invocation: reserved.invocation } : {}) }, 409);
+  }
+  if (!reserved.invocation || !("runs" in reserved)) {
+    return c.json({ error: "Re-review reservation failed." }, 409);
+  }
+  const failed = await setupReviewSkillRerun(c, loaded, reserved.invocation, requestId, reserved.runs);
+  if (failed) return failed;
+  const current = await review.getSkillInvocation(requestId) ?? reserved.invocation;
+  return c.json({
+    kind: "skill_root",
+    invocation: current,
     tabs: await review.listSkillInvocationTabs(requestId),
     runs: await review.listSkillInvocationRuns(requestId),
   }, reserved.status === "created" ? 202 : 200);
@@ -769,10 +913,10 @@ envReviewRoutes.get("/api/envs/:slug/review/skill-invocations/:invocationId", as
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   await failStaleReviewSkillInvocations(review, loaded.meta.slug, loaded.sessionId);
   let invocation = await review.getSkillInvocation(c.req.param("invocationId"));
-  if (!invocation || invocation.envSlug !== loaded.meta.slug || invocation.mainSessionId !== loaded.sessionId) {
+  if (!invocation || invocation.envSlug !== loaded.meta.slug) {
     return c.json({ error: "Skill invocation not found" }, 404);
   }
-  if (invocation.status === "active" && invocation.overviewMode === "auto" && !invocation.overviewRunId) {
+  if (invocation.definitionSnapshot.agents.length > 1 && invocation.status === "active" && invocation.overviewMode === "auto" && !invocation.overviewRunId) {
     await assignSkillOverview({ env: c.env, review, invocationId: invocation.invocationId, automatic: true }).catch(() => undefined);
     invocation = await review.getSkillInvocation(invocation.invocationId) ?? invocation;
   }
@@ -788,8 +932,14 @@ envReviewRoutes.put("/api/envs/:slug/review/skill-invocations/:invocationId/cont
   if (!loaded.ok) return loaded.response;
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   const invocation = await review.getSkillInvocation(c.req.param("invocationId"));
-  if (!invocation || invocation.envSlug !== loaded.meta.slug || invocation.mainSessionId !== loaded.sessionId) {
+  if (!invocation || invocation.envSlug !== loaded.meta.slug) {
     return c.json({ error: "Skill invocation not found" }, 404);
+  }
+  if (readString(loaded.body.expectedRoundId) !== invocation.invocationId) {
+    return c.json({ error: "The selected review round is stale." }, 409);
+  }
+  if (invocation.definitionSnapshot.agents.length === 1) {
+    return c.json({ error: "One-agent Review invocations do not use Overview." }, 409);
   }
   if (invocation.overviewRunId || invocation.status !== "active") {
     return c.json({ error: "Overview controls are frozen." }, 409);
@@ -823,8 +973,14 @@ envReviewRoutes.post("/api/envs/:slug/review/skill-invocations/:invocationId/ove
   if (!loaded.ok) return loaded.response;
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   const invocation = await review.getSkillInvocation(c.req.param("invocationId"));
-  if (!invocation || invocation.envSlug !== loaded.meta.slug || invocation.mainSessionId !== loaded.sessionId) {
+  if (!invocation || invocation.envSlug !== loaded.meta.slug) {
     return c.json({ error: "Skill invocation not found" }, 404);
+  }
+  if (readString(loaded.body.expectedRoundId) !== invocation.invocationId) {
+    return c.json({ error: "The selected review round is stale." }, 409);
+  }
+  if (invocation.definitionSnapshot.agents.length === 1) {
+    return c.json({ error: "One-agent Review invocations do not use Overview." }, 409);
   }
   try {
     const result = await assignSkillOverview({
@@ -845,7 +1001,7 @@ envReviewRoutes.post("/api/envs/:slug/review/skill-invocations/:invocationId/can
   if (!loaded.ok) return loaded.response;
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   const invocation = await review.getSkillInvocation(c.req.param("invocationId"));
-  if (!invocation || invocation.envSlug !== loaded.meta.slug || invocation.mainSessionId !== loaded.sessionId) {
+  if (!invocation || invocation.envSlug !== loaded.meta.slug) {
     return c.json({ error: "Skill invocation not found" }, 404);
   }
   const runs = await review.listSkillInvocationRuns(invocation.invocationId);
@@ -858,6 +1014,51 @@ envReviewRoutes.post("/api/envs/:slug/review/skill-invocations/:invocationId/can
     }
   }
   return c.json({ ok: true, invocation: cancelled });
+});
+
+envReviewRoutes.delete("/api/envs/:slug/review/skill-invocations/:invocationId", async (c) => {
+  const loaded = await loadEnvReviewRequest(c);
+  if (!loaded.ok) return loaded.response;
+  const review = getEnvReviewStub(c.env, loaded.meta.slug);
+  const invocation = await review.getSkillInvocation(c.req.param("invocationId"));
+  if (!invocation || invocation.envSlug !== loaded.meta.slug) {
+    return c.json({ error: "Review skill invocation not found" }, 404);
+  }
+
+  await review.cancelSkillInvocation(invocation.invocationId);
+  const stoppedRuns = await review.listSkillInvocationRuns(invocation.invocationId);
+  for (const run of stoppedRuns) {
+    if (!run.runtime) continue;
+    try {
+      await cleanupEnvReviewRunRuntime(c.env, review, run);
+    } catch (error) {
+      return c.json({
+        error: `The review stopped, but a reviewer runtime could not be removed. Retry Remove. ${error instanceof Error ? error.message : String(error)}`,
+        code: "review_round_cleanup_failed",
+      }, 502);
+    }
+  }
+
+  const removed = await review.removeSkillInvocation({
+    invocationId: invocation.invocationId,
+    envSlug: loaded.meta.slug,
+    mainSessionId: loaded.sessionId,
+  });
+  if (removed.status === "not_found") {
+    return c.json({ error: "Review skill invocation not found" }, 404);
+  }
+  if (removed.status === "active") {
+    return c.json({ error: "The review is still stopping. Retry Remove." }, 409);
+  }
+  if (removed.status === "runtime_retained") {
+    return c.json({ error: "A reviewer runtime is still being removed. Retry Remove round." }, 409);
+  }
+  return c.json({
+    ok: true,
+    parentThreadId: removed.parentThreadId,
+    removedChildThreadIds: removed.childThreadIds,
+    state: await stateFor(c, loaded.meta, loaded.sessionId),
+  });
 });
 
 envReviewRoutes.post("/api/envs/:slug/review/recipes/code-review", async (c) => {
@@ -1006,24 +1207,57 @@ envReviewRoutes.get("/api/envs/:slug/review/tabs/:threadId/messages", async (c) 
   if (!tab || tab.envSlug !== loaded.meta.slug || tab.mainSessionId !== loaded.sessionId || tab.removedAt) {
     return c.json({ error: "Reviewer tab not found" }, 404);
   }
-  const messages = await getThreadStub(c.env, tab.threadId).listMessages({ limit: 200 });
-  return c.json({ messages: messages.slice().reverse() });
+  const messages = await listAllThreadMessages(getThreadStub(c.env, tab.threadId));
+  return c.json({ messages });
 });
 
-envReviewRoutes.post("/api/envs/:slug/review/tabs/:threadId/messages", async (c) => {
+async function sendEnvReviewMessageRoute(c: any) {
   const loaded = await loadEnvReviewRequestWithBody(c, { createsWorkload: true });
   if (!loaded.ok) return loaded.response;
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
-  const tab = await review.getTab(c.req.param("threadId"));
-  if (!tab || tab.envSlug !== loaded.meta.slug || tab.mainSessionId !== loaded.sessionId || tab.removedAt) {
-    return c.json({ error: "Reviewer tab not found" }, 404);
-  }
-  if (tab.status === "preparing" || tab.status === "queued" || tab.status === "running") {
-    return c.json({ error: "Reviewer is already running." }, 409);
+  const requestedThreadId = readString(c.req.param("threadId"));
+  const requestId = readString(loaded.body.requestId);
+  if (!requestedThreadId && !requestId) {
+    return c.json({ error: "requestId is required" }, 400);
   }
   const text = readString(loaded.body.text);
   if (!text) {
     return c.json({ error: "text is required" }, 400);
+  }
+  const existingRun = !requestedThreadId && requestId
+    ? await review.getRun(requestId)
+    : null;
+  if (existingRun && (
+    existingRun.envSlug !== loaded.meta.slug
+    || existingRun.repoId !== loaded.meta.repoId
+    || existingRun.mainSessionId !== loaded.sessionId
+    || existingRun.skillDefinitionSnapshot
+    || existingRun.skillInvocationId
+    || existingRun.customTask !== text
+  )) {
+    return c.json({ error: "requestId is already used by a different launch" }, 409);
+  }
+  let tab: EnvReviewTab | null;
+  try {
+    tab = requestedThreadId
+      ? await review.getTab(requestedThreadId)
+      : existingRun
+        ? await review.getTab(existingRun.threadId)
+        : await ensurePrimaryReviewer(c.env, review, {
+          envSlug: loaded.meta.slug,
+          repoId: loaded.meta.repoId,
+          mainSessionId: loaded.sessionId,
+          harness: loaded.meta.harness,
+          harnessSettings: loaded.meta.harnessSettings,
+        });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+  }
+  if (!tab || tab.envSlug !== loaded.meta.slug || tab.mainSessionId !== loaded.sessionId || tab.removedAt) {
+    return c.json({ error: "Reviewer tab not found" }, 404);
+  }
+  if (!existingRun && (tab.status === "preparing" || tab.status === "queued" || tab.status === "running")) {
+    return c.json({ error: "Reviewer is already running." }, 409);
   }
   try {
     await requireReviewerSelection(c.env, tab.provider, tab.model, tab.effort);
@@ -1036,65 +1270,132 @@ envReviewRoutes.post("/api/envs/:slug/review/tabs/:threadId/messages", async (c)
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
   }
-  const thread = getThreadStub(c.env, tab.threadId);
-  if (tab.skillInvocationId) {
-    const invocation = await review.getSkillInvocation(tab.skillInvocationId);
-    if (!invocation || invocation.mainSessionId !== loaded.sessionId || invocation.envSlug !== loaded.meta.slug) {
+  let thread: ReturnType<typeof getThreadStub>;
+  try {
+    thread = await ensureReviewerThread(c.env, tab);
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : String(error),
+      code: "message_setup_incomplete",
+      retryable: true,
+    }, 502);
+  }
+  if (tab.nodeKind !== "generic") {
+    const rootThreadId = tab.skillRootThreadId ?? tab.threadId;
+    const invocation = await review.getLatestSkillInvocationForRoot(rootThreadId);
+    if (!invocation || invocation.envSlug !== loaded.meta.slug) {
       return c.json({ error: "Linked skill invocation not found" }, 409);
     }
+    const expectedRoundId = readString(loaded.body.expectedRoundId);
+    if (expectedRoundId !== invocation.invocationId) {
+      return c.json({ error: "The selected review round is stale." }, 409);
+    }
     const initial = (await review.listSkillInvocationRuns(invocation.invocationId)).find((candidate) =>
-      candidate.skillRunRole === "child_initial"
-      && candidate.skillAgentId === tab.skillAgentId
+      (candidate.skillRunRole === "root_initial" || candidate.skillRunRole === "report_initial")
+      && (tab.skillAgentId ? candidate.skillAgentId === tab.skillAgentId : true)
+      && candidate.preparationOpId === invocation.preparationOpId
       && candidate.preparation
       && candidate.changeContext
     );
     if (!initial?.preparation || !initial.changeContext) {
       return c.json({ error: "The invocation's immutable Review context is not ready." }, 409);
     }
-    const agent = invocation.definitionSnapshot.agents.find((candidate) => candidate.id === tab.skillAgentId);
-    if (!agent) return c.json({ error: "Linked skill agent not found" }, 409);
-    await appendThreadMessage(thread, "user", text);
-    const created = await review.createRun({
-      runId: crypto.randomUUID(),
+    const agent = tab.skillAgentId
+      ? invocation.definitionSnapshot.agents.find((candidate) => candidate.id === tab.skillAgentId)
+      : null;
+    if (tab.skillAgentId && !agent) return c.json({ error: "Linked skill agent not found" }, 409);
+    if (!agent && !invocation.overviewRunId) {
+      return c.json({ error: "Create the Overview before following up with the skill root." }, 409);
+    }
+    const selectedRoute = agent
+      ? { provider: tab.provider, model: tab.model, effort: tab.effort }
+      : invocation.overviewRoute;
+    if (!selectedRoute) {
+      return c.json({ error: "The frozen Overview route is unavailable." }, 409);
+    }
+    if (
+      selectedRoute.provider !== tab.provider
+      || selectedRoute.model !== tab.model
+      || selectedRoute.effort !== tab.effort
+    ) {
+      try {
+        await requireReviewerSelection(
+          c.env,
+          selectedRoute.provider,
+          selectedRoute.model,
+          selectedRoute.effort,
+        );
+        launchProvenance = await resolveNewEnvReviewLaunchProvenance(
+          c.env,
+          selectedRoute.provider,
+        );
+      } catch (error) {
+        return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+      }
+    }
+    const runId = crypto.randomUUID();
+    const reserved = await review.createSkillFollowupIfNoActive({
+      runId,
       threadId: tab.threadId,
       envSlug: loaded.meta.slug,
       repoId: loaded.meta.repoId,
       mainSessionId: loaded.sessionId,
-      provider: tab.provider,
-      model: tab.model,
-      effort: tab.effort,
+      provider: selectedRoute.provider,
+      model: selectedRoute.model,
+      effort: selectedRoute.effort,
       roleLabel: tab.roleLabel,
       taskKind: "custom",
-      customTask: "Respond to the user's latest child-tab message using only the invocation's original Review basis.",
-      recipeInstructions: [invocation.definitionSnapshot.sharedInstructions, agent.instructions].filter(Boolean).join("\n\n"),
+      customTask: text,
+      recipeInstructions: composeReviewerInstructions(
+        invocation.definitionSnapshot.sharedInstructions,
+        agent?.instructions ?? invocation.definitionSnapshot.overviewInstructions,
+      ),
       preparationOpId: initial.preparationOpId,
       skillInvocationId: invocation.invocationId,
-      skillAgentId: agent.id,
-      skillRunRole: "child_followup",
+      ...(agent ? { skillAgentId: agent.id } : {}),
+      skillRunRole: tab.nodeKind === "report" ? "report_followup" : "root_followup",
       skillDefinitionSnapshot: invocation.definitionSnapshot,
       launchProvenance,
     });
-    const chronological = (await thread.listMessages({ limit: 12 })).slice().reverse();
+    if (!reserved.ok) {
+      return c.json({ error: "Another operation is active for this skill conversation." }, 409);
+    }
+    const created = reserved.run;
+    try {
+      await appendThreadMessage(thread, "user", text, [], { id: `env-review-message:${runId}`, runId });
+    } catch (error) {
+      await review.cancelRun(runId, "Reviewer setup failed before the user message was stored.");
+      return c.json({ error: error instanceof Error ? error.message : String(error), retryable: true }, 502);
+    }
+    const chronological = await listAllThreadMessages(thread);
+    const history = buildThreadMessageHistory(chronological, runId, {
+      messageLimit: ENV_REVIEW_THREAD_CONTEXT_MESSAGE_LIMIT,
+    });
     const prompt = buildEnvReviewPrompt({
       run: created,
-      preparation: initial.preparation,
       changeContext: initial.changeContext,
-      planBasis: initial.planBasis,
+      planBasis: normalizeEnvReviewPlanBasis(initial.planBasis),
       recipeInstructions: created.recipeInstructions ?? undefined,
-      priorMessages: chronological.map((message) => {
+      currentInstruction: text,
+      priorMessages: [
+        ...(history.truncated
+          ? [{ role: "system", text: "[Earlier eligible reviewer messages were omitted by the context window.]" }]
+          : []),
+        ...history.messages.map((message) => {
         const body = isRecord(message.body) ? message.body : {};
         return {
           role: typeof body.role === "string" ? body.role : message.senderSessionId,
           text: typeof body.text === "string" ? body.text : JSON.stringify(message.body),
         };
-      }),
+        }),
+      ],
     });
     const run = await review.updateRun({
       runId: created.runId,
       status: "queued",
       preparation: initial.preparation,
       changeContext: initial.changeContext,
-      planBasis: initial.planBasis,
+      planBasis: normalizeEnvReviewPlanBasis(initial.planBasis),
       prompt,
       queuedAt: new Date().toISOString(),
       error: null,
@@ -1103,17 +1404,20 @@ envReviewRoutes.post("/api/envs/:slug/review/tabs/:threadId/messages", async (c)
       runId: created.runId,
       type: "run_queued",
       message: "Child follow-up queued with the invocation's frozen Review context.",
-      data: { invocationId: invocation.invocationId, agentId: agent.id },
+      data: {
+        invocationId: invocation.invocationId,
+        ...(agent ? { agentId: agent.id } : { role: "overview" }),
+      },
     });
     await review.scheduleOrchestration();
-    const messages = await thread.listMessages({ limit: 200 });
+    const messages = await listAllThreadMessages(thread);
     return c.json({
       run,
-      messages: messages.slice().reverse(),
+      messages,
       state: await stateFor(c, loaded.meta, loaded.sessionId),
     }, 202);
   }
-  const runId = crypto.randomUUID();
+  const runId = requestId ?? crypto.randomUUID();
   const reserved = await review.reserveTopLevelRun({
     runId,
     threadId: tab.threadId,
@@ -1125,36 +1429,45 @@ envReviewRoutes.post("/api/envs/:slug/review/tabs/:threadId/messages", async (c)
     effort: tab.effort,
     roleLabel: tab.roleLabel,
     taskKind: "custom",
-    customTask: "Respond to the user's latest reviewer chat message using the prepared workspace snapshot.",
+    customTask: text,
     preparationOpId: crypto.randomUUID(),
     preparationTimeoutMs: PREPARATION_WAIT_MS,
     requestUrl: c.req.url,
     launchProvenance,
   });
+  if (reserved.status === "conflict") return c.json({ error: "requestId is already used by a different launch" }, 409);
   if (reserved.status === "not_found") return c.json({ error: "Reviewer tab not found" }, 404);
   if (reserved.status === "parent_locked") return c.json({ error: "The selected reviewer is not idle." }, 409);
-  if (reserved.status !== "created") return c.json({ error: "Reviewer run id is already in use." }, 409);
+  if (!reserved.run) return c.json({ error: "Reviewer run reservation failed." }, 409);
+  if (reserved.run.customTask !== text) {
+    return c.json({ error: "requestId is already used by a different message" }, 409);
+  }
   try {
     await appendThreadMessage(thread, "user", text, [], { id: `env-review-message:${runId}`, runId });
   } catch (error) {
-    await review.cancelRun(runId, "Reviewer setup failed before the user message was stored.");
+    if (reserved.status === "created") {
+      await review.cancelRun(runId, "Reviewer setup failed before the user message was stored.");
+    }
     return c.json({ error: error instanceof Error ? error.message : String(error), retryable: true }, 502);
   }
   await review.scheduleOrchestration();
-  const messages = await thread.listMessages({ limit: 200 });
+  const messages = await listAllThreadMessages(thread);
   return c.json({
     run: reserved.run,
-    messages: messages.slice().reverse(),
+    messages,
     state: await stateFor(c, loaded.meta, loaded.sessionId),
-  }, 202);
-});
+  }, reserved.status === "created" ? 202 : 200);
+}
+
+envReviewRoutes.post("/api/envs/:slug/review/messages", sendEnvReviewMessageRoute);
+envReviewRoutes.post("/api/envs/:slug/review/tabs/:threadId/messages", sendEnvReviewMessageRoute);
 
 envReviewRoutes.get("/api/envs/:slug/review/runs/:runId", async (c) => {
   const loaded = await loadEnvReviewRequest(c);
   if (!loaded.ok) return loaded.response;
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   const run = await review.getRun(c.req.param("runId"));
-  if (!run || run.envSlug !== loaded.meta.slug || run.mainSessionId !== loaded.sessionId) {
+  if (!run || run.envSlug !== loaded.meta.slug) {
     return c.json({ error: "Env review run not found" }, 404);
   }
   const afterSeqRaw = c.req.query("afterSeq");
@@ -1170,7 +1483,7 @@ envReviewRoutes.post("/api/envs/:slug/review/runs/:runId/cancel", async (c) => {
   if (!loaded.ok) return loaded.response;
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   const run = await review.getRun(c.req.param("runId"));
-  if (!run || run.envSlug !== loaded.meta.slug || run.mainSessionId !== loaded.sessionId) {
+  if (!run || run.envSlug !== loaded.meta.slug) {
     return c.json({ error: "Env review run not found" }, 404);
   }
   const cancelled = await review.cancelRun(run.runId);
@@ -1179,7 +1492,11 @@ envReviewRoutes.post("/api/envs/:slug/review/runs/:runId/cancel", async (c) => {
       console.error(`[env-review] job cleanup failed for cancelled run ${cancelled.runId}:`, error);
     }));
   }
-  if (cancelled?.skillInvocationId && cancelled.skillRunRole === "child_initial") {
+  if (
+    cancelled?.skillInvocationId &&
+    (cancelled.skillRunRole === "root_initial" ||
+      cancelled.skillRunRole === "report_initial")
+  ) {
     await assignSkillOverview({
       env: c.env,
       review,
@@ -1197,7 +1514,7 @@ async function updateFeedback(c: any, status: "pending" | "sent" | "dismissed") 
   const deliveredText = readString(body.deliveredText);
   const review = getEnvReviewStub(c.env, loaded.meta.slug);
   const feedback = await review.getFeedback(c.req.param("feedbackId"));
-  if (!feedback || feedback.envSlug !== loaded.meta.slug || feedback.mainSessionId !== loaded.sessionId) {
+  if (!feedback || feedback.envSlug !== loaded.meta.slug) {
     return c.json({ error: "Feedback not found" }, 404);
   }
   if (status === "pending") {

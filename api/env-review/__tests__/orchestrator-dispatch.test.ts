@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   loadEnvView: vi.fn(),
   loadRepo: vi.fn(),
   buildEnvReviewChangeContext: vi.fn(),
+  buildEnvReviewInspectionBundle: vi.fn(),
   buildEnvReviewPrompt: vi.fn(),
   readEnvReviewPlanBasis: vi.fn(),
   resolveEnvReviewDispatchTarget: vi.fn(),
@@ -18,8 +19,16 @@ vi.mock("../../repo/access", async (importOriginal) => ({
 }));
 vi.mock("../context", () => ({
   buildEnvReviewChangeContext: mocks.buildEnvReviewChangeContext,
+  buildEnvReviewInspectionBundle: mocks.buildEnvReviewInspectionBundle,
   buildEnvReviewPrompt: mocks.buildEnvReviewPrompt,
   readEnvReviewPlanBasis: mocks.readEnvReviewPlanBasis,
+  normalizeEnvReviewPlanBasis: (basis: any) => basis ?? {
+    source: "none",
+    artifactId: null,
+    version: null,
+    title: null,
+    markdown: null,
+  },
 }));
 vi.mock("../dispatch", () => ({
   resolveEnvReviewDispatchTarget: mocks.resolveEnvReviewDispatchTarget,
@@ -32,9 +41,11 @@ vi.mock("../../helpers", () => ({
   getWorkspaceStub: vi.fn(),
 }));
 vi.mock("../snapshots", () => ({
+  ENV_REVIEW_INSPECTION_CONTENT_TYPE: "application/x-tar",
   ENV_REVIEW_SNAPSHOT_EXCLUDE_PREFIXES: [],
   ENV_REVIEW_SNAPSHOT_FORMAT_VERSION: 1,
   ENV_REVIEW_SNAPSHOT_MAX_BYTES: 1_000_000,
+  buildReviewInspectionKey: (envSlug: string, snapshotId: string) => `${envSlug}/${snapshotId}.inspection.tar`,
   buildReviewSnapshotTarFromWorkspace: vi.fn(),
   normalizeReviewSnapshotDeletedPaths: vi.fn((paths) => paths),
   r2ObjectToBytes: vi.fn(async () => new Uint8Array()),
@@ -68,6 +79,10 @@ describe("environment-review dispatch orchestration", () => {
       },
     });
     mocks.buildEnvReviewChangeContext.mockResolvedValue({ summary: { total: 1 } });
+    mocks.buildEnvReviewInspectionBundle.mockResolvedValue({
+      manifest: { formatVersion: 1, files: [] },
+      tarBytes: new Uint8Array([1, 2, 3]),
+    });
     mocks.readEnvReviewPlanBasis.mockResolvedValue(null);
     mocks.resolveEnvReviewDispatchTarget.mockResolvedValue({
       backend: "host",
@@ -118,7 +133,7 @@ describe("environment-review dispatch orchestration", () => {
         backend: "host",
         machineId: "machine-1",
       },
-      skillRunRole: "child_initial",
+      skillRunRole: "report_initial",
     };
     const preparation = {
       opId: "op-1",
@@ -131,6 +146,8 @@ describe("environment-review dispatch orchestration", () => {
         status: "succeeded",
         completedAt: "2026-01-01T00:00:00.000Z",
         snapshot: {
+          snapshotId: "snapshot-1",
+          snapshotHash: "hash-1",
           r2Key: "review-snapshots/env-1/op-1.tar",
           baseCommitSha: "base-1",
           githubDeletedPaths: [],
@@ -150,10 +167,12 @@ describe("environment-review dispatch orchestration", () => {
         jobSlug: "env-review-run-1",
       } })),
       scheduleOrchestration: vi.fn(async () => undefined),
+      getSkillInvocation: vi.fn(async () => null),
     };
 
+    const bucketPut = vi.fn(async () => undefined);
     await processEnvReviewOrchestration(review as any, {
-      BUCKET: { get: vi.fn(async () => ({})) },
+      BUCKET: { get: vi.fn(async () => ({})), put: bucketPut },
     } as any);
 
     expect(updateRun).toHaveBeenCalledWith({
@@ -163,6 +182,14 @@ describe("environment-review dispatch orchestration", () => {
       },
     });
     expect(mocks.buildEnvReviewPrompt).toHaveBeenCalledWith(expect.objectContaining({ planBasis }));
+    expect(mocks.buildEnvReviewInspectionBundle).toHaveBeenCalledWith(expect.objectContaining({
+      changeContext: { summary: { total: 1 } },
+    }));
+    expect(bucketPut).toHaveBeenCalledWith(
+      "env-1/snapshot-1.inspection.tar",
+      new Uint8Array([1, 2, 3]),
+      expect.objectContaining({ httpMetadata: { contentType: "application/x-tar" } }),
+    );
     expect(updateRun).toHaveBeenCalledWith(expect.objectContaining({
       runId: "run-1",
       status: "queued",
@@ -212,7 +239,7 @@ describe("environment-review dispatch orchestration", () => {
       planBasis: pinnedPlanBasis,
       runtime: { jobSlug: "already-running" },
       skillInvocationId: "invocation-1",
-      skillRunRole: "child_initial",
+      skillRunRole: "report_initial",
     };
     const unfinishedRun = {
       ...pinnedRun,
@@ -225,6 +252,11 @@ describe("environment-review dispatch orchestration", () => {
       changeContext: null,
       planBasis: null,
       runtime: null,
+      customTask: "Re-review the latest workspace and validate earlier findings.",
+      skillAgentId: "agent-1",
+      skillDefinitionSnapshot: {
+        agents: [{ id: "agent-1", instructions: "Initial reviewer instructions." }],
+      },
     };
     const operation = {
       opId: "shared-op",
@@ -253,6 +285,9 @@ describe("environment-review dispatch orchestration", () => {
         runtime: { jobSlug: "env-review-run-1" },
       })),
       scheduleOrchestration: vi.fn(async () => undefined),
+      getSkillInvocation: vi.fn(async () => ({
+        definitionSnapshot: { agents: [{ id: "agent-1" }, { id: "agent-2" }] },
+      })),
     };
 
     await processEnvReviewOrchestration(review as any, { BUCKET: { get: vi.fn() } } as any);
@@ -260,9 +295,9 @@ describe("environment-review dispatch orchestration", () => {
     expect(mocks.readEnvReviewPlanBasis).not.toHaveBeenCalled();
     expect(mocks.buildEnvReviewChangeContext).not.toHaveBeenCalled();
     expect(mocks.buildEnvReviewPrompt).toHaveBeenCalledWith(expect.objectContaining({
-      preparation: pinnedPreparation,
       changeContext: pinnedChangeContext,
       planBasis: pinnedPlanBasis,
+      currentInstruction: "Re-review the latest workspace and validate earlier findings.",
     }));
     expect(updateRun).toHaveBeenCalledWith(expect.objectContaining({
       runId: "unfinished-child",

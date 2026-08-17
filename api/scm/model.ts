@@ -48,6 +48,7 @@ export function createInitialRepoScmState(): Pick<
 
 export function createInitialEnvScmState(args: {
   slug: string;
+  incarnationId?: string | null;
   startupPlanId?: string | null;
   branchName?: string | null;
   mainCommit?: string | null;
@@ -107,7 +108,7 @@ export function createInitialEnvScmState(args: {
     scmLastTimings: null,
     githubBaseBranch: args.githubBaseBranch ?? null,
     githubBaseCommitSha: args.githubBaseCommitSha ?? null,
-    githubBranch: buildGitHubEnvBranchName(args.slug),
+    githubBranch: buildGitHubEnvBranchName(args.slug, args.incarnationId),
     githubHeadCommitSha: null,
     githubPrNumber: null,
     githubPrUrl: null,
@@ -122,8 +123,14 @@ export function createInitialEnvScmState(args: {
   };
 }
 
-export function buildGitHubEnvBranchName(slug: string): string {
-  return `tiller/env/${slug.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "env"}`;
+export function buildGitHubEnvBranchName(slug: string, incarnationId?: string | null): string {
+  const normalizedSlug = slug.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "env";
+  const incarnationSuffix = incarnationId
+    ?.trim()
+    .replace(/^env-/i, "")
+    .replace(/[^a-zA-Z0-9]+/g, "")
+    .slice(0, 12);
+  return `tiller/env/${normalizedSlug}${incarnationSuffix ? `-${incarnationSuffix}` : ""}`;
 }
 
 export function createGitHubPendingPublishProjection(args: {
@@ -250,10 +257,14 @@ export function getEffectiveEnvBranchStatus(
 }
 
 export function deriveGitHubEnvBranchStatus(
-  meta: Pick<EnvMeta, "githubBaseCommitSha" | "githubPublishStatus" | "githubPrState" | "githubMergedAt" | "workspaceDirty" | "workspaceNeedsAttention">,
+  meta: Pick<EnvMeta, "githubBaseCommitSha" | "githubPublishStatus" | "githubPrState" | "githubMergedAt" | "workspaceDirty" | "workspaceNeedsAttention">
+    & Partial<Pick<EnvMeta, "githubPublishError">>,
   repo: Pick<RepoMeta, "githubDefaultBranchHeadSha"> | null | undefined,
 ): EnvBranchStatus {
-  if (meta.workspaceNeedsAttention || meta.githubPublishStatus === "attention" || meta.githubPublishStatus === "failed") {
+  if (
+    (meta.workspaceNeedsAttention && !isRecoverableGitHubPublishFailure(meta))
+    || meta.githubPublishStatus === "attention"
+  ) {
     return "needs-attention";
   }
   if (meta.githubMergedAt || meta.githubPrState === "merged") {
@@ -263,6 +274,13 @@ export function deriveGitHubEnvBranchStatus(
     return "behind-main";
   }
   return meta.workspaceDirty ? "ready-to-merge" : "up-to-date";
+}
+
+export function isRecoverableGitHubPublishFailure(
+  meta: Pick<EnvMeta, "githubPublishStatus"> & Partial<Pick<EnvMeta, "githubPublishError">>,
+): boolean {
+  return meta.githubPublishStatus === "failed"
+    && /(?:without [`'"]?workflows[`'"]? permission|workflows(?::write|: read and write)?(?: to publish| permission)|remote:\s*repository not found|repository ['"]?https?:\/\/github\.com\/[^\s'"]+['"]? not found)/i.test(meta.githubPublishError ?? "");
 }
 
 export function hasCurrentMainBase(

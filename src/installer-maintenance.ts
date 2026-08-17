@@ -1,4 +1,5 @@
 export const INSTALLER_MAINTENANCE_URL = "https://install.paperwing.dev/maintenance";
+export const INSTALLER_REINSTALL_URL = "https://install.paperwing.dev/deploy";
 
 export function installerMaintenanceAction(options: {
   updateAvailable: boolean;

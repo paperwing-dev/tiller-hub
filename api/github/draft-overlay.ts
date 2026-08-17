@@ -1,3 +1,5 @@
+import { bytesToArrayBuffer } from "../bytes";
+
 export const GITHUB_DELETED_PATHS_WORKSPACE_PATH = "/.tiller/github-deleted-paths.json";
 
 export interface GitHubDraftManifestEntry {
@@ -30,7 +32,7 @@ export function parseGitHubDeletedPathsJson(text: string | null): string[] {
 }
 
 async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const digest = await crypto.subtle.digest("SHA-256", bytesToArrayBuffer(bytes));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 

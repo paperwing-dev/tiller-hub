@@ -6,6 +6,16 @@ import {
   readCanonicalWorkersDevAccessTrust,
   readWorkersDevAccessCredential,
 } from "../workers-dev-access/records";
+import { getOrCreateSecret } from "../setup/config";
+
+const CONTROL_SECRET_KEY = "TILLER_CONTROL_SECRET";
+
+function generateControlSecret(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
 
 const MAX_CONNECT_PACKAGE_BODY_BYTES = 8 * 1_024;
 
@@ -321,9 +331,10 @@ cliRoutes.post("/api/cli/connect-package", async (c) => {
         code: "protected_connection_required",
       }, 409);
     }
-    const [trust, credential] = await Promise.all([
+    const [trust, credential, controlSecret] = await Promise.all([
       readCanonicalWorkersDevAccessTrust(c.env),
       readWorkersDevAccessCredential(c.env),
+      getOrCreateSecret(c.env, CONTROL_SECRET_KEY, generateControlSecret),
     ]);
     const clientId = trust?.serviceClientId.trim() ?? "";
     const clientSecret = credential?.currentSecret.trim() ?? "";
@@ -336,6 +347,7 @@ cliRoutes.post("/api/cli/connect-package", async (c) => {
       || !activeWorkersDevTrustMatches
       || !clientId
       || !clientSecret
+      || !/^[A-Za-z0-9_-]{43}$/.test(controlSecret)
       || !Number.isFinite(Date.parse(tokenExpiresAt))
     ) {
       return c.json({
@@ -349,6 +361,7 @@ cliRoutes.post("/api/cli/connect-package", async (c) => {
       hubUrl,
       clientId,
       clientSecret,
+      controlSecret,
       tokenExpiresAt,
       state: input.state,
       iat: now,

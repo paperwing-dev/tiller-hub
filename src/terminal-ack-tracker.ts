@@ -1,9 +1,25 @@
 export const TERMINAL_ACK_TIMEOUT_MS = 1000;
 export const TERMINAL_WARNING_COOLDOWN_MS = 2000;
+const TERMINAL_OWNER_UNAVAILABLE_ERRORS = new Set([
+  "No active terminal owner for session",
+  "Terminal owner delivery failed",
+  "Terminal owner socket closed before input could be delivered",
+]);
+const TERMINAL_DISCONNECTED_NOTICE =
+  "Terminal disconnected: no active harness owns this session. Restart or reconnect the environment, then retry input.";
+
+export type TerminalAckOperation = "input" | "resize" | "abort";
+
+export interface TerminalStaleWarning {
+  message: string;
+  operation: TerminalAckOperation;
+}
 
 export interface TerminalAckTrackerOptions {
   // Stale-ACK warning (yellow): at most one while any tracked seq is pending.
-  onStaleWarning: (message: string) => void;
+  onStaleWarning: (warning: TerminalStaleWarning) => void;
+  // A late or subsequent successful ACK proves the live terminal is responsive.
+  onRecovered?: () => void;
   // Failed-ACK report (red): coalesced on a cooldown, see warnFailure below.
   onFailure: (message: string) => void;
   // Live-send drop warning (yellow): coalesced on a cooldown.
@@ -17,7 +33,10 @@ export interface TerminalAckTrackerOptions {
 // clear() on disconnect — anything in flight then will never be acked.
 export class TerminalAckTracker {
   private pendingInputs = new Map<number, ReturnType<typeof setTimeout>>();
-  private pendingControls = new Map<number, ReturnType<typeof setTimeout>>();
+  private pendingControls = new Map<number, {
+    action: Exclude<TerminalAckOperation, "input">;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   private warningActive = false;
   private failureWarnedAt: number | null = null;
   private dropWarnedAt: number | null = null;
@@ -34,43 +53,65 @@ export class TerminalAckTracker {
       // Delete on timeout so a never-acked seq (e.g. across a dropped socket)
       // can't grow the map forever or suppress future warnings.
       this.pendingInputs.delete(inputSeq);
-      this.warnOnce("Terminal input is delayed; waiting for the remote session.");
+      this.warnOnce({
+        message: "Terminal input is delayed; waiting for the remote session.",
+        operation: "input",
+      });
       this.resetWarningIfIdle();
     }, this.timeoutMs);
     this.pendingInputs.set(inputSeq, timer);
   }
 
-  trackControl(controlSeq: number): void {
+  trackControl(
+    controlSeq: number,
+    action: Exclude<TerminalAckOperation, "input">,
+  ): void {
     const timer = setTimeout(() => {
       this.pendingControls.delete(controlSeq);
-      this.warnOnce("Terminal control is delayed; waiting for the remote session.");
+      this.warnOnce(action === "resize"
+        ? {
+            message: "Terminal resize acknowledgement is delayed; terminal input may still work.",
+            operation: action,
+          }
+        : {
+            message: "Terminal abort is delayed; waiting for the remote session.",
+            operation: action,
+          });
       this.resetWarningIfIdle();
     }, this.timeoutMs);
-    this.pendingControls.set(controlSeq, timer);
+    this.pendingControls.set(controlSeq, { action, timer });
   }
 
   handleInputAck(inputSeq: number, error?: string): void {
     const timer = this.pendingInputs.get(inputSeq);
-    if (!timer) return;
+    if (!timer) {
+      if (!error) this.recover();
+      return;
+    }
     clearTimeout(timer);
     this.pendingInputs.delete(inputSeq);
     if (error) {
-      this.warnFailure(`Terminal input failed: ${error}`);
+      this.warnFailure(TERMINAL_OWNER_UNAVAILABLE_ERRORS.has(error)
+        ? TERMINAL_DISCONNECTED_NOTICE
+        : `Terminal input failed: ${error}`);
     } else {
-      this.failureWarnedAt = null;
+      this.recover();
     }
     this.resetWarningIfIdle();
   }
 
   handleControlAck(controlSeq: number, error?: string): void {
-    const timer = this.pendingControls.get(controlSeq);
-    if (!timer) return;
-    clearTimeout(timer);
+    const pending = this.pendingControls.get(controlSeq);
+    if (!pending) {
+      if (!error) this.recover();
+      return;
+    }
+    clearTimeout(pending.timer);
     this.pendingControls.delete(controlSeq);
     if (error) {
-      this.warnFailure(`Terminal control failed: ${error}`);
+      this.warnFailure(`Terminal ${pending.action} failed: ${error}`);
     } else {
-      this.failureWarnedAt = null;
+      this.recover();
     }
     this.resetWarningIfIdle();
   }
@@ -86,8 +127,8 @@ export class TerminalAckTracker {
     for (const timer of this.pendingInputs.values()) {
       clearTimeout(timer);
     }
-    for (const timer of this.pendingControls.values()) {
-      clearTimeout(timer);
+    for (const pending of this.pendingControls.values()) {
+      clearTimeout(pending.timer);
     }
     this.pendingInputs.clear();
     this.pendingControls.clear();
@@ -95,10 +136,16 @@ export class TerminalAckTracker {
     this.failureWarnedAt = null;
   }
 
-  private warnOnce(message: string): void {
+  private warnOnce(warning: TerminalStaleWarning): void {
     if (this.warningActive) return;
     this.warningActive = true;
-    this.options.onStaleWarning(message);
+    this.options.onStaleWarning(warning);
+  }
+
+  private recover(): void {
+    this.warningActive = false;
+    this.failureWarnedAt = null;
+    this.options.onRecovered?.();
   }
 
   private resetWarningIfIdle(): void {

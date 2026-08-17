@@ -177,6 +177,19 @@ describe("ShipView actions", () => {
     expect(html).toContain("ask the agent to pull in main");
   });
 
+  it("keeps workflow permission failures retryable without suggesting a reset", () => {
+    const html = render(makeEnv({
+      branchStatus: "needs-attention",
+      workspaceNeedsAttention: true,
+      githubPublishStatus: "failed",
+      githubPublishError: "refusing to allow a GitHub App to update workflow files without `workflows` permission",
+    }));
+
+    expect(html).toContain("Create Draft PR");
+    expect(html).not.toContain("conflicts or unsupported git state");
+    expect(html).not.toContain("Shipping is unavailable");
+  });
+
   it("switches to Update Draft PR when an open PR has newer workspace changes", () => {
     const html = render(makeEnv({
       githubPrState: "open",

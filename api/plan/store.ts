@@ -21,6 +21,7 @@ import { canonicalizeGitHubRepo, githubRepoUrlFromFullName } from "../github/rep
 import { readCommitRef } from "../github/git-api";
 import { UnsupportedGitHubRepoMetadataError, validateGitHubManagedTree } from "../github/metadata-validation";
 import workspacePolicy from "../env/workspace-policy.json";
+import { normalizeEnvDisplayName } from "../../shared/env-display-name";
 
 const PLAN_STORE_PREFIX = "plan-store:";
 const REPO_INDEX_PREFIX = "repo:";
@@ -60,6 +61,7 @@ function isCanonicalGitHubFullName(value: unknown): value is string {
 
 const ENV_DEFINITION_KEYS = new Set<keyof EnvDefinition>([
   "slug",
+  "displayName",
   "incarnationId",
   "sidebarSlot",
   "repoId",
@@ -78,6 +80,13 @@ function isEnvDefinitionRecord(value: unknown): value is EnvDefinition {
     isObjectRecord(value) &&
     Object.keys(value).every((key) => ENV_DEFINITION_KEYS.has(key as keyof EnvDefinition)) &&
     typeof value.slug === "string" &&
+    (
+      value.displayName === undefined
+      || (
+        typeof value.displayName === "string"
+        && normalizeEnvDisplayName(value.displayName) === value.displayName
+      )
+    ) &&
     typeof value.incarnationId === "string" &&
     Boolean(value.incarnationId.trim()) &&
     (value.sidebarSlot === undefined || isPositiveInteger(value.sidebarSlot)) &&
@@ -289,9 +298,10 @@ export async function persistEnvDefinition(
   env: Pick<Env, "ENVS_KV">,
   definition: EnvDefinition,
 ): Promise<EnvDefinition> {
+  const slug = definition.slug;
   if (!isEnvDefinitionRecord(definition)) {
     throw new Error(
-      `Env definition for ${definition.slug} is missing immutable workload identity or execution placement.`,
+      `Env definition for ${slug} is missing immutable workload identity or execution placement.`,
     );
   }
   await env.ENVS_KV.put(getEnvDefinitionKey(definition.slug), JSON.stringify(definition));

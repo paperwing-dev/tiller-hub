@@ -301,6 +301,8 @@ describe("ShipView publish completion", () => {
     ));
 
     expect(screen.getByText("GitHub rejected the branch update.")).toBeInTheDocument();
+    expect(screen.queryByText(/conflicts or unsupported git state/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create Draft PR" })).toBeEnabled();
     expect(mocks.addToast).not.toHaveBeenCalled();
     expect(mocks.navigate).not.toHaveBeenCalled();
   });
@@ -321,6 +323,29 @@ describe("ShipView publish completion", () => {
     expect(mocks.navigate).not.toHaveBeenCalled();
     expect(onRecoverEnv).toHaveBeenCalledWith("demo-env");
     expect(onRecoverEntities).toHaveBeenCalledWith({ slug: "demo-env", repoId: "repo-1" });
+  });
+
+  it("disambiguates duplicate display names in reset confirmation and resets by slug", async () => {
+    const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    const onRecoverEnv = vi.fn();
+    const onRecoverEntities = vi.fn();
+    renderShip(makeEnv({ displayName: "Shared plan" }), {
+      onRecoverEnv,
+      onRecoverEntities,
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Reset to Main" }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      'Reset "Shared plan" (slug: demo-env) to the GitHub default branch? This will discard unpublished changes.',
+    );
+    await waitFor(() => expect(mocks.resetEnvToRepo).toHaveBeenCalledWith(
+      "https://hub.test",
+      "demo-env",
+    ));
+    expect(onRecoverEnv).toHaveBeenCalledWith("demo-env");
+    expect(onRecoverEntities).toHaveBeenCalledWith({ slug: "demo-env", repoId: "repo-1" });
+    confirmSpy.mockRestore();
   });
 
   it("treats an accepted operation that finishes up-to-date as no changes", async () => {

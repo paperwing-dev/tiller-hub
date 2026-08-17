@@ -1,11 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { StopIcon } from "@phosphor-icons/react";
+import { PlayIcon, StopIcon } from "@phosphor-icons/react";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import type {
   AgentRoute,
   PlanWriterState,
   PlanContribution,
-  PlanWriterProvider,
 } from "../api/coordination/types";
 import type { StoredSession } from "../api/types";
 import {
@@ -16,15 +15,43 @@ import {
   stopPlanWriter,
 } from "./api";
 import { useDashboardData } from "./DashboardDataProvider";
-import TerminalView, { type TerminalViewHandle } from "./TerminalView";
+import TerminalView, {
+  type TerminalResizeRequest,
+  type TerminalViewHandle,
+} from "./TerminalView";
 import type { TerminalRecoveryState } from "./terminal-recovery";
 import { planWriterTabStatus, type PlanTabStatus } from "./plan-tab-status";
-import { bracketedPasteAndSubmit } from "./plan-writer-paste";
+import { bracketedPasteAndSubmit, bracketedTerminalPaste } from "./plan-writer-paste";
 import { codexAuthModeLabel } from "./codex-auth-ui";
 import { planWriterEffortLabel, type PlanWriterModelSelection } from "./PlanWriterModelPicker";
+import { PLAN_AGENT_LABEL } from "./plan-agent-copy";
+import { EnvironmentLaunchIllustration } from "./EnvWaitingView";
+import { getHarnessBadgeLabel } from "./env-harness";
 
 const NO_ACTIVE_TERMINAL_OWNER_ERROR = "No active terminal owner for session";
 const WRITER_STOPPED_DELIVERY_ERROR = "The Scribe stopped before receiving the message";
+const SCRIBE_INPUT_NOT_DELIVERED_ERROR = "The Scribe terminal disconnected. Your last input was not delivered.";
+const SCRIBE_TERMINAL_UNAVAILABLE_ERROR = "The Scribe terminal disconnected. Input is paused until it reconnects.";
+const SCRIBE_TERMINAL_STILL_UNAVAILABLE_ERROR = "The Scribe workload is running, but its terminal has not reconnected.";
+const SLOW_SCRIBE_START_MS = 120_000;
+
+interface TerminalOwnerIssue {
+  terminalId: string;
+  generation: number;
+  message: string;
+}
+
+function formatScribeWaitTime(elapsedMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
 
 export interface PlanContributionPresentation {
   sourceLabel: string;
@@ -45,10 +72,10 @@ interface PlanWriterPaneProps {
   handoff?: PlanWriterHandoff | null;
   queuedHandoffContributionIds?: string[];
   hidden?: boolean;
+  compact?: boolean;
   canAddReviewer?: boolean;
   onWriterChange(writer: PlanWriterState): void;
   onTabStatusChange(status: PlanTabStatus): void;
-  onArtifactChanged(): void;
   onContributionsChanged(): void;
   onHandoffSettled(handoffId: string, error?: string): void;
   onViewContributionSource?(contributionId: string): void;
@@ -61,6 +88,8 @@ export interface PlanWriterHandoff {
   id: string;
   contributionIds: string[];
 }
+
+const RECOVERING_TERMINAL_STATE: TerminalRecoveryState = { status: "recovering" };
 
 function syntheticTerminalSession(writer: PlanWriterState): StoredSession | null {
   if (!writer.terminalId || !writer.generation) return null;
@@ -95,10 +124,10 @@ export default function PlanWriterPane({
   handoff = null,
   queuedHandoffContributionIds = [],
   hidden = false,
+  compact = false,
   canAddReviewer = true,
   onWriterChange,
   onTabStatusChange,
-  onArtifactChanged,
   onContributionsChanged,
   onHandoffSettled,
   onViewContributionSource,
@@ -110,9 +139,10 @@ export default function PlanWriterPane({
     hubUrl,
     connected,
     terminalFastLane,
+    terminalMetrics,
     liveMessageRef,
     terminalAckRef,
-    planWriterHintRef,
+    planWriterRefreshHintRef,
     wsRef,
     updateLastSeq,
   } = useDashboardData();
@@ -122,9 +152,16 @@ export default function PlanWriterPane({
   const [startupContributionIds, setStartupContributionIds] = useState<string[]>([]);
   const [deliveredContributionIds, setDeliveredContributionIds] = useState<Set<string>>(() => new Set());
   const [operationError, setOperationError] = useState<string | null>(null);
+  const [operationNotice, setOperationNotice] = useState<string | null>(null);
   const [terminalError, setTerminalError] = useState<string | null>(null);
-  const [syncRefreshing, setSyncRefreshing] = useState(false);
-  const [recovery, setRecovery] = useState<TerminalRecoveryState>({ status: "recovering" });
+  const [terminalOwnerIssue, setTerminalOwnerIssue] = useState<TerminalOwnerIssue | null>(null);
+  const [ownerRecoveryPending, setOwnerRecoveryPending] = useState(false);
+  const [ownerRecoveryError, setOwnerRecoveryError] = useState<string | null>(null);
+  const [localStartupStartedAtMs, setLocalStartupStartedAtMs] = useState<number | null>(null);
+  const [terminalRecovery, setTerminalRecovery] = useState<{
+    terminalId: string | null;
+    state: TerminalRecoveryState;
+  }>({ terminalId: initialWriter.terminalId, state: RECOVERING_TERMINAL_STATE });
   const termRef = useRef<TerminalViewHandle>(null);
   const clientIdRef = useRef(crypto.randomUUID());
   const inputSeqRef = useRef(0);
@@ -135,37 +172,64 @@ export default function PlanWriterPane({
     timer: ReturnType<typeof setTimeout>;
   }>());
   const activeHandoffRef = useRef<string | null>(null);
+  const attemptedHandoffIdRef = useRef<string | null>(null);
+  const preparedHandoffIdRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
   const writerMutationVersionRef = useRef(0);
   const refreshRequestRef = useRef(0);
-  const callbackRef = useRef({ onWriterChange, onTabStatusChange, onArtifactChanged });
-  callbackRef.current = { onWriterChange, onTabStatusChange, onArtifactChanged };
+  const refreshQueuedRef = useRef(false);
+  const refreshInFlightRef = useRef<Promise<PlanWriterState | null> | null>(null);
+  const callbackRef = useRef({ onWriterChange, onTabStatusChange });
+  callbackRef.current = { onWriterChange, onTabStatusChange };
 
   const selectedRoute = routes.find((route) => route.key === selection.routeKey) ?? null;
   const selectionUsable = Boolean(
     selectedRoute?.available && selectedRoute.supportedEfforts.includes(selection.effort),
   );
   const activeRoute = routes.find((route) => (
-    route.provider === writer.provider && route.model === writer.model
+    route.provider === writer.provider
+    && route.model === writer.model
+    && Boolean(writer.effort && route.supportedEfforts.includes(writer.effort))
   )) ?? null;
   const displayedRoute = writer.lifecycle === "not_running" ? selectedRoute : activeRoute;
   const displayedEffort = writer.lifecycle === "not_running" ? selection.effort : writer.effort;
-  const operationPending = operation !== null;
-  const saving = syncRefreshing || writer.synchronization.state === "saving";
+  const activeTerminalOwnerIssue = writer.lifecycle === "running"
+    && terminalOwnerIssue?.terminalId === writer.terminalId
+    && terminalOwnerIssue.generation === writer.generation
+    ? terminalOwnerIssue
+    : null;
+  const operationPending = operation !== null || ownerRecoveryPending;
+  const saving = writer.synchronization.state === "saving";
   const terminalSession = useMemo(() => syntheticTerminalSession(writer), [writer]);
+  const recovery = terminalRecovery.terminalId === writer.terminalId
+    ? terminalRecovery.state
+    : RECOVERING_TERMINAL_STATE;
+  const terminalReady = connected && terminalFastLane && recovery.status === "ready";
   const terminalInteractive = writer.lifecycle === "running"
-    && connected
-    && terminalFastLane
-    && recovery.status === "ready";
-  const queuedContributionIds = useMemo(() => new Set([
+    && terminalReady
+    && !activeTerminalOwnerIssue;
+  const terminalRecoveryError = recovery.status === "fault"
+    ? `Terminal recovery stopped (${recovery.code.replace(/_/g, " ")}).`
+    : null;
+  const connectingDetail = !connected
+    ? "The Hub connection is offline. Reconnecting to the live Scribe."
+    : !terminalFastLane
+      ? "Waiting for live terminal controls."
+      : "Restoring live Scribe output.";
+  const handoffContributionIds = useMemo(() => new Set([
     ...queuedHandoffContributionIds,
     ...(handoff?.contributionIds ?? []),
+  ]), [handoff?.contributionIds, queuedHandoffContributionIds]);
+  const queuedContributionIds = useMemo(() => new Set([
+    ...handoffContributionIds,
     ...startupContributionIds,
-  ]), [handoff?.contributionIds, queuedHandoffContributionIds, startupContributionIds]);
+  ]), [handoffContributionIds, startupContributionIds]);
   const pendingContributions = useMemo(() => contributions.filter((contribution) => (
     contribution.status === "pending" && !deliveredContributionIds.has(contribution.id)
   )), [contributions, deliveredContributionIds]);
 
   const acceptWriter = useCallback((next: PlanWriterState) => {
+    if (!mountedRef.current) return;
     setWriter(next);
     callbackRef.current.onWriterChange(next);
   }, []);
@@ -177,26 +241,32 @@ export default function PlanWriterPane({
   }, [acceptWriter]);
 
   const handleRecoveryState = useCallback((next: TerminalRecoveryState) => {
-    setRecovery(next);
-    if (next.status === "ready") setTerminalError(null);
-  }, []);
+    setTerminalRecovery({ terminalId: writer.terminalId, state: next });
+    if (next.status === "ready" && !activeTerminalOwnerIssue) setTerminalError(null);
+  }, [activeTerminalOwnerIssue, writer.terminalId]);
 
   const tabStatus = useMemo(() => planWriterTabStatus(writer, {
     operation,
     saving,
-    connecting: !hidden && writer.lifecycle === "running" && recovery.status !== "ready",
-    error: writer.lifecycle === "running" ? null : operationError ?? terminalError,
+    connecting: writer.lifecycle === "running" && recovery.status !== "fault" && !terminalReady,
+    connectingDetail,
+    error: writer.lifecycle === "running"
+      ? activeTerminalOwnerIssue?.message ?? terminalRecoveryError
+      : operationError ?? terminalError,
     routeLabel: displayedRoute?.label ?? null,
     effortLabel: planWriterEffortLabel(displayedEffort),
   }), [
+    connectingDetail,
+    activeTerminalOwnerIssue?.message,
     displayedEffort,
     displayedRoute?.label,
-    hidden,
     operation,
     operationError,
     recovery,
     saving,
+    terminalReady,
     terminalError,
+    terminalRecoveryError,
     writer,
   ]);
 
@@ -204,15 +274,57 @@ export default function PlanWriterPane({
     callbackRef.current.onTabStatusChange(tabStatus);
   }, [tabStatus]);
 
-  const refresh = useCallback(async (includeArtifact = false): Promise<PlanWriterState | null> => {
+  const performRefresh = useCallback(async (): Promise<PlanWriterState | null> => {
     const request = ++refreshRequestRef.current;
     const mutationVersion = writerMutationVersionRef.current;
     const next = await fetchPlanWriter(hubUrl, repoId, planArtifactId);
-    if (includeArtifact) callbackRef.current.onArtifactChanged();
-    if (request !== refreshRequestRef.current || mutationVersion !== writerMutationVersionRef.current) return null;
+    if (
+      !mountedRef.current
+      || request !== refreshRequestRef.current
+      || mutationVersion !== writerMutationVersionRef.current
+    ) return null;
     acceptWriter(next);
     return next;
   }, [acceptWriter, hubUrl, planArtifactId, repoId]);
+
+  const refresh = useCallback((): Promise<PlanWriterState | null> => {
+    refreshQueuedRef.current = true;
+    if (refreshInFlightRef.current) return refreshInFlightRef.current;
+
+    const drain = async (): Promise<PlanWriterState | null> => {
+      let latest: PlanWriterState | null = null;
+      let lastError: unknown = null;
+      while (mountedRef.current && refreshQueuedRef.current) {
+        refreshQueuedRef.current = false;
+        try {
+          latest = await performRefresh();
+          lastError = null;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (lastError) throw lastError;
+      return latest;
+    };
+
+    const pending: Promise<PlanWriterState | null> = drain().finally(() => {
+      if (refreshInFlightRef.current === pending) refreshInFlightRef.current = null;
+      if (mountedRef.current && refreshQueuedRef.current) {
+        void refresh().catch(() => undefined);
+      }
+    });
+    refreshInFlightRef.current = pending;
+    return pending;
+  }, [performRefresh]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      refreshQueuedRef.current = false;
+      refreshRequestRef.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     if (writer.lifecycle !== "starting") return;
@@ -222,36 +334,47 @@ export default function PlanWriterPane({
 
   useEffect(() => {
     setTerminalError(null);
+    setTerminalOwnerIssue(null);
+    setOwnerRecoveryPending(false);
+    setOwnerRecoveryError(null);
     for (const pending of pendingInputAcksRef.current.values()) {
       window.clearTimeout(pending.timer);
       pending.resolve({ ok: false, error: WRITER_STOPPED_DELIVERY_ERROR });
     }
     pendingInputAcksRef.current.clear();
+  }, [writer.generation, writer.terminalId]);
+
+  useEffect(() => {
+    const terminalId = writer.terminalId;
+    if (!terminalId) return;
+    const clientId = clientIdRef.current;
+    return () => {
+      wsRef.current?.send({
+        type: "terminal-detach",
+        sessionId: terminalId,
+        clientId,
+      });
+    };
   }, [writer.terminalId]);
 
   useEffect(() => {
-    planWriterHintRef.current = (event) => {
-      if (event.repoId !== repoId || event.planArtifactId !== planArtifactId) return;
-      if (event.type === "artifact") {
-        setSyncRefreshing(true);
-        void refresh(true).finally(() => setSyncRefreshing(false));
-      } else {
-        void refresh().catch(() => undefined);
-      }
+    planWriterRefreshHintRef.current = (hintRepoId, hintPlanArtifactId) => {
+      if (hintRepoId !== repoId || hintPlanArtifactId !== planArtifactId) return;
+      void refresh().catch(() => undefined);
     };
-    return () => { planWriterHintRef.current = null; };
-  }, [planArtifactId, planWriterHintRef, refresh, repoId]);
+    return () => { planWriterRefreshHintRef.current = null; };
+  }, [planArtifactId, planWriterRefreshHintRef, refresh, repoId]);
 
   useEffect(() => {
     if (!connected) return;
     setTerminalError(null);
     termRef.current?.recover();
-    void refresh(true).catch(() => undefined);
+    void refresh().catch(() => undefined);
   }, [connected, refresh]);
 
   useEffect(() => {
     const onVisibility = () => {
-      if (!document.hidden) void refresh(true).catch(() => undefined);
+      if (!document.hidden) void refresh().catch(() => undefined);
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => document.removeEventListener("visibilitychange", onVisibility);
@@ -262,12 +385,19 @@ export default function PlanWriterPane({
     if (!terminalId) return;
     liveMessageRef.current = (message) => {
       if (message.sessionId !== terminalId) return;
+      setTerminalOwnerIssue((current) => (
+        current?.terminalId === terminalId && current.generation === writer.generation
+          ? null
+          : current
+      ));
+      setOwnerRecoveryError(null);
       setTerminalError(null);
       termRef.current?.acceptMessage(message);
     };
     terminalAckRef.current = (message) => {
       if (message.sessionId !== terminalId || message.clientId !== clientIdRef.current) return;
       if (message.type === "terminal-input-ack") {
+        termRef.current?.markInputAcknowledged?.(message.inputSeq, message.ok);
         const pending = pendingInputAcksRef.current.get(message.inputSeq);
         if (pending) {
           window.clearTimeout(pending.timer);
@@ -283,12 +413,27 @@ export default function PlanWriterPane({
         }
       }
       if (message.ok) {
+        setTerminalOwnerIssue((current) => (
+          current?.terminalId === terminalId && current.generation === writer.generation
+            ? null
+            : current
+        ));
+        setOwnerRecoveryError(null);
         setTerminalError(null);
       } else if (message.error === NO_ACTIVE_TERMINAL_OWNER_ERROR) {
-        setTerminalError(null);
-        void refresh().then((next) => {
-          if (next?.lifecycle === "running") termRef.current?.recover();
-        }).catch(() => undefined);
+        const ownerError = message.type === "terminal-input-ack"
+          ? SCRIBE_INPUT_NOT_DELIVERED_ERROR
+          : SCRIBE_TERMINAL_UNAVAILABLE_ERROR;
+        if (writer.generation !== null) {
+          setTerminalOwnerIssue({
+            terminalId,
+            generation: writer.generation,
+            message: ownerError,
+          });
+        }
+        setOwnerRecoveryError(null);
+        setTerminalError(ownerError);
+        void refresh().catch(() => undefined);
       } else {
         setTerminalError(message.error ?? "Terminal operation was rejected");
       }
@@ -297,7 +442,7 @@ export default function PlanWriterPane({
       liveMessageRef.current = null;
       terminalAckRef.current = null;
     };
-  }, [liveMessageRef, refresh, terminalAckRef, writer.terminalId]);
+  }, [liveMessageRef, refresh, terminalAckRef, writer.generation, writer.terminalId]);
 
   useEffect(() => {
     if (connected) return;
@@ -328,8 +473,13 @@ export default function PlanWriterPane({
       ...(lastSizeRef.current ?? {}),
     }) ?? false;
     if (!sent) setTerminalError("Terminal input could not be delivered");
+    else termRef.current?.markInputEnqueued?.(inputSeq);
     return sent;
   }, [terminalInteractive, writer.terminalId, wsRef]);
+
+  const pasteIntoCodex = useCallback((text: string) => {
+    sendInput(bracketedTerminalPaste(text));
+  }, [sendInput]);
 
   const submitText = useCallback(async (text: string): Promise<{ ok: boolean; error?: string }> => {
     if (!terminalInteractive || !writer.terminalId) {
@@ -356,11 +506,17 @@ export default function PlanWriterPane({
         pendingInputAcksRef.current.delete(inputSeq);
         setTerminalError("Scribe input could not be delivered");
         resolve({ ok: false, error: "Scribe input could not be delivered" });
+      } else {
+        termRef.current?.markInputEnqueued?.(inputSeq);
       }
     });
   }, [terminalInteractive, writer.terminalId, wsRef]);
 
-  const sendControl = useCallback((action: "resize" | "abort", size?: { cols: number; rows: number }) => {
+  const sendControl = useCallback((
+    action: "resize" | "abort",
+    size?: { cols: number; rows: number },
+    request?: TerminalResizeRequest,
+  ) => {
     if (!terminalInteractive || !writer.terminalId) return false;
     const controlSeq = ++controlSeqRef.current;
     return wsRef.current?.send({
@@ -370,31 +526,106 @@ export default function PlanWriterPane({
       controlSeq,
       action,
       ...(size ?? {}),
+      ...(request?.claim !== undefined ? { claim: request.claim } : {}),
     }) ?? false;
   }, [terminalInteractive, writer.terminalId, wsRef]);
 
-  const start = async (includeSharedItems = false) => {
-    const sharedItemIds = includeSharedItems
-      ? pendingContributions.map((contribution) => contribution.id)
-      : [];
-    setStartupContributionIds(sharedItemIds);
-    setOperation("starting");
-    setOperationError(null);
+  const requestWriterStart = useCallback((): Promise<PlanWriterState> => (
+    startPlanWriter(
+      hubUrl,
+      repoId,
+      planArtifactId,
+      settingsAvailable && selectionUsable && selectedRoute
+        ? { routeKey: selectedRoute.key, effort: selection.effort }
+        : {},
+    )
+  ), [
+    hubUrl,
+    planArtifactId,
+    repoId,
+    selectedRoute,
+    selection.effort,
+    selectionUsable,
+    settingsAvailable,
+  ]);
+
+  const ensureWriter = useCallback(async (): Promise<PlanWriterState> => {
+    const next = await requestWriterStart();
+    acceptMutationWriter(next);
+    setTerminalError(null);
+    return next;
+  }, [
+    acceptMutationWriter,
+    requestWriterStart,
+  ]);
+
+  const retryTerminal = useCallback(() => {
+    setTerminalOwnerIssue(null);
+    setOwnerRecoveryError(null);
+    setTerminalError(null);
+    termRef.current?.recover();
+  }, []);
+
+  const checkAndRecoverTerminal = useCallback(async () => {
+    if (!writer.terminalId || writer.generation === null || ownerRecoveryPending) return;
+    const checkedTerminalId = writer.terminalId;
+    const checkedGeneration = writer.generation;
+    setOwnerRecoveryPending(true);
+    setOwnerRecoveryError(null);
+    setOperationNotice(null);
     try {
-      const next = await startPlanWriter(hubUrl, repoId, planArtifactId, {
-        ...(selectedRoute?.provider === "claude-code" || selectedRoute?.provider === "codex"
-          ? { provider: selectedRoute.provider as PlanWriterProvider }
-          : {}),
-        ...(selectedRoute?.model ? { model: selectedRoute.model } : {}),
-        effort: selection.effort,
-      });
+      const next = await requestWriterStart();
       acceptMutationWriter(next);
-      setTerminalError(null);
+      if (next.lifecycle === "not_running") {
+        throw new Error(next.startupError ?? "The Scribe could not be recovered");
+      }
+      const sameGeneration = next.generation === checkedGeneration
+        && next.terminalId === checkedTerminalId;
+      if (next.lifecycle === "running" && sameGeneration) {
+        setTerminalOwnerIssue({
+          terminalId: checkedTerminalId,
+          generation: checkedGeneration,
+          message: SCRIBE_TERMINAL_STILL_UNAVAILABLE_ERROR,
+        });
+        setTerminalError(SCRIBE_TERMINAL_STILL_UNAVAILABLE_ERROR);
+        termRef.current?.recover();
+      } else {
+        setTerminalOwnerIssue(null);
+        setTerminalError(null);
+      }
+    } catch (error) {
+      setOwnerRecoveryError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (mountedRef.current) setOwnerRecoveryPending(false);
+    }
+  }, [
+    acceptMutationWriter,
+    ownerRecoveryPending,
+    requestWriterStart,
+    writer.generation,
+    writer.terminalId,
+  ]);
+
+  const start = async () => {
+    setTerminalOwnerIssue(null);
+    setOwnerRecoveryError(null);
+    setTerminalError(null);
+    setStartupContributionIds(pendingContributions
+      .filter((contribution) => !handoffContributionIds.has(contribution.id))
+      .map((contribution) => contribution.id));
+    setOperation("starting");
+    setLocalStartupStartedAtMs(Date.now());
+    setOperationError(null);
+    setOperationNotice(null);
+    try {
+      const next = await ensureWriter();
+      if (next.lifecycle !== "starting") setLocalStartupStartedAtMs(null);
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
       const next = await refresh().catch(() => null);
       if (next?.lifecycle === "running") {
         setOperationError(null);
+        setLocalStartupStartedAtMs(null);
       } else {
         setStartupContributionIds([]);
       }
@@ -407,8 +638,16 @@ export default function PlanWriterPane({
     if (!writer.generation) return;
     setOperation("stopping");
     setOperationError(null);
+    setOperationNotice(null);
     try {
-      acceptMutationWriter(await stopPlanWriter(hubUrl, repoId, planArtifactId, writer.generation));
+      const next = await stopPlanWriter(hubUrl, repoId, planArtifactId, writer.generation);
+      acceptMutationWriter(next);
+      setTerminalOwnerIssue(null);
+      setOwnerRecoveryError(null);
+      setTerminalError(null);
+      if (next.cleanupPending) {
+        setOperationNotice(next.cleanupWarning ?? "Scribe abandoned. Workload cleanup is continuing in the background.");
+      }
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
       const next = await refresh().catch(() => null);
@@ -465,7 +704,56 @@ export default function PlanWriterPane({
   };
 
   useEffect(() => {
-    if (!handoff || !terminalInteractive || activeHandoffRef.current === handoff.id) return;
+    if (
+      !handoff
+      || operation !== null
+      || attemptedHandoffIdRef.current === handoff.id
+    ) return;
+    attemptedHandoffIdRef.current = handoff.id;
+    setOperation("starting");
+    setOperationError(null);
+    setOperationNotice(null);
+    void ensureWriter().then((next) => {
+      if (!mountedRef.current) return;
+      if (next.lifecycle === "not_running") {
+        throw new Error(next.startupError ?? "The Scribe could not be started");
+      }
+      preparedHandoffIdRef.current = handoff.id;
+    }).catch((error) => {
+      if (!mountedRef.current) return;
+      const message = error instanceof Error ? error.message : String(error);
+      setOperationError(message);
+      void refresh().catch(() => null);
+      onHandoffSettled(handoff.id, message);
+    }).finally(() => {
+      if (mountedRef.current) setOperation(null);
+    });
+  }, [ensureWriter, handoff, onHandoffSettled, operation, refresh]);
+
+  useEffect(() => {
+    if (
+      !handoff
+      || preparedHandoffIdRef.current !== handoff.id
+      || activeHandoffRef.current === handoff.id
+    ) return;
+    const error = writer.lifecycle === "not_running"
+      ? writer.startupError ?? "The Scribe stopped before receiving the message"
+      : writer.lifecycle === "running" && recovery.status === "fault"
+        ? terminalRecoveryError ?? "The live Scribe terminal could not be restored"
+        : null;
+    if (!error) return;
+    preparedHandoffIdRef.current = null;
+    setOperationError(error);
+    onHandoffSettled(handoff.id, error);
+  }, [handoff, onHandoffSettled, recovery.status, terminalRecoveryError, writer.lifecycle, writer.startupError]);
+
+  useEffect(() => {
+    if (
+      !handoff
+      || preparedHandoffIdRef.current !== handoff.id
+      || !terminalInteractive
+      || activeHandoffRef.current === handoff.id
+    ) return;
     const items = handoff.contributionIds
       .map((id) => contributions.find((contribution) => contribution.id === id))
       .filter((contribution): contribution is PlanContribution => Boolean(contribution));
@@ -473,6 +761,7 @@ export default function PlanWriterPane({
     activeHandoffRef.current = handoff.id;
     void submitContributions(items).then((result) => {
       activeHandoffRef.current = null;
+      preparedHandoffIdRef.current = null;
       onHandoffSettled(handoff.id, result.ok ? undefined : result.error);
     });
   }, [contributions, handoff, onHandoffSettled, submitContributions, terminalInteractive]);
@@ -490,18 +779,94 @@ export default function PlanWriterPane({
     });
   }, [contributions, startupContributionIds, submitContributions, terminalInteractive]);
 
-  if (hidden) return <div className="hidden" />;
-  const showTerminal = Boolean(terminalSession && writer.lifecycle !== "starting");
-  const errorNotice = operationError
+  const showLaunchAnimation = writer.lifecycle === "starting" || operation === "starting";
+  const startupUpdatedAtMs = writer.lifecycle === "starting" && writer.startup?.updatedAt
+    ? Date.parse(writer.startup.updatedAt)
+    : localStartupStartedAtMs;
+  const [startupElapsedMs, setStartupElapsedMs] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!showLaunchAnimation || startupUpdatedAtMs == null || !Number.isFinite(startupUpdatedAtMs)) {
+      setStartupElapsedMs(null);
+      return undefined;
+    }
+    const updateElapsed = () => {
+      const elapsed = Date.now() - startupUpdatedAtMs;
+      setStartupElapsedMs(elapsed >= 0 ? elapsed : null);
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1_000);
+    return () => window.clearInterval(timer);
+  }, [showLaunchAnimation, startupUpdatedAtMs]);
+
+  useEffect(() => {
+    if (!showLaunchAnimation) setLocalStartupStartedAtMs(null);
+  }, [showLaunchAnimation]);
+
+  const launchHarness = displayedRoute?.harness ?? writer.provider;
+  const launchConfiguration = [
+    launchHarness ? getHarnessBadgeLabel(launchHarness) : null,
+    displayedRoute?.label ?? writer.model,
+    displayedEffort ? `${planWriterEffortLabel(displayedEffort)} effort` : null,
+    writer.codexAuthMode ? codexAuthModeLabel(writer.codexAuthMode) : null,
+  ].filter((value): value is string => Boolean(value));
+  const launchStepLabel = operation === "stopping"
+    ? "Stopping"
+    : writer.startup?.stage === "launching"
+      ? "Connecting"
+      : "Requesting";
+  const launchStepMessage = operation === "stopping"
+    ? "Abandoning this Scribe start and cleaning up its runtime…"
+    : writer.startup?.stage === "launching"
+      ? `Waiting for ${launchHarness ? getHarnessBadgeLabel(launchHarness) : "the Scribe"} to open its terminal…`
+      : "Reserving a Scribe session for this plan…";
+  const slowStartup = startupElapsedMs != null && startupElapsedMs >= SLOW_SCRIBE_START_MS;
+  const showTerminal = Boolean(terminalSession && !showLaunchAnimation);
+
+  useEffect(() => {
+    const terminalId = writer.terminalId;
+    if (!connected || !terminalFastLane || hidden || !showTerminal || !terminalId) return;
+    wsRef.current?.send({
+      type: "reconnect",
+      sessionId: terminalId,
+      lastSeq: 0,
+      revive: false,
+      replay: false,
+    });
+  }, [connected, hidden, showTerminal, terminalFastLane, writer.terminalId, wsRef]);
+  const needsAbandon = writer.lifecycle === "not_running" && Boolean(writer.cleanupError && writer.generation);
+  const errorNotice = activeTerminalOwnerIssue
+    ? null
+    : operationError
     ?? terminalError
     ?? (writer.cleanupError ? `Cleanup failed: ${writer.cleanupError}` : null)
     ?? (writer.startupError ? `Startup failed: ${writer.startupError}` : null)
     ?? (writer.synchronization.state === "sync_failed"
       ? `Sync failed: ${writer.synchronization.error ?? "retry the last plan publication"}`
       : null);
+  const startControl = (
+    <button
+      type="button"
+      aria-label={compact ? `Start ${PLAN_AGENT_LABEL}` : undefined}
+      disabled={operationPending || !writer.editable || !selectionUsable}
+      onClick={() => void start()}
+      className={compact
+        ? "tiller-square-button tiller-square-button--primary tiller-square-button--icon-label disabled:opacity-50"
+        : "rounded bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"}
+    >
+      {compact ? (
+        <>
+          <PlayIcon className="size-3.5" weight="fill" aria-hidden="true" />
+          <span>Start {PLAN_AGENT_LABEL}</span>
+        </>
+      ) : pendingContributions.length > 0
+        ? `Start Scribe and share ${pendingContributions.length} ${pendingContributions.length === 1 ? "item" : "items"}`
+        : "Start Scribe in Plan Mode"}
+    </button>
+  );
   return (
-    <div className="flex h-full min-h-0 flex-col bg-kumo-base">
-      <div className="shrink-0 border-b border-kumo-line bg-kumo-recessed px-3 py-1">
+    <div className={`${hidden ? "hidden" : "flex"} h-full min-h-0 flex-col bg-kumo-base`}>
+      {!compact && <div className="shrink-0 border-b border-kumo-line bg-kumo-recessed px-3 py-1">
         <div className="flex items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2">
             <div className="min-w-0 truncate text-xs text-kumo-subtle">
@@ -525,39 +890,27 @@ export default function PlanWriterPane({
                 Scribe Settings
               </button>
             )}
-            {writer.lifecycle === "not_running" && showTerminal ? (
-              <>
-                {pendingContributions.length > 0 && (
-                  <button
-                    type="button"
-                    disabled={operationPending || !writer.editable || !selectionUsable}
-                    onClick={() => void start(false)}
-                    className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs font-medium text-kumo-subtle hover:bg-kumo-tint disabled:opacity-50"
-                  >
-                    Start without context
-                  </button>
-                )}
-                <button
-                  type="button"
-                  disabled={operationPending || !writer.editable || !selectionUsable}
-                  onClick={() => void start(pendingContributions.length > 0)}
-                  className="rounded bg-kumo-brand px-3 py-1 text-xs font-medium text-white disabled:opacity-50"
-                >
-                  {pendingContributions.length > 0
-                    ? `Start Scribe with ${pendingContributions.length}`
-                    : "Start Scribe"}
-                </button>
-              </>
-            ) : writer.lifecycle !== "not_running" ? (
+            {writer.lifecycle === "not_running" && showTerminal && !needsAbandon ? (
+              <button
+                type="button"
+                disabled={operationPending || !writer.editable || !selectionUsable}
+                onClick={() => void start()}
+                className="rounded bg-kumo-brand px-3 py-1 text-xs font-medium text-white disabled:opacity-50"
+              >
+                {pendingContributions.length > 0
+                  ? `Start Scribe and share ${pendingContributions.length}`
+                  : "Start Scribe"}
+              </button>
+            ) : writer.lifecycle !== "not_running" || needsAbandon ? (
               <Tooltip
-                content="Ends this Scribe generation and its provider conversation. The saved plan and terminal history remain; Start Scribe creates a new conversation."
+                content="Abandons this Scribe generation immediately. The saved plan and terminal history remain, and workload cleanup continues in the background."
                 side="bottom"
                 align="end"
                 delay={250}
                 render={(
                   <button
                     type="button"
-                    aria-label="Stop Scribe"
+                    aria-label="Abandon Scribe"
                     disabled={operationPending || !writer.generation}
                     onClick={() => void stop()}
                     className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded bg-kumo-danger text-white transition-colors hover:bg-kumo-danger/85 disabled:cursor-not-allowed disabled:opacity-40"
@@ -572,9 +925,54 @@ export default function PlanWriterPane({
         {errorNotice && (
           <div role="alert" className="mt-1 text-xs text-kumo-danger">{errorNotice}</div>
         )}
-      </div>
+        {!errorNotice && operationNotice && (
+          <div role="status" className="mt-1 text-xs text-kumo-subtle">{operationNotice}</div>
+        )}
+      </div>}
+      {compact && errorNotice && (
+        <div role="alert" className="shrink-0 border-b border-kumo-line px-3 py-2 text-xs text-kumo-danger">
+          {errorNotice}
+        </div>
+      )}
+      {compact && !errorNotice && operationNotice && (
+        <div role="status" className="shrink-0 border-b border-kumo-line px-3 py-2 text-xs text-kumo-subtle">
+          {operationNotice}
+        </div>
+      )}
 
-      {pendingContributions.length > 0 && (
+      {activeTerminalOwnerIssue && (
+        <div
+          role="alert"
+          data-testid="scribe-terminal-unavailable"
+          className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-kumo-line bg-kumo-warning/5 px-3 py-2"
+        >
+          <span className="min-w-0 text-xs text-kumo-danger">
+            {activeTerminalOwnerIssue.message}
+            {operationError && ` ${operationError}`}
+            {ownerRecoveryError && ` Recovery check failed: ${ownerRecoveryError}`}
+          </span>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              disabled={operationPending}
+              onClick={retryTerminal}
+              className="rounded border border-kumo-line bg-kumo-base px-2.5 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Try again
+            </button>
+            <button
+              type="button"
+              disabled={operationPending}
+              onClick={() => void checkAndRecoverTerminal()}
+              className="rounded bg-kumo-brand px-2.5 py-1 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {ownerRecoveryPending ? "Checking…" : "Check & recover"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!compact && pendingContributions.length > 0 && (
         <div data-testid="scribe-context-tray" className="max-h-44 shrink-0 overflow-y-auto border-b border-kumo-line bg-kumo-info/5 px-3 py-2">
           <div className="mb-2 flex items-center justify-between gap-3">
             <div className="text-xs font-semibold text-kumo-default">From reviewers</div>
@@ -635,55 +1033,115 @@ export default function PlanWriterPane({
         </div>
       )}
 
-      {writer.lifecycle === "starting" && (
-        <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-kumo-subtle">Starting Scribe…</div>
+      {showLaunchAnimation && (
+        <div className="tiller-scribe-launch-surface flex min-h-0 flex-1 flex-col px-5 py-4">
+          <h2 className="shrink-0 text-[14px] font-semibold text-kumo-strong">
+            {operation === "stopping" ? `Stopping ${PLAN_AGENT_LABEL}` : `Starting ${PLAN_AGENT_LABEL}`}
+          </h2>
+          <p className="mt-1 shrink-0 text-[12px] leading-5 text-kumo-subtle">
+            Preparing a live planning terminal.
+            {startupElapsedMs != null && (
+              <span data-testid="scribe-startup-elapsed" className="ml-1 tabular-nums">
+                Waiting {formatScribeWaitTime(startupElapsedMs)}.
+              </span>
+            )}
+          </p>
+          {launchConfiguration.length > 0 && (
+            <div className="tiller-launch-runtime-viewport" aria-label={launchConfiguration.join("; ")}>
+              <div className="tiller-launch-runtime-line">
+                <span>{launchConfiguration.join(" · ")}</span>
+                <span className="tiller-launch-runtime-caret" aria-hidden="true" />
+              </div>
+            </div>
+          )}
+          <EnvironmentLaunchIllustration compact />
+          <div
+            data-testid="scribe-launch-status"
+            className="tiller-launch-current-step tiller-launch-current-step--action shrink-0 border-t border-kumo-line pt-3 text-left"
+          >
+            <span className="tiller-launch-current-step-label">{launchStepLabel}</span>
+            <span className="min-w-0 truncate text-[12px] text-kumo-subtle">
+              Current: {launchStepMessage}
+            </span>
+            {writer.lifecycle === "starting" && (
+              <button
+                type="button"
+                disabled={operationPending || !writer.generation}
+                onClick={() => void stop()}
+                className="tiller-launch-current-step-action rounded border border-kumo-danger/40 bg-kumo-base px-2.5 py-1.5 text-[12px] font-medium text-kumo-danger disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {operation === "stopping" ? "Abandoning…" : "Abandon start"}
+              </button>
+            )}
+          </div>
+          {slowStartup && operation !== "stopping" && (
+            <p role="status" className="mt-3 shrink-0 text-[12px] leading-5 text-kumo-subtle">
+              The Scribe has not connected yet. You can keep waiting or abandon this start.
+            </p>
+          )}
+        </div>
       )}
       {showTerminal && terminalSession && (
-        <div className="flex min-h-0 flex-1 flex-col">
+        <div className="tiller-scribe-terminal-surface flex min-h-0 flex-1 flex-col">
           <TerminalView
             ref={termRef}
             session={terminalSession}
             hubUrl={hubUrl}
-            fontSize={12}
+            fontSize={compact ? 14 : 12}
             updateLastSeq={updateLastSeq}
             interactive={terminalInteractive}
+            metricsEnabled={terminalMetrics}
+            visible={!hidden}
             onInput={sendInput}
-            onResize={(cols, rows) => {
+            onPaste={writer.provider === "codex" ? pasteIntoCodex : undefined}
+            onResize={(cols, rows, request) => {
               lastSizeRef.current = { cols, rows };
-              sendControl("resize", { cols, rows });
+              sendControl("resize", { cols, rows }, request);
             }}
             onRecoveryState={handleRecoveryState}
           />
         </div>
       )}
-      {!showTerminal && writer.lifecycle === "not_running" && (
+      {compact && showTerminal && writer.lifecycle === "running" && (
+        <div className="flex h-11 shrink-0 items-center justify-between gap-3 border-t border-kumo-line bg-kumo-recessed px-3">
+          <div className="flex min-w-0 items-center gap-2 text-[12px] text-kumo-subtle">
+            <span
+              className={`size-1.5 shrink-0 rotate-45 ${activeTerminalOwnerIssue
+                ? "bg-kumo-danger"
+                : "bg-[var(--paperwing-signal-live)]"}`}
+              aria-hidden="true"
+            />
+            <span className="truncate">
+              {activeTerminalOwnerIssue
+                ? `${PLAN_AGENT_LABEL} terminal unavailable · history is read-only`
+                : terminalInteractive
+                  ? `${PLAN_AGENT_LABEL} is live · ready for input`
+                  : `${PLAN_AGENT_LABEL} is live · reconnecting`}
+            </span>
+          </div>
+          <button
+            type="button"
+            aria-label={`Stop ${PLAN_AGENT_LABEL}`}
+            disabled={operationPending || !writer.generation}
+            onClick={() => void stop()}
+            className="inline-flex h-7 shrink-0 items-center gap-1.5 border border-kumo-danger/40 px-2.5 text-[12px] font-semibold text-kumo-danger hover:bg-kumo-danger-tint disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <StopIcon className="size-3" weight="fill" aria-hidden="true" />
+            <span>Stop {PLAN_AGENT_LABEL}</span>
+          </button>
+        </div>
+      )}
+      {!showTerminal && writer.lifecycle === "not_running" && !showLaunchAnimation && (
         <div className="flex min-h-0 flex-1 items-center justify-center px-6 py-8 text-center">
-          <div className="max-w-lg">
-            <div className="text-sm font-medium text-kumo-default">Start an interactive Scribe session</div>
+          <div className={compact ? "w-fit max-w-sm text-left" : "max-w-lg"}>
+            <div className="text-sm font-medium text-kumo-default">{compact ? `Start ${PLAN_AGENT_LABEL}` : "Start an interactive Scribe session"}</div>
             <p className="mt-1 text-xs leading-5 text-kumo-subtle">
-              The Scribe uses the native provider TUI in Plan Mode to converse with you, run Plan Skills, show live harness output, and update this plan. Reviewers advise without editing it.
+              {compact
+                ? `${PLAN_AGENT_LABEL} reads this plan and helps refine it.`
+                : "The Scribe uses the native provider TUI in Plan Mode to converse with you, show live harness output, and update this plan. Reviewers can advise and run Plan Skills without editing it."}
             </p>
-            <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-              {pendingContributions.length > 0 && (
-                <button
-                  type="button"
-                  disabled={operationPending || !writer.editable || !selectionUsable}
-                  onClick={() => void start(false)}
-                  className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
-                >
-                  Start without shared items
-                </button>
-              )}
-              <button
-                type="button"
-                disabled={operationPending || !writer.editable || !selectionUsable}
-                onClick={() => void start(pendingContributions.length > 0)}
-                className="rounded bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
-              >
-                {pendingContributions.length > 0
-                  ? `Start Scribe with ${pendingContributions.length} shared ${pendingContributions.length === 1 ? "item" : "items"}`
-                  : "Start Scribe in Plan Mode"}
-              </button>
+            <div className={`mt-4 flex flex-wrap items-center gap-2 ${compact ? "justify-start" : "justify-center"}`}>
+              {startControl}
               {canAddReviewer && onAddReviewer && (
                 <button
                   type="button"
@@ -695,6 +1153,22 @@ export default function PlanWriterPane({
               )}
             </div>
           </div>
+        </div>
+      )}
+      {compact && showTerminal && writer.lifecycle === "not_running" && (
+        <div className="flex shrink-0 items-center border-t border-kumo-line bg-kumo-base px-3 py-2">
+          {needsAbandon ? (
+            <button
+              type="button"
+              aria-label="Abandon Scribe"
+              disabled={operationPending || !writer.generation}
+              onClick={() => void stop()}
+              className="tiller-square-button tiller-square-button--secondary tiller-square-button--icon-label text-kumo-danger disabled:opacity-50"
+            >
+              <StopIcon className="size-3.5" weight="fill" aria-hidden="true" />
+              <span>Abandon {PLAN_AGENT_LABEL}</span>
+            </button>
+          ) : startControl}
         </div>
       )}
     </div>

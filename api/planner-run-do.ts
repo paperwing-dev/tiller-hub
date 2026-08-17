@@ -2,6 +2,12 @@ import { Container } from "@cloudflare/containers";
 import type { Env } from "./types";
 
 const NATIVE_WRITER_IDENTITY_KEY = "native-plan-writer-identity";
+const NATIVE_RUNTIME_FENCE_KEY = "native-runtime-fence";
+
+interface NativeRuntimeFence {
+  state: "fenced" | "absent";
+  jobSlug: string | null;
+}
 
 // Dedicated container class for one-shot hosted planner runs. Bound to the
 // sandbox image in wrangler.jsonc — the planner needs the coding CLIs and the
@@ -10,15 +16,35 @@ export class PlannerRunDO extends Container<Env> {
   // Native lifecycle RPCs may arrive while container start/destroy is awaiting
   // I/O. Keep the complete operation ordered inside this deterministic DO so
   // a fenced Stop cannot be overtaken by an earlier late Start.
-  private planWriterRuntimeTail: Promise<void> = Promise.resolve();
+  private runtimeOperationTail: Promise<void> = Promise.resolve();
   sleepAfter = "8h";
 
   async startPlannerJob(envVars: Record<string, string>): Promise<void> {
-    await this.start({ envVars, enableInternet: true });
+    await this.enqueueRuntimeOperation(async () => {
+      if (await this.ctx.storage.get<NativeRuntimeFence>(NATIVE_RUNTIME_FENCE_KEY)) {
+        throw new Error("Planner runtime was already destroyed.");
+      }
+      if (envVars.TILLER_REVIEWER_ISOLATION_PROTOCOL !== "1") {
+        throw new Error("Protected reviewer isolation is required.");
+      }
+      await this.start({ envVars, enableInternet: true });
+    });
   }
 
   async destroyPlannerJob(): Promise<void> {
-    await this.ctx.container?.destroy();
+    await this.enqueueRuntimeOperation(async () => {
+      const existing = await this.ctx.storage.get<NativeRuntimeFence>(NATIVE_RUNTIME_FENCE_KEY);
+      if (existing?.state === "absent") return;
+      await this.ctx.storage.put(NATIVE_RUNTIME_FENCE_KEY, {
+        state: "fenced",
+        jobSlug: null,
+      } satisfies NativeRuntimeFence);
+      await this.ctx.container?.destroy();
+      await this.ctx.storage.put(NATIVE_RUNTIME_FENCE_KEY, {
+        state: "absent",
+        jobSlug: null,
+      } satisfies NativeRuntimeFence);
+    });
   }
 
   async onActivityExpired(): Promise<void> {
@@ -40,9 +66,12 @@ export class PlannerRunDO extends Container<Env> {
     jobSlug: string,
     envVars: Record<string, string>,
   ): Promise<{ jobSlug: string; created: boolean }> {
-    return this.enqueuePlanWriterOperation(async () => {
+    return this.enqueueRuntimeOperation(async () => {
       let created = false;
       await this.ctx.storage.transaction(async (transaction) => {
+        if (await transaction.get<NativeRuntimeFence>(NATIVE_RUNTIME_FENCE_KEY)) {
+          throw new Error(`Plan Writer runtime ${jobSlug} was already destroyed.`);
+        }
         const existing = await transaction.get<string>(NATIVE_WRITER_IDENTITY_KEY);
         if (existing && existing !== jobSlug) {
           throw new Error(`Planner runtime is already reserved for ${existing}.`);
@@ -68,7 +97,7 @@ export class PlannerRunDO extends Container<Env> {
   }
 
   async inspectPlanWriterRuntime(jobSlug: string): Promise<{ registered: boolean; live: boolean; jobSlug: string | null }> {
-    return this.enqueuePlanWriterOperation(async () => {
+    return this.enqueueRuntimeOperation(async () => {
       const registeredJobSlug = await this.ctx.storage.get<string>(NATIVE_WRITER_IDENTITY_KEY) ?? null;
       if (registeredJobSlug && registeredJobSlug !== jobSlug) {
         throw new Error(`Planner runtime is reserved for ${registeredJobSlug}, not ${jobSlug}.`);
@@ -83,24 +112,42 @@ export class PlannerRunDO extends Container<Env> {
   }
 
   async destroyPlanWriterRuntime(jobSlug: string): Promise<void> {
-    await this.enqueuePlanWriterOperation(async () => {
-      const registeredJobSlug = await this.ctx.storage.get<string>(NATIVE_WRITER_IDENTITY_KEY) ?? null;
-      if (!registeredJobSlug) return;
-      if (registeredJobSlug !== jobSlug) {
-        throw new Error(`Refusing to destroy ${registeredJobSlug} through the ${jobSlug} fence.`);
-      }
+    await this.enqueueRuntimeOperation(async () => {
+      let alreadyAbsent = false;
+      await this.ctx.storage.transaction(async (transaction) => {
+        const registeredJobSlug = await transaction.get<string>(NATIVE_WRITER_IDENTITY_KEY) ?? null;
+        const fence = await transaction.get<NativeRuntimeFence>(NATIVE_RUNTIME_FENCE_KEY) ?? null;
+        if (registeredJobSlug && registeredJobSlug !== jobSlug) {
+          throw new Error(`Refusing to destroy ${registeredJobSlug} through the ${jobSlug} fence.`);
+        }
+        if (fence?.jobSlug && fence.jobSlug !== jobSlug) {
+          throw new Error(`Refusing to destroy ${fence.jobSlug} through the ${jobSlug} fence.`);
+        }
+        alreadyAbsent = fence?.state === "absent";
+        if (!alreadyAbsent) {
+          await transaction.put(NATIVE_RUNTIME_FENCE_KEY, {
+            state: "fenced",
+            jobSlug,
+          } satisfies NativeRuntimeFence);
+        }
+      });
+      if (alreadyAbsent) return;
       await this.ctx.container?.destroy();
       await this.ctx.storage.transaction(async (transaction) => {
         if (await transaction.get<string>(NATIVE_WRITER_IDENTITY_KEY) === jobSlug) {
           await transaction.delete(NATIVE_WRITER_IDENTITY_KEY);
         }
+        await transaction.put(NATIVE_RUNTIME_FENCE_KEY, {
+          state: "absent",
+          jobSlug,
+        } satisfies NativeRuntimeFence);
       });
     });
   }
 
-  private enqueuePlanWriterOperation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.planWriterRuntimeTail.then(operation, operation);
-    this.planWriterRuntimeTail = result.then(() => undefined, () => undefined);
+  private enqueueRuntimeOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.runtimeOperationTail.then(operation, operation);
+    this.runtimeOperationTail = result.then(() => undefined, () => undefined);
     return result;
   }
 }

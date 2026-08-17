@@ -1,77 +1,71 @@
-import { Navigate, useLocation, useNavigate, useParams } from 'react-router';
+import { useEffect } from 'react';
+import { Navigate, useNavigate, useParams } from 'react-router';
 import { Button } from '@cloudflare/kumo/components/button';
 import type { EnvMeta, RepoMeta } from '../api/types';
 import { useDashboardData } from './DashboardDataProvider';
-import SessionView from './SessionView';
 import EnvWaitingView from './EnvWaitingView';
-import PlanView from './PlanView';
-import ShipView from './ShipView';
-import ProjectsHome from './ProjectsHome';
-import SettingsPage, { parseAuthConnectIntent } from './SettingsPage';
-import RepoSettingsPage from './RepoSettingsPage';
 import { isRepoMainReady } from './repo-status';
-import { getSessionEnvSlug } from './dashboard-route-scope';
-import { RouteLoading } from './dashboard-route-state';
-import {
-  HomeSettingsFrame,
-  StatusActions,
-} from './DashboardLayout';
+import { StatusActions } from './DashboardLayout';
 import {
   planPath,
-  projectPath,
   shipPath,
 } from './dashboard-paths';
+import ImplementationWorkspaceFrame from './ImplementationWorkspaceFrame';
+import ProjectWorkspaceChrome from './ProjectWorkspaceChrome';
+import { resolveLastProjectId } from './project-selection-storage';
+import { RouteLoadError } from './dashboard-route-state';
 
-export function ProjectsHomeRoute() {
+export function WorkspaceRootRoute() {
   const data = useDashboardData();
-  const navigate = useNavigate();
-  const setupStatus = data.setupStatus;
-  const onboarding = setupStatus
-    ? {
-        ...setupStatus.dashboardOnboarding,
-        modelReady: setupStatus.modelAuthConfigured,
-        machineReady: setupStatus.hostConnected,
-      }
-    : null;
+  if (data.reposLoadState === 'error') {
+    return <RouteLoadError label="Repository load failed" onRetry={() => void data.refreshRepos()} />;
+  }
+  const repoId = resolveLastProjectId(data.repos.map((repo) => repo.repoId));
+  if (repoId) return <Navigate to={planPath(repoId)} replace />;
+
   return (
-    <div className="relative min-h-screen bg-kumo-base">
-      <ProjectsHome
-        repos={data.repos}
-        envs={data.envs}
-        hubUrl={data.hubUrl}
-        toolbar={<StatusActions />}
-        onboarding={onboarding}
-        onDismissOnboarding={data.dismissDashboardOnboarding}
-        onOpenSettings={() => navigate('/settings')}
-        onAddProject={() => data.setShowNewRepo(true)}
-        onOpenProject={(repoId) => navigate(projectPath(repoId))}
-        onProjectDeleted={data.handleDashboardRepoDeleted}
+    <div className="relative flex h-screen min-h-0 flex-col overflow-hidden bg-kumo-base">
+      <div className="absolute right-4 top-0 z-[1200] flex h-16 items-center">
+        <StatusActions />
+      </div>
+      <ProjectWorkspaceChrome
+        repoId={null}
+        activeView="plans"
+        planCount={0}
+        implementationCount={0}
       />
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        <aside className="tiller-workspace-sidebar-shell flex w-80 shrink-0 flex-col border-r border-kumo-line bg-kumo-recessed">
+          <div className="tiller-workspace-sidebar-header flex h-11 shrink-0 items-center border-b border-kumo-line px-3">
+            <span className="text-[13px] font-semibold text-kumo-default">Plans</span>
+          </div>
+        </aside>
+        <main className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
+          <div className="max-w-sm px-6 text-center">
+            <h1 className="text-sm font-semibold text-kumo-default">Add a GitHub repository to get started</h1>
+            <p className="mt-2 text-sm leading-6 text-kumo-subtle">
+              Choose a repository to use as your first Tiller project.
+            </p>
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              className="mt-4"
+              onClick={() => data.setShowNewRepo(true)}
+            >
+              Add project
+            </Button>
+          </div>
+        </main>
+      </div>
     </div>
   );
 }
 
-export function SettingsRoute() {
-  const data = useDashboardData();
-  const location = useLocation();
-  const navigate = useNavigate();
-  if (!data.setupStatus) {
-    return <RouteLoading label="Loading settings" />;
-  }
-  return (
-    <HomeSettingsFrame>
-      <SettingsPage
-        status={data.setupStatus}
-        onRefresh={data.refreshSetupStatus}
-        onDone={() => navigate('/', { replace: true })}
-        authConnectIntent={parseAuthConnectIntent(location.search)}
-      />
-    </HomeSettingsFrame>
-  );
-}
-
 export function UpdateRoute() {
-  return <ProjectsHomeRoute />;
+  const data = useDashboardData();
+  useEffect(() => data.setShowUpdate(true), [data.setShowUpdate]);
+  return <WorkspaceRootRoute />;
 }
 
 export function ProjectWorkspaceHomeRoute() {
@@ -91,119 +85,25 @@ export function ProjectWorkspaceHomeRoute() {
   );
 }
 
-export function PlanRoute() {
-  const data = useDashboardData();
-  const { repoId, planArtifactId } = useParams();
-  const repo = data.repos.find((candidate) => candidate.repoId === repoId) ?? null;
-  if (!repo || !repoId) return <Navigate to="/" replace />;
-  return (
-    <PlanView
-      key={repo.repoId}
-      repoId={repo.repoId}
-      repoUrl={repo.repoUrl}
-      repoMainCommit={repo.mainCommit ?? null}
-      planArtifactId={planArtifactId ?? null}
-      mainEvent={data.lastRepoMainEvent}
-      chatgptAvailable={data.setupStatus?.openaiPlannerAvailable ?? true}
-      chatgptUnavailableReason={data.setupStatus?.openaiPlannerReason ?? null}
-    />
-  );
-}
-
-export function RepoSettingsRoute() {
-  const data = useDashboardData();
-  const navigate = useNavigate();
-  const { repoId } = useParams();
-  const repo = data.repos.find((candidate) => candidate.repoId === repoId) ?? null;
-  if (!repo) return <Navigate to="/" replace />;
-  return (
-    <RepoSettingsPage
-      key={repo.repoId}
-      repo={repo}
-      onDone={() => navigate(projectPath(repo.repoId))}
-    />
-  );
-}
-
-export function WorkspaceSettingsRoute() {
-  const data = useDashboardData();
-  const navigate = useNavigate();
-  const { repoId } = useParams();
-  if (!data.setupStatus) {
-    return <RouteLoading label="Loading settings" />;
-  }
-  if (!repoId) return <Navigate to="/" replace />;
-  return (
-    <SettingsPage
-      status={data.setupStatus}
-      onRefresh={data.refreshSetupStatus}
-      onDone={() => navigate(projectPath(repoId), { replace: true })}
-    />
-  );
-}
-
 export function EnvWaitingRoute() {
   const data = useDashboardData();
   const { envSlug } = useParams();
   const env = data.envs.find((candidate) => candidate.slug === envSlug) ?? null;
   if (!env) return <Navigate to="/" replace />;
   return (
-    <EnvWaitingView
-      env={env}
-      hubUrl={data.hubUrl}
-      onRecoverEnv={data.recoverEnv}
-      onStartRequest={(slug) => data.setStartDialogSlug(slug)}
-    />
-  );
-}
-
-export function ShipRoute() {
-  const data = useDashboardData();
-  const { envSlug } = useParams();
-  const env = data.envs.find((candidate) => candidate.slug === envSlug) ?? null;
-  const repo = env ? data.repos.find((candidate) => candidate.repoId === env.repoId) ?? null : null;
-  if (!env || !repo) return <Navigate to="/" replace />;
-  return (
-    <ShipView
-      key={env.slug}
-      env={env}
-      repo={repo}
-      hubUrl={data.hubUrl}
-      onRecoverEnv={data.recoverEnv}
-      onRecoverEntities={data.recoverEntities}
-    />
+    <ImplementationWorkspaceFrame repoId={env.repoId} selectedEnvSlug={env.slug}>
+      <EnvWaitingView
+        env={env}
+        hubUrl={data.hubUrl}
+        onRecoverEnv={data.recoverEnv}
+      />
+    </ImplementationWorkspaceFrame>
   );
 }
 
 export function LegacyChangesRoute() {
   const { envSlug } = useParams();
   return envSlug ? <Navigate to={shipPath(envSlug)} replace /> : <Navigate to="/" replace />;
-}
-
-export function SessionRoute() {
-  const data = useDashboardData();
-  const { sessionId } = useParams();
-  const session = data.sessions.find((candidate) => candidate.id === sessionId) ?? null;
-  if (!session || !sessionId) return <Navigate to="/" replace />;
-  const envSlug = getSessionEnvSlug(session, session.id, data.sessionEnvMap);
-  const env = envSlug ? data.envs.find((candidate) => candidate.slug === envSlug) ?? null : null;
-  const selectedPermissions = data.permissions.get(session.id) || [];
-  return (
-    <SessionView
-      session={session}
-      env={env}
-      hubUrl={data.hubUrl}
-      onWsMessage={data.liveMessageRef}
-      onTerminalAck={data.terminalAckRef}
-      wsSend={data.wsRef}
-      connected={data.connected}
-      terminalFastLane={data.terminalFastLane}
-      updateLastSeq={data.updateLastSeq}
-      permissions={selectedPermissions}
-      onPermissionResolved={data.handlePermissionResolved}
-      onRecoverEnv={data.recoverEnv}
-    />
-  );
 }
 
 export function ProjectWorkspaceHome({

@@ -153,11 +153,15 @@ export function NewRepoDialog({
         if (!open) onClose();
       }}
     >
-      <Dialog className="w-full max-w-md p-0">
-        <div className="border-b border-kumo-line px-5 py-4">
-          <Dialog.Title className="text-sm font-semibold text-kumo-strong">Add Repository</Dialog.Title>
+      <Dialog className="tiller-dialog-shell tiller-project-dialog w-full max-w-[30rem] p-0">
+        <div className="tiller-dialog-header border-b border-kumo-line px-5 py-4">
+          <Dialog.Title className="tiller-dialog-title text-sm font-semibold text-kumo-strong">Add Project</Dialog.Title>
+          <Dialog.Description className="tiller-dialog-description mt-1 text-xs text-kumo-subtle">
+            Choose a GitHub repository to use as a Tiller project.
+          </Dialog.Description>
         </div>
-        <form onSubmit={handleSubmit} className="px-5 py-4">
+        <form onSubmit={handleSubmit}>
+          <div className="tiller-dialog-body px-5 py-4">
           <Input
             label="GitHub Repository"
             type="text"
@@ -241,7 +245,8 @@ export function NewRepoDialog({
           {error && (
             <p className="mt-2 text-xs text-kumo-danger">{error}</p>
           )}
-          <div className="mt-4 flex items-center justify-between gap-3">
+          </div>
+          <div className="tiller-dialog-footer flex items-center justify-between gap-3 border-t border-kumo-line px-5 py-3">
             <a
               href={githubAppConfigured ? "/api/github/manage" : "/api/github/manifest/setup"}
               target="_blank"
@@ -258,6 +263,7 @@ export function NewRepoDialog({
                 size="sm"
                 onClick={onClose}
                 disabled={loading}
+                className="tiller-dialog-button tiller-dialog-button--secondary"
               >
                 Cancel
               </Button>
@@ -267,6 +273,7 @@ export function NewRepoDialog({
                 size="sm"
                 loading={loading}
                 disabled={loading || loadingRepositories || !selected || existingRepoIds.has(String(selected.repositoryId))}
+                className="tiller-dialog-button tiller-dialog-button--primary"
               >
                 {loading ? "Adding..." : "Add"}
               </Button>
@@ -297,6 +304,8 @@ interface NewEnvDialogProps {
   workersAiConfigured?: boolean;
   enabledHarnesses: EnvHarness[];
   repo: RepoMeta;
+  initialPlanChoice?: "none" | "specific";
+  hideStartupPlan?: boolean;
   onRefreshSetupStatus?: () => Promise<void>;
   onCreate: (options: CreateEnvOptions) => Promise<void>;
 }
@@ -377,7 +386,7 @@ export function getNewEnvHarnessDefault(
   backend?: "cf" | "host",
   credentialStatus?: HarnessCredentialStatus,
 ): HarnessSettings {
-  const fallback = harness === "opencode"
+  const fallback: HarnessSettings = harness === "opencode"
     ? { model: "gpt-5.6-sol", effort: "xhigh" }
     : getHarnessDefault(harness);
 
@@ -410,6 +419,8 @@ export function NewEnvDialog({
   workersAiConfigured = false,
   enabledHarnesses,
   repo,
+  initialPlanChoice = "none",
+  hideStartupPlan = false,
   onRefreshSetupStatus,
   onCreate,
 }: NewEnvDialogProps) {
@@ -430,13 +441,16 @@ export function NewEnvDialog({
   );
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatus | null>(null);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [plansLoading, setPlansLoading] = useState(true);
+  const [plansLoading, setPlansLoading] = useState(!hideStartupPlan);
   const [plansError, setPlansError] = useState<string | null>(null);
-  const [planChoice, setPlanChoice] = useState<"none" | "specific">("none");
+  const [planChoice, setPlanChoice] = useState<"none" | "specific">(
+    hideStartupPlan ? "none" : initialPlanChoice,
+  );
   const [selectedPlanId, setSelectedPlanId] = useState("");
   const [scheduleTonight, setScheduleTonight] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requiresStartupPlan = !hideStartupPlan && initialPlanChoice === "specific";
   const refreshAfterSettings = useCallback(async () => {
     await onRefreshSetupStatus?.();
     try {
@@ -496,6 +510,14 @@ export function NewEnvDialog({
   });
 
   useEffect(() => {
+    if (hideStartupPlan) {
+      setArtifacts([]);
+      setPlansError(null);
+      setPlansLoading(false);
+      setPlanChoice("none");
+      return undefined;
+    }
+    if (requiresStartupPlan) setPlanChoice("specific");
     let cancelled = false;
     const loadPlans = async () => {
       setPlansLoading(true);
@@ -517,7 +539,7 @@ export function NewEnvDialog({
     return () => {
       cancelled = true;
     };
-  }, [hubUrl, repo.repoId]);
+  }, [hideStartupPlan, hubUrl, repo.repoId, requiresStartupPlan]);
 
   useEffect(() => {
     let cancelled = false;
@@ -559,12 +581,12 @@ export function NewEnvDialog({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (credentialError) return;
-    const planSelection: StartupPlanSelection = planChoice === "specific"
+    const planSelection: StartupPlanSelection = !hideStartupPlan && planChoice === "specific"
       ? selectedPlan
         ? { mode: "specific", artifactId: selectedPlan.id }
         : { mode: "none" }
       : { mode: "none" };
-    if (planChoice === "specific" && !selectedPlan) {
+    if (!hideStartupPlan && planChoice === "specific" && !selectedPlan) {
       setError("Choose a plan before creating the environment.");
       return;
     }
@@ -593,13 +615,16 @@ export function NewEnvDialog({
         if (!open) onClose();
       }}
     >
-      <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-3xl flex-col overflow-hidden p-0 sm:w-[calc(100vw-2rem)]">
-        <div className="border-b border-kumo-line px-5 py-4">
-          <Dialog.Title className="text-sm font-semibold text-kumo-strong">New Environment</Dialog.Title>
-          <Dialog.Description className="text-xs text-kumo-subtle mt-0.5">{repoLabel(repo.repoUrl)}</Dialog.Description>
+      <Dialog
+        className="tiller-dialog-shell flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-3xl flex-col overflow-hidden p-0 sm:w-[calc(100vw-2rem)]"
+        style={{ maxWidth: "40rem" }}
+      >
+        <div className="tiller-dialog-header border-b border-kumo-line px-5 py-4">
+          <Dialog.Title className="tiller-dialog-title text-sm font-semibold text-kumo-strong">New implementation</Dialog.Title>
+          <Dialog.Description className="tiller-dialog-description text-xs text-kumo-subtle mt-0.5">{repoLabel(repo.repoUrl)}</Dialog.Description>
         </div>
         <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          <div className="tiller-dialog-body min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {!repoMainReady && (
             <div className="mb-3 rounded border border-kumo-warning/30 bg-kumo-warning-tint px-3 py-2">
               <div className="text-xs font-semibold uppercase tracking-wide text-kumo-warning">
@@ -638,6 +663,7 @@ export function NewEnvDialog({
             value={harnessSettings}
             credentialStatus={credentialStatus}
             disabled={loading}
+            showFastMode={false}
             settingsPath={projectGlobalSettingsPath(repo.repoId)}
             onRefreshSettings={refreshAfterSettings}
             onChange={(nextSettings) => {
@@ -645,51 +671,58 @@ export function NewEnvDialog({
               setError(null);
             }}
           />
-          <div className="mt-3">
-            <div className="mb-1.5 text-xs font-medium text-kumo-subtle">Startup Plan</div>
-            {plansLoading ? (
-              <div className="rounded border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-subtle">
-                Loading plans...
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <label className="flex cursor-pointer items-start gap-3 rounded border border-kumo-line px-3 py-2">
-                  <input
-                    type="radio"
-                    name={`new-env-plan-choice-${repo.repoId}`}
-                    value="none"
-                    checked={planChoice === "none"}
-                    onChange={() => setPlanChoice("none")}
-                    disabled={loading}
-                    className="mt-0.5"
-                  />
-                  <span className="min-w-0">
-                    <span className="block text-sm font-medium text-kumo-default">No plan</span>
-                    <span className="block text-xs text-kumo-subtle">
-                      Best for quick debugging, small changes, or exploratory work that does not need a saved plan.
+          {!hideStartupPlan && (
+            <div className="mt-3">
+              <div className="mb-1.5 text-xs font-medium text-kumo-subtle">Startup Plan</div>
+              {plansLoading ? (
+                <div className="rounded border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-subtle">
+                  Loading plans...
+                </div>
+              ) : (
+                <div className="space-y-2">
+                {!requiresStartupPlan && (
+                  <label className="flex cursor-pointer items-start gap-3 rounded border border-kumo-line px-3 py-2">
+                    <input
+                      type="radio"
+                      name={`new-env-plan-choice-${repo.repoId}`}
+                      value="none"
+                      checked={planChoice === "none"}
+                      onChange={() => setPlanChoice("none")}
+                      disabled={loading}
+                      className="mt-0.5"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-kumo-default">No plan</span>
+                      <span className="block text-xs text-kumo-subtle">
+                        Best for quick debugging, small changes, or exploratory work that does not need a saved plan.
+                      </span>
                     </span>
-                  </span>
-                </label>
+                  </label>
+                )}
 
                 <label className="flex cursor-pointer items-start gap-3 rounded border border-kumo-line px-3 py-2">
-                  <input
-                    type="radio"
-                    name={`new-env-plan-choice-${repo.repoId}`}
-                    value="specific"
-                    checked={planChoice === "specific"}
-                    onChange={() => setPlanChoice("specific")}
-                    disabled={planArtifacts.length === 0 || loading}
-                    className="mt-0.5"
-                  />
+                  {!requiresStartupPlan && (
+                    <input
+                      type="radio"
+                      name={`new-env-plan-choice-${repo.repoId}`}
+                      value="specific"
+                      checked={planChoice === "specific"}
+                      onChange={() => setPlanChoice("specific")}
+                      disabled={planArtifacts.length === 0 || loading}
+                      className="mt-0.5"
+                    />
+                  )}
                   <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-medium text-kumo-default">Select from Plans to Do</span>
+                    <span className="block text-sm font-medium text-kumo-default">
+                      {requiresStartupPlan ? "Plan to implement" : "Select from Plans to Do"}
+                    </span>
                     <Select
                       aria-label="Startup Plan"
                       className="mt-2 h-auto min-h-6.5 w-full py-1.5"
                       size="sm"
                       value={selectedPlanId}
                       onValueChange={(value) => setSelectedPlanId(value ?? "")}
-                      disabled={planChoice !== "specific" || planArtifacts.length === 0 || loading}
+                      disabled={(!requiresStartupPlan && planChoice !== "specific") || planArtifacts.length === 0 || loading}
                       renderValue={(value) => {
                         const plan = planArtifacts.find((candidate) => candidate.id === value);
                         return plan ? (
@@ -715,10 +748,11 @@ export function NewEnvDialog({
                     )}
                   </span>
                 </label>
-              </div>
-            )}
-          </div>
-          {selectedPlan && planChoice === "specific" && !plansLoading && (
+                </div>
+              )}
+            </div>
+          )}
+          {!hideStartupPlan && selectedPlan && planChoice === "specific" && !plansLoading && (
             <div className="mt-3 rounded border border-kumo-line bg-kumo-recessed px-3 py-3">
               <div className="text-xs font-medium text-kumo-subtle">Selected plan</div>
               <div
@@ -742,7 +776,9 @@ export function NewEnvDialog({
               </div>
             </div>
           )}
-          {selectedPlan && planChoice === "specific" && !plansLoading && (
+          {/* Temporarily hidden from the new implementation flow; retain the
+              scheduling UI and state so it can be restored without rebuilding it.
+          {!hideStartupPlan && selectedPlan && planChoice === "specific" && !plansLoading && (
             <div className="mt-3 rounded border border-kumo-line bg-kumo-recessed px-3 py-2">
               <label className={`flex items-start gap-3 ${scheduledRunRequirementError ? "cursor-not-allowed opacity-70" : "cursor-pointer"}`}>
                 <input
@@ -762,17 +798,19 @@ export function NewEnvDialog({
               )}
             </div>
           )}
+          */}
             {visibleError && (
               <p className="mt-2 text-xs text-kumo-danger">{visibleError}</p>
             )}
           </div>
-          <div className="flex shrink-0 justify-end gap-2 border-t border-kumo-line px-5 py-4">
+          <div className="tiller-dialog-footer flex shrink-0 justify-end gap-2 border-t border-kumo-line px-5 py-4">
             <Button
               type="button"
               variant="secondary"
               size="sm"
               onClick={onClose}
               disabled={loading}
+              className="tiller-dialog-button tiller-dialog-button--secondary"
             >
               Cancel
             </Button>
@@ -782,6 +820,7 @@ export function NewEnvDialog({
               size="sm"
               loading={loading}
               disabled={loading || !repoMainReady || Boolean(credentialError)}
+              className="tiller-dialog-button tiller-dialog-button--primary"
             >
               {loading ? "Creating..." : !repoMainReady ? "Waiting for Main..." : scheduleTonight ? "Schedule" : "Create"}
             </Button>

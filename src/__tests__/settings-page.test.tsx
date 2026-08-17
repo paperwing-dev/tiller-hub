@@ -53,7 +53,6 @@ function baseStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
       workersCiCommitSha: null,
       workersCiBranch: null,
     },
-    selfUpdateRepo: { status: 'not_checked', lastDetectedAt: null },
     dashboardOnboarding: { dismissed: false, executionReady: false },
   };
   return Object.assign(status, overrides);
@@ -114,7 +113,7 @@ describe('Global Settings', () => {
     expect(html).not.toContain('Canonical main history depth');
   });
 
-  it('hides appearance settings while only one theme is offered', async () => {
+  it('offers only Paperwing Light and Classic Light in Global Settings', async () => {
     const { default: SettingsPage } = await import('../SettingsPage');
     const html = renderToString(
       <SettingsPage
@@ -124,8 +123,14 @@ describe('Global Settings', () => {
       />,
     );
 
-    expect(html).not.toContain('Appearance');
-    expect(html).not.toContain('Theme');
+    expect(html).toContain('Appearance');
+    expect(html).toContain('Theme');
+    expect(html).toContain('Paperwing Light');
+    expect(html).toContain('Classic Light');
+    expect(html).toContain('tiller-settings-select');
+    expect(html).not.toContain('Current · System');
+    expect(html).not.toContain('Current · Dark');
+    expect(html).toContain('previous high-contrast palette');
   });
 
   it('exposes stable targets for exact model-access settings links', async () => {
@@ -183,37 +188,40 @@ describe('Global Settings', () => {
     expect(idleTimeoutHtml).not.toContain('Canonical main history depth');
   });
 
-  it('shows regional and legacy installer placement without a change action', async () => {
+  it('shows hosted regional placement without a change action', async () => {
     const { InstallationRegionRow, shouldShowInstallationRegion } =
       await import('../SettingsPage');
     const regional = renderToString(<InstallationRegionRow region="wnam" />);
-    const automatic = renderToString(<InstallationRegionRow region={null} />);
 
-    expect(regional).toContain('Installation region');
+    expect(regional).toContain('Cloudflare placement region');
     expect(regional).toContain('Western North America (WNAM)');
     expect(regional).toContain(
-      'Chosen during installation. Reinstall Tiller to change it.',
+      'Used for Durable Object and Cloudflare Container placement in this deployment.',
     );
     expect(regional).not.toContain('<button');
-    expect(automatic).toContain('Automatic (Cloudflare-managed)');
-    expect(automatic).toContain('Reinstall Tiller to select a region.');
-    expect(automatic).not.toContain('<button');
+    expect(regional).not.toContain('Automatic');
     expect(
       shouldShowInstallationRegion({
-        installerManaged: true,
         isLocalDev: false,
+        installationRegion: 'wnam',
       }),
     ).toBe(true);
     expect(
       shouldShowInstallationRegion({
-        installerManaged: false,
         isLocalDev: false,
+        installationRegion: 'wnam',
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowInstallationRegion({
+        isLocalDev: true,
+        installationRegion: 'wnam',
       }),
     ).toBe(false);
     expect(
       shouldShowInstallationRegion({
-        installerManaged: true,
-        isLocalDev: true,
+        isLocalDev: false,
+        installationRegion: null,
       }),
     ).toBe(false);
   });
@@ -271,7 +279,7 @@ describe('Global Settings', () => {
   });
 
   it('shows independent unselected modes and configured inactive credentials', async () => {
-    const { default: SettingsPage } = await import('../SettingsPage');
+    const { default: SettingsPage, getCredentialStatusChip } = await import('../SettingsPage');
     const html = renderToString(
       <SettingsPage
         status={baseStatus({
@@ -293,6 +301,16 @@ describe('Global Settings', () => {
     expect(html.match(/No mode selected yet\./g)).toHaveLength(2);
     expect(html).toContain('Claude subscription');
     expect(html).toContain('Connected · inactive');
+    expect(html).toContain('Configured · not selected');
+    expect(html).toContain('Test API key');
+    expect(getCredentialStatusChip('configured', false, {
+      key: 'ANTHROPIC_API_KEY',
+      mode: 'api',
+      ok: true,
+    })).toEqual({
+      label: 'Verified · not selected',
+      variant: 'success',
+    });
     expect(html).toContain('Saving a credential does not activate it');
     expect(html).toContain(
       'retained Scribe runtimes remain pinned until recreated',
@@ -397,7 +415,28 @@ describe('Global Settings', () => {
 
     expect(html).toContain('OpenAI API key');
     expect(html).toContain('Use OpenAI-backed models with Codex or OpenCode.');
+    expect(html).toContain('Claude API key');
+    expect(html).toContain(
+      'Use Anthropic-backed models with Claude Code or OpenCode.',
+    );
     expect(html).toContain('Codex subscription');
+  });
+
+  it('describes the Cloudflare usage included with the built-in Kimi model', async () => {
+    const { default: SettingsPage } = await import('../SettingsPage');
+    const html = renderToString(
+      <SettingsPage
+        status={baseStatus()}
+        onDone={() => undefined}
+        onRefresh={async () => undefined}
+      />,
+    );
+
+    expect(html).toContain('Kimi K2.7 Code');
+    expect(html).toContain(
+      "runs through Tiller&#x27;s built-in Workers AI binding, using the Workers AI usage included with your Cloudflare account.",
+    );
+    expect(html).not.toContain('OpenAI- and Anthropic-backed OpenCode models');
   });
 
   it('shows the reconnection command when a subscription login is already present', async () => {
@@ -497,7 +536,7 @@ describe('Global Settings', () => {
     expect(html).toContain('Your machine');
     expect(html).toContain('Can reduce compute costs, and will not shut down.');
     expect(html).toContain(
-      'It installs Tiller only if needed, then connects it.',
+      'It installs Tiller CLI only if needed, then connects it.',
     );
     expect(html).toContain(
       '(command -v tiller &gt;/dev/null 2&gt;&amp;1 || npm install -g @paperwing-dev/tiller@latest) &amp;&amp; tiller host setup --hub-url https://demo.preview.workers.dev',

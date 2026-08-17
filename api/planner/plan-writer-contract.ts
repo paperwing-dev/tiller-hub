@@ -5,7 +5,12 @@ import type {
   ReviewerRegistryEntry,
 } from "../coordination";
 import { MAX_PLAN_MARKDOWN_BYTES } from "../coordination/planning";
+import { planWriterTerminalId } from "./runtime-identity";
+import { normalizePlanMarkdown } from "../coordination/planning";
 
+export { planWriterTerminalId } from "./runtime-identity";
+
+export const PLAN_WRITER_PROTOCOL_VERSION = 2 as const;
 export const MAX_PLAN_PUBLICATION_BYTES = MAX_PLAN_MARKDOWN_BYTES;
 export const MAX_PROVIDER_IDENTIFIER_BYTES = 256;
 
@@ -26,17 +31,16 @@ export function normalizePlanWriterIdentifier(value: string, label: string): str
 
 /** Normalize a provider's complete plan without aggressive planner-output cleanup. */
 export function normalizeObservedPlanMarkdown(markdown: string): string {
-  const normalized = markdown.replace(/\r\n?/g, "\n").replace(/(?:\n[ \t]*)+$/u, "");
+  const normalized = normalizePlanMarkdown(markdown);
   if (!normalized.trim()) throw new Error("Published plan Markdown cannot be empty");
-  if (textEncoder.encode(normalized).byteLength + 1 > MAX_PLAN_PUBLICATION_BYTES) {
+  if (textEncoder.encode(normalized).byteLength > MAX_PLAN_PUBLICATION_BYTES) {
     throw new Error(`Published plan Markdown exceeds ${MAX_PLAN_PUBLICATION_BYTES} UTF-8 bytes`);
   }
-  return `${normalized}\n`;
+  return normalized;
 }
 
 export function normalizeCanonicalPlanForDigest(markdown: string): string {
-  const normalized = markdown.replace(/\r\n?/g, "\n").replace(/(?:\n[ \t]*)+$/u, "");
-  return normalized ? `${normalized}\n` : "";
+  return normalizePlanMarkdown(markdown);
 }
 
 export async function sha256Hex(value: string): Promise<string> {
@@ -69,25 +73,8 @@ export async function normalizeObservedPlanPublication(
   };
 }
 
-function stableHash(value: string): string {
-  let left = 0x811c9dc5;
-  let right = 0x9e3779b9;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    left = Math.imul(left ^ code, 0x01000193);
-    right = Math.imul(right ^ (code + index), 0x85ebca6b);
-  }
-  return `${(left >>> 0).toString(36)}${(right >>> 0).toString(36)}`;
-}
-
-/** Deterministic from the sole writer identity; bounded for Hub session IDs. */
-export function planWriterTerminalId(repoId: string, planArtifactId: string, generation: number): string {
-  if (!Number.isInteger(generation) || generation < 1) throw new Error("generation must be a positive integer");
-  return `plan-writer-${stableHash(`${repoId}\0${planArtifactId}`)}-${generation}`;
-}
-
 export function isPlanWriterProvider(value: unknown): value is PlanWriterProvider {
-  return value === "claude-code" || value === "codex";
+  return value === "claude-code" || value === "codex" || value === "opencode";
 }
 
 export function derivePlanWriterState(
@@ -104,6 +91,7 @@ export function derivePlanWriterState(
   const synchronizationError = writer?.synchronizationError?.trim() || null;
   return {
     lifecycle,
+    threadId: writer?.threadId ?? null,
     generation,
     provider: isPlanWriterProvider(writer?.provider) ? writer.provider : null,
     model: writer?.model ?? null,
@@ -116,6 +104,14 @@ export function derivePlanWriterState(
     ...(writer?.stopReason ? { stopReason: writer.stopReason } : {}),
     ...(writer?.startupError ? { startupError: writer.startupError } : {}),
     ...(writer?.cleanupError ? { cleanupError: writer.cleanupError } : {}),
+    ...(lifecycle === "starting" && writer
+      ? {
+          startup: {
+            stage: writer.runtime ? "launching" as const : "reserving" as const,
+            updatedAt: writer.updatedAt,
+          },
+        }
+      : {}),
     synchronization: synchronizationError
       ? { state: "sync_failed", error: synchronizationError }
       : { state: "up_to_date" },

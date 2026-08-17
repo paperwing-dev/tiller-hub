@@ -30,6 +30,9 @@ const mocks = vi.hoisted(() => ({
   getPlannerRunStub: vi.fn(),
   startPlannerJob: vi.fn(),
   destroyPlannerJob: vi.fn(),
+  destroyPlanWriterRuntime: vi.fn(),
+  revokePlanWriterTerminal: vi.fn(),
+  broadcastPlanWriterState: vi.fn(),
   ensurePlanWriterRuntime: vi.fn(),
 }));
 
@@ -94,6 +97,7 @@ const [
   { default: plannerRoutes },
   {
     buildProviderAuthEnvVars,
+    cleanupPlanRuntimeTarget,
     cleanupPlannerRunRuntime,
     dispatchPlannerRun,
     ensurePlanWriterRuntime,
@@ -106,6 +110,7 @@ const [
   import("../dispatch"),
 ]);
 const { listPlannerProviders } = await import("../providers");
+const { planWriterTerminalId } = await import("../runtime-identity");
 
 function createEnv(
   overrides: Record<string, unknown> = {},
@@ -132,6 +137,8 @@ function createEnv(
       idFromName: () => "hub-id",
       get: () => ({
         requestLocalRunner: mocks.requestLocalRunner,
+        revokePlanWriterTerminal: mocks.revokePlanWriterTerminal,
+        broadcastPlanWriterState: mocks.broadcastPlanWriterState,
         resolveNewExecutionPlacement: vi.fn().mockResolvedValue(resolvedPlacement),
         getExecutionStatus: vi.fn().mockResolvedValue(
           resolvedPlacement.backend === "cf"
@@ -197,13 +204,18 @@ describe("planner dispatch", () => {
     mocks.resolveProtectionState.mockResolvedValue({ protectionMode: "none" });
     mocks.readRegisteredHostService.mockResolvedValue(null);
     mocks.readRoutableHostService.mockResolvedValue(null);
-    mocks.requestLocalRunner.mockResolvedValue({ machineId: "machine-1", result: {} });
+    mocks.requestLocalRunner.mockImplementation(async (machineId, _action, _slug, options) => ({
+      machineId: machineId ?? "machine-1",
+      result: options ?? {},
+    }));
     mocks.startPlannerJob.mockResolvedValue(undefined);
     mocks.destroyPlannerJob.mockResolvedValue(undefined);
+    mocks.destroyPlanWriterRuntime.mockResolvedValue(undefined);
     mocks.ensurePlanWriterRuntime.mockResolvedValue({ jobSlug: "writer", created: true });
     mocks.getPlannerRunStub.mockReturnValue({
       startPlannerJob: mocks.startPlannerJob,
       destroyPlannerJob: mocks.destroyPlannerJob,
+      destroyPlanWriterRuntime: mocks.destroyPlanWriterRuntime,
       ensurePlanWriterRuntime: mocks.ensurePlanWriterRuntime,
     });
     mocks.loadTrackedRepoForRequest.mockResolvedValue({
@@ -221,6 +233,17 @@ describe("planner dispatch", () => {
         },
         workspace: {},
       },
+    });
+  });
+
+  it("routes Cloudflare Review without a duplicate compiled image capability", async () => {
+    await expect(resolvePlannerExecution(createEnv({
+      PLANNER_RUN: {},
+      OPENAI_API_KEY: "key",
+    }) as any, "codex")).resolves.toMatchObject({
+      kind: "dispatched",
+      backend: "cf",
+      machineId: null,
     });
   });
 
@@ -258,6 +281,19 @@ describe("planner dispatch", () => {
     } as const;
   }
 
+  function codexWriterApiLaunch(backend: "cf" | "host") {
+    return {
+      schemaVersion: 1,
+      backend,
+      machineId: backend === "host" ? "machine-1" : null,
+      codexExecution: {
+        kind: "api-key-app-server",
+        surface: "plan-writer",
+        backend,
+      },
+    } as const;
+  }
+
   it("uses the full sanitized run id for job slugs", () => {
     expect(plannerJobSlug("AbC-123_xyz")).toBe("planner-abc-123-xyz");
     const a = plannerJobSlug("11111111-2222-3333-4444-555555555555");
@@ -268,6 +304,7 @@ describe("planner dispatch", () => {
   it("connects Plan Writer terminals to the canonical Hub namespace", async () => {
     const plan = createPlan();
     const writer = artifactStore.startPlanWriter({
+      skills: [],
       repoId: "repo-1",
       planArtifactId: plan.id,
       provider: "claude-code",
@@ -312,6 +349,7 @@ describe("planner dispatch", () => {
     mocks.getIdleTimeoutMinutes.mockResolvedValueOnce(42);
     const plan = createPlan();
     const writer = artifactStore.startPlanWriter({
+      skills: [],
       repoId: "repo-1",
       planArtifactId: plan.id,
       provider: "claude-code",
@@ -347,6 +385,7 @@ describe("planner dispatch", () => {
   it("retains exact Plan Writer provenance when launch cleanup fails", async () => {
     const plan = createPlan();
     const writer = artifactStore.startPlanWriter({
+      skills: [],
       repoId: "repo-1",
       planArtifactId: plan.id,
       provider: "claude-code",
@@ -399,6 +438,7 @@ describe("planner dispatch", () => {
       machineId: "pi-1",
       runnerCommandProtocol: 1,
       codexRuntimeAuthProtocol: 1,
+      reviewerIsolationProtocol: 1,
     });
     expect(await resolvePlannerExecution(createEnv({}, hostPlacement) as any, "codex"))
       .toMatchObject({ kind: "dispatched", backend: "host", machineId: "pi-1" });
@@ -449,6 +489,7 @@ describe("planner dispatch", () => {
       machineId: "pi-1",
       runnerCommandProtocol: 1,
       codexRuntimeAuthProtocol: 1,
+      reviewerIsolationProtocol: 1,
     });
     const hostPlacement = { backend: "host" as const, machineId: "pi-1" };
     expect(await resolvePlannerExecution(createEnv({
@@ -462,9 +503,8 @@ describe("planner dispatch", () => {
       CLAUDE_CODE_OAUTH_TOKEN: "subscription",
       PLANNER_RUN: {},
     }, hostPlacement) as any, "claude-code")).toMatchObject({
-      kind: "dispatched",
-      backend: "host",
-      machineId: "pi-1",
+      kind: "unavailable",
+      reason: "The selected execution backend is unavailable. Choose another backend in Settings.",
     });
     mocks.getBillingSelections.mockResolvedValue({
       claudeBillingMode: "api",
@@ -497,6 +537,7 @@ describe("planner dispatch", () => {
       machineId: "pi-1",
       runnerCommandProtocol: 1,
       codexRuntimeAuthProtocol: 1,
+      reviewerIsolationProtocol: 1,
     });
     const host = await resolvePlannerExecution(createEnv({
       OPENAI_API_KEY: "api-key",
@@ -510,6 +551,21 @@ describe("planner dispatch", () => {
         kind: "api-key-direct-cli",
         backend: "host",
       },
+    });
+  });
+
+  it("rejects an incompatible host before reserving reviewer work", async () => {
+    mocks.readRoutableHostService.mockResolvedValue({
+      machineId: "pi-1",
+      runnerCommandProtocol: 1,
+      codexRuntimeAuthProtocol: 1,
+    });
+
+    await expect(resolvePlannerExecution(createEnv({
+      PLANNER_RUN: {},
+    }, { backend: "host", machineId: "pi-1" }) as any, "codex")).resolves.toMatchObject({
+      kind: "unavailable",
+      reason: expect.stringMatching(/tiller host update.*recreate or restart/i),
     });
   });
 
@@ -559,13 +615,15 @@ describe("planner dispatch", () => {
       TILLER_OPENCODE_MODEL_ID: "@cf/moonshotai/kimi-k2.7-code",
       TILLER_OPENCODE_MODEL_ALIAS: "tiller-kimi-k2-7-code",
       TILLER_OPENCODE_MODEL_LABEL: "Kimi K2.7 Code",
+      TILLER_OPENCODE_MODEL_CONTEXT_LIMIT: "262144",
+      TILLER_OPENCODE_MODEL_OUTPUT_LIMIT: "262144",
       TILLER_OPENCODE_PROVIDER_KIND: "cloudflare-workers-ai",
       TILLER_OPENCODE_PROVIDER_ALIAS: "tiller-hub",
       TILLER_OPENCODE_PROVIDER_LABEL: "Tiller Hub",
     });
   });
 
-  it("does not read global billing when evaluating the Workers AI-only OpenCode provider", async () => {
+  it("reads global billing when evaluating OpenCode API writer routes", async () => {
     mocks.getBillingSelections.mockClear();
 
     const catalog = await listPlannerProviders(
@@ -574,7 +632,7 @@ describe("planner dispatch", () => {
     );
 
     expect(catalog.providers.map((provider) => provider.id)).toEqual(["opencode"]);
-    expect(mocks.getBillingSelections).not.toHaveBeenCalled();
+    expect(mocks.getBillingSelections).toHaveBeenCalledOnce();
   });
 
   it("inspects provider availability without resolving a new workload placement", async () => {
@@ -625,8 +683,8 @@ describe("planner dispatch", () => {
     });
   });
 
-  it("rejects an OpenCode planner model outside the catalog-owned selection", async () => {
-    await expect(buildProviderAuthEnvVars(
+  it("resolves every catalog-owned OpenCode writer model", async () => {
+    const env = await buildProviderAuthEnvVars(
       createEnv() as any,
       {
         provider: "opencode",
@@ -634,7 +692,18 @@ describe("planner dispatch", () => {
       },
       { backend: "cf", machineId: null },
       "https://hub.example.com",
-    )).rejects.toThrow("Unsupported planner OpenCode model: gpt-5.5");
+    );
+    expect(mocks.resolveOpenCodeContainerAuth).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: "gpt-5.5", harness: "opencode" }),
+    );
+    expect(env).toMatchObject({
+      TILLER_OPENCODE_MODEL_LABEL: "GPT-5.5",
+      TILLER_OPENCODE_MODEL_CONTEXT_LIMIT: "1050000",
+      TILLER_OPENCODE_MODEL_INPUT_LIMIT: "922000",
+      TILLER_OPENCODE_MODEL_OUTPUT_LIMIT: "128000",
+      TILLER_OPENCODE_PROVIDER_KIND: "openai",
+    });
   });
 
   it("dispatches and destroys hosted runs through the PlannerRunDO container", async () => {
@@ -661,8 +730,11 @@ describe("planner dispatch", () => {
     expect(mocks.startPlannerJob).toHaveBeenCalledTimes(1);
     expect(mocks.startPlannerJob.mock.calls[0][0]).toMatchObject({
       TILLER_BOOTSTRAP_MODE: "planner-run",
+      TILLER_REVIEWER_ISOLATION_PROTOCOL: "1",
       TILLER_HARNESS: "codex",
+      RUNNER_BACKEND: "cf",
     });
+    expect(mocks.startPlannerJob.mock.calls[0][0]).not.toHaveProperty("TILLER_REVIEWER_ISOLATION_IMAGE");
     const updated = artifactStore.getPlannerRun(run.runId);
     expect(updated?.runtime).toEqual({ jobSlug: plannerJobSlug(run.runId) });
 
@@ -673,6 +745,108 @@ describe("planner dispatch", () => {
     );
     expect(mocks.destroyPlannerJob).toHaveBeenCalledTimes(1);
     expect(artifactStore.getPlannerRun(run.runId)?.runtime).toBeUndefined();
+  });
+
+  it("retains terminal writer cleanup intent and retries the exact detached runtime", async () => {
+    const plan = createPlan();
+    const writer = artifactStore.startPlanWriter({
+      skills: [],
+      repoId: "repo-1",
+      planArtifactId: plan.id,
+      provider: "codex",
+      model: "gpt-5.5",
+      basisCommit: "main-1",
+      startBodyDigest: "a".repeat(64),
+      launchProvenance: codexWriterApiLaunch("cf"),
+    });
+    artifactStore.setPlanWriterRuntimeIfCurrent(writer.threadId, {
+      jobSlug: planWriterTerminalId("repo-1", plan.id, writer.generation!),
+      generation: writer.generation!,
+    });
+    const completed = artifactStore.updateArtifactStatus({
+      repoId: "repo-1",
+      id: plan.id,
+      status: "completed",
+    });
+    const target = completed.cleanupTargets.find((candidate) => candidate.kind === "writer");
+    expect(target).toBeTruthy();
+    mocks.destroyPlanWriterRuntime
+      .mockRejectedValueOnce(new Error("temporary cleanup failure"))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(cleanupPlanRuntimeTarget(
+      createEnv({ PLANNER_RUN: {} }) as any,
+      artifactStore as any,
+      target!,
+    )).rejects.toThrow("temporary cleanup failure");
+    expect(artifactStore.getPlanWriter("repo-1", plan.id)).toMatchObject({
+      stoppedAt: expect.any(String),
+    });
+    expect(artifactStore.getPlanWriter("repo-1", plan.id)?.runtime).toBeUndefined();
+    expect(artifactStore.listPlanRuntimeCleanupTargetsForRepo("repo-1")).toEqual([target]);
+    expect(mocks.broadcastPlanWriterState).toHaveBeenCalledWith("repo-1", plan.id);
+
+    await cleanupPlanRuntimeTarget(
+      createEnv({ PLANNER_RUN: {} }) as any,
+      artifactStore as any,
+      target!,
+    );
+    expect(artifactStore.getPlanWriter("repo-1", plan.id)?.runtime).toBeUndefined();
+    expect(artifactStore.listPlanRuntimeCleanupTargetsForRepo("repo-1")).toEqual([]);
+    expect(mocks.destroyPlanWriterRuntime).toHaveBeenCalledTimes(2);
+  });
+
+  it("executes and acknowledges an immutable writer cleanup target after plan deletion", async () => {
+    const plan = createPlan();
+    const writer = artifactStore.startPlanWriter({
+      skills: [],
+      repoId: "repo-1",
+      planArtifactId: plan.id,
+      provider: "codex",
+      model: "gpt-5.5",
+      basisCommit: "main-1",
+      startBodyDigest: "a".repeat(64),
+      launchProvenance: codexWriterApiLaunch("cf"),
+    });
+    artifactStore.setPlanWriterRuntimeIfCurrent(writer.threadId, {
+      jobSlug: planWriterTerminalId("repo-1", plan.id, writer.generation!),
+      generation: writer.generation!,
+    });
+    const discarded = artifactStore.discardPlan({
+      repoId: "repo-1",
+      id: plan.id,
+      expectedVersion: plan.version,
+    });
+    const target = discarded.cleanupTargets.find((candidate) => candidate.kind === "writer");
+    expect(target).toBeTruthy();
+    mocks.destroyPlanWriterRuntime
+      .mockRejectedValueOnce(new Error("backend offline"))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(cleanupPlanRuntimeTarget(
+      createEnv({ PLANNER_RUN: {} }) as any,
+      asAsyncStub(artifactStore) as any,
+      target!,
+    )).rejects.toThrow("backend offline");
+    expect(artifactStore.listPlanRuntimeCleanupTargetsForRepo("repo-1")).toEqual([target]);
+
+    await cleanupPlanRuntimeTarget(
+      createEnv({ PLANNER_RUN: {} }) as any,
+      asAsyncStub(artifactStore) as any,
+      target!,
+    );
+
+    expect(mocks.revokePlanWriterTerminal).toHaveBeenCalledWith(
+      expect.stringMatching(new RegExp(`^plan-writer-.+-${writer.generation}$`)),
+      "repo-1",
+      plan.id,
+      writer.generation,
+    );
+    expect(mocks.destroyPlanWriterRuntime).toHaveBeenCalledTimes(2);
+    expect(mocks.destroyPlanWriterRuntime).toHaveBeenLastCalledWith(
+      planWriterTerminalId("repo-1", plan.id, writer.generation!),
+    );
+    expect(artifactStore.listPlanRuntimeCleanupTargetsForRepo("repo-1")).toEqual([]);
   });
 
   it("dispatches a queued run with the pinned GitHub base and planner env contract", async () => {
@@ -705,6 +879,7 @@ describe("planner dispatch", () => {
     expect(options.envVars).toMatchObject({
       TILLER_BOOTSTRAP_MODE: "planner-run",
       TILLER_HARNESS: "codex",
+      RUNNER_BACKEND: "host",
       OPENAI_API_KEY: "test-openai-key",
     });
     expect(options.envVars.TILLER_PLANNER_CALLBACK_BASE).toBe(
@@ -837,6 +1012,140 @@ describe("planner dispatch", () => {
     );
     expect(mocks.startPlannerJob).not.toHaveBeenCalled();
   });
+
+  it("preserves a runtime when dispatch failure races with a result claimed for saving", async () => {
+    const plan = createPlan();
+    const run = artifactStore.createPlannerRun({
+      repoId: "repo-1",
+      planArtifactId: plan.id,
+      role: "reviewer",
+      provider: "codex",
+      model: "gpt-5.5",
+      launchProvenance: codexApiLaunch("host"),
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.requestLocalRunner.mockRejectedValueOnce(new Error("ambiguous runner response"));
+    const asyncStore = asAsyncStub(artifactStore) as any;
+    const racingStore = new Proxy(asyncStore, {
+      get(target, property, receiver) {
+        if (property === "finishActiveReviewerRun") {
+          return async (input: Parameters<typeof artifactStore.finishActiveReviewerRun>[0]) => {
+            expect(artifactStore.claimPlannerRunSaving(run.runId)).toMatchObject({ status: "saving" });
+            return artifactStore.finishActiveReviewerRun(input);
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await dispatchPlannerRun({
+      env: createEnv({ LOCAL_DEV_ONLY_BACKEND: "1" }) as any,
+      requestUrl: "http://hub.test/x",
+      artifactStore: racingStore,
+      run,
+      repo: { repoId: "repo-1", repoUrl: "https://github.com/test/repo", githubFullName: "test/repo", githubBaseCommitSha: "main-1" },
+    });
+
+    expect(artifactStore.getPlannerRun(run.runId)).toMatchObject({
+      status: "saving",
+      runtime: { jobSlug: plannerJobSlug(run.runId) },
+    });
+    expect(mocks.requestLocalRunner.mock.calls.map((call) => call[1])).toEqual(["create"]);
+    expect(artifactStore.listPlannerRunEvents(run.runId)).toEqual([]);
+    consoleError.mockRestore();
+  });
+
+  it("preserves a runtime when dispatch failure cannot read concurrent saving state", async () => {
+    const plan = createPlan();
+    const run = artifactStore.createPlannerRun({
+      repoId: "repo-1",
+      planArtifactId: plan.id,
+      role: "reviewer",
+      provider: "codex",
+      model: "gpt-5.5",
+      launchProvenance: codexApiLaunch("host"),
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.requestLocalRunner.mockRejectedValueOnce(new Error("ambiguous runner response"));
+    const asyncStore = asAsyncStub(artifactStore) as any;
+    const racingStore = new Proxy(asyncStore, {
+      get(target, property, receiver) {
+        if (property === "finishActiveReviewerRun") {
+          return async () => {
+            expect(artifactStore.claimPlannerRunSaving(run.runId)).toMatchObject({ status: "saving" });
+            throw new Error("ArtifactStore response unavailable");
+          };
+        }
+        if (property === "getPlannerRun") {
+          return async () => {
+            throw new Error("ArtifactStore read unavailable");
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await dispatchPlannerRun({
+      env: createEnv({ LOCAL_DEV_ONLY_BACKEND: "1" }) as any,
+      requestUrl: "http://hub.test/x",
+      artifactStore: racingStore,
+      run,
+      repo: { repoId: "repo-1", repoUrl: "https://github.com/test/repo", githubFullName: "test/repo", githubBaseCommitSha: "main-1" },
+    });
+
+    expect(artifactStore.getPlannerRun(run.runId)).toMatchObject({
+      status: "saving",
+      runtime: { jobSlug: plannerJobSlug(run.runId) },
+    });
+    expect(mocks.requestLocalRunner.mock.calls.map((call) => call[1])).toEqual(["create"]);
+    consoleError.mockRestore();
+  });
+
+  it.each(["queued", "running"] as const)(
+    "preserves an active %s runtime after ambiguous failure finalization",
+    async (status) => {
+      const plan = createPlan();
+      const run = artifactStore.createPlannerRun({
+        repoId: "repo-1",
+        planArtifactId: plan.id,
+        role: "reviewer",
+        provider: "codex",
+        model: "gpt-5.5",
+        launchProvenance: codexApiLaunch("host"),
+      });
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      mocks.requestLocalRunner.mockRejectedValueOnce(new Error("ambiguous runner response"));
+      const asyncStore = asAsyncStub(artifactStore) as any;
+      const racingStore = new Proxy(asyncStore, {
+        get(target, property, receiver) {
+          if (property === "finishActiveReviewerRun") {
+            return async () => {
+              if (status === "running") {
+                artifactStore.updateActivePlannerRun({ runId: run.runId, status: "running" });
+              }
+              throw new Error("ArtifactStore response unavailable");
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+
+      await dispatchPlannerRun({
+        env: createEnv({ LOCAL_DEV_ONLY_BACKEND: "1" }) as any,
+        requestUrl: "http://hub.test/x",
+        artifactStore: racingStore,
+        run,
+        repo: { repoId: "repo-1", repoUrl: "https://github.com/test/repo", githubFullName: "test/repo", githubBaseCommitSha: "main-1" },
+      });
+
+      expect(artifactStore.getPlannerRun(run.runId)).toMatchObject({
+        status,
+        runtime: { jobSlug: plannerJobSlug(run.runId) },
+      });
+      expect(mocks.requestLocalRunner.mock.calls.map((call) => call[1])).toEqual(["create"]);
+      consoleError.mockRestore();
+    },
+  );
 
   it("destroys the runner job for terminal runs", async () => {
     const plan = createPlan();

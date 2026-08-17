@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from "react"
 import type { MutableRefObject } from "react";
 import type { StoredSession, StoredPermission, EnvMeta, WsServerMessage } from "../api/types";
 import type { LiveMessage, ReconnectingWebSocket } from "./api";
-import type { TerminalViewHandle } from "./TerminalView";
+import type { TerminalResizeRequest, TerminalViewHandle } from "./TerminalView";
 import TerminalView from "./TerminalView";
 import PermissionBanner from "./PermissionBanner";
 import StatusBar from "./StatusBar";
@@ -12,13 +12,22 @@ import { useVoiceAgent } from "@cloudflare/voice/react";
 import type { UseVoiceAgentReturn } from "@cloudflare/voice/react";
 import { canStopEnvStatus } from "./env-runtime";
 import { TerminalAckTracker } from "./terminal-ack-tracker";
+import type { TerminalAckOperation } from "./terminal-ack-tracker";
 import type { TerminalRecoveryState } from "./terminal-recovery";
 
 const CLI_PROMPT_DISMISS_KEY = "tiller:session-cli-prompt-dismissed";
+const TERMINAL_RESIZE_NOTICE_MS = 4000;
 
 type TerminalAckMessage =
   | Extract<WsServerMessage, { type: "terminal-input-ack" }>
   | Extract<WsServerMessage, { type: "terminal-control-ack" }>;
+
+interface TerminalAlert {
+  message: string;
+  operation?: TerminalAckOperation;
+  source: "stale" | "failure" | "drop" | "detached";
+  tone: "warning" | "error";
+}
 
 interface SessionViewProps {
   session: StoredSession;
@@ -36,6 +45,7 @@ interface SessionViewProps {
   wsSend: MutableRefObject<ReconnectingWebSocket | null>;
   connected: boolean;
   terminalFastLane?: boolean;
+  terminalMetrics?: boolean;
   updateLastSeq: (sessionId: string, seq: number) => void;
   permissions?: StoredPermission[];
   onPermissionResolved: (permId: string) => void;
@@ -59,11 +69,12 @@ export default function SessionView({
   wsSend,
   connected,
   terminalFastLane = false,
+  terminalMetrics = false,
   updateLastSeq,
   permissions = [],
   onPermissionResolved,
 }: SessionViewProps) {
-  const [sendError, setSendError] = useState<string | null>(null);
+  const [terminalAlert, setTerminalAlert] = useState<TerminalAlert | null>(null);
   const [terminalRecoveryState, setTerminalRecoveryState] = useState<TerminalRecoveryState>({ status: "recovering" });
   const [terminalDetached, setTerminalDetached] = useState(false);
   const [cliPromptDismissed, setCliPromptDismissed] = useState(() => {
@@ -91,12 +102,18 @@ export default function SessionView({
   }>());
   if (!ackTrackerRef.current) {
     ackTrackerRef.current = new TerminalAckTracker({
-      onStaleWarning: (message) =>
-        setSendError(message),
+      onStaleWarning: ({ message, operation }) =>
+        setTerminalAlert((current) => current?.tone === "error"
+          ? current
+          : { message, operation, source: "stale", tone: "warning" }),
+      onRecovered: () =>
+        setTerminalAlert((current) => current?.source === "stale" ? null : current),
       onFailure: (message) =>
-        setSendError(message),
+        setTerminalAlert({ message, source: "failure", tone: "error" }),
       onDrop: (message) =>
-        setSendError(message),
+        setTerminalAlert((current) => current?.tone === "error"
+          ? current
+          : { message, source: "drop", tone: "warning" }),
     });
   }
 
@@ -375,10 +392,30 @@ export default function SessionView({
     if (connected) termRef.current?.recover();
   }, [connected]);
 
-  // Clear send error when connection restores
   useEffect(() => {
-    if (connected) setSendError(null);
+    if (!connected || !terminalFastLane || terminalDetached) return;
+    wsSend.current?.send({
+      type: "reconnect",
+      sessionId: session.id,
+      lastSeq: 0,
+      revive: false,
+      replay: false,
+    });
+  }, [connected, session.id, terminalDetached, terminalFastLane, wsSend]);
+
+  // Clear terminal alerts when the connection restores.
+  useEffect(() => {
+    if (connected) setTerminalAlert(null);
   }, [connected]);
+
+  useEffect(() => {
+    if (terminalAlert?.source !== "stale" || terminalAlert.operation !== "resize") return;
+    const displayedAlert = terminalAlert;
+    const timer = setTimeout(() => {
+      setTerminalAlert((current) => current === displayedAlert ? null : current);
+    }, TERMINAL_RESIZE_NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [terminalAlert]);
 
   const clearPendingAcks = useCallback(() => {
     ackTrackerRef.current?.clear();
@@ -394,6 +431,7 @@ export default function SessionView({
     inputSeqRef.current = 0;
     controlSeqRef.current = 0;
     clearPendingAcks();
+    setTerminalAlert(null);
     setTerminalDetached(false);
     terminalRecoveryStateRef.current = { status: "recovering" };
     setTerminalRecoveryState({ status: "recovering" });
@@ -425,11 +463,15 @@ export default function SessionView({
     ackTrackerRef.current?.trackInput(inputSeq);
   }, []);
 
-  const trackControlAck = useCallback((controlSeq: number) => {
-    ackTrackerRef.current?.trackControl(controlSeq);
+  const trackControlAck = useCallback((
+    controlSeq: number,
+    action: "resize" | "abort",
+  ) => {
+    ackTrackerRef.current?.trackControl(controlSeq, action);
   }, []);
 
   const clearInputAck = useCallback((inputSeq: number, error?: string) => {
+    termRef.current?.markInputAcknowledged?.(inputSeq, !error);
     ackTrackerRef.current?.handleInputAck(inputSeq, error);
   }, []);
 
@@ -507,6 +549,7 @@ export default function SessionView({
         warnSendFailed("terminal input");
         return false;
       }
+      termRef.current?.markInputEnqueued?.(inputSeq);
       trackInputAck(inputSeq);
       return true;
     } catch (err) {
@@ -516,9 +559,11 @@ export default function SessionView({
     }
   }, [session.id, terminalDetached, terminalFastLane, trackInputAck, warnSendFailed, wsSend]);
 
-  const sendTextToHarness = useCallback(async (text: string): Promise<{ ok: boolean; error?: string }> => {
+  const sendTextToHarness = useCallback(async (
+    text: string,
+    deliveryId?: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
     if (
-      terminalRecoveryStateRef.current.status !== "ready" ||
       terminalDetached ||
       !terminalFastLane ||
       !connected ||
@@ -546,6 +591,7 @@ export default function SessionView({
           clientId: clientIdRef.current,
           inputSeq,
           data,
+          ...(deliveryId ? { deliveryId } : {}),
           ...(lastTerminalSizeRef.current ?? {}),
         });
         if (!sent) {
@@ -555,6 +601,7 @@ export default function SessionView({
           resolve({ ok: false, error: "Terminal send failed" });
           return;
         }
+        termRef.current?.markInputEnqueued?.(inputSeq);
         trackInputAck(inputSeq);
       } catch (error) {
         clearTimeout(timer);
@@ -569,6 +616,7 @@ export default function SessionView({
   const sendTerminalControl = useCallback((
     action: "resize" | "abort",
     size?: { cols: number; rows: number },
+    request?: TerminalResizeRequest,
   ): boolean => {
     if (!terminalFastLane || !wsSend.current?.send) {
       // Dropped resizes self-heal on reconnect (the terminal re-fits and
@@ -586,12 +634,13 @@ export default function SessionView({
         controlSeq,
         action,
         ...(size ? { cols: size.cols, rows: size.rows } : {}),
+        ...(request?.claim !== undefined ? { claim: request.claim } : {}),
       });
       if (!sent) {
         if (action === "abort") warnSendFailed("abort");
         return false;
       }
-      trackControlAck(controlSeq);
+      trackControlAck(controlSeq, action);
       return true;
     } catch (err) {
       console.error("Send terminal control failed:", err);
@@ -600,9 +649,13 @@ export default function SessionView({
     }
   }, [session.id, terminalFastLane, trackControlAck, warnSendFailed, wsSend]);
 
-  const sendTerminalResize = useCallback((cols: number, rows: number) => {
+  const sendTerminalResize = useCallback((
+    cols: number,
+    rows: number,
+    request?: TerminalResizeRequest,
+  ) => {
     lastTerminalSizeRef.current = { cols, rows };
-    sendTerminalControl("resize", { cols, rows });
+    sendTerminalControl("resize", { cols, rows }, request);
   }, [sendTerminalControl]);
 
   const handleTerminalDetach = useCallback(() => {
@@ -612,7 +665,11 @@ export default function SessionView({
       clientId: clientIdRef.current,
     });
     setTerminalDetached(true);
-    setSendError("Terminal detached. Switch sessions or reload to reattach.");
+    setTerminalAlert({
+      message: "Terminal detached. Switch sessions or reload to reattach.",
+      source: "detached",
+      tone: "error",
+    });
   }, [session.id, wsSend]);
 
   const handleTerminalRecoveryState = useCallback((state: TerminalRecoveryState) => {
@@ -632,8 +689,14 @@ export default function SessionView({
   const pendingPermissions = permissions.filter((p) => p.status === "pending");
   const displayName = session.tag;
   const showSessionDetails = !env;
+  const showStatusBar = !(
+    env
+    && connected
+    && active
+    && pendingPermissions.length === 0
+  );
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div className={`flex min-h-0 flex-1 flex-col overflow-hidden ${env ? "tiller-implementation-session" : ""}`}>
       {showSessionDetails && (
         <div className="px-4 py-2.5 border-b border-kumo-line flex items-center justify-between bg-kumo-recessed">
           <div className="flex items-center gap-3">
@@ -655,7 +718,18 @@ export default function SessionView({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {!VOICE_DISABLED && !voiceActive && (
+            {VOICE_DISABLED ? (
+              <button
+                type="button"
+                disabled
+                aria-label="Voice unavailable"
+                title="Voice sessions are not available"
+                className="flex cursor-not-allowed items-center gap-1 rounded border border-kumo-line bg-kumo-base px-2.5 py-1 text-xs text-kumo-subtle opacity-55"
+              >
+                <MicIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                Voice unavailable
+              </button>
+            ) : !voiceActive && (
               <button
                 onClick={handleStartVoice}
                 className="text-xs px-2.5 py-1 rounded border border-kumo-line bg-kumo-base hover:bg-kumo-tint text-kumo-subtle transition-colors flex items-center gap-1"
@@ -681,17 +755,33 @@ export default function SessionView({
             ref={termRef}
             session={session}
             hubUrl={hubUrl}
+            surface={env ? "implementation" : "default"}
+            fontSize={env ? 14 : undefined}
             updateLastSeq={updateLastSeq}
-            interactive={active && connected && terminalRecoveryState.status === "ready" && !terminalDetached}
+            interactive={
+              active &&
+              connected &&
+              terminalFastLane === true &&
+              terminalRecoveryState.status === "ready" &&
+              !terminalDetached
+            }
             onInput={sendRawKey}
             onResize={sendTerminalResize}
             onRecoveryState={handleTerminalRecoveryState}
             onDetach={handleTerminalDetach}
             onDurableMessageComplete={handleDurableMessageComplete}
+            metricsEnabled={terminalMetrics}
           />
-          {sendError && (
-            <div className="absolute right-3 top-3 z-40 max-w-md rounded border border-kumo-danger/40 bg-kumo-elevated px-3 py-2 text-xs text-kumo-danger shadow-sm">
-              {sendError}
+          {terminalAlert && (
+            <div
+              role={terminalAlert.tone === "error" ? "alert" : "status"}
+              className={`absolute right-3 top-3 z-40 max-w-md rounded border bg-kumo-elevated px-3 py-2 text-xs shadow-sm ${
+                terminalAlert.tone === "error"
+                  ? "border-kumo-danger/40 text-kumo-danger"
+                  : "border-kumo-warning/40 text-kumo-warning"
+              }`}
+            >
+              {terminalAlert.message}
             </div>
           )}
           {pendingPermissions.length > 0 && (
@@ -756,9 +846,9 @@ export default function SessionView({
             sessionId={session.id}
             hubUrl={hubUrl}
             harnessInputReady={
+              active &&
               connected &&
               terminalFastLane &&
-              terminalRecoveryState.status === "ready" &&
               !terminalDetached
             }
             onSendToHarness={sendTextToHarness}
@@ -768,11 +858,11 @@ export default function SessionView({
       </div>
 
       {/* Status bar */}
-      <StatusBar
+      {showStatusBar && <StatusBar
         connected={connected}
         sessionActive={active}
         pendingPermissions={pendingPermissions.length}
-      />
+      />}
 
     </div>
   );

@@ -38,6 +38,10 @@ const { default: envReviewRuntimeRoutes } = await import("../runtime-routes");
 
 function createApp() {
   const app = new Hono<HonoEnv>();
+  app.use("*", async (c, next) => {
+    c.set("authorization", { kind: "specialized" });
+    return next();
+  });
   app.route("/", envReviewRuntimeRoutes);
   return app;
 }
@@ -266,6 +270,7 @@ describe("env review runtime context", () => {
       model: "sonnet",
       effort: "max",
       roleLabel: "Bug Reviewer",
+      skillRunRole: "report_initial",
       status: "queued",
       prompt: "Review this workspace.",
       preparation: {
@@ -295,11 +300,86 @@ describe("env review runtime context", () => {
         provider: "claude-code",
         model: "sonnet",
         effort: "max",
+        requiresRepositoryInspection: true,
       },
       workspace: {
         githubDeletedPaths: ["src/old.ts"],
       },
     });
+  });
+
+  it("exempts synthesis-only Overview runs from repository inspection", async () => {
+    const run = currentRun({
+      runId: "run-overview",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      threadId: "thread-1",
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "high",
+      roleLabel: "Code Review Overview",
+      skillRunRole: "overview",
+      status: "queued",
+      prompt: "Synthesize only the frozen child reports.",
+      preparation: {
+        status: "succeeded",
+        snapshot: {
+          snapshotId: "snapshot-1",
+          githubDeletedPaths: [],
+        },
+      },
+    });
+    mocks.getEnvReviewStub.mockReturnValue({
+      getRun: vi.fn(async () => run),
+    });
+
+    const response = await createApp().request(
+      "https://hub.test/api/env-review-runtime/envs/env-1/runs/run-overview/context",
+      { headers: { "X-Tiller-Env-Review-Run-Token": "run-token" } },
+      {} as any,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      run: { requiresRepositoryInspection: false },
+    });
+  });
+
+  it("serves the complete frozen change material for reviewer inspection", async () => {
+    const run = currentRun({
+      runId: "run-inspection",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      threadId: "thread-1",
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "high",
+      roleLabel: "Bug Reviewer",
+      status: "queued",
+      prompt: "Review this workspace.",
+      preparation: {
+        status: "succeeded",
+        snapshot: {
+          snapshotId: "snapshot-1",
+          githubDeletedPaths: [],
+        },
+      },
+    });
+    mocks.getEnvReviewStub.mockReturnValue({
+      getRun: vi.fn(async () => run),
+    });
+    const get = vi.fn(async () => ({ body: new Uint8Array([1, 2, 3]) }));
+
+    const response = await createApp().request(
+      "https://hub.test/api/env-review-runtime/envs/env-1/runs/run-inspection/inspection.tar",
+      { headers: { "X-Tiller-Env-Review-Run-Token": "run-token" } },
+      { BUCKET: { get } } as any,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("application/x-tar");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
+    expect(get).toHaveBeenCalledWith("envs/env-1/review-snapshots/snapshot-1.inspection.tar");
   });
 
   it("rejects legacy provider events without recording contact", async () => {
@@ -424,7 +504,7 @@ describe("env review runtime context", () => {
     expect(appendRunEvent).not.toHaveBeenCalled();
   });
 
-  it("records current startup and model activity events", async () => {
+  it("records current startup, model activity, and commentary events", async () => {
     const queuedRun = currentRun({
       runId: "run-events",
       envSlug: "env-1",
@@ -459,6 +539,7 @@ describe("env review runtime context", () => {
           events: [
             { type: "runtime_startup", message: "provider controlled" },
             { type: "model_activity", message: "Read: packages/hub/src/EnvReviewPanel.tsx" },
+            { type: "model_commentary", message: "I’m checking how the panel consumes events." },
           ],
         }),
       },
@@ -478,6 +559,11 @@ describe("env review runtime context", () => {
       runId: "run-events",
       type: "model_activity",
       message: "Read: packages/hub/src/EnvReviewPanel.tsx",
+    });
+    expect(appendRunEvent).toHaveBeenNthCalledWith(3, {
+      runId: "run-events",
+      type: "model_commentary",
+      message: "I’m checking how the panel consumes events.",
     });
   });
 
@@ -550,12 +636,14 @@ describe("env review runtime context", () => {
       taskKind: "correctness",
       status: "ready",
       skillInvocationId: "invocation-1",
-      skillRunRole: "child_initial",
+      skillRunRole: "report_initial",
       runtime: null,
     });
     const getSkillInvocation = vi.fn(async () => ({
       invocationId: "invocation-1",
-      status: "completed",
+      status: "active",
+      overviewMode: "manual",
+      definitionSnapshot: { agents: [{ id: "one" }, { id: "two" }] },
       overviewRunId: null,
     }));
     mocks.getEnvReviewStub.mockReturnValue({

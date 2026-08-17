@@ -54,3 +54,8 @@ export function groupPlansByStatus(artifacts: Artifact[]): Record<PlanStatus, Pl
   }
   return grouped;
 }
+
+export function getPlanDisplayVersion(plan: PlanArtifact): number {
+  if (!renderArtifactBodyMarkdown(plan.body).trim()) return 0;
+  return Math.max(1, (plan.version ?? 1) - 1);
+}

@@ -3,13 +3,22 @@ import {
   type ArtifactStoreDO,
   type PlanArtifact,
   type PlannerRun,
+  type PlannerRunRuntimeProvenance,
   type ThreadDO,
+  type FinishActiveReviewerRunResult,
+  type PlanHealthSkillResult,
+  type ReviewerTerminalOutput,
 } from "../coordination";
 import { REVIEWER_RUNTIME_STARTUP_MESSAGE } from "../reviewer-runtime-events";
+import { PLAN_HEALTH_TRANSPORT_INSTRUCTION } from "./plan-health";
 
 // Statuses that hold the one-active-run slot for a one-shot reviewer run.
 export function isActiveRun(run: PlannerRun): boolean {
-  return run.status === "queued" || run.status === "running" || run.status === "saving";
+  return (
+    run.status === "queued" ||
+    run.status === "running" ||
+    run.status === "saving"
+  );
 }
 
 export interface ExecuteReviewerRunOptions {
@@ -32,7 +41,11 @@ function summarizeError(error: unknown): string {
 }
 
 function ensurePlan(value: unknown): PlanArtifact {
-  if (!value || typeof value !== "object" || (value as { type?: string }).type !== "plan") {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    (value as { type?: string }).type !== "plan"
+  ) {
     throw new Error("Plan artifact not found");
   }
   return value as PlanArtifact;
@@ -53,14 +66,29 @@ function planAtRunBasis(plan: PlanArtifact, run: PlannerRun): PlanArtifact {
 const PROVIDER_ADAPTERS: Record<string, PlannerProviderAdapter> = {
   fake: {
     runReviewer: ({ plan, skill, skillInstructions, instruction }) =>
-      buildFakeReviewText(plan, skill, skillInstructions, instruction),
+      skillInstructions.includes(PLAN_HEALTH_TRANSPORT_INSTRUCTION)
+        ? JSON.stringify({
+            risk: {
+              level: "medium",
+              summary:
+                "The plan coordinates multiple components and requires careful rollout, but it retains a feasible rollback path.",
+            },
+            changeSize: {
+              size: "medium",
+              summary:
+                "The work spans several coordinated components but remains one coherent phase.",
+            },
+          })
+        : buildFakeReviewText(plan, skill, skillInstructions, instruction),
   },
 };
 
 function getProviderAdapter(provider: string): PlannerProviderAdapter {
   const adapter = PROVIDER_ADAPTERS[provider];
   if (!adapter) {
-    throw new Error(`One-shot reviewer provider is not executable in-process: ${provider}`);
+    throw new Error(
+      `One-shot reviewer provider is not executable in-process: ${provider}`,
+    );
   }
   return adapter;
 }
@@ -82,46 +110,58 @@ async function appendRunEvent(
   });
 }
 
-export async function executeReviewerRun(options: ExecuteReviewerRunOptions): Promise<PlannerRun> {
+export async function executeReviewerRun(
+  options: ExecuteReviewerRunOptions,
+): Promise<PlannerRun> {
   const { artifactStore, thread, run } = options;
+  let plan: PlanArtifact;
+  let text: string;
+  if (run.role !== "reviewer") {
+    throw new Error("Only reviewer runs may use one-shot execution.");
+  }
+  const claimed = await artifactStore.claimQueuedPlannerRunForInProcess(
+    run.runId,
+  );
+  if (!claimed) {
+    return (await artifactStore.getPlannerRun(run.runId)) ?? run;
+  }
   try {
-    if (run.role !== "reviewer") {
-      throw new Error("Only reviewer runs may use one-shot execution.");
-    }
-    const runningRun = await artifactStore.updateActivePlannerRun({ runId: run.runId, status: "running" });
-    if (runningRun.status === "cancelled") return runningRun;
-    await appendRunEvent(artifactStore, run, "runtime_startup", REVIEWER_RUNTIME_STARTUP_MESSAGE);
-    const adapter = getProviderAdapter(run.provider);
-    const plan = planAtRunBasis(ensurePlan(await artifactStore.getArtifact(run.planArtifactId)), run);
-    const text = await adapter.runReviewer({
+    await appendRunEvent(
+      artifactStore,
+      claimed,
+      "runtime_startup",
+      REVIEWER_RUNTIME_STARTUP_MESSAGE,
+    );
+    const adapter = getProviderAdapter(claimed.provider);
+    plan = planAtRunBasis(
+      ensurePlan(await artifactStore.getArtifact(claimed.planArtifactId)),
+      claimed,
+    );
+    text = await adapter.runReviewer({
       plan,
-      skill: run.skill ?? "plan-review",
-      skillInstructions: run.input?.skillSnapshot?.instructions ?? "",
-      instruction: run.input?.instruction ?? null,
-    });
-    await appendThreadMessage(thread, "assistant", text, [plan.id], {
-      runId: run.runId,
-      planVersion: run.input?.sourcePlanVersion,
-    });
-    await appendRunEvent(artifactStore, run, "contribution_candidate", "Reviewer feedback is ready to send to the writer.", {
-      text,
-    });
-    await appendRunEvent(artifactStore, run, "run_completed", "Reviewer run completed.");
-    return await artifactStore.updateActivePlannerRun({
-      runId: run.runId,
-      status: "completed",
-      completedAt: new Date().toISOString(),
+      skill: claimed.skill ?? "plan-review",
+      skillInstructions: claimed.input?.skillSnapshot?.instructions ?? "",
+      instruction: claimed.input?.instruction ?? null,
     });
   } catch (error) {
     const message = summarizeError(error);
-    await appendRunEvent(artifactStore, run, "run_failed", message).catch(() => undefined);
-    return await artifactStore.updateActivePlannerRun({
-      runId: run.runId,
-      status: "failed",
-      completedAt: new Date().toISOString(),
-      error: message,
+    const finished = await completeReviewerOutput({
+      artifactStore,
+      thread,
+      run: claimed,
+      output: { status: "failed", error: message },
     });
+    return finished.run;
   }
+  // From saving onward, completion is a resumable commit protocol. A failure
+  // here must never be reclassified as a provider failure.
+  const finished = await completeReviewerOutput({
+    artifactStore,
+    thread,
+    run: claimed,
+    output: { status: "succeeded", text },
+  });
+  return finished.run;
 }
 
 function buildFakeReviewText(
@@ -134,7 +174,9 @@ function buildFakeReviewText(
   return [
     `Fake ${skill} feedback`,
     "",
-    ...(instruction?.trim() ? ["Reviewer instruction:", instruction.trim(), ""] : []),
+    ...(instruction?.trim()
+      ? ["Reviewer instruction:", instruction.trim(), ""]
+      : []),
     skillInstructions,
     "",
     markdown
@@ -160,8 +202,153 @@ export async function appendThreadMessage(
       role,
       text,
       ...(options.runId ? { runId: options.runId } : {}),
-      ...(typeof options.planVersion === "number" ? { planVersion: options.planVersion } : {}),
+      ...(typeof options.planVersion === "number"
+        ? { planVersion: options.planVersion }
+        : {}),
     },
     ...(artifactIds.length > 0 ? { artifactIds } : {}),
+  });
+}
+
+export async function completeActiveReviewerRun(options: {
+  artifactStore: ArtifactStoreDO;
+  thread: ThreadDO;
+  run: PlannerRun;
+  text: string;
+}): Promise<FinishActiveReviewerRunResult> {
+  const { artifactStore, thread, run, text } = options;
+  const saving = await artifactStore.claimPlannerRunSaving(run.runId);
+  if (!saving) {
+    return {
+      run: (await artifactStore.getPlannerRun(run.runId)) ?? run,
+      finalized: false,
+    };
+  }
+  await appendThreadMessage(thread, "assistant", text, [run.planArtifactId], {
+    id: `reviewer-result:${run.runId}`,
+    runId: run.runId,
+    planVersion: run.input?.sourcePlanVersion,
+  });
+  return await artifactStore.finishActiveReviewerRun({
+    runId: run.runId,
+    repoId: run.repoId,
+    planArtifactId: run.planArtifactId,
+    status: "completed",
+    completedAt: new Date().toISOString(),
+    error: null,
+    events: [
+      {
+        type: "contribution_candidate",
+        message: "Reviewer feedback is ready to send to the writer.",
+        data: { text },
+      },
+      { type: "run_completed", message: "Reviewer run completed." },
+    ],
+  });
+}
+
+export interface CompleteReviewerOutputResult extends FinishActiveReviewerRunResult {
+  structured: boolean;
+  result?: PlanHealthSkillResult;
+  error?: string;
+}
+
+export async function completeReviewerOutput(options: {
+  artifactStore: ArtifactStoreDO;
+  thread?: ThreadDO | null;
+  run: PlannerRun;
+  output: ReviewerTerminalOutput;
+  expectedRuntime?: PlannerRunRuntimeProvenance | null;
+  staleActiveCutoff?: string;
+}): Promise<CompleteReviewerOutputResult> {
+  const structured =
+    await options.artifactStore.completePlanHealthReviewerOutput(
+      options.run.runId,
+      options.output,
+      {
+        expectedRuntime: options.expectedRuntime,
+        staleActiveCutoff: options.staleActiveCutoff,
+      },
+    );
+  if (structured.handled) {
+    return {
+      run: structured.run,
+      finalized: structured.finalized,
+      structured: true,
+      ...(structured.result ? { result: structured.result } : {}),
+      ...(structured.error ? { error: structured.error } : {}),
+    };
+  }
+  if (options.output.status === "failed") {
+    const failed = options.staleActiveCutoff
+      ? await finalizeStaleReviewerRunFailure(
+          options.artifactStore,
+          options.run,
+          options.output.error,
+          options.staleActiveCutoff,
+        )
+      : await finalizeReviewerRunFailure(
+          options.artifactStore,
+          options.run,
+          options.output.error,
+          { expectedRuntime: options.expectedRuntime },
+        );
+    return { ...failed, structured: false };
+  }
+  const text = options.output.text.trim();
+  if (!text || !options.thread) {
+    const failed = await finalizeReviewerRunFailure(
+      options.artifactStore,
+      options.run,
+      !text
+        ? "Reviewer returned no feedback text."
+        : "Reviewer run has no thread.",
+    );
+    return { ...failed, structured: false };
+  }
+  const completed = await completeActiveReviewerRun({
+    artifactStore: options.artifactStore,
+    thread: options.thread,
+    run: options.run,
+    text,
+  });
+  return { ...completed, structured: false };
+}
+
+export async function finalizeReviewerRunFailure(
+  artifactStore: ArtifactStoreDO,
+  run: PlannerRun,
+  error: string,
+  options: { expectedRuntime?: PlannerRunRuntimeProvenance | null } = {},
+): Promise<FinishActiveReviewerRunResult> {
+  return await artifactStore.finishActiveReviewerRun({
+    runId: run.runId,
+    repoId: run.repoId,
+    planArtifactId: run.planArtifactId,
+    status: "failed",
+    completedAt: new Date().toISOString(),
+    error,
+    ...(options.expectedRuntime === undefined
+      ? {}
+      : { expectedRuntime: options.expectedRuntime }),
+    events: [{ type: "run_failed", message: error }],
+  });
+}
+
+export async function finalizeStaleReviewerRunFailure(
+  artifactStore: ArtifactStoreDO,
+  run: PlannerRun,
+  error: string,
+  staleActiveCutoff: string,
+): Promise<FinishActiveReviewerRunResult> {
+  return await artifactStore.finishActiveReviewerRun({
+    runId: run.runId,
+    repoId: run.repoId,
+    planArtifactId: run.planArtifactId,
+    status: "failed",
+    completedAt: new Date().toISOString(),
+    error,
+    staleActiveCutoff,
+    events: [{ type: "run_failed", message: error }],
   });
 }

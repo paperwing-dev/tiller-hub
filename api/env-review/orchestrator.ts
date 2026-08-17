@@ -1,4 +1,3 @@
-import { isLifecycleStopInProgress } from "../env-lifecycle";
 import { loadEnvView } from "../env/view";
 import { getThreadStub, getWorkspaceStub } from "../helpers";
 import type { HubDO } from "../hub";
@@ -7,7 +6,13 @@ import type { PlannerRunRuntimeProvenance } from "../coordination";
 import { REVIEWER_RUNTIME_STARTUP_MESSAGE } from "../reviewer-runtime-events";
 import { loadRepo } from "../repo/access";
 import type { Env } from "../types";
-import { buildEnvReviewChangeContext, buildEnvReviewPrompt, readEnvReviewPlanBasis } from "./context";
+import {
+  buildEnvReviewChangeContext,
+  buildEnvReviewInspectionBundle,
+  buildEnvReviewPrompt,
+  normalizeEnvReviewPlanBasis,
+  readEnvReviewPlanBasis,
+} from "./context";
 import {
   cleanupEnvReviewRunRuntime,
   destroyEnvReviewRuntimeJob,
@@ -18,7 +23,9 @@ import type { EnvReviewDO } from "./env-review-do";
 import {
   ENV_REVIEW_SNAPSHOT_EXCLUDE_PREFIXES,
   ENV_REVIEW_SNAPSHOT_FORMAT_VERSION,
+  ENV_REVIEW_INSPECTION_CONTENT_TYPE,
   ENV_REVIEW_SNAPSHOT_MAX_BYTES,
+  buildReviewInspectionKey,
   buildReviewSnapshotTarFromWorkspace,
   normalizeReviewSnapshotDeletedPaths,
   r2ObjectToBytes,
@@ -36,6 +43,11 @@ import type {
 } from "./types";
 import { assignSkillOverview, finalizeSuccessfulReviewOutput } from "./skill-orchestration";
 import { getDurableObjectStub } from "../durable-object";
+import {
+  buildThreadMessageHistory,
+  ENV_REVIEW_THREAD_CONTEXT_MESSAGE_LIMIT,
+  listAllThreadMessages,
+} from "../planner/context-window";
 
 const ACTIVE_SYNC_TIMEOUT_MS = 130_000;
 
@@ -144,7 +156,8 @@ function savedSnapshotBlocked(meta: {
   scmOperationType?: string | null;
   githubPublishStatus?: string | null;
 }): string | null {
-  if (isLifecycleStopInProgress(meta)) {
+  const phase = meta.lifecyclePhase ?? meta.status ?? null;
+  if (phase === "saving" || phase === "stopping") {
     return "Workspace persistence is active. Retry review after the environment finishes saving.";
   }
   if (meta.scmOperationType) {
@@ -181,12 +194,13 @@ async function createSavedWorkspaceSnapshot(
     };
     const mode = snapshotModeForMeta(meta);
     const baseCommitSha = mode === "github-overlay" ? meta.githubBaseCommitSha?.trim() || null : null;
-    if (mode === "github-overlay" && !workspace.readGitHubDeletedWorkspacePaths) {
+    const readDeletedPaths = workspace.readGitHubDeletedWorkspacePaths?.bind(workspace);
+    if (mode === "github-overlay" && !readDeletedPaths) {
       throw new Error("GitHub deletion metadata is unavailable for saved review snapshot.");
     }
     const githubDeletedPaths = normalizeReviewSnapshotDeletedPaths(
       mode === "github-overlay"
-        ? await workspace.readGitHubDeletedWorkspacePaths()
+        ? await readDeletedPaths!()
         : [],
     );
     const tarBytes = await buildReviewSnapshotTarFromWorkspace(workspace, {
@@ -325,10 +339,8 @@ async function loadSnapshotWorkspaceSource(env: Env, preparation: EnvReviewPrepa
   return source;
 }
 
-function priorMessagesFromThread(messages: Array<{ senderSessionId: string; body: unknown }>) {
-  return messages
-    .slice()
-    .reverse()
+function priorMessagesFromThread(messages: Array<{ senderSessionId: string; body: unknown }>, truncated: boolean) {
+  const prior = messages
     .map((message) => {
       const body = message.body as { role?: unknown; text?: unknown } | undefined;
       return {
@@ -336,6 +348,19 @@ function priorMessagesFromThread(messages: Array<{ senderSessionId: string; body
         text: typeof body?.text === "string" ? body.text : JSON.stringify(message.body),
       };
     });
+  if (truncated) {
+    prior.unshift({ role: "system", text: "[Earlier eligible reviewer messages were omitted by the context window.]" });
+  }
+  return prior;
+}
+
+function currentInstructionForRun(run: EnvReviewRun): string | undefined {
+  const instruction = run.customTask?.trim();
+  if (!instruction || !run.skillInvocationId) return undefined;
+  const configuredInstruction = run.skillDefinitionSnapshot?.agents
+    .find((agent) => agent.id === run.skillAgentId)
+    ?.instructions.trim();
+  return instruction === configuredInstruction ? undefined : instruction;
 }
 
 async function queueRunIfNeeded(args: {
@@ -344,26 +369,29 @@ async function queueRunIfNeeded(args: {
   run: EnvReviewRun;
   preparation: EnvReviewPreparationResult;
   changeContext: EnvReviewChangeContext;
-  planBasis: Awaited<ReturnType<typeof readEnvReviewPlanBasis>>;
+  planBasis: Awaited<ReturnType<typeof readEnvReviewPlanBasis>> | null;
 }): Promise<EnvReviewRun | null> {
   if (args.run.status === "queued" && args.run.prompt) return args.run;
   if (args.run.status !== "preparing" && args.run.status !== "queued") return null;
 
-  const threadMessages = await getThreadStub(args.env, args.run.threadId).listMessages({ limit: 12 });
+  const threadMessages = await listAllThreadMessages(getThreadStub(args.env, args.run.threadId));
+  const history = buildThreadMessageHistory(threadMessages, args.run.runId, {
+    messageLimit: ENV_REVIEW_THREAD_CONTEXT_MESSAGE_LIMIT,
+  });
   const prompt = buildEnvReviewPrompt({
     run: args.run,
-    preparation: args.preparation,
     changeContext: args.changeContext,
-    planBasis: args.planBasis,
+    planBasis: normalizeEnvReviewPlanBasis(args.planBasis),
     recipeInstructions: args.run.recipeInstructions ?? undefined,
-    priorMessages: priorMessagesFromThread(threadMessages),
+    currentInstruction: currentInstructionForRun(args.run),
+    priorMessages: priorMessagesFromThread(history.messages, history.truncated),
   });
   const queued = await args.review.updateRun({
     runId: args.run.runId,
     status: "queued",
     preparation: args.preparation,
     changeContext: args.changeContext,
-    planBasis: args.planBasis,
+    planBasis: normalizeEnvReviewPlanBasis(args.planBasis),
     prompt,
     queuedAt: args.run.queuedAt ?? nowIso(),
     error: null,
@@ -443,7 +471,7 @@ async function processDispatchablePreparation(
   for (const run of operationRuns) {
     if (
       run.skillInvocationId
-      && run.skillRunRole === "child_initial"
+      && (run.skillRunRole === "root_initial" || run.skillRunRole === "report_initial")
       && run.preparation
       && run.changeContext
       && !pinnedInitialContext.has(run.skillInvocationId)
@@ -459,7 +487,7 @@ async function processDispatchablePreparation(
     (run.status === "preparing" || run.status === "queued")
       && !run.prompt
       && !(run.skillInvocationId
-        && run.skillRunRole === "child_initial"
+        && (run.skillRunRole === "root_initial" || run.skillRunRole === "report_initial")
         && pinnedInitialContext.has(run.skillInvocationId))
   );
   let changeContext: EnvReviewChangeContext | null = null;
@@ -467,21 +495,49 @@ async function processDispatchablePreparation(
   if (requiresFreshContext) {
     try {
       const snapshotWorkspace = await loadSnapshotWorkspaceSource(env, preparation);
-      [changeContext, planBasis] = await Promise.all([
-        buildEnvReviewChangeContext({
+      const changeContextPromise = buildEnvReviewChangeContext({
+        env,
+        repo: loadedRepo.repo,
+        meta,
+        envWorkspace: snapshotWorkspace,
+        githubBaseCommitSha: preparation.snapshot.baseCommitSha,
+        allowGitHubBaseFallback: false,
+      });
+      const inspectionBundlePromise = changeContextPromise.then((nextChangeContext) => (
+        buildEnvReviewInspectionBundle({
           env,
           repo: loadedRepo.repo,
           meta,
           envWorkspace: snapshotWorkspace,
           githubBaseCommitSha: preparation.snapshot.baseCommitSha,
           allowGitHubBaseFallback: false,
-        }),
+          changeContext: nextChangeContext,
+        })
+      ));
+      const [nextChangeContext, nextPlanBasis, inspectionBundle] = await Promise.all([
+        changeContextPromise,
         readEnvReviewPlanBasis({
           env,
           repo: loadedRepo.repo,
           planArtifactId: meta.startupPlanId,
         }),
+        inspectionBundlePromise,
       ]);
+      changeContext = nextChangeContext;
+      planBasis = nextPlanBasis;
+      await env.BUCKET.put(
+        buildReviewInspectionKey(meta.slug, preparation.snapshot.snapshotId),
+        inspectionBundle.tarBytes,
+        {
+          httpMetadata: { contentType: ENV_REVIEW_INSPECTION_CONTENT_TYPE },
+          customMetadata: {
+            envSlug: meta.slug,
+            snapshotId: preparation.snapshot.snapshotId,
+            snapshotHash: preparation.snapshot.snapshotHash,
+            formatVersion: String(inspectionBundle.manifest.formatVersion),
+          },
+        },
+      );
     } catch (error) {
       await failRunsForPreparation(
         review,
@@ -513,11 +569,14 @@ async function processDispatchablePreparation(
         // retried here without rebuilding a prompt.
         queued = run;
       } else {
-        const siblingContext = run.skillInvocationId && run.skillRunRole === "child_initial"
+        const siblingContext = run.skillInvocationId
+          && (run.skillRunRole === "root_initial" || run.skillRunRole === "report_initial")
           ? pinnedInitialContext.get(run.skillInvocationId) ?? null
           : null;
         const frozenChangeContext = run.changeContext ?? siblingContext?.changeContext ?? changeContext;
-        const linkedFrozenTurn = run.skillRunRole === "child_followup" || run.skillRunRole === "overview";
+        const linkedFrozenTurn = run.skillRunRole === "root_followup"
+          || run.skillRunRole === "report_followup"
+          || run.skillRunRole === "overview";
         const frozenPlanBasis = linkedFrozenTurn
           ? run.planBasis
           : siblingContext
@@ -603,9 +662,12 @@ async function processDispatchablePreparation(
     }
   }
   const invocationIds = new Set(operationRuns
-    .filter((run) => run.skillInvocationId && run.skillRunRole === "child_initial")
+    .filter((run) => run.skillInvocationId
+      && (run.skillRunRole === "root_initial" || run.skillRunRole === "report_initial"))
     .map((run) => run.skillInvocationId!));
   for (const invocationId of invocationIds) {
+    const invocation = await review.getSkillInvocation(invocationId);
+    if (invocation?.definitionSnapshot.agents.length === 1) continue;
     await assignSkillOverview({ env, review, invocationId, automatic: true }).catch((error) => {
       console.error(`[env-review] automatic Overview check failed for ${invocationId}:`, error);
     });

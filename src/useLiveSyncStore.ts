@@ -17,13 +17,6 @@ import {
   reconcileFetchedRepoSnapshot,
 } from "./live-sync-store";
 import { isEnvTransitioning, isRepoTransitioning } from "../api/scm/model";
-import {
-  getMockDashboardEnv,
-  getMockDashboardEnvs,
-  getMockDashboardRepo,
-  getMockDashboardRepos,
-  shouldUseLocalDashboardMock,
-} from "./mock-dashboard";
 
 const WATCHDOG_DELAYS_MS = [10_000, 30_000, 60_000, 120_000];
 
@@ -44,7 +37,6 @@ export function useLiveSyncStore({
   setStartDialogSlug,
   setNewEnvTarget,
 }: UseLiveSyncStoreOptions) {
-  const useLocalMock = shouldUseLocalDashboardMock(hubUrl);
   const [envs, setEnvs] = useState<EnvMeta[]>([]);
   const [repos, setRepos] = useState<RepoMeta[]>([]);
   const envsRef = useRef<EnvMeta[]>([]);
@@ -119,11 +111,6 @@ export function useLiveSyncStore({
   }, [clearRepoWatchdog, updateRepoStore]);
 
   const refreshEnvEntity = useCallback(async (slug: string): Promise<EnvMeta | null> => {
-    const mockEnv = useLocalMock ? getMockDashboardEnv(slug) : null;
-    if (mockEnv) {
-      return upsertEnv(mockEnv);
-    }
-
     try {
       return upsertEnv(await fetchEnv(hubUrl, slug));
     } catch (err) {
@@ -134,14 +121,9 @@ export function useLiveSyncStore({
       console.error("[tiller] Failed to fetch env:", err);
       return envsRef.current.find((env) => env.slug === slug) ?? null;
     }
-  }, [hubUrl, removeEnv, upsertEnv, useLocalMock]);
+  }, [hubUrl, removeEnv, upsertEnv]);
 
   const refreshRepoEntity = useCallback(async (repoId: string): Promise<RepoMeta | null> => {
-    const mockRepo = useLocalMock ? getMockDashboardRepo(repoId) : null;
-    if (mockRepo) {
-      return upsertRepo(mockRepo);
-    }
-
     try {
       return upsertRepo(await fetchRepo(hubUrl, repoId));
     } catch (err) {
@@ -152,15 +134,12 @@ export function useLiveSyncStore({
       console.error("[tiller] Failed to fetch repo:", err);
       return reposRef.current.find((repo) => repo.repoId === repoId) ?? null;
     }
-  }, [hubUrl, removeRepo, upsertRepo, useLocalMock]);
+  }, [hubUrl, removeRepo, upsertRepo]);
 
   const refreshEnvs = useCallback(async (): Promise<boolean> => {
     try {
       const fetched = await fetchEnvs(hubUrl);
-      const source = useLocalMock && fetched.length === 0
-        ? getMockDashboardEnvs()
-        : fetched;
-      const list = source.map((env) => requireExplicitEnvMeta(env));
+      const list = fetched.map((env) => requireExplicitEnvMeta(env));
       const { items, missingSlugs } = reconcileFetchedEnvSnapshot(
         () => envsRef.current,
         list,
@@ -179,15 +158,12 @@ export function useLiveSyncStore({
       console.error("[tiller] Failed to fetch envs:", err);
       return false;
     }
-  }, [hubUrl, refreshEnvEntity, setStartDialogSlug, updateEnvStore, useLocalMock]);
+  }, [hubUrl, refreshEnvEntity, setStartDialogSlug, updateEnvStore]);
 
   const refreshRepos = useCallback(async (): Promise<boolean> => {
     try {
       const fetched = await fetchRepos(hubUrl);
-      const source = useLocalMock && fetched.length === 0
-        ? getMockDashboardRepos()
-        : fetched;
-      const list = source.map((repo) => requireExplicitRepoMeta(repo));
+      const list = fetched.map((repo) => requireExplicitRepoMeta(repo));
       const { items, missingRepoIds } = reconcileFetchedRepoSnapshot(
         () => reposRef.current,
         list,
@@ -205,7 +181,7 @@ export function useLiveSyncStore({
       console.error("[tiller] Failed to fetch repos:", err);
       return false;
     }
-  }, [hubUrl, refreshRepoEntity, setNewEnvTarget, updateRepoStore, useLocalMock]);
+  }, [hubUrl, refreshRepoEntity, setNewEnvTarget, updateRepoStore]);
 
   const scheduleEnvWatchdog = useCallback((slug: string, attempt: number, updatedAt: string) => {
     clearEnvWatchdog(slug);

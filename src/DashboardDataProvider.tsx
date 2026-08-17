@@ -1,5 +1,7 @@
 import {
   createContext,
+  lazy,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -24,6 +26,7 @@ import {
   checkForUpdate,
   dismissDashboardOnboarding as dismissDashboardOnboardingRequest,
   ApiActionError,
+  acknowledgeImplementorAttention,
   isApiAuthenticationError,
   type CreateEnvOptions,
 } from './api';
@@ -35,11 +38,7 @@ import type {
   GitHubRepositorySelection,
 } from './api';
 import { useToast } from './Toast';
-import { NewRepoDialog, NewEnvDialog } from './NewEnvDialog';
-import StartPlanDialog from './StartPlanDialog';
-import SetupWizard from './SetupWizard';
-import UpdateDialog from './UpdateDialog';
-import { dismissUpdate, isUpdateDismissed } from './update-storage';
+import { ignoreUpdateUntilNext, isUpdateDismissed } from './update-storage';
 import { isRepoMainReady } from './repo-status';
 import { getBackendBadgeLabel, getEnvDisplayName } from './env-display';
 import { getHarnessBadgeLabel } from './env-harness';
@@ -52,14 +51,29 @@ import {
   routeTouchesDeletedRepo,
 } from './dashboard-route-scope';
 import { RouteLoading, SetupStatusLoadError } from './dashboard-route-state';
+import { useSerializedRefresh } from './useSerializedRefresh';
 import {
   envPath,
+  projectImplementationsPath,
   projectPath,
 } from './dashboard-paths';
+import {
+  acknowledgeImplementorAttentionAndRecover,
+  resolveVisibleImplementorAttentionTarget,
+} from './implementor-attention';
 
 const HUB_URL = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
 const AUTH_RELOAD_STORAGE_KEY = 'tiller-auth-reload';
 const AUTH_RELOAD_COOLDOWN_MS = 10_000;
+
+const NewRepoDialog = lazy(() => import('./NewEnvDialog').then((module) => ({
+  default: module.NewRepoDialog,
+})));
+const NewEnvDialog = lazy(() => import('./NewEnvDialog').then((module) => ({
+  default: module.NewEnvDialog,
+})));
+const SetupWizard = lazy(() => import('./SetupWizard'));
+const UpdateDialog = lazy(() => import('./UpdateDialog'));
 
 interface BrowserAuthenticationTarget {
   location: Pick<Location, 'reload'>;
@@ -93,6 +107,11 @@ export function recoverBrowserAuthentication(
 
 export type LoadState = 'idle' | 'loading' | 'loaded' | 'error';
 
+export function settleDashboardReadState(current: LoadState, succeeded: boolean): LoadState {
+  if (succeeded) return 'loaded';
+  return current === 'loaded' ? current : 'error';
+}
+
 export type TerminalAckMessage =
   | Extract<WsServerMessage, { type: 'terminal-input-ack' }>
   | Extract<WsServerMessage, { type: 'terminal-control-ack' }>;
@@ -116,7 +135,7 @@ export interface DashboardData {
   updateIssueCode: string | null;
   updateDismissed: boolean;
   isCheckingUpdate: boolean;
-  refreshUpdateStatus: () => Promise<{
+  refreshUpdateStatus: (options?: { forceRefresh?: boolean }) => Promise<{
     status: UpdateCheckResult | null;
     issue: string | null;
     issueCode: string | null;
@@ -124,16 +143,14 @@ export interface DashboardData {
   }>;
   connected: boolean;
   terminalFastLane: boolean;
+  terminalMetrics: boolean;
   reconnectExhausted: boolean;
   hostRefreshNonce: number;
   permissions: Map<string, StoredPermission[]>;
   liveMessageRef: MutableRefObject<((msg: LiveMessage) => void) | null>;
   terminalAckRef: MutableRefObject<((msg: TerminalAckMessage) => void) | null>;
-  planWriterHintRef: MutableRefObject<((event: {
-    type: 'artifact' | 'state';
-    repoId: string;
-    planArtifactId: string;
-  }) => void) | null>;
+  planWriterRefreshHintRef: MutableRefObject<((repoId: string, planArtifactId: string) => void) | null>;
+  planArtifactHintRef: MutableRefObject<((repoId: string, planArtifactId: string) => void) | null>;
   wsRef: MutableRefObject<ReconnectingWebSocket | null>;
   updateLastSeq: (sessionId: string, seq: number) => void;
   handlePermissionResolved: (permId: string) => void;
@@ -182,13 +199,13 @@ export function refreshDashboardStateAfterHubConnect(actions: {
 }
 
 export function getTopLevelUpdateIssue(result: UpdateCheckResult): string | null {
-  return result.issue?.code === 'update_check_failed' ? result.issue.message : null;
+  return result.errors[0]?.message ?? null;
 }
 
 export function getUpdateDismissalSourceId(result: UpdateCheckResult): string {
-  return result.kind === 'installer-maintenance'
-    ? result.stableRelease?.releaseId ?? result.installedReleaseId
-    : result.latestUpdate.sourceId;
+  return result.stableRelease?.releaseId
+    ?? result.currentRelease.releaseId
+    ?? result.currentRelease.hubVersion;
 }
 
 export function getUpdateCheckFailure(error: unknown): { message: string; code: string | null } {
@@ -210,6 +227,7 @@ export default function DashboardDataProvider() {
   const [sessions, setSessions] = useState<StoredSession[]>([]);
   const [connected, setConnected] = useState(false);
   const [terminalFastLane, setTerminalFastLane] = useState(false);
+  const [terminalMetrics, setTerminalMetrics] = useState(false);
   const [reconnectExhausted, setReconnectExhausted] = useState(false);
   const [permissions, setPermissions] = useState<Map<string, StoredPermission[]>>(new Map());
   const [showNewRepo, setShowNewRepo] = useState(false);
@@ -225,11 +243,8 @@ export default function DashboardDataProvider() {
   } | null>(null);
   const liveMessageRef = useRef<((msg: LiveMessage) => void) | null>(null);
   const terminalAckRef = useRef<((msg: TerminalAckMessage) => void) | null>(null);
-  const planWriterHintRef = useRef<((event: {
-    type: 'artifact' | 'state';
-    repoId: string;
-    planArtifactId: string;
-  }) => void) | null>(null);
+  const planWriterRefreshHintRef = useRef<((repoId: string, planArtifactId: string) => void) | null>(null);
+  const planArtifactHintRef = useRef<((repoId: string, planArtifactId: string) => void) | null>(null);
   const wsRef = useRef<ReconnectingWebSocket | null>(null);
   const lastSeqRef = useRef<Map<string, number>>(new Map());
   const activeSessionIdRef = useRef<string | null>(null);
@@ -251,6 +266,9 @@ export default function DashboardDataProvider() {
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(true);
   const [hostRefreshNonce, setHostRefreshNonce] = useState(0);
+  const [documentVisible, setDocumentVisible] = useState(
+    () => typeof document !== 'undefined' && !document.hidden,
+  );
   const addToast = useToast();
   const setupReady = setupChecked && !!setupStatus && !setupStatus.needsSetup;
 
@@ -283,6 +301,56 @@ export default function DashboardDataProvider() {
     envRepoIdMapRef.current = new Map(envs.map((env) => [env.slug, env.repoId]));
   }, [envs]);
 
+  useEffect(() => {
+    const handleVisibility = () => setDocumentVisible(!document.hidden);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, []);
+
+  const implementorAttentionTarget = resolveVisibleImplementorAttentionTarget({
+    visible: documentVisible,
+    pathname: location.pathname,
+    envs,
+    sessions,
+  });
+  const implementorAttentionSlug = implementorAttentionTarget?.slug ?? null;
+  const implementorAttentionToken = implementorAttentionTarget?.token ?? null;
+
+  useEffect(() => {
+    if (!implementorAttentionSlug || !implementorAttentionToken) return;
+    const abortController = new AbortController();
+    void acknowledgeImplementorAttentionAndRecover(
+      { slug: implementorAttentionSlug, token: implementorAttentionToken },
+      (slug, token) => acknowledgeImplementorAttention(
+        HUB_URL,
+        slug,
+        token,
+        abortController.signal,
+      ),
+      recoverEnv,
+      {
+        signal: abortController.signal,
+        shouldRetry: (error) => !(error instanceof ApiActionError)
+          || error.status === null
+          || error.status === 408
+          || error.status === 425
+          || error.status === 429
+          || error.status >= 500,
+        onRetry: (error) => {
+          console.error('[tiller] Failed to acknowledge implementor attention; retrying:', error);
+        },
+      },
+    )
+      .catch((error) => {
+        if (!abortController.signal.aborted) {
+          console.error('[tiller] Failed to acknowledge implementor attention:', error);
+        }
+      });
+    return () => {
+      abortController.abort();
+    };
+  }, [implementorAttentionSlug, implementorAttentionToken, recoverEnv]);
+
   const getKnownEnvRepoId = useCallback(
     (slug: string) => envRepoIdMapRef.current.get(slug) ?? null,
     [],
@@ -306,19 +374,19 @@ export default function DashboardDataProvider() {
     rememberSessions([session]);
   }, [rememberSessions]);
 
-  const loadUpdateStatus = useCallback(async (): Promise<{
+  const loadUpdateStatus = useCallback(async (forceRefresh = false): Promise<{
     status: UpdateCheckResult | null;
     issue: string | null;
     issueCode: string | null;
     dismissed: boolean;
   }> => {
     try {
-      const result = await checkForUpdate(HUB_URL);
+      const result = await checkForUpdate(HUB_URL, { forceRefresh });
       const issue = getTopLevelUpdateIssue(result);
       return {
         status: result,
         issue,
-        issueCode: issue ? result.issue?.code ?? null : null,
+        issueCode: issue ? result.errors[0]?.code ?? null : null,
         dismissed: isUpdateDismissed(getUpdateDismissalSourceId(result)),
       };
     } catch (error) {
@@ -332,9 +400,9 @@ export default function DashboardDataProvider() {
     }
   }, []);
 
-  const refreshUpdateStatus = useCallback(async () => {
+  const refreshUpdateStatus = useCallback(async (options: { forceRefresh?: boolean } = {}) => {
     setIsCheckingUpdate(true);
-    const next = await loadUpdateStatus();
+    const next = await loadUpdateStatus(options.forceRefresh === true);
     setUpdateStatus(next.status);
     setUpdateIssue(next.issue);
     setUpdateIssueCode(next.issueCode);
@@ -343,7 +411,7 @@ export default function DashboardDataProvider() {
     return next;
   }, [loadUpdateStatus]);
 
-  const refreshSetupStatus = useCallback(async () => {
+  const performSetupStatusRefresh = useCallback(async () => {
     try {
       const nextStatus = await fetchSetupStatus(HUB_URL);
       setSetupStatus(nextStatus);
@@ -357,13 +425,21 @@ export default function DashboardDataProvider() {
     }
   }, []);
 
+  const {
+    refresh: bootstrapSetupStatus,
+    invalidateAndWait: invalidateSetupStatus,
+  } = useSerializedRefresh(performSetupStatusRefresh);
+  const refreshSetupStatus = useCallback(async (): Promise<void> => {
+    await invalidateSetupStatus();
+  }, [invalidateSetupStatus]);
+
   const dismissDashboardOnboarding = useCallback(async () => {
     await dismissDashboardOnboardingRequest(HUB_URL);
     await refreshSetupStatus();
   }, [refreshSetupStatus]);
 
-  const refreshSessions = useCallback(async (): Promise<boolean> => {
-    setSessionsLoadState('loading');
+  const performSessionsRefresh = useCallback(async (): Promise<boolean> => {
+    setSessionsLoadState((current) => current === 'loaded' ? current : 'loading');
     try {
       const list = await fetchSessions(HUB_URL);
       rememberSessions(list);
@@ -372,24 +448,48 @@ export default function DashboardDataProvider() {
       return true;
     } catch (err) {
       recoverBrowserAuthentication(err);
-      setSessionsLoadState('error');
+      setSessionsLoadState((current) => settleDashboardReadState(current, false));
       return false;
     }
   }, [rememberSessions]);
 
-  const refreshEnvs = useCallback(async (): Promise<boolean> => {
-    setEnvsLoadState('loading');
+  const {
+    refresh: bootstrapSessions,
+    invalidateAndWait: invalidateSessions,
+  } = useSerializedRefresh(performSessionsRefresh);
+  const refreshSessions = useCallback(async (): Promise<boolean> => {
+    return (await invalidateSessions()) ?? false;
+  }, [invalidateSessions]);
+
+  const performEnvsRefresh = useCallback(async (): Promise<boolean> => {
+    setEnvsLoadState((current) => current === 'loaded' ? current : 'loading');
     const ok = await refreshEnvsStore();
-    setEnvsLoadState(ok ? 'loaded' : 'error');
+    setEnvsLoadState((current) => settleDashboardReadState(current, ok));
     return ok;
   }, [refreshEnvsStore]);
 
-  const refreshRepos = useCallback(async (): Promise<boolean> => {
-    setReposLoadState('loading');
+  const {
+    refresh: bootstrapEnvs,
+    invalidateAndWait: invalidateEnvs,
+  } = useSerializedRefresh(performEnvsRefresh);
+  const refreshEnvs = useCallback(async (): Promise<boolean> => {
+    return (await invalidateEnvs()) ?? false;
+  }, [invalidateEnvs]);
+
+  const performReposRefresh = useCallback(async (): Promise<boolean> => {
+    setReposLoadState((current) => current === 'loaded' ? current : 'loading');
     const ok = await refreshReposStore();
-    setReposLoadState(ok ? 'loaded' : 'error');
+    setReposLoadState((current) => settleDashboardReadState(current, ok));
     return ok;
   }, [refreshReposStore]);
+
+  const {
+    refresh: bootstrapRepos,
+    invalidateAndWait: invalidateRepos,
+  } = useSerializedRefresh(performReposRefresh);
+  const refreshRepos = useCallback(async (): Promise<boolean> => {
+    return (await invalidateRepos()) ?? false;
+  }, [invalidateRepos]);
 
   useEffect(() => {
     if (!setupReady) return;
@@ -412,8 +512,8 @@ export default function DashboardDataProvider() {
   }, [loadUpdateStatus, setupReady]);
 
   useEffect(() => {
-    refreshSetupStatus().finally(() => setSetupChecked(true));
-  }, [refreshSetupStatus]);
+    bootstrapSetupStatus().finally(() => setSetupChecked(true));
+  }, [bootstrapSetupStatus]);
 
   const retrySetupStatus = useCallback(() => {
     setSetupChecked(false);
@@ -531,7 +631,7 @@ export default function DashboardDataProvider() {
     const repoId = envRepoIdMapRef.current.get(slug) ?? null;
     removeEnv(slug);
     if (repoId && routeTouchesDeletedEnv(locationPathnameRef.current, slug, sessionEnvMapRef.current)) {
-      navigate(projectPath(repoId), { replace: true });
+      navigate(projectImplementationsPath(repoId), { replace: true });
     }
   }, [navigate, removeEnv]);
 
@@ -545,9 +645,9 @@ export default function DashboardDataProvider() {
   useEffect(() => {
     if (!setupReady) return;
 
-    void refreshSessions();
-    void refreshEnvs();
-    void refreshRepos();
+    void bootstrapSessions();
+    void bootstrapEnvs();
+    void bootstrapRepos();
     setReconnectExhausted(false);
 
     const ws = createReconnectingWebSocket(HUB_URL, {
@@ -556,20 +656,22 @@ export default function DashboardDataProvider() {
         setReconnectExhausted(false);
         void loadPermissions();
         refreshDashboardStateAfterHubConnect({
-          refreshSessions: () => void refreshSessions(),
-          refreshEnvs: () => void refreshEnvs(),
-          refreshRepos: () => void refreshRepos(),
-          refreshSetupStatus,
+          refreshSessions: () => void invalidateSessions(),
+          refreshEnvs: () => void invalidateEnvs(),
+          refreshRepos: () => void invalidateRepos(),
+          refreshSetupStatus: () => void invalidateSetupStatus(),
         });
         addToast({ title: 'Connected', variant: 'success', duration: 2000 });
       },
       onDisconnected: () => {
         setConnected(false);
         setTerminalFastLane(false);
+        setTerminalMetrics(false);
       },
       onReconnectExhausted: () => {
         setReconnectExhausted(true);
         setTerminalFastLane(false);
+        setTerminalMetrics(false);
         addToast({
           title: 'Connection lost',
           body: 'Max reconnection attempts reached',
@@ -579,6 +681,7 @@ export default function DashboardDataProvider() {
       },
       onCapabilities: (capabilities) => {
         setTerminalFastLane(capabilities.terminalFastLane);
+        setTerminalMetrics(capabilities.terminalMetrics);
       },
       onMessage: (msg) => {
         liveMessageRef.current?.(msg);
@@ -590,7 +693,7 @@ export default function DashboardDataProvider() {
         terminalAckRef.current?.(msg);
       },
       onMachineUpdated: () => {
-        void refreshSetupStatus();
+        void invalidateSetupStatus();
         setHostRefreshNonce((n) => n + 1);
       },
       onSessionUpdated: (session) => {
@@ -651,10 +754,13 @@ export default function DashboardDataProvider() {
         removeRepo(repoId);
       },
       onPlanArtifactUpdated: (repoId, planArtifactId) => {
-        planWriterHintRef.current?.({ type: 'artifact', repoId, planArtifactId });
+        // Keep the selected Scribe's terminal lifecycle converged without
+        // presenting this generic artifact/attention hint as active saving.
+        planWriterRefreshHintRef.current?.(repoId, planArtifactId);
+        planArtifactHintRef.current?.(repoId, planArtifactId);
       },
       onPlanWriterState: (repoId, planArtifactId) => {
-        planWriterHintRef.current?.({ type: 'state', repoId, planArtifactId });
+        planWriterRefreshHintRef.current?.(repoId, planArtifactId);
       },
       onRepoMainChanged: (repoId, repoUrl, previousMainCommit, currentMainCommit, sourceEnvSlug) => {
         setLastRepoMainEvent({
@@ -663,6 +769,12 @@ export default function DashboardDataProvider() {
           previousMainCommit,
           currentMainCommit,
           sourceEnvSlug,
+        });
+        addToast({
+          title: 'Repository updated',
+          body: 'Tiller merged new changes from GitHub.',
+          variant: 'info',
+          duration: 5000,
         });
       },
       onPermissionResolved: (permission) => {
@@ -690,9 +802,13 @@ export default function DashboardDataProvider() {
     };
   }, [
     setupReady,
-    refreshSessions,
-    refreshEnvs,
-    refreshRepos,
+    bootstrapSessions,
+    bootstrapEnvs,
+    bootstrapRepos,
+    invalidateSessions,
+    invalidateEnvs,
+    invalidateRepos,
+    invalidateSetupStatus,
     loadPermissions,
     updateLastSeq,
     addToast,
@@ -701,7 +817,6 @@ export default function DashboardDataProvider() {
     removeRepo,
     upsertEnv,
     upsertRepo,
-    refreshSetupStatus,
     rememberSession,
   ]);
 
@@ -731,12 +846,14 @@ export default function DashboardDataProvider() {
     refreshUpdateStatus,
     connected,
     terminalFastLane,
+    terminalMetrics,
     reconnectExhausted,
     hostRefreshNonce,
     permissions,
     liveMessageRef,
     terminalAckRef,
-    planWriterHintRef,
+    planWriterRefreshHintRef,
+    planArtifactHintRef,
     wsRef,
     updateLastSeq,
     handlePermissionResolved,
@@ -775,6 +892,7 @@ export default function DashboardDataProvider() {
     refreshUpdateStatus,
     connected,
     terminalFastLane,
+    terminalMetrics,
     reconnectExhausted,
     hostRefreshNonce,
     permissions,
@@ -808,10 +926,12 @@ export default function DashboardDataProvider() {
 
   if (setupStatus?.needsSetup) {
     return (
-      <SetupWizard
-        status={setupStatus}
-        onRefresh={refreshSetupStatus}
-      />
+      <Suspense fallback={<RouteLoading label="Loading setup" fullScreen />}>
+        <SetupWizard
+          status={setupStatus}
+          onRefresh={refreshSetupStatus}
+        />
+      </Suspense>
     );
   }
 
@@ -822,12 +942,13 @@ export default function DashboardDataProvider() {
   return (
     <DashboardDataContext.Provider value={value}>
       <Outlet />
-      <DashboardDialogs
-        showNewRepo={showNewRepo}
-        showUpdate={showUpdate || location.pathname === '/update'}
-        newEnvTarget={newEnvTarget}
-        startDialogSlug={startDialogSlug}
-      />
+      <Suspense fallback={<RouteLoading label="Loading dialog" />}>
+        <DashboardDialogs
+          showNewRepo={showNewRepo}
+          showUpdate={showUpdate || location.pathname === '/update'}
+          newEnvTarget={newEnvTarget}
+        />
+      </Suspense>
     </DashboardDataContext.Provider>
   );
 }
@@ -836,24 +957,16 @@ function DashboardDialogs({
   showNewRepo,
   showUpdate,
   newEnvTarget,
-  startDialogSlug,
 }: {
   showNewRepo: boolean;
   showUpdate: boolean;
   newEnvTarget: NewEnvTarget | null;
-  startDialogSlug: string | null;
 }) {
   const data = useDashboardData();
   const location = useLocation();
   const navigate = useNavigate();
   const newEnvRepo = newEnvTarget
     ? data.repos.find((repo) => repo.repoId === newEnvTarget.repoId) ?? null
-    : null;
-  const startDialogEnv = startDialogSlug
-    ? data.envs.find((env) => env.slug === startDialogSlug) ?? null
-    : null;
-  const startDialogRepo = startDialogEnv?.repoId
-    ? data.repos.find((repo) => repo.repoId === startDialogEnv.repoId) ?? null
     : null;
   const closeUpdate = () => {
     data.setShowUpdate(false);
@@ -884,28 +997,10 @@ function DashboardDialogs({
           workersAiConfigured={data.setupStatus?.workersAiConfigured ?? false}
           enabledHarnesses={data.setupStatus?.enabledHarnesses ?? ['claude-code']}
           repo={newEnvRepo}
+          initialPlanChoice={newEnvTarget.planChoice}
+          hideStartupPlan={newEnvTarget.planChoice === 'none'}
           onRefreshSetupStatus={data.refreshSetupStatus}
           onCreate={data.handleCreateEnv}
-        />
-      )}
-      {startDialogEnv && (
-        <StartPlanDialog
-          env={startDialogEnv}
-          repoMainCommit={startDialogRepo?.mainCommit ?? null}
-          hubUrl={data.hubUrl}
-          onClose={() => data.setStartDialogSlug(null)}
-          onStarted={() => {
-            data.recoverEnv(startDialogEnv.slug);
-          }}
-          hasClaudeSubscription={data.setupStatus?.hasClaudeSubscription ?? false}
-          hasAnthropicKey={data.setupStatus?.hasAnthropicKey ?? false}
-          hasChatGPTAuth={data.setupStatus?.hasChatGPTAuth ?? false}
-          hasOpenAIKey={data.setupStatus?.hasOpenAIKey ?? false}
-          workersAiConfigured={data.setupStatus?.workersAiConfigured ?? false}
-          chatgptAuthStatus={data.setupStatus?.chatgptAuthStatus ?? 'missing'}
-          claudeBillingMode={data.setupStatus?.claudeBillingMode ?? null}
-          openaiBillingMode={data.setupStatus?.openaiBillingMode ?? null}
-          onRefreshSetupStatus={data.refreshSetupStatus}
         />
       )}
       {showUpdate && (
@@ -916,24 +1011,22 @@ function DashboardDialogs({
           issueCode={data.updateIssueCode}
           isChecking={data.isCheckingUpdate}
           hasExecutionMachine={Boolean(data.setupStatus?.hostRegistered)}
-          onDismiss={() => {
+          onDismiss={closeUpdate}
+          onIgnore={() => {
             if (data.updateStatus) {
-              dismissUpdate(getUpdateDismissalSourceId(data.updateStatus));
+              ignoreUpdateUntilNext(getUpdateDismissalSourceId(data.updateStatus));
               data.refreshUpdateStatus().catch(() => undefined);
             }
             closeUpdate();
           }}
           onOpenSettings={() => {
             data.setShowUpdate(false);
-            navigate('/settings');
-          }}
-          onRetryCheck={() => {
-            void data.refreshUpdateStatus().then((next) => {
-              if (next.status && !next.issue && !next.status.updateAvailable) closeUpdate();
+            navigate('/settings', {
+              state: { returnTo: `${location.pathname}${location.search}${location.hash}` },
             });
           }}
-          onUpdated={() => {
-            data.refreshUpdateStatus().catch(() => undefined);
+          onCheckNow={() => {
+            void data.refreshUpdateStatus({ forceRefresh: true });
           }}
         />
       )}

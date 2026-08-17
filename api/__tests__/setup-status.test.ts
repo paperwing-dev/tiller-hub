@@ -79,13 +79,6 @@ vi.mock("../protection", async (importOriginal) => {
   };
 });
 
-vi.mock("../update/hub-repo", () => ({
-  resolveHubUpdateRepoState: vi.fn(async () => ({
-    status: "not_checked",
-    lastDetectedAt: null,
-  })),
-}));
-
 import setupRoutes from "../setup/routes";
 
 function createApp() {
@@ -117,6 +110,7 @@ function createEnv(
   return {
     PLANNER_RUN: {},
     TILLER_INSTALLER_SCHEMA: "1",
+    DO_LOCATION_HINT: "wnam",
     TILLER_RELEASE_ID: "a".repeat(40),
     TILLER_WORKERS_DEV_HOSTNAME: "tiller.demo.workers.dev",
     CF_ACCESS_ISSUER: "https://demo-tiller.cloudflareaccess.com",
@@ -256,6 +250,40 @@ describe("POST /api/setup", () => {
   });
 });
 
+describe("POST /api/setup/verify-model-auth", () => {
+  it("tests only the requested Anthropic API key", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ content: [] }), { status: 200 }),
+    );
+    const response = await createApp().request(
+      "https://demo.preview.workers.dev/api/setup/verify-model-auth",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: "ANTHROPIC_API_KEY" }),
+      },
+      createEnv({
+        ANTHROPIC_API_KEY: "anthropic-test-key",
+        OPENAI_API_KEY: "openai-test-key",
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      ok: true,
+      results: [{ key: "ANTHROPIC_API_KEY", mode: "api", ok: true }],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.anthropic.com/v1/messages",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "x-api-key": "anthropic-test-key" }),
+      }),
+    );
+  });
+});
+
 describe("GET /api/setup/status", () => {
   it("keeps subscription execution available while a valid cached login refreshes", async () => {
     mocks.getBillingSelections.mockResolvedValue({
@@ -299,7 +327,7 @@ describe("GET /api/setup/status", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(body.workersDevHubUrl).toBe("https://tiller.demo.workers.dev");
     expect(body.installerManaged).toBe(true);
-    expect(body.installationRegion).toBe(null);
+    expect(body.installationRegion).toBe("wnam");
     expect(body.tokenExpiresAt).toBe("2027-07-17T00:00:00.000Z");
     expect(body.renewalRecommended).toBe(false);
     expect(body).not.toHaveProperty("deploymentMode");
@@ -309,7 +337,7 @@ describe("GET /api/setup/status", () => {
     expect(body).not.toHaveProperty("workerServiceName");
   });
 
-  it("reports only a validated live regional placement for installer-managed production", async () => {
+  it("reports only a validated live regional placement for hosted deployments", async () => {
     for (const [extra, expected] of [
       [{ DO_LOCATION_HINT: "wnam" }, "wnam"],
     ] as const) {
@@ -328,6 +356,23 @@ describe("GET /api/setup/status", () => {
       createEnv({ DO_LOCATION_HINT: "wnam", LOCAL_DEV_ONLY_BACKEND: "1" }),
     );
     await expect(local.json()).resolves.toMatchObject({ installationRegion: null });
+  });
+
+  it.each([
+    [undefined],
+    ["WNAM"],
+    ["unknown"],
+  ])("fails closed when installer-managed region configuration is %s", async (hint) => {
+    const response = await createApp().request(
+      "https://demo.preview.workers.dev/api/setup/status",
+      { method: "GET" },
+      createEnv({ DO_LOCATION_HINT: hint }),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "installation_region_configuration_error",
+    });
   });
 
   it("exposes binding-based Access renewal readiness to installer-managed owners", async () => {
@@ -362,7 +407,7 @@ describe("GET /api/setup/status", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       installerManaged: false,
-      installationRegion: null,
+      installationRegion: "wnam",
       tokenExpiresAt,
       renewalRecommended: false,
     });

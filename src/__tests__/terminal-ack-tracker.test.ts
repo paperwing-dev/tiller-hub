@@ -1,14 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TerminalAckTracker } from "../terminal-ack-tracker";
+import {
+  TerminalAckTracker,
+  type TerminalStaleWarning,
+} from "../terminal-ack-tracker";
 
 describe("TerminalAckTracker", () => {
-  let staleWarnings: string[];
+  let staleWarnings: TerminalStaleWarning[];
   let failures: string[];
   let drops: string[];
+  let recoveries: number;
 
   const createTracker = () =>
     new TerminalAckTracker({
-      onStaleWarning: (message) => staleWarnings.push(message),
+      onStaleWarning: (warning) => staleWarnings.push(warning),
+      onRecovered: () => { recoveries += 1; },
       onFailure: (message) => failures.push(message),
       onDrop: (message) => drops.push(message),
     });
@@ -18,6 +23,7 @@ describe("TerminalAckTracker", () => {
     staleWarnings = [];
     failures = [];
     drops = [];
+    recoveries = 0;
   });
 
   afterEach(() => {
@@ -40,22 +46,25 @@ describe("TerminalAckTracker", () => {
     expect(staleWarnings).toHaveLength(2);
   });
 
-  it("ignores ACKs for entries already removed by timeout", () => {
+  it("ignores late failed ACKs but treats late successful ACKs as recovery", () => {
     const tracker = createTracker();
 
     tracker.trackInput(1);
     vi.advanceTimersByTime(1000);
 
     tracker.handleInputAck(1, "boom");
-
     expect(failures).toHaveLength(0);
+    expect(recoveries).toBe(0);
+
+    tracker.handleInputAck(1);
+    expect(recoveries).toBe(1);
   });
 
   it("clear() drops pending entries so no warning fires after disconnect", () => {
     const tracker = createTracker();
 
     tracker.trackInput(1);
-    tracker.trackControl(1);
+    tracker.trackControl(1, "resize");
     tracker.clear();
     vi.advanceTimersByTime(5000);
 
@@ -71,13 +80,29 @@ describe("TerminalAckTracker", () => {
     tracker.handleInputAck(1, "No active terminal owner for session");
     tracker.trackInput(2);
     tracker.handleInputAck(2, "No active terminal owner for session");
-    expect(failures).toHaveLength(1);
+    expect(failures).toEqual([
+      "Terminal disconnected: no active harness owns this session. Restart or reconnect the environment, then retry input.",
+    ]);
 
     // After the cooldown the next failure reports again.
     vi.advanceTimersByTime(2001);
     tracker.trackInput(3);
     tracker.handleInputAck(3, "No active terminal owner for session");
     expect(failures).toHaveLength(2);
+  });
+
+  it.each([
+    "No active terminal owner for session",
+    "Terminal owner delivery failed",
+    "Terminal owner socket closed before input could be delivered",
+  ])("maps owner-unavailable input failure %j to the disconnected notice", (error) => {
+    const tracker = createTracker();
+    tracker.trackInput(1);
+    tracker.handleInputAck(1, error);
+
+    expect(failures).toEqual([
+      "Terminal disconnected: no active harness owns this session. Restart or reconnect the environment, then retry input.",
+    ]);
   });
 
   it("resets failure coalescing on a successful ACK", () => {
@@ -114,9 +139,24 @@ describe("TerminalAckTracker", () => {
   it("tracks control ACK failures separately from inputs", () => {
     const tracker = createTracker();
 
-    tracker.trackControl(1);
+    tracker.trackControl(1, "abort");
     tracker.handleControlAck(1, "boom");
 
-    expect(failures).toEqual(["Terminal control failed: boom"]);
+    expect(failures).toEqual(["Terminal abort failed: boom"]);
+  });
+
+  it("identifies resize delays without implying that input is blocked", () => {
+    const tracker = createTracker();
+
+    tracker.trackControl(1, "resize");
+    vi.advanceTimersByTime(1000);
+
+    expect(staleWarnings).toEqual([{
+      message: "Terminal resize acknowledgement is delayed; terminal input may still work.",
+      operation: "resize",
+    }]);
+
+    tracker.handleControlAck(1);
+    expect(recoveries).toBe(1);
   });
 });

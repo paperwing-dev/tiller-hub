@@ -24,22 +24,29 @@ import {
   validateHarnessSettings,
 } from "../shared/harness-catalog";
 import {
-  isCloudflareIdleTimeoutMinutes,
-} from "../shared/cloudflare-timeout";
+  decodePlanHealthAssessment,
+  decodePlanHealthSkillResult,
+} from "../api/coordination/plan-health-schema";
+import { isCloudflareIdleTimeoutMinutes } from "../shared/cloudflare-timeout";
+import { normalizeEnvDisplayName } from "../shared/env-display-name";
 import type {
   Artifact,
   AgentRoute,
   AgentSkillDefinition,
   ArtifactRef,
   PlanArtifact,
+  PlanAttentionItem,
   PlanContribution,
   PlannerEffort,
   PlannerProviderMetadata,
   PlannerRun,
   PlannerRunEvent,
   PlanStatus,
+  PlanHealthSkillResult,
   ReviewerRegistryEntry,
+  ReviewerRunAttribution,
   PlanSkillInvocation,
+  SkillInvocationSummary,
   RepoPlanWriterSettings,
   PlanWriterState,
   PlanWriterProvider,
@@ -55,14 +62,10 @@ import type {
   ReviewSkillInvocation,
 } from "../api/env-review/types";
 import type {
-  HubUpdateRepoCandidate,
-  HubUpdateRepoState,
-  InstallerMaintenanceUpdateCheckResult,
-  LegacyUpdateCheckResult,
+  ReleaseInfo,
   StableReleaseSummary,
-  TillerUpdateMetadata,
-  UpdateApplyResult,
   UpdateBuildDiagnostics,
+  UpdateCheckError,
   UpdateCheckResult,
 } from "../api/update/types";
 import type { BillingMode } from "../shared/billing";
@@ -74,7 +77,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function normalizeArrayResponse<T>(payload: unknown): T[] {
-  return Array.isArray(payload) ? payload as T[] : [];
+  return Array.isArray(payload) ? (payload as T[]) : [];
 }
 
 function isPresent<T>(value: T | null | undefined): value is T {
@@ -102,7 +105,9 @@ function readBooleanOr(value: unknown, fallback = false): boolean {
 }
 
 function readIntegerOr(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isInteger(value) ? value : fallback;
+  return typeof value === "number" && Number.isInteger(value)
+    ? value
+    : fallback;
 }
 
 function normalizeHarnessPresentation(
@@ -114,10 +119,10 @@ function normalizeHarnessPresentation(
   const providerKind = readString(value.providerKind);
   const providerLabel = readString(value.providerLabel);
   if (
-    !modelLabel
-    || !isHarnessCredentialRequirement(credentialRequirement)
-    || !isHarnessProviderKind(providerKind)
-    || !providerLabel
+    !modelLabel ||
+    !isHarnessCredentialRequirement(credentialRequirement) ||
+    !isHarnessProviderKind(providerKind) ||
+    !providerLabel
   ) {
     return undefined;
   }
@@ -129,8 +134,15 @@ function normalizeHarnessPresentation(
   };
 }
 
-function readPlanStatusOr(value: unknown, fallback: PlanStatus = "draft"): PlanStatus {
-  return value === "draft" || value === "evaluating" || value === "todo" || value === "completed" || value === "archived"
+function readPlanStatusOr(
+  value: unknown,
+  fallback: PlanStatus = "draft",
+): PlanStatus {
+  return value === "draft" ||
+    value === "evaluating" ||
+    value === "todo" ||
+    value === "completed" ||
+    value === "archived"
     ? value
     : fallback;
 }
@@ -185,9 +197,10 @@ function normalizeStoredPermission(payload: unknown): StoredPermission | null {
   const toolName = readString(payload.tool_name);
   if (!id || !sessionId || !toolName) return null;
 
-  const status = payload.status === "allowed" || payload.status === "denied"
-    ? payload.status
-    : "pending";
+  const status =
+    payload.status === "allowed" || payload.status === "denied"
+      ? payload.status
+      : "pending";
 
   return {
     id,
@@ -233,31 +246,40 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
   const updatedAt = readString(payload.updatedAt);
   const status = readString(payload.status);
   if (
-    !slug
-    || !incarnationId
-    || !repoUrl
-    || !repoId
-    || !executionPlacement
-    || payload.backend !== executionPlacement.backend
-    || !harness
-    || !createdAt
-    || !updatedAt
-    || !status
-  ) return null;
+    !slug ||
+    !incarnationId ||
+    !repoUrl ||
+    !repoId ||
+    !executionPlacement ||
+    payload.backend !== executionPlacement.backend ||
+    !harness ||
+    !createdAt ||
+    !updatedAt ||
+    !status
+  )
+    return null;
   if (!isEnvHarness(harness)) return null;
   if (!isEnvStatus(status)) return null;
   if (!hasExplicitEnvScmFields(payload)) return null;
-  const harnessSettings = validateHarnessSettings(harness, payload.harnessSettings);
+  const harnessSettings = validateHarnessSettings(
+    harness,
+    payload.harnessSettings,
+  );
+  const displayName = normalizeEnvDisplayName(payload.displayName);
+  const { displayName: _untrustedDisplayName, ...normalizedPayload } =
+    payload as Partial<EnvMeta>;
 
   return {
-    ...(payload as Partial<EnvMeta>),
+    ...normalizedPayload,
     slug,
+    ...(displayName ? { displayName } : {}),
     incarnationId,
-    sidebarSlot: typeof payload.sidebarSlot === "number"
-      && Number.isInteger(payload.sidebarSlot)
-      && payload.sidebarSlot > 0
-      ? payload.sidebarSlot
-      : undefined,
+    sidebarSlot:
+      typeof payload.sidebarSlot === "number" &&
+      Number.isInteger(payload.sidebarSlot) &&
+      payload.sidebarSlot > 0
+        ? payload.sidebarSlot
+        : undefined,
     repoUrl,
     repoId,
     scmModel: "github",
@@ -268,29 +290,38 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
     harnessPresentation: harnessSettings
       ? normalizeHarnessPresentation(payload.harnessPresentation)
       : undefined,
-    scheduledRun: isRecord(payload.scheduledRun)
-      && (payload.scheduledRun.state === "scheduled"
-        || payload.scheduledRun.state === "running"
-        || payload.scheduledRun.state === "completed"
-        || payload.scheduledRun.state === "interrupted"
-        || payload.scheduledRun.state === "failed")
-      && typeof payload.scheduledRun.runAtMs === "number"
-      && Number.isFinite(payload.scheduledRun.runAtMs)
-      && typeof payload.scheduledRun.timeZone === "string"
-      ? {
-          state: payload.scheduledRun.state,
-          ...(payload.scheduledRun.stage === "implementing" || payload.scheduledRun.stage === "saving"
-            ? { stage: payload.scheduledRun.stage }
-            : {}),
-          runAtMs: payload.scheduledRun.runAtMs,
-          timeZone: payload.scheduledRun.timeZone,
-          ...(typeof payload.scheduledRun.error === "string" ? { error: payload.scheduledRun.error } : {}),
-          ...(payload.scheduledRun.cleanupRequired === true ? { cleanupRequired: true } : {}),
-        }
-      : undefined,
+    scheduledRun:
+      isRecord(payload.scheduledRun) &&
+      (payload.scheduledRun.state === "scheduled" ||
+        payload.scheduledRun.state === "running" ||
+        payload.scheduledRun.state === "completed" ||
+        payload.scheduledRun.state === "interrupted" ||
+        payload.scheduledRun.state === "failed") &&
+      typeof payload.scheduledRun.runAtMs === "number" &&
+      Number.isFinite(payload.scheduledRun.runAtMs) &&
+      typeof payload.scheduledRun.timeZone === "string"
+        ? {
+            state: payload.scheduledRun.state,
+            ...(payload.scheduledRun.stage === "implementing" ||
+            payload.scheduledRun.stage === "saving"
+              ? { stage: payload.scheduledRun.stage }
+              : {}),
+            runAtMs: payload.scheduledRun.runAtMs,
+            timeZone: payload.scheduledRun.timeZone,
+            ...(typeof payload.scheduledRun.error === "string"
+              ? { error: payload.scheduledRun.error }
+              : {}),
+            ...(payload.scheduledRun.cleanupRequired === true
+              ? { cleanupRequired: true }
+              : {}),
+          }
+        : undefined,
     createdAt,
     updatedAt,
     status,
+    implementorAttentionToken: readNullableString(
+      payload.implementorAttentionToken,
+    ),
     startupPlanId: payload.startupPlanId,
     branchName: payload.branchName,
     branchStatus: payload.branchStatus,
@@ -311,9 +342,18 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
     githubBaseCommitSha: readNullableString(payload.githubBaseCommitSha),
     githubBranch: readNullableString(payload.githubBranch),
     githubHeadCommitSha: readNullableString(payload.githubHeadCommitSha),
-    githubPrNumber: typeof payload.githubPrNumber === "number" && Number.isInteger(payload.githubPrNumber) ? payload.githubPrNumber : null,
+    githubPrNumber:
+      typeof payload.githubPrNumber === "number" &&
+      Number.isInteger(payload.githubPrNumber)
+        ? payload.githubPrNumber
+        : null,
     githubPrUrl: readNullableString(payload.githubPrUrl),
-    githubPrState: payload.githubPrState === "open" || payload.githubPrState === "closed" || payload.githubPrState === "merged" ? payload.githubPrState : null,
+    githubPrState:
+      payload.githubPrState === "open" ||
+      payload.githubPrState === "closed" ||
+      payload.githubPrState === "merged"
+        ? payload.githubPrState
+        : null,
     githubMergedAt: readNullableString(payload.githubMergedAt),
     githubPublishStatus:
       payload.githubPublishStatus === "publishing" ||
@@ -324,13 +364,20 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
       payload.githubPublishStatus === "merged"
         ? payload.githubPublishStatus
         : "idle",
-    githubPublishOperationId: readNullableString(payload.githubPublishOperationId),
+    githubPublishOperationId: readNullableString(
+      payload.githubPublishOperationId,
+    ),
     githubPublishError: readNullableString(payload.githubPublishError),
     githubLastPublishedAt: readNullableString(payload.githubLastPublishedAt),
-    githubLastPublishedWorkspaceHash: readNullableString(payload.githubLastPublishedWorkspaceHash),
+    githubLastPublishedWorkspaceHash: readNullableString(
+      payload.githubLastPublishedWorkspaceHash,
+    ),
     githubPendingPublish: isRecord(payload.githubPendingPublish)
       ? {
-          operationId: readStringOr(payload.githubPendingPublish.operationId, ""),
+          operationId: readStringOr(
+            payload.githubPendingPublish.operationId,
+            "",
+          ),
           status:
             payload.githubPendingPublish.status === "pushed" ||
             payload.githubPendingPublish.status === "finalizing" ||
@@ -338,10 +385,20 @@ function normalizeEnvMetaObject(payload: unknown): EnvMeta | null {
               ? payload.githubPendingPublish.status
               : "starting",
           branch: readStringOr(payload.githubPendingPublish.branch, ""),
-          baseCommitSha: readStringOr(payload.githubPendingPublish.baseCommitSha, ""),
-          workspaceHash: readStringOr(payload.githubPendingPublish.workspaceHash, ""),
-          expectedPriorHead: readNullableString(payload.githubPendingPublish.expectedPriorHead),
-          pushedCommitSha: readNullableString(payload.githubPendingPublish.pushedCommitSha),
+          baseCommitSha: readStringOr(
+            payload.githubPendingPublish.baseCommitSha,
+            "",
+          ),
+          workspaceHash: readStringOr(
+            payload.githubPendingPublish.workspaceHash,
+            "",
+          ),
+          expectedPriorHead: readNullableString(
+            payload.githubPendingPublish.expectedPriorHead,
+          ),
+          pushedCommitSha: readNullableString(
+            payload.githubPendingPublish.pushedCommitSha,
+          ),
           startedAt: readStringOr(payload.githubPendingPublish.startedAt, ""),
           updatedAt: readStringOr(payload.githubPendingPublish.updatedAt, ""),
           error: readNullableString(payload.githubPendingPublish.error),
@@ -354,34 +411,48 @@ function normalizeRepoMetaObject(payload: unknown): RepoMeta | null {
   if (!isRecord(payload)) return null;
   const repoId = readString(payload.repoId);
   const repoUrl = readString(payload.repoUrl);
-  const githubInstallationId = typeof payload.githubInstallationId === "number" && Number.isInteger(payload.githubInstallationId) && payload.githubInstallationId > 0
-    ? payload.githubInstallationId
-    : null;
+  const githubInstallationId =
+    typeof payload.githubInstallationId === "number" &&
+    Number.isInteger(payload.githubInstallationId) &&
+    payload.githubInstallationId > 0
+      ? payload.githubInstallationId
+      : null;
   const githubFullName = readString(payload.githubFullName);
   const createdAt = readString(payload.createdAt);
   const updatedAt = readString(payload.updatedAt);
   const gitStatus = readString(payload.gitStatus);
-  if (!repoId || !repoUrl || !githubInstallationId || !githubFullName || !createdAt || !updatedAt || !gitStatus) return null;
+  if (
+    !repoId ||
+    !repoUrl ||
+    !githubInstallationId ||
+    !githubFullName ||
+    !createdAt ||
+    !updatedAt ||
+    !gitStatus
+  )
+    return null;
   if (!isRepoGitStatus(gitStatus)) return null;
   if (!hasExplicitRepoScmFields(payload)) return null;
-  const githubPublish = payload.githubPublish === undefined
-    ? undefined
-    : payload.githubPublish === null
-      ? null
-      : hasExplicitGitHubPublishFields(payload.githubPublish)
-        ? {
-            status: payload.githubPublish.status,
-            branch: payload.githubPublish.branch,
-            commitSha: payload.githubPublish.commitSha ?? null,
-            prNumber: payload.githubPublish.prNumber ?? null,
-            prUrl: payload.githubPublish.prUrl ?? null,
-            sourceEnvSlug: payload.githubPublish.sourceEnvSlug ?? null,
-            operationId: payload.githubPublish.operationId ?? null,
-            updatedAt: payload.githubPublish.updatedAt,
-            error: payload.githubPublish.error ?? null,
-          }
-        : undefined;
-  if (payload.githubPublish !== undefined && githubPublish === undefined) return null;
+  const githubPublish =
+    payload.githubPublish === undefined
+      ? undefined
+      : payload.githubPublish === null
+        ? null
+        : hasExplicitGitHubPublishFields(payload.githubPublish)
+          ? {
+              status: payload.githubPublish.status,
+              branch: payload.githubPublish.branch,
+              commitSha: payload.githubPublish.commitSha ?? null,
+              prNumber: payload.githubPublish.prNumber ?? null,
+              prUrl: payload.githubPublish.prUrl ?? null,
+              sourceEnvSlug: payload.githubPublish.sourceEnvSlug ?? null,
+              operationId: payload.githubPublish.operationId ?? null,
+              updatedAt: payload.githubPublish.updatedAt,
+              error: payload.githubPublish.error ?? null,
+            }
+          : undefined;
+  if (payload.githubPublish !== undefined && githubPublish === undefined)
+    return null;
 
   return {
     ...(payload as Partial<RepoMeta>),
@@ -391,8 +462,13 @@ function normalizeRepoMetaObject(payload: unknown): RepoMeta | null {
     githubInstallationId,
     githubFullName,
     githubDefaultBranch: readNullableString(payload.githubDefaultBranch),
-    githubDefaultBranchHeadSha: readNullableString(payload.githubDefaultBranchHeadSha),
-    githubWebhookConfigured: readBooleanOr(payload.githubWebhookConfigured, false),
+    githubDefaultBranchHeadSha: readNullableString(
+      payload.githubDefaultBranchHeadSha,
+    ),
+    githubWebhookConfigured: readBooleanOr(
+      payload.githubWebhookConfigured,
+      false,
+    ),
     githubWebhookError: readNullableString(payload.githubWebhookError),
     mainCommit: payload.mainCommit,
     gitArtifactId: payload.gitArtifactId,
@@ -420,8 +496,14 @@ function normalizeArtifact(payload: unknown): Artifact | null {
   const createdAt = readString(payload.createdAt);
   if (!id || !repoId || !type || title === null || !createdAt) return null;
 
+  const planHealth = decodePlanHealthAssessment(payload.planHealth);
+  const {
+    planHealth: _untrustedPlanHealth,
+    riskAssessment: _legacyRiskAssessment,
+    ...trustedPayload
+  } = payload;
   return {
-    ...(payload as Partial<Artifact>),
+    ...(trustedPayload as Partial<Artifact>),
     id,
     repoId,
     type: type as Artifact["type"],
@@ -430,6 +512,7 @@ function normalizeArtifact(payload: unknown): Artifact | null {
     status: readPlanStatusOr(payload.status),
     updatedAt: readStringOr(payload.updatedAt, createdAt),
     version: readIntegerOr(payload.version, 1),
+    ...(planHealth ? { planHealth } : {}),
     basis: {
       repoId: readStringOr(payload.basis.repoId, repoId),
       mainCommit: readNullableString(payload.basis.mainCommit),
@@ -440,22 +523,39 @@ function normalizeArtifact(payload: unknown): Artifact | null {
   } as Artifact;
 }
 
-function normalizeReviewerRegistryEntry(payload: unknown): ReviewerRegistryEntry | null {
+function normalizeReviewerRegistryEntry(
+  payload: unknown,
+): ReviewerRegistryEntry | null {
   if (!isRecord(payload)) return null;
   const threadId = readString(payload.threadId);
   const planArtifactId = readString(payload.planArtifactId);
   const repoId = readString(payload.repoId);
   const provider = readString(payload.provider);
   const model = readString(payload.model);
-  const effort = payload.effort === "low" || payload.effort === "medium" || payload.effort === "high"
-    || payload.effort === "xhigh" || payload.effort === "ultra" || payload.effort === "max"
-    ? payload.effort
-    : null;
+  const effort =
+    payload.effort === "low" ||
+    payload.effort === "medium" ||
+    payload.effort === "high" ||
+    payload.effort === "xhigh" ||
+    payload.effort === "ultra" ||
+    payload.effort === "max"
+      ? payload.effort
+      : null;
   const skill = readString(payload.skill);
   const reviewerModel = readString(payload.reviewerModel) ?? model;
   const createdAt = readString(payload.createdAt);
   const updatedAt = readString(payload.updatedAt);
-  if (!threadId || !planArtifactId || !repoId || !provider || !model || !reviewerModel || !createdAt || !updatedAt) return null;
+  if (
+    !threadId ||
+    !planArtifactId ||
+    !repoId ||
+    !provider ||
+    !model ||
+    !reviewerModel ||
+    !createdAt ||
+    !updatedAt
+  )
+    return null;
   return {
     threadId,
     planArtifactId,
@@ -465,30 +565,48 @@ function normalizeReviewerRegistryEntry(payload: unknown): ReviewerRegistryEntry
     ...(effort ? { effort } : {}),
     ...(skill ? { skill } : {}),
     role: "reviewer",
-    ...(readNullableString(payload.runId) ? { runId: readNullableString(payload.runId) ?? undefined } : {}),
-    ...(payload.status === "queued" || payload.status === "running" || payload.status === "saving" || payload.status === "completed" || payload.status === "failed" || payload.status === "cancelled"
+    nodeKind:
+      payload.nodeKind === "skill_root" || payload.nodeKind === "report"
+        ? payload.nodeKind
+        : "generic",
+    skillRootThreadId: readNullableString(payload.skillRootThreadId),
+    ...(readNullableString(payload.runId)
+      ? { runId: readNullableString(payload.runId) ?? undefined }
+      : {}),
+    ...(payload.status === "queued" ||
+    payload.status === "running" ||
+    payload.status === "saving" ||
+    payload.status === "completed" ||
+    payload.status === "failed" ||
+    payload.status === "cancelled"
       ? { status: payload.status }
       : {}),
-    ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
+    ...(readNullableString(payload.error)
+      ? { error: readNullableString(payload.error) ?? undefined }
+      : {}),
     reviewerModel,
-    ...(readNullableString(payload.removedAt) ? { removedAt: readNullableString(payload.removedAt) ?? undefined } : {}),
+    ...(readNullableString(payload.removedAt)
+      ? { removedAt: readNullableString(payload.removedAt) ?? undefined }
+      : {}),
     createdAt,
     updatedAt,
   };
 }
 
 function normalizePlannerEffortId(payload: unknown): PlannerEffort | null {
-  return payload === "low"
-    || payload === "medium"
-    || payload === "high"
-    || payload === "xhigh"
-    || payload === "ultra"
-    || payload === "max"
+  return payload === "low" ||
+    payload === "medium" ||
+    payload === "high" ||
+    payload === "xhigh" ||
+    payload === "ultra" ||
+    payload === "max"
     ? payload
     : null;
 }
 
-function normalizePlannerEfforts(payload: unknown): PlannerProviderMetadata["efforts"] {
+function normalizePlannerEfforts(
+  payload: unknown,
+): PlannerProviderMetadata["efforts"] {
   return normalizeArrayResponse(payload)
     .map((effort) => {
       if (!isRecord(effort)) return null;
@@ -499,13 +617,18 @@ function normalizePlannerEfforts(payload: unknown): PlannerProviderMetadata["eff
     .filter(isPresent);
 }
 
-function normalizePlannerProviderModel(payload: unknown): PlannerProviderMetadata["models"][number] | null {
+function normalizePlannerProviderModel(
+  payload: unknown,
+): PlannerProviderMetadata["models"][number] | null {
   if (!isRecord(payload)) return null;
   const id = readString(payload.id);
   const displayName = readString(payload.displayName);
-  const authStatus = payload.authStatus === "available" || payload.authStatus === "missing" || payload.authStatus === "unavailable"
-    ? payload.authStatus
-    : null;
+  const authStatus =
+    payload.authStatus === "available" ||
+    payload.authStatus === "missing" ||
+    payload.authStatus === "unavailable"
+      ? payload.authStatus
+      : null;
   if (!id || !displayName || !authStatus) return null;
   const efforts = normalizePlannerEfforts(payload.efforts);
   const defaultEffort = normalizePlannerEffortId(payload.defaultEffort);
@@ -514,23 +637,36 @@ function normalizePlannerProviderModel(payload: unknown): PlannerProviderMetadat
     displayName,
     available: readBooleanOr(payload.available, false),
     authStatus,
-    ...(readNullableString(payload.disabledReason) ? { disabledReason: readNullableString(payload.disabledReason) ?? undefined } : {}),
+    ...(readNullableString(payload.disabledReason)
+      ? {
+          disabledReason:
+            readNullableString(payload.disabledReason) ?? undefined,
+        }
+      : {}),
     ...(efforts.length ? { efforts } : {}),
-    ...(defaultEffort && efforts.some((effort) => effort.id === defaultEffort) ? { defaultEffort } : {}),
+    ...(defaultEffort && efforts.some((effort) => effort.id === defaultEffort)
+      ? { defaultEffort }
+      : {}),
   };
 }
 
-function normalizePlannerProvider(payload: unknown): PlannerProviderMetadata | null {
+function normalizePlannerProvider(
+  payload: unknown,
+): PlannerProviderMetadata | null {
   if (!isRecord(payload) || !isRecord(payload.capabilities)) return null;
   const id = readString(payload.id);
   const displayName = readString(payload.displayName);
-  const authStatus = payload.authStatus === "available" || payload.authStatus === "missing" || payload.authStatus === "unavailable"
-    ? payload.authStatus
-    : null;
+  const authStatus =
+    payload.authStatus === "available" ||
+    payload.authStatus === "missing" ||
+    payload.authStatus === "unavailable"
+      ? payload.authStatus
+      : null;
   if (!id || !displayName || !authStatus) return null;
   const efforts = normalizePlannerEfforts(payload.efforts);
   const defaultEffort = normalizePlannerEffortId(payload.defaultEffort);
-  if (!defaultEffort || !efforts.some((effort) => effort.id === defaultEffort)) return null;
+  if (!defaultEffort || !efforts.some((effort) => effort.id === defaultEffort))
+    return null;
   return {
     id,
     displayName,
@@ -540,12 +676,17 @@ function normalizePlannerProvider(payload: unknown): PlannerProviderMetadata | n
     capabilities: {
       writer: readBooleanOr(payload.capabilities.writer, false),
       reviewer: readBooleanOr(payload.capabilities.reviewer, false),
-      chatContinuation: readBooleanOr(payload.capabilities.chatContinuation, false),
+      chatContinuation: readBooleanOr(
+        payload.capabilities.chatContinuation,
+        false,
+      ),
       cancellation: readBooleanOr(payload.capabilities.cancellation, false),
       planDelta: readBooleanOr(payload.capabilities.planDelta, false),
       checklist: readBooleanOr(payload.capabilities.checklist, false),
     },
-    models: normalizeArrayResponse(payload.models).map(normalizePlannerProviderModel).filter(isPresent),
+    models: normalizeArrayResponse(payload.models)
+      .map(normalizePlannerProviderModel)
+      .filter(isPresent),
     efforts,
     defaultEffort,
   };
@@ -555,29 +696,59 @@ function normalizeAgentRoute(payload: unknown): AgentRoute | null {
   if (!isRecord(payload)) return null;
   const key = readString(payload.key);
   const label = readString(payload.label);
-  const harness = payload.harness === "codex" || payload.harness === "claude-code" || payload.harness === "opencode"
-    ? payload.harness
-    : null;
+  const harness =
+    payload.harness === "codex" ||
+    payload.harness === "claude-code" ||
+    payload.harness === "opencode"
+      ? payload.harness
+      : null;
   const provider = readString(payload.provider);
   const model = readString(payload.model);
   const modelId = readString(payload.modelId);
-  if (!key || !label || !harness || !provider || !model || !modelId) return null;
+  if (!key || !label || !harness || !provider || !model || !modelId)
+    return null;
   return payload as unknown as AgentRoute;
 }
 
 function normalizeAgentSkill(payload: unknown): AgentSkillDefinition | null {
   if (!isRecord(payload)) return null;
   if (
-    !readString(payload.id)
-    || (payload.surface !== "plan" && payload.surface !== "review")
-    || !readString(payload.command)
-    || !readString(payload.label)
-    || !readString(payload.sharedInstructions)
-    || !Array.isArray(payload.agents)
-    || payload.agents.length < 1
-    || payload.agents.length > 4
-  ) return null;
+    !readString(payload.id) ||
+    (payload.surface !== "plan" && payload.surface !== "review") ||
+    !readString(payload.command) ||
+    !readString(payload.label) ||
+    typeof payload.sharedInstructions !== "string" ||
+    !Array.isArray(payload.agents) ||
+    payload.agents.length < 1 ||
+    payload.agents.length > 4
+  )
+    return null;
   return payload as unknown as AgentSkillDefinition;
+}
+
+function normalizePlanSkillInvocation<T extends object>(
+  payload: T,
+): T & {
+  result: PlanHealthSkillResult | null;
+} {
+  const result = decodePlanHealthSkillResult(
+    (payload as { result?: unknown }).result,
+  );
+  return { ...payload, result };
+}
+
+function normalizeInvocationHistory(payload: unknown): {
+  invocations: Array<Record<string, unknown>>;
+  nextCursor: string | null;
+} {
+  if (!isRecord(payload)) return { invocations: [], nextCursor: null };
+  return {
+    invocations: normalizeArrayResponse(payload.invocations)
+      .filter(isRecord)
+      .map((invocation) => ({ ...invocation })),
+    nextCursor:
+      typeof payload.nextCursor === "string" ? payload.nextCursor : null,
+  };
 }
 
 export type {
@@ -598,72 +769,137 @@ function normalizePlanContribution(payload: unknown): PlanContribution | null {
   const text = readString(payload.text);
   const createdAt = readString(payload.createdAt);
   const updatedAt = readString(payload.updatedAt);
-  const status = payload.status === "pending" || payload.status === "incorporated" || payload.status === "dismissed"
-    ? payload.status
-    : null;
-  if (!id || !repoId || !planArtifactId || !provider || !model || !text || !status || !createdAt || !updatedAt) return null;
+  const status =
+    payload.status === "pending" ||
+    payload.status === "incorporated" ||
+    payload.status === "dismissed"
+      ? payload.status
+      : null;
+  if (
+    !id ||
+    !repoId ||
+    !planArtifactId ||
+    !provider ||
+    !model ||
+    !text ||
+    !status ||
+    !createdAt ||
+    !updatedAt
+  )
+    return null;
   return {
     id,
     repoId,
     planArtifactId,
-    sourceKind: payload.sourceKind === "reviewer_message"
-      || payload.sourceKind === "reviewer_run"
-      || payload.sourceKind === "skill_guidance"
-      ? payload.sourceKind
-      : "manual",
+    sourceKind:
+      payload.sourceKind === "reviewer_message" ||
+      payload.sourceKind === "reviewer_run" ||
+      payload.sourceKind === "skill_guidance" ||
+      payload.sourceKind === "skill_overview" ||
+      payload.sourceKind === "curated_reviewer_handoff"
+        ? payload.sourceKind
+        : "manual",
     provider,
     model,
     text,
     status,
     createdAt,
     updatedAt,
-    ...(readNullableString(payload.sourceRunId) ? { sourceRunId: readNullableString(payload.sourceRunId) ?? undefined } : {}),
-    ...(readNullableString(payload.sourceThreadId) ? { sourceThreadId: readNullableString(payload.sourceThreadId) ?? undefined } : {}),
-    ...(readNullableString(payload.sourceMessageId) ? { sourceMessageId: readNullableString(payload.sourceMessageId) ?? undefined } : {}),
-    ...(typeof payload.sourcePlanVersion === "number" ? { sourcePlanVersion: payload.sourcePlanVersion } : {}),
-    ...(readNullableString(payload.skill) ? { skill: readNullableString(payload.skill) ?? undefined } : {}),
-    ...(readNullableString(payload.incorporatedAt) ? { incorporatedAt: readNullableString(payload.incorporatedAt) ?? undefined } : {}),
-    ...(readNullableString(payload.dismissedAt) ? { dismissedAt: readNullableString(payload.dismissedAt) ?? undefined } : {}),
+    sourceRefs: Array.isArray(payload.sourceRefs)
+      ? payload.sourceRefs.flatMap((source) => {
+          if (!isRecord(source)) return [];
+          const threadId = readString(source.threadId);
+          const messageId = readString(source.messageId);
+          const runId = readString(source.runId);
+          return threadId && messageId && runId
+            ? [{ threadId, messageId, runId }]
+            : [];
+        })
+      : [],
+    ...(readNullableString(payload.sourceRunId)
+      ? { sourceRunId: readNullableString(payload.sourceRunId) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.sourceThreadId)
+      ? {
+          sourceThreadId:
+            readNullableString(payload.sourceThreadId) ?? undefined,
+        }
+      : {}),
+    ...(readNullableString(payload.sourceMessageId)
+      ? {
+          sourceMessageId:
+            readNullableString(payload.sourceMessageId) ?? undefined,
+        }
+      : {}),
+    ...(typeof payload.sourcePlanVersion === "number"
+      ? { sourcePlanVersion: payload.sourcePlanVersion }
+      : {}),
+    ...(readNullableString(payload.skill)
+      ? { skill: readNullableString(payload.skill) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.incorporatedAt)
+      ? {
+          incorporatedAt:
+            readNullableString(payload.incorporatedAt) ?? undefined,
+        }
+      : {}),
+    ...(readNullableString(payload.dismissedAt)
+      ? { dismissedAt: readNullableString(payload.dismissedAt) ?? undefined }
+      : {}),
   };
 }
 
-function normalizePlannerRunInput(payload: unknown): PlannerRun["input"] | undefined {
+function normalizePlannerRunInput(
+  payload: unknown,
+): PlannerRun["input"] | undefined {
   if (!isRecord(payload)) return undefined;
-  const skillSnapshot = isRecord(payload.skillSnapshot)
-    && readString(payload.skillSnapshot.id)
-    && readString(payload.skillSnapshot.command)
-    && readString(payload.skillSnapshot.label)
-    && readString(payload.skillSnapshot.instructions)
-    ? {
-      id: readString(payload.skillSnapshot.id) ?? "",
-      command: readString(payload.skillSnapshot.command) ?? "",
-      label: readString(payload.skillSnapshot.label) ?? "",
-      instructions: readString(payload.skillSnapshot.instructions) ?? "",
-    }
-    : null;
-  const skillDefinitionSnapshot = normalizeAgentSkill(payload.skillDefinitionSnapshot);
-  const basis = isRecord(payload.basis)
-    && readString(payload.basis.artifactId)
-    && readString(payload.basis.title)
-    && typeof payload.basis.markdown === "string"
-    && typeof payload.basis.version === "number"
-    ? payload.basis as unknown as NonNullable<PlannerRun["input"]>["basis"]
-    : null;
-  const effort = payload.effort === "low"
-    || payload.effort === "medium"
-    || payload.effort === "high"
-    || payload.effort === "xhigh"
-    || payload.effort === "ultra"
-    || payload.effort === "max"
-    ? payload.effort
-    : null;
+  const skillSnapshot =
+    isRecord(payload.skillSnapshot) &&
+    readString(payload.skillSnapshot.id) &&
+    readString(payload.skillSnapshot.command) &&
+    readString(payload.skillSnapshot.label) &&
+    readString(payload.skillSnapshot.instructions)
+      ? {
+          id: readString(payload.skillSnapshot.id) ?? "",
+          command: readString(payload.skillSnapshot.command) ?? "",
+          label: readString(payload.skillSnapshot.label) ?? "",
+          instructions: readString(payload.skillSnapshot.instructions) ?? "",
+        }
+      : null;
+  const skillDefinitionSnapshot = normalizeAgentSkill(
+    payload.skillDefinitionSnapshot,
+  );
+  const basis =
+    isRecord(payload.basis) &&
+    readString(payload.basis.artifactId) &&
+    readString(payload.basis.title) &&
+    typeof payload.basis.markdown === "string" &&
+    typeof payload.basis.version === "number"
+      ? (payload.basis as unknown as NonNullable<PlannerRun["input"]>["basis"])
+      : null;
+  const effort =
+    payload.effort === "low" ||
+    payload.effort === "medium" ||
+    payload.effort === "high" ||
+    payload.effort === "xhigh" ||
+    payload.effort === "ultra" ||
+    payload.effort === "max"
+      ? payload.effort
+      : null;
   return {
-    ...(readNullableString(payload.instruction) ? { instruction: readNullableString(payload.instruction) ?? undefined } : {}),
-    ...(typeof payload.sourcePlanVersion === "number" ? { sourcePlanVersion: payload.sourcePlanVersion } : {}),
+    ...(readNullableString(payload.instruction)
+      ? { instruction: readNullableString(payload.instruction) ?? undefined }
+      : {}),
+    ...(typeof payload.sourcePlanVersion === "number"
+      ? { sourcePlanVersion: payload.sourcePlanVersion }
+      : {}),
     ...(payload.githubBaseCommitSha === null
       ? { githubBaseCommitSha: null }
       : readNullableString(payload.githubBaseCommitSha)
-        ? { githubBaseCommitSha: readNullableString(payload.githubBaseCommitSha) ?? undefined }
+        ? {
+            githubBaseCommitSha:
+              readNullableString(payload.githubBaseCommitSha) ?? undefined,
+          }
         : {}),
     ...(skillSnapshot ? { skillSnapshot } : {}),
     ...(skillDefinitionSnapshot ? { skillDefinitionSnapshot } : {}),
@@ -680,25 +916,47 @@ function normalizePlannerRun(payload: unknown): PlannerRun | null {
   const role = payload.role === "reviewer" ? payload.role : null;
   const provider = readString(payload.provider);
   const model = readString(payload.model);
-  const status = payload.status === "queued" || payload.status === "running" || payload.status === "saving" || payload.status === "completed" || payload.status === "failed" || payload.status === "cancelled"
-    ? payload.status
-    : null;
+  const status =
+    payload.status === "queued" ||
+    payload.status === "running" ||
+    payload.status === "saving" ||
+    payload.status === "completed" ||
+    payload.status === "failed" ||
+    payload.status === "cancelled"
+      ? payload.status
+      : null;
   const startedAt = readString(payload.startedAt);
-  if (!runId || !repoId || !planArtifactId || !role || !provider || !model || !status || !startedAt) return null;
+  if (
+    !runId ||
+    !repoId ||
+    !planArtifactId ||
+    !role ||
+    !provider ||
+    !model ||
+    !status ||
+    !startedAt
+  )
+    return null;
   const input = normalizePlannerRunInput(payload.input);
-  const skillRunRole = payload.skillRunRole === "child_initial"
-    || payload.skillRunRole === "child_followup"
-    || payload.skillRunRole === "overview"
-    ? payload.skillRunRole
-    : null;
-  const runtime = isRecord(payload.runtime)
-    && (payload.runtime.backend === "cf" || payload.runtime.backend === "host")
-    && readString(payload.runtime.jobSlug)
-    ? payload.runtime as unknown as NonNullable<PlannerRun["runtime"]>
-    : null;
-  const codexAuthMode = payload.codexAuthMode === "subscription" || payload.codexAuthMode === "api-key"
-    ? payload.codexAuthMode
-    : null;
+  const skillRunRole =
+    payload.skillRunRole === "root_initial" ||
+    payload.skillRunRole === "root_followup" ||
+    payload.skillRunRole === "report_initial" ||
+    payload.skillRunRole === "report_followup" ||
+    payload.skillRunRole === "overview"
+      ? payload.skillRunRole
+      : null;
+  const runtime =
+    isRecord(payload.runtime) &&
+    (payload.runtime.backend === "cf" || payload.runtime.backend === "host") &&
+    readString(payload.runtime.jobSlug)
+      ? (payload.runtime as unknown as NonNullable<PlannerRun["runtime"]>)
+      : null;
+  const codexAuthMode =
+    payload.codexAuthMode === "subscription" ||
+    payload.codexAuthMode === "api-key"
+      ? payload.codexAuthMode
+      : null;
   return {
     runId,
     repoId,
@@ -708,16 +966,35 @@ function normalizePlannerRun(payload: unknown): PlannerRun | null {
     model,
     status,
     startedAt,
-    ...(readNullableString(payload.skill) ? { skill: readNullableString(payload.skill) ?? undefined } : {}),
-    ...(readNullableString(payload.completedAt) ? { completedAt: readNullableString(payload.completedAt) ?? undefined } : {}),
-    ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
-    ...(readNullableString(payload.threadId) ? { threadId: readNullableString(payload.threadId) ?? undefined } : {}),
-    ...(readNullableString(payload.skillInvocationId) ? { skillInvocationId: readNullableString(payload.skillInvocationId) ?? undefined } : {}),
-    ...(readNullableString(payload.skillAgentId) ? { skillAgentId: readNullableString(payload.skillAgentId) ?? undefined } : {}),
+    ...(readNullableString(payload.skill)
+      ? { skill: readNullableString(payload.skill) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.completedAt)
+      ? { completedAt: readNullableString(payload.completedAt) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.error)
+      ? { error: readNullableString(payload.error) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.threadId)
+      ? { threadId: readNullableString(payload.threadId) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.skillInvocationId)
+      ? {
+          skillInvocationId:
+            readNullableString(payload.skillInvocationId) ?? undefined,
+        }
+      : {}),
+    ...(readNullableString(payload.skillAgentId)
+      ? { skillAgentId: readNullableString(payload.skillAgentId) ?? undefined }
+      : {}),
     ...(skillRunRole ? { skillRunRole } : {}),
     ...(runtime ? { runtime } : {}),
     ...(codexAuthMode ? { codexAuthMode } : {}),
-    ...(readNullableString(payload.lastContactAt) ? { lastContactAt: readNullableString(payload.lastContactAt) ?? undefined } : {}),
+    ...(readNullableString(payload.lastContactAt)
+      ? {
+          lastContactAt: readNullableString(payload.lastContactAt) ?? undefined,
+        }
+      : {}),
     ...(input ? { input } : {}),
   };
 }
@@ -736,7 +1013,9 @@ function normalizePlannerRunEvent(payload: unknown): PlannerRunEvent | null {
     planArtifactId,
     seq: readIntegerOr(payload.seq, 0),
     type,
-    ...(readNullableString(payload.message) ? { message: readNullableString(payload.message) ?? undefined } : {}),
+    ...(readNullableString(payload.message)
+      ? { message: readNullableString(payload.message) ?? undefined }
+      : {}),
     ...(payload.data === undefined ? {} : { data: payload.data }),
     createdAt,
   };
@@ -754,9 +1033,16 @@ function normalizeThreadMessage(payload: unknown): ThreadMessage | null {
     threadId,
     seq: readIntegerOr(payload.seq, 0),
     senderSessionId,
-    kind: payload.kind === "status" || payload.kind === "question" || payload.kind === "ack" ? payload.kind : "chat",
+    kind:
+      payload.kind === "status" ||
+      payload.kind === "question" ||
+      payload.kind === "ack"
+        ? payload.kind
+        : "chat",
     body: payload.body,
-    ...(readNullableString(payload.localId) ? { localId: readNullableString(payload.localId) ?? undefined } : {}),
+    ...(readNullableString(payload.localId)
+      ? { localId: readNullableString(payload.localId) ?? undefined }
+      : {}),
     artifactIds: normalizeStringArray(payload.artifactIds),
     createdAt,
   };
@@ -792,7 +1078,9 @@ function normalizeEnvReviewRun(payload: unknown): EnvReviewRun | null {
   return payload as unknown as EnvReviewRun;
 }
 
-function normalizeEnvReviewRunEvent(payload: unknown): EnvReviewRunEvent | null {
+function normalizeEnvReviewRunEvent(
+  payload: unknown,
+): EnvReviewRunEvent | null {
   if (!isRecord(payload)) return null;
   const runId = readString(payload.runId);
   const type = readString(payload.type);
@@ -801,7 +1089,9 @@ function normalizeEnvReviewRunEvent(payload: unknown): EnvReviewRunEvent | null 
   return payload as unknown as EnvReviewRunEvent;
 }
 
-function normalizeEnvReviewFeedback(payload: unknown): EnvReviewFeedback | null {
+function normalizeEnvReviewFeedback(
+  payload: unknown,
+): EnvReviewFeedback | null {
   if (!isRecord(payload)) return null;
   const feedbackId = readString(payload.feedbackId);
   const runId = readString(payload.runId);
@@ -818,9 +1108,15 @@ function normalizeEnvReviewState(payload: unknown): EnvReviewState {
   if (!session) throw new Error("Malformed env review session");
   return {
     session,
-    tabs: normalizeArrayResponse(payload.tabs).map(normalizeEnvReviewTab).filter(isPresent),
-    runs: normalizeArrayResponse(payload.runs).map(normalizeEnvReviewRun).filter(isPresent),
-    feedback: normalizeArrayResponse(payload.feedback).map(normalizeEnvReviewFeedback).filter(isPresent),
+    tabs: normalizeArrayResponse(payload.tabs)
+      .map(normalizeEnvReviewTab)
+      .filter(isPresent),
+    runs: normalizeArrayResponse(payload.runs)
+      .map(normalizeEnvReviewRun)
+      .filter(isPresent),
+    feedback: normalizeArrayResponse(payload.feedback)
+      .map(normalizeEnvReviewFeedback)
+      .filter(isPresent),
   };
 }
 
@@ -841,10 +1137,14 @@ function normalizeArtifactRef(payload: unknown): ArtifactRef | null {
 }
 
 function normalizeStringArray(value: unknown): string[] {
-  return normalizeArrayResponse(value).filter((item): item is string => typeof item === "string");
+  return normalizeArrayResponse(value).filter(
+    (item): item is string => typeof item === "string",
+  );
 }
 
-function normalizeVerifyModelAuthResult(payload: unknown): VerifyModelAuthResult | null {
+function normalizeVerifyModelAuthResult(
+  payload: unknown,
+): VerifyModelAuthResult | null {
   if (!isRecord(payload)) return null;
   const key = readString(payload.key);
   const mode = readString(payload.mode);
@@ -854,9 +1154,15 @@ function normalizeVerifyModelAuthResult(payload: unknown): VerifyModelAuthResult
     key,
     mode,
     ok: payload.ok === true,
-    ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
-    ...(readNullableString(payload.warning) ? { warning: readNullableString(payload.warning) ?? undefined } : {}),
-    ...(readNullableString(payload.note) ? { note: readNullableString(payload.note) ?? undefined } : {}),
+    ...(readNullableString(payload.error)
+      ? { error: readNullableString(payload.error) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.warning)
+      ? { warning: readNullableString(payload.warning) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.note)
+      ? { note: readNullableString(payload.note) ?? undefined }
+      : {}),
   };
 }
 
@@ -865,176 +1171,80 @@ function normalizeSetupMutationResult(
 ): { ok: boolean; saved?: string[]; error?: string } | null {
   if (!isRecord(payload) || typeof payload.ok !== "boolean") return null;
   if (
-    payload.saved !== undefined
-    && (!Array.isArray(payload.saved) || payload.saved.some((value) => typeof value !== "string"))
+    payload.saved !== undefined &&
+    (!Array.isArray(payload.saved) ||
+      payload.saved.some((value) => typeof value !== "string"))
   ) {
     return null;
   }
   return {
     ok: payload.ok,
-    ...(Array.isArray(payload.saved) ? { saved: normalizeStringArray(payload.saved) } : {}),
-    ...(readString(payload.error) ? { error: readString(payload.error) ?? undefined } : {}),
-  };
-}
-
-function normalizeUpdateApplyResult(payload: unknown): UpdateApplyResult | null {
-  if (!isRecord(payload)) return null;
-  const expectedSourceId = readString(payload.expectedSourceId);
-  if (payload.ok === true && payload.status === "queued") {
-    const commitSha = readString(payload.commitSha);
-    return expectedSourceId && commitSha
-      ? { ok: true, status: "queued", expectedSourceId, commitSha }
-      : null;
-  }
-  if (payload.ok === true && payload.status === "noop") {
-    return expectedSourceId
-      ? { ok: true, status: "noop", expectedSourceId }
-      : null;
-  }
-  const failureStatus = payload.status === "hub_repo_not_configured"
-    || payload.status === "not_a_tiller_hub_repo"
-    || payload.status === "managed_files_removed"
-    || payload.status === "advanced_repair_required"
-    || payload.status === "update_branch_moved"
-    || payload.status === "direct_update_rejected"
-    ? payload.status
-    : null;
-  const error = readString(payload.error);
-  if (payload.ok !== false || !failureStatus || !error) return null;
-  return {
-    ok: false,
-    status: failureStatus,
-    error,
-    ...(typeof payload.retryable === "boolean" ? { retryable: payload.retryable } : {}),
-    ...(Array.isArray(payload.missingManagedFiles)
-      && payload.missingManagedFiles.every((value) => typeof value === "string")
-      ? { missingManagedFiles: normalizeStringArray(payload.missingManagedFiles) }
+    ...(Array.isArray(payload.saved)
+      ? { saved: normalizeStringArray(payload.saved) }
+      : {}),
+    ...(readString(payload.error)
+      ? { error: readString(payload.error) ?? undefined }
       : {}),
   };
 }
 
-function normalizeCodexRouteStatus(value: unknown): SetupStatus["codexRouteStatus"] {
-  return isCodexRouteStatus(value)
-    ? value
-    : "unavailable";
+function normalizeCodexRouteStatus(
+  value: unknown,
+): SetupStatus["codexRouteStatus"] {
+  return isCodexRouteStatus(value) ? value : "unavailable";
 }
 
-function isCodexRouteStatus(value: unknown): value is SetupStatus["codexRouteStatus"] {
-  return value === "available"
-    || value === "backend_offline"
-    || value === "runtime_update_required"
-    || value === "environment_not_connected"
-    || value === "authentication_unavailable"
-    || value === "direct_api"
-    || value === "unavailable";
+function isCodexRouteStatus(
+  value: unknown,
+): value is SetupStatus["codexRouteStatus"] {
+  return (
+    value === "available" ||
+    value === "backend_offline" ||
+    value === "runtime_update_required" ||
+    value === "environment_not_connected" ||
+    value === "authentication_unavailable" ||
+    value === "direct_api" ||
+    value === "unavailable"
+  );
 }
 
-function normalizeUpdateMetadata(payload: unknown): TillerUpdateMetadata | null {
+function normalizeReleaseInfo(payload: unknown): ReleaseInfo | null {
   if (!isRecord(payload)) return null;
   if (
     payload.schemaVersion !== 1 ||
-    payload.channel !== "deploy-button" ||
-    payload.updateMode !== "full-source" ||
-    payload.sourceRepo !== "paperwing-dev/tiller-hub"
-  ) {
+    (payload.channel !== "development" && payload.channel !== "release")
+  )
     return null;
-  }
-  const sourceId = readString(payload.sourceId);
-  const version = readString(payload.version);
-  const label = readString(payload.label);
-  const managedFiles = normalizeStringArray(payload.managedFiles);
-  if (!sourceId || !version || !label || managedFiles.length === 0) return null;
-  const selfHostRuntime = isRecord(payload.selfHostRuntime)
-    && typeof payload.selfHostRuntime.imageSourceId === "string"
-    && typeof payload.selfHostRuntime.sandboxImage === "string"
-    ? {
-        imageSourceId: payload.selfHostRuntime.imageSourceId,
-        sandboxImage: payload.selfHostRuntime.sandboxImage,
-      }
-    : null;
+  const hubVersion = readString(payload.hubVersion)?.trim() ?? "";
+  if (!/^\d+\.\d+\.\d+$/.test(hubVersion)) return null;
+  const releaseId =
+    payload.releaseId === undefined
+      ? null
+      : (readString(payload.releaseId)?.trim() ?? "");
+  if (releaseId !== null && !/^[0-9a-f]{40}$/.test(releaseId)) return null;
+  const selfHostRuntimeImage =
+    payload.selfHostRuntimeImage === undefined
+      ? null
+      : (readString(payload.selfHostRuntimeImage)?.trim() ?? "");
+  if (
+    selfHostRuntimeImage !== null &&
+    !/^docker\.io\/jamieatlason\/tiller-sandbox@sha256:[0-9a-f]{64}$/.test(
+      selfHostRuntimeImage,
+    )
+  )
+    return null;
   return {
     schemaVersion: 1,
-    channel: "deploy-button",
-    updateMode: "full-source",
-    sourceRepo: "paperwing-dev/tiller-hub",
-    sourceId,
-    version,
-    label,
-    managedFiles,
-    ...(selfHostRuntime ? { selfHostRuntime } : {}),
+    channel: payload.channel,
+    hubVersion,
+    ...(releaseId ? { releaseId } : {}),
+    ...(selfHostRuntimeImage
+      ? {
+          selfHostRuntimeImage:
+            selfHostRuntimeImage as ReleaseInfo["selfHostRuntimeImage"],
+        }
+      : {}),
   };
-}
-
-function normalizeHubUpdateRepoCandidate(payload: unknown): HubUpdateRepoCandidate | null {
-  if (!isRecord(payload)) return null;
-  const owner = readString(payload.owner);
-  const repo = readString(payload.repo);
-  const fullName = readString(payload.fullName);
-  const label = readString(payload.label);
-  const branch = readString(payload.branch);
-  const sourceId = readString(payload.sourceId);
-  const repoId = readIntegerOr(payload.repoId, 0);
-  const installationId = readIntegerOr(payload.installationId, 0);
-  if (!owner || !repo || !fullName || !label || !branch || !sourceId || repoId <= 0 || installationId <= 0) return null;
-  return {
-    owner,
-    repo,
-    fullName,
-    label,
-    repoId,
-    installationId,
-    branch,
-    private: readBooleanOr(payload.private, false),
-    defaultBranch: readNullableString(payload.defaultBranch),
-    sourceId,
-  };
-}
-
-function normalizeHubUpdateRepoState(payload: unknown): HubUpdateRepoState {
-  if (!isRecord(payload)) {
-    return { status: "not_checked", lastDetectedAt: null };
-  }
-  if (payload.status === "detected") {
-    const owner = readString(payload.owner);
-    const repo = readString(payload.repo);
-    const fullName = readString(payload.fullName);
-    const label = readString(payload.label);
-    const branch = readString(payload.branch);
-    const lastDetectedAt = readString(payload.lastDetectedAt);
-    const repoId = readIntegerOr(payload.repoId, 0);
-    const installationId = readIntegerOr(payload.installationId, 0);
-    if (owner && repo && fullName && label && branch && lastDetectedAt && repoId > 0 && installationId > 0) {
-      return {
-        status: "detected",
-        owner,
-        repo,
-        fullName,
-        label,
-        repoId,
-        installationId,
-        branch,
-        lastDetectedAt,
-        detectedBy: payload.detectedBy === "manual" || payload.detectedBy === "selection" ? payload.detectedBy : "auto",
-      };
-    }
-  }
-  if (payload.status === "missing") {
-    return {
-      status: "missing",
-      lastDetectedAt: readNullableString(payload.lastDetectedAt),
-      visibleGitHubOwners: normalizeStringArray(payload.visibleGitHubOwners),
-    };
-  }
-  if (payload.status === "ambiguous") {
-    return {
-      status: "ambiguous",
-      lastDetectedAt: readStringOr(payload.lastDetectedAt, ""),
-      candidates: normalizeArrayResponse(payload.candidates)
-        .map(normalizeHubUpdateRepoCandidate)
-        .filter(isPresent),
-    };
-  }
-  return { status: "not_checked", lastDetectedAt: null };
 }
 
 function normalizeBuildDiagnostics(payload: unknown): UpdateBuildDiagnostics {
@@ -1055,74 +1265,69 @@ function normalizeBuildDiagnostics(payload: unknown): UpdateBuildDiagnostics {
   };
 }
 
-function normalizeUpdateCheckResult(payload: unknown): UpdateCheckResult | null {
+function normalizeUpdateCheckResult(
+  payload: unknown,
+): UpdateCheckResult | null {
   if (!isRecord(payload)) return null;
-  const currentUpdate = normalizeUpdateMetadata(payload.currentUpdate);
-  if (typeof payload.updateAvailable !== "boolean" || !currentUpdate) {
+  if (payload.kind !== "installer-managed" && payload.kind !== "unmanaged")
     return null;
+  const currentRelease = normalizeReleaseInfo(payload.currentRelease);
+  if (
+    typeof payload.updateAvailable !== "boolean" ||
+    !currentRelease ||
+    !Array.isArray(payload.errors)
+  )
+    return null;
+  let stableRelease: StableReleaseSummary | null = null;
+  if (payload.stableRelease !== null) {
+    if (!isRecord(payload.stableRelease)) return null;
+    const releaseId = readString(payload.stableRelease.releaseId);
+    const version = readString(payload.stableRelease.version);
+    const releaseNotesUrl = readString(payload.stableRelease.releaseNotesUrl);
+    if (!releaseId || !version || !releaseNotesUrl) return null;
+    stableRelease = { releaseId, version, releaseNotesUrl };
   }
-
-  const issue = isRecord(payload.issue) && readString(payload.issue.code) && readString(payload.issue.message)
-    ? {
-        code: readString(payload.issue.code) as NonNullable<UpdateCheckResult["issue"]>["code"],
-        message: readString(payload.issue.message) ?? "",
-        retryable: readBooleanOr(payload.issue.retryable, false),
-      }
-    : null;
-  const common = {
-    updateAvailable: payload.updateAvailable,
-    currentUpdate,
-    buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
-    ...(issue ? { issue } : {}),
-  };
-
-  if (payload.kind === "installer-maintenance") {
-    const installedReleaseId = readString(payload.installedReleaseId);
-    let stableRelease: StableReleaseSummary | null = null;
-    if (payload.stableRelease !== null) {
-      if (!isRecord(payload.stableRelease)) return null;
-      const releaseId = readString(payload.stableRelease.releaseId);
-      const version = readString(payload.stableRelease.version);
-      const releaseNotesUrl = readString(payload.stableRelease.releaseNotesUrl);
-      if (!releaseId || !version || !releaseNotesUrl) return null;
-      stableRelease = { releaseId, version, releaseNotesUrl };
-    }
-    if (!installedReleaseId) return null;
-    return {
-      kind: "installer-maintenance",
-      ...common,
-      installedReleaseId,
-      stableRelease,
-    } satisfies InstallerMaintenanceUpdateCheckResult;
-  }
-
-  if (payload.kind !== "legacy") return null;
-  const latestUpdate = normalizeUpdateMetadata(payload.latestUpdate);
-  const releaseNotesUrl = readString(payload.releaseNotesUrl);
-  if (!latestUpdate || !releaseNotesUrl) return null;
+  const errors = payload.errors
+    .map((error): UpdateCheckError | null => {
+      if (!isRecord(error)) return null;
+      const code =
+        error.code === "stable_release_unavailable" ||
+        error.code === "release_info_invalid"
+          ? error.code
+          : null;
+      const message = readString(error.message);
+      return code && message
+        ? { code, message, retryable: readBooleanOr(error.retryable) }
+        : null;
+    })
+    .filter(isPresent);
+  if (errors.length !== payload.errors.length) return null;
   return {
-    kind: "legacy",
-    ...common,
-    latestUpdate,
-    hubRepo: normalizeHubUpdateRepoState(payload.hubRepo),
-    updateMethod: payload.updateMethod === "github_repo" || payload.updateMethod === "connect_hub_repo" || payload.updateMethod === "advanced_repair"
-      ? payload.updateMethod
-      : "advanced_repair",
-    releaseNotesUrl,
-  } satisfies LegacyUpdateCheckResult;
+    kind: payload.kind,
+    currentRelease,
+    stableRelease,
+    updateAvailable: payload.updateAvailable,
+    buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
+    errors,
+  };
 }
 
 export class ApiAuthenticationError extends Error {
   readonly status: number | null;
 
-  constructor(message = "Browser authentication is required.", status: number | null = null) {
+  constructor(
+    message = "Browser authentication is required.",
+    status: number | null = null,
+  ) {
     super(message);
     this.name = "ApiAuthenticationError";
     this.status = status;
   }
 }
 
-export function isApiAuthenticationError(error: unknown): error is ApiAuthenticationError {
+export function isApiAuthenticationError(
+  error: unknown,
+): error is ApiAuthenticationError {
   return error instanceof ApiAuthenticationError;
 }
 
@@ -1130,24 +1335,47 @@ export class ApiActionError extends Error {
   readonly code?: string;
   readonly hint?: string;
   readonly missingPermissions: string[];
+  readonly retryable: boolean;
+  readonly status: number | null;
 
-  constructor(body: { error?: string; code?: string; hint?: string; missingPermissions?: string[] }, fallback: string) {
+  constructor(
+    body: {
+      error?: string;
+      code?: string;
+      hint?: string;
+      missingPermissions?: string[];
+      retryable?: boolean;
+    },
+    fallback: string,
+    status: number | null = null,
+  ) {
     super(body.error || fallback);
     this.name = "ApiActionError";
     this.code = body.code;
     this.hint = body.hint;
-    this.missingPermissions = Array.isArray(body.missingPermissions) ? body.missingPermissions : [];
+    this.missingPermissions = Array.isArray(body.missingPermissions)
+      ? body.missingPermissions
+      : [];
+    this.retryable = body.retryable === true;
+    this.status = status;
+  }
+}
+
+export class ApiReadTimeoutError extends Error {
+  readonly operation: string;
+  readonly deadlineMs: number;
+
+  constructor(operation: string, deadlineMs: number) {
+    super(`${operation} timed out after ${deadlineMs}ms.`);
+    this.name = "ApiReadTimeoutError";
+    this.operation = operation;
+    this.deadlineMs = deadlineMs;
   }
 }
 
 export type {
-  HubUpdateRepoCandidate,
-  HubUpdateRepoState,
-  InstallerMaintenanceUpdateCheckResult,
-  LegacyUpdateCheckResult,
+  ReleaseInfo,
   StableReleaseSummary,
-  TillerUpdateMetadata,
-  UpdateApplyResult,
   UpdateBuildDiagnostics,
   UpdateCheckResult,
 } from "../api/update/types";
@@ -1155,6 +1383,7 @@ export type {
   Artifact,
   ArtifactRef,
   PlanArtifact,
+  PlanAttentionItem,
   PlanContribution,
   PlannerEffort,
   PlannerProviderMetadata,
@@ -1166,6 +1395,7 @@ export type {
 } from "../api/coordination/types";
 export type {
   EnvReviewFeedback,
+  EnvReviewFanoutHandoff,
   EnvReviewRun,
   EnvReviewRunEvent,
   EnvReviewSession,
@@ -1173,13 +1403,16 @@ export type {
   EnvReviewTab,
 } from "../api/env-review/types";
 
-function normalizeRepoArtifactState(
-  payload: unknown,
-): { artifacts: Artifact[]; refs: ArtifactRef[] } {
+function normalizeRepoArtifactState(payload: unknown): {
+  artifacts: Artifact[];
+  refs: ArtifactRef[];
+  attention: PlanAttentionItem[];
+} {
   if (!isRecord(payload)) {
     return {
       artifacts: [],
       refs: [],
+      attention: [],
     };
   }
 
@@ -1190,7 +1423,26 @@ function normalizeRepoArtifactState(
     refs: normalizeArrayResponse(payload.refs)
       .map((ref) => normalizeArtifactRef(ref))
       .filter(isPresent),
+    attention: normalizeArrayResponse(payload.attention)
+      .map((item) => normalizePlanAttentionItem(item))
+      .filter(isPresent),
   };
+}
+
+function normalizePlanAttentionItem(
+  payload: unknown,
+): PlanAttentionItem | null {
+  if (!isRecord(payload)) return null;
+  const planArtifactId = readString(payload.planArtifactId);
+  const sourceId = readString(payload.sourceId);
+  const token = readString(payload.token);
+  const sourceKind =
+    payload.sourceKind === "scribe" || payload.sourceKind === "reviewer"
+      ? payload.sourceKind
+      : null;
+  return planArtifactId && sourceKind && sourceId && token
+    ? { planArtifactId, sourceKind, sourceId, token }
+    : null;
 }
 
 const SETUP_BOOLEAN_FIELDS = [
@@ -1234,7 +1486,6 @@ const SETUP_STATUS_KEYS = [
   "githubAppInstallUrl",
   "githubAppManageUrl",
   "buildDiagnostics",
-  "selfUpdateRepo",
   "dashboardOnboarding",
 ] as const;
 
@@ -1242,9 +1493,16 @@ function isNullableSetupString(value: unknown): boolean {
   return value === null || typeof value === "string";
 }
 
-function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void {
-  if (Object.keys(payload).sort().join(",") !== [...SETUP_STATUS_KEYS].sort().join(",")) {
-    throw new Error("Malformed setup status: exact current setup schema is required.");
+function assertCurrentSetupStatusPayload(
+  payload: Record<string, unknown>,
+): void {
+  if (
+    Object.keys(payload).sort().join(",") !==
+    [...SETUP_STATUS_KEYS].sort().join(",")
+  ) {
+    throw new Error(
+      "Malformed setup status: exact current setup schema is required.",
+    );
   }
   for (const field of SETUP_BOOLEAN_FIELDS) {
     if (typeof payload[field] !== "boolean") {
@@ -1252,31 +1510,37 @@ function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void
     }
   }
   if (
-    (
-      payload.setupPhase !== "github-app"
-      && payload.setupPhase !== "complete"
-    )
-    || payload.needsSetup !== (payload.setupPhase !== "complete")
-    || (payload.protectionMode !== "public" && payload.protectionMode !== "cf-access")
-    || !Array.isArray(payload.enabledHarnesses)
-    || payload.enabledHarnesses.length === 0
-    || payload.enabledHarnesses.some((value) =>
-      value !== "claude-code" && value !== "codex" && value !== "opencode"
-    )
-    || !isCloudflareIdleTimeoutMinutes(payload.idleTimeoutMinutes)
-    || (payload.installationRegion !== null && !isPlacementRegion(payload.installationRegion))
-    || typeof payload.githubAppManageUrl !== "string"
-    || !isRecord(payload.codexBackendReadiness)
-    || !isCodexRouteStatus(payload.codexRouteStatus)
-    || !isCodexRouteStatus(payload.codexBackendReadiness.cf)
-    || !isCodexRouteStatus(payload.codexBackendReadiness.host)
-    || !isRecord(payload.buildDiagnostics)
-    || !isRecord(payload.selfUpdateRepo)
-    || !isRecord(payload.dashboardOnboarding)
-    || typeof payload.dashboardOnboarding.dismissed !== "boolean"
-    || typeof payload.dashboardOnboarding.executionReady !== "boolean"
+    (payload.setupPhase !== "github-app" &&
+      payload.setupPhase !== "complete") ||
+    payload.needsSetup !== (payload.setupPhase !== "complete") ||
+    (payload.protectionMode !== "public" &&
+      payload.protectionMode !== "cf-access") ||
+    !Array.isArray(payload.enabledHarnesses) ||
+    payload.enabledHarnesses.length === 0 ||
+    payload.enabledHarnesses.some(
+      (value) =>
+        value !== "claude-code" && value !== "codex" && value !== "opencode",
+    ) ||
+    !isCloudflareIdleTimeoutMinutes(payload.idleTimeoutMinutes) ||
+    (payload.installationRegion !== null &&
+      !isPlacementRegion(payload.installationRegion)) ||
+    (payload.isLocalDev && payload.installationRegion !== null) ||
+    (payload.installerManaged &&
+      !payload.isLocalDev &&
+      payload.installationRegion === null) ||
+    typeof payload.githubAppManageUrl !== "string" ||
+    !isRecord(payload.codexBackendReadiness) ||
+    !isCodexRouteStatus(payload.codexRouteStatus) ||
+    !isCodexRouteStatus(payload.codexBackendReadiness.cf) ||
+    !isCodexRouteStatus(payload.codexBackendReadiness.host) ||
+    !isRecord(payload.buildDiagnostics) ||
+    !isRecord(payload.dashboardOnboarding) ||
+    typeof payload.dashboardOnboarding.dismissed !== "boolean" ||
+    typeof payload.dashboardOnboarding.executionReady !== "boolean"
   ) {
-    throw new Error("Malformed setup status: current setup schema is required.");
+    throw new Error(
+      "Malformed setup status: current setup schema is required.",
+    );
   }
   for (const field of [
     "workersDevHubUrl",
@@ -1286,30 +1550,30 @@ function assertCurrentSetupStatusPayload(payload: Record<string, unknown>): void
     "githubAppInstallUrl",
   ] as const) {
     if (!isNullableSetupString(payload[field])) {
-      throw new Error(`Malformed setup status: ${field} must be a string or null.`);
+      throw new Error(
+        `Malformed setup status: ${field} must be a string or null.`,
+      );
     }
   }
   if (
-    (payload.claudeBillingMode !== null
-      && payload.claudeBillingMode !== "subscription"
-      && payload.claudeBillingMode !== "api")
-    || (payload.openaiBillingMode !== null
-      && payload.openaiBillingMode !== "subscription"
-      && payload.openaiBillingMode !== "api")
-    || (
-      payload.chatgptAuthStatus !== "missing"
-      && payload.chatgptAuthStatus !== "connected"
-      && payload.chatgptAuthStatus !== "refreshing"
-      && payload.chatgptAuthStatus !== "needs_reconnect"
-      && payload.chatgptAuthStatus !== "temporarily_unavailable"
-    )
-    || (
-      payload.openaiPlannerRoute !== null
-      && payload.openaiPlannerRoute !== "api-key"
-      && payload.openaiPlannerRoute !== "subscription-app-server"
-    )
+    (payload.claudeBillingMode !== null &&
+      payload.claudeBillingMode !== "subscription" &&
+      payload.claudeBillingMode !== "api") ||
+    (payload.openaiBillingMode !== null &&
+      payload.openaiBillingMode !== "subscription" &&
+      payload.openaiBillingMode !== "api") ||
+    (payload.chatgptAuthStatus !== "missing" &&
+      payload.chatgptAuthStatus !== "connected" &&
+      payload.chatgptAuthStatus !== "refreshing" &&
+      payload.chatgptAuthStatus !== "needs_reconnect" &&
+      payload.chatgptAuthStatus !== "temporarily_unavailable") ||
+    (payload.openaiPlannerRoute !== null &&
+      payload.openaiPlannerRoute !== "api-key" &&
+      payload.openaiPlannerRoute !== "subscription-app-server")
   ) {
-    throw new Error("Malformed setup status: current setup enum values are required.");
+    throw new Error(
+      "Malformed setup status: current setup enum values are required.",
+    );
   }
 }
 
@@ -1325,7 +1589,6 @@ function normalizeSetupStatus(payload: unknown): SetupStatus {
     enabledHarnesses: [...current.enabledHarnesses],
     codexBackendReadiness: { ...current.codexBackendReadiness },
     buildDiagnostics: normalizeBuildDiagnostics(payload.buildDiagnostics),
-    selfUpdateRepo: normalizeHubUpdateRepoState(payload.selfUpdateRepo),
     dashboardOnboarding: {
       dismissed: current.dashboardOnboarding.dismissed,
       executionReady: current.dashboardOnboarding.executionReady,
@@ -1343,6 +1606,7 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
       return {
         type: "capabilities",
         terminalFastLane: readBooleanOr(payload.terminalFastLane),
+        terminalMetrics: readBooleanOr(payload.terminalMetrics),
       };
     case "error": {
       const message = readString(payload.message);
@@ -1359,7 +1623,9 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
         clientId,
         inputSeq,
         ok: readBooleanOr(payload.ok),
-        ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
+        ...(readNullableString(payload.error)
+          ? { error: readNullableString(payload.error) ?? undefined }
+          : {}),
       };
     }
     case "terminal-control-ack": {
@@ -1373,7 +1639,9 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
         clientId,
         controlSeq,
         ok: readBooleanOr(payload.ok),
-        ...(readNullableString(payload.error) ? { error: readNullableString(payload.error) ?? undefined } : {}),
+        ...(readNullableString(payload.error)
+          ? { error: readNullableString(payload.error) ?? undefined }
+          : {}),
       };
     }
     case "message-received": {
@@ -1386,7 +1654,9 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
         sessionId,
         content: payload.content,
         seq: readIntegerOr(payload.seq, 0),
-        ...(readNullableString(payload.localId) ? { localId: readNullableString(payload.localId) ?? undefined } : {}),
+        ...(readNullableString(payload.localId)
+          ? { localId: readNullableString(payload.localId) ?? undefined }
+          : {}),
       };
     }
     case "session-updated": {
@@ -1436,7 +1706,9 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
     case "plan-writer-state": {
       const repoId = readString(payload.repoId);
       const planArtifactId = readString(payload.planArtifactId);
-      return repoId && planArtifactId ? { type: payload.type, repoId, planArtifactId } : null;
+      return repoId && planArtifactId
+        ? { type: payload.type, repoId, planArtifactId }
+        : null;
     }
     case "repo-main-changed": {
       const repoId = readString(payload.repoId);
@@ -1448,7 +1720,9 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
         repoUrl,
         previousMainCommit: readNullableString(payload.previousMainCommit),
         currentMainCommit: readNullableString(payload.currentMainCommit),
-        ...(readNullableString(payload.sourceEnvSlug) ? { sourceEnvSlug: readNullableString(payload.sourceEnvSlug) } : {}),
+        ...(readNullableString(payload.sourceEnvSlug)
+          ? { sourceEnvSlug: readNullableString(payload.sourceEnvSlug) }
+          : {}),
       };
     }
     default:
@@ -1457,32 +1731,77 @@ function normalizeWsServerMessage(payload: unknown): WsServerMessage | null {
 }
 
 function buildApiActionError(
-  body: { error?: string; code?: string; hint?: string; missingPermissions?: string[] },
+  body: {
+    error?: string;
+    code?: string;
+    hint?: string;
+    missingPermissions?: string[];
+    retryable?: boolean;
+  },
   fallback: string,
+  status: number | null = null,
 ): ApiActionError {
-  return new ApiActionError(body, fallback);
+  return new ApiActionError(body, fallback, status);
 }
 
-async function parseApiError(
-  res: Response,
-  fallback: string,
-): Promise<Error> {
+async function parseApiError(res: Response, fallback: string): Promise<Error> {
   const contentType = res.headers.get("content-type") || "";
   if (contentType.includes("application/json")) {
     const body = await res.json().catch(() => null);
     if (isRecord(body)) {
-      return buildApiActionError({
-        error: readString(body.error) ?? undefined,
-        code: readString(body.code) ?? undefined,
-        hint: readString(body.hint) ?? undefined,
-        missingPermissions: Array.isArray(body.missingPermissions)
-          ? body.missingPermissions.filter((value): value is string => typeof value === "string")
-          : undefined,
-      }, fallback);
+      return buildApiActionError(
+        {
+          error: readString(body.error) ?? undefined,
+          code: readString(body.code) ?? undefined,
+          hint: readString(body.hint) ?? undefined,
+          missingPermissions: Array.isArray(body.missingPermissions)
+            ? body.missingPermissions.filter(
+                (value): value is string => typeof value === "string",
+              )
+            : undefined,
+          retryable: body.retryable === true,
+        },
+        fallback,
+        res.status,
+      );
     }
   }
   const text = (await res.text().catch(() => "")).trim();
-  return new Error(text || fallback);
+  return new ApiActionError({ error: text || undefined }, fallback, res.status);
+}
+
+const API_READ_DEADLINE_MS = 15_000;
+
+async function fetchApiRead(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  operation: string,
+): Promise<Response> {
+  const controller = new AbortController();
+  const externalSignal = init.signal;
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) abortFromCaller();
+  else
+    externalSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, API_READ_DEADLINE_MS);
+  try {
+    const requestInit = { ...init, signal: controller.signal };
+    const response = await fetch(input, requestInit);
+    const buffered = response.clone();
+    await response.arrayBuffer();
+    return buffered;
+  } catch (error) {
+    if (timedOut)
+      throw new ApiReadTimeoutError(operation, API_READ_DEADLINE_MS);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", abortFromCaller);
+  }
 }
 
 // ── REST helpers ──────────────────────────────────────────────────
@@ -1540,12 +1859,16 @@ async function readJsonWithinLimit(
 }
 
 export async function fetchSessions(hubUrl: string): Promise<StoredSession[]> {
-  const res = await fetch(`${hubUrl}/api/sessions`, {
-    headers: { Accept: "application/json" },
-    credentials: "include",
-    cache: "no-store",
-    redirect: "manual",
-  });
+  const res = await fetchApiRead(
+    `${hubUrl}/api/sessions`,
+    {
+      headers: { Accept: "application/json" },
+      credentials: "include",
+      cache: "no-store",
+      redirect: "manual",
+    },
+    "Sessions",
+  );
   await throwIfBrowserAuthenticationRequired(res);
   if (!res.ok) throw new Error(`Failed to fetch sessions: ${res.status}`);
   return normalizeArrayResponse(await res.json().catch(() => null))
@@ -1564,14 +1887,16 @@ export async function fetchMessages(
     signal: AbortSignal;
     onBytes(receivedBytes: number): void;
   },
-): Promise<Array<{
-  id: string;
-  session_id: string;
-  content: unknown;
-  seq: number;
-  local_id: string | null;
-  created_at: string;
-}>> {
+): Promise<
+  Array<{
+    id: string;
+    session_id: string;
+    content: unknown;
+    seq: number;
+    local_id: string | null;
+    created_at: string;
+  }>
+> {
   const params = new URLSearchParams();
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.beforeSeq != null) params.set("before_seq", String(opts.beforeSeq));
@@ -1583,7 +1908,8 @@ export async function fetchMessages(
   });
   if (!res.ok) throw new Error(`Failed to fetch messages: ${res.status}`);
   const payload = await readJsonWithinLimit(res, opts.maxBytes, opts.onBytes);
-  if (!Array.isArray(payload)) throw new Error("Invalid terminal history response");
+  if (!Array.isArray(payload))
+    throw new Error("Invalid terminal history response");
   return payload.map((message) => {
     if (
       !isRecord(message) ||
@@ -1616,7 +1942,10 @@ export async function fetchMessages(
   });
 }
 
-export async function fetchPendingPermissions(hubUrl: string, sessionId: string): Promise<StoredPermission[]> {
+export async function fetchPendingPermissions(
+  hubUrl: string,
+  sessionId: string,
+): Promise<StoredPermission[]> {
   const res = await fetch(`${hubUrl}/api/sessions/${sessionId}/permissions`, {
     credentials: "include",
   });
@@ -1633,14 +1962,19 @@ export async function resolvePermission(
   status: string,
   allowForSession = false,
 ): Promise<StoredPermission> {
-  const res = await fetch(`${hubUrl}/api/sessions/${sessionId}/permissions/${permId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ status, allow_for_session: allowForSession }),
-  });
+  const res = await fetch(
+    `${hubUrl}/api/sessions/${sessionId}/permissions/${permId}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ status, allow_for_session: allowForSession }),
+    },
+  );
   if (!res.ok) throw new Error(`Failed to resolve permission: ${res.status}`);
-  const permission = normalizeStoredPermission(await res.json().catch(() => null));
+  const permission = normalizeStoredPermission(
+    await res.json().catch(() => null),
+  );
   if (!permission) {
     throw new Error("Malformed permission response");
   }
@@ -1649,7 +1983,13 @@ export async function resolvePermission(
 
 // ── Environment (sandbox) helpers ─────────────────────────────────
 
-export type { CodexAuthPreference, EnvHarness, EnvMeta, RepoMeta, StartupDiagnosticsState } from "../api/types";
+export type {
+  CodexAuthPreference,
+  EnvHarness,
+  EnvMeta,
+  RepoMeta,
+  StartupDiagnosticsState,
+} from "../api/types";
 
 export type StartupPlanSelection =
   | { mode: "todo" }
@@ -1657,10 +1997,14 @@ export type StartupPlanSelection =
   | { mode: "none" };
 
 export async function fetchEnvs(hubUrl: string): Promise<EnvMeta[]> {
-  const res = await fetch(`${hubUrl}/api/envs`, {
-    credentials: "include",
-    cache: "no-store",
-  });
+  const res = await fetchApiRead(
+    `${hubUrl}/api/envs`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Environment list",
+  );
   if (!res.ok) throw new Error(`Failed to fetch envs: ${res.status}`);
   return normalizeStrictArrayResponse(
     await res.json().catch(() => null),
@@ -1670,13 +2014,46 @@ export async function fetchEnvs(hubUrl: string): Promise<EnvMeta[]> {
 }
 
 export async function fetchEnv(hubUrl: string, slug: string): Promise<EnvMeta> {
-  const res = await fetch(`${hubUrl}/api/envs/${slug}`, { credentials: "include" });
+  const res = await fetchApiRead(
+    `${hubUrl}/api/envs/${slug}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Environment",
+  );
   if (!res.ok) throw new Error(`Failed to fetch env: ${res.status}`);
   const env = normalizeEnvMetaObject(await res.json().catch(() => null));
   if (!env) {
     throw new Error("Malformed env response");
   }
   return env;
+}
+
+export type ImplementorAttentionAcknowledgeResult = "acknowledged" | "conflict";
+
+export async function acknowledgeImplementorAttention(
+  hubUrl: string,
+  slug: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<ImplementorAttentionAcknowledgeResult> {
+  const res = await fetch(
+    `${hubUrl}/api/envs/${encodeURIComponent(slug)}/implementor-attention/acknowledge`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ token }),
+      signal,
+    },
+  );
+  if (res.status === 204) return "acknowledged";
+  if (res.status === 409) return "conflict";
+  throw await parseApiError(
+    res,
+    `Failed to acknowledge implementor attention: ${res.status}`,
+  );
 }
 
 export async function fetchEnvStartupDiagnostics(
@@ -1686,14 +2063,19 @@ export async function fetchEnvStartupDiagnostics(
   const res = await fetch(`${hubUrl}/api/envs/${slug}/startup-diagnostics`, {
     credentials: "include",
   });
-  if (!res.ok) throw new Error(`Failed to fetch startup diagnostics: ${res.status}`);
+  if (!res.ok)
+    throw new Error(`Failed to fetch startup diagnostics: ${res.status}`);
   const body = await res.json().catch(() => null);
   if (!isRecord(body)) {
     return { active: null, lastFailed: null };
   }
   return {
-    active: isRecord(body.active) ? body.active as unknown as StartupDiagnosticsState["active"] : null,
-    lastFailed: isRecord(body.lastFailed) ? body.lastFailed as unknown as StartupDiagnosticsState["lastFailed"] : null,
+    active: isRecord(body.active)
+      ? (body.active as unknown as StartupDiagnosticsState["active"])
+      : null,
+    lastFailed: isRecord(body.lastFailed)
+      ? (body.lastFailed as unknown as StartupDiagnosticsState["lastFailed"])
+      : null,
   };
 }
 
@@ -1709,20 +2091,23 @@ export async function createEnv(
   repoId: string,
   options: CreateEnvOptions,
 ): Promise<EnvMeta> {
-  const {
-    harness,
-    planSelection,
-    harnessSettings,
-    schedule,
-  } = options;
+  const { harness, planSelection, harnessSettings, schedule } = options;
   const res = await fetch(`${hubUrl}/api/envs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify({ repoId, harness, planSelection, harnessSettings, schedule }),
+    body: JSON.stringify({
+      repoId,
+      harness,
+      planSelection,
+      harnessSettings,
+      schedule,
+    }),
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error?: string };
+    const body = (await res
+      .json()
+      .catch(() => ({ error: `HTTP ${res.status}` }))) as { error?: string };
     throw new Error(body.error || `Failed to create env: ${res.status}`);
   }
   const env = normalizeEnvMetaObject(await res.json().catch(() => null));
@@ -1732,18 +2117,28 @@ export async function createEnv(
   return env;
 }
 
-export async function cancelScheduledRun(hubUrl: string, slug: string): Promise<void> {
+export async function cancelScheduledRun(
+  hubUrl: string,
+  slug: string,
+): Promise<void> {
   const res = await fetch(`${hubUrl}/api/envs/${slug}/scheduled-run/cancel`, {
     method: "POST",
     credentials: "include",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to cancel Scheduled Run: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to cancel Scheduled Run: ${res.status}`,
+    );
 }
 
 export async function startEnv(
   hubUrl: string,
   slug: string,
-  options?: { harnessSettings?: HarnessSettings },
+  options?: {
+    harnessSettings?: HarnessSettings;
+    implementationMode?: "fresh" | "plan";
+  },
 ): Promise<{ ok: boolean; slug: string; status: string }> {
   const res = await fetch(`${hubUrl}/api/envs/${slug}/start`, {
     method: "POST",
@@ -1751,7 +2146,8 @@ export async function startEnv(
     credentials: "include",
     body: JSON.stringify(options ?? {}),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to start env: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to start env: ${res.status}`);
   const body = await res.json().catch(() => null);
   return {
     ok: isRecord(body) ? readBooleanOr(body.ok, true) : true,
@@ -1760,12 +2156,16 @@ export async function startEnv(
   };
 }
 
-export async function stopEnv(hubUrl: string, slug: string): Promise<{ ok: boolean; slug: string; status: string }> {
+export async function stopEnv(
+  hubUrl: string,
+  slug: string,
+): Promise<{ ok: boolean; slug: string; status: string }> {
   const res = await fetch(`${hubUrl}/api/envs/${slug}/stop`, {
     method: "POST",
     credentials: "include",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to stop env: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to stop env: ${res.status}`);
   const body = await res.json().catch(() => null);
   return {
     ok: isRecord(body) ? readBooleanOr(body.ok, true) : true,
@@ -1787,11 +2187,15 @@ export async function publishEnvDraftPr(
   prNumber?: number | null;
   prUrl?: string | null;
 }> {
-  const res = await fetch(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/github/publish-draft-pr`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Publish Draft PR failed: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/envs/${encodeURIComponent(slug)}/github/publish-draft-pr`,
+    {
+      method: "POST",
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Publish Draft PR failed: ${res.status}`);
   return res.json();
 }
 
@@ -1814,7 +2218,8 @@ export interface EnvChangesResponse {
   comparisonBasis: "draft-pr-diff";
   oldCommit: string | null;
   newBaseCommit: string | null;
-  branchStatus: "ready-to-merge" | "up-to-date" | "behind-main" | "needs-attention";
+  branchStatus:
+    "ready-to-merge" | "up-to-date" | "behind-main" | "needs-attention";
   summary: {
     total: number;
     added: number;
@@ -1836,11 +2241,18 @@ export interface EnvChangeFileResponse {
   newSize: number | null;
 }
 
-export async function fetchEnvChanges(hubUrl: string, slug: string): Promise<EnvChangesResponse> {
-  const res = await fetch(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/changes`, {
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to load draft diff: ${res.status}`);
+export async function fetchEnvChanges(
+  hubUrl: string,
+  slug: string,
+): Promise<EnvChangesResponse> {
+  const res = await fetch(
+    `${hubUrl}/api/envs/${encodeURIComponent(slug)}/changes`,
+    {
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to load draft diff: ${res.status}`);
   return res.json();
 }
 
@@ -1849,24 +2261,36 @@ export async function fetchEnvChangeFile(
   slug: string,
   path: string,
 ): Promise<EnvChangeFileResponse> {
-  const url = new URL(`${hubUrl}/api/envs/${encodeURIComponent(slug)}/changes/file`);
+  const url = new URL(
+    `${hubUrl}/api/envs/${encodeURIComponent(slug)}/changes/file`,
+  );
   url.searchParams.set("path", path);
   const res = await fetch(url.toString(), {
     credentials: "include",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to load file diff: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to load file diff: ${res.status}`);
   return res.json();
 }
 
 export async function resetEnvToRepo(
   hubUrl: string,
   slug: string,
-): Promise<{ ok: boolean; slug: string; repoId: string; currentMainCommit: string | null }> {
+): Promise<{
+  ok: boolean;
+  slug: string;
+  repoId: string;
+  currentMainCommit: string | null;
+}> {
   const res = await fetch(`${hubUrl}/api/envs/${slug}/reset-to-repo`, {
     method: "POST",
     credentials: "include",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to reset env to repo: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to reset env to repo: ${res.status}`,
+    );
   return res.json();
 }
 
@@ -1875,7 +2299,8 @@ export async function deleteEnv(hubUrl: string, slug: string): Promise<void> {
     method: "DELETE",
     credentials: "include",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to delete env: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to delete env: ${res.status}`);
 }
 
 export async function deleteRepo(
@@ -1887,15 +2312,21 @@ export async function deleteRepo(
     credentials: "include",
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(readErrorMessage(body) || `Failed to delete repo: ${res.status}`);
+    const body = await res
+      .json()
+      .catch(() => ({ error: `HTTP ${res.status}` }));
+    throw new Error(
+      readErrorMessage(body) || `Failed to delete repo: ${res.status}`,
+    );
   }
   const body = await res.json().catch(() => null);
   return {
     ok: true,
     repoId: isRecord(body) ? readStringOr(body.repoId, repoId) : repoId,
     deletedEnvSlugs: isRecord(body)
-      ? normalizeArrayResponse(body.deletedEnvSlugs).filter((candidate): candidate is string => typeof candidate === "string")
+      ? normalizeArrayResponse(body.deletedEnvSlugs).filter(
+          (candidate): candidate is string => typeof candidate === "string",
+        )
       : [],
   };
 }
@@ -1903,31 +2334,83 @@ export async function deleteRepo(
 export async function fetchRepoArtifacts(
   hubUrl: string,
   repoId: string,
-): Promise<{ artifacts: Artifact[]; refs: ArtifactRef[] }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/artifacts`, {
-    credentials: "include",
-    cache: "no-store",
-  });
+): Promise<{
+  artifacts: Artifact[];
+  refs: ArtifactRef[];
+  attention: PlanAttentionItem[];
+}> {
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/artifacts`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Repository artifacts",
+  );
   if (!res.ok) throw new Error(`Failed to fetch artifacts: ${res.status}`);
   return normalizeRepoArtifactState(await res.json().catch(() => null));
+}
+
+export async function acknowledgePlanAttention(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  item: Pick<PlanAttentionItem, "sourceKind" | "sourceId" | "token">,
+): Promise<"acknowledged" | "conflict"> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${encodeURIComponent(repoId)}/plans/${encodeURIComponent(planArtifactId)}/attention/acknowledge`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(item),
+    },
+  );
+  if (res.status === 204) return "acknowledged";
+  if (res.status === 409) return "conflict";
+  throw await parseApiError(
+    res,
+    `Failed to acknowledge plan attention: ${res.status}`,
+  );
 }
 
 export async function fetchPlannerProviders(
   hubUrl: string,
   repoId: string,
-): Promise<{ providers: PlannerProviderMetadata[]; skillRoutes: AgentRoute[] }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/planner-providers`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch planner providers: ${res.status}`);
+): Promise<{
+  providers: PlannerProviderMetadata[];
+  writerRoutes: AgentRoute[];
+  skillRoutes: AgentRoute[];
+}> {
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/planner-providers`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Planner providers",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch planner providers: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
   return {
     providers: isRecord(body)
-      ? normalizeArrayResponse(body.providers).map(normalizePlannerProvider).filter(isPresent)
+      ? normalizeArrayResponse(body.providers)
+          .map(normalizePlannerProvider)
+          .filter(isPresent)
+      : [],
+    writerRoutes: isRecord(body)
+      ? normalizeArrayResponse(body.writerRoutes)
+          .map(normalizeAgentRoute)
+          .filter(isPresent)
       : [],
     skillRoutes: isRecord(body)
-      ? normalizeArrayResponse(body.skillRoutes).map(normalizeAgentRoute).filter(isPresent)
+      ? normalizeArrayResponse(body.skillRoutes)
+          .map(normalizeAgentRoute)
+          .filter(isPresent)
       : [],
   };
 }
@@ -1938,18 +2421,31 @@ export async function fetchEnvReviewState(
   sessionId: string,
 ): Promise<EnvReviewState> {
   const params = new URLSearchParams({ sessionId });
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch env review state: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/envs/${envSlug}/review?${params}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Environment review state",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch env review state: ${res.status}`,
+    );
   return normalizeEnvReviewState(await res.json().catch(() => null));
 }
 
 export async function addEnvReviewer(
   hubUrl: string,
   envSlug: string,
-  input: { sessionId: string; provider: string; model: string; effort?: PlannerEffort },
+  input: {
+    sessionId: string;
+    provider: string;
+    model: string;
+    effort?: PlannerEffort;
+  },
 ): Promise<EnvReviewState> {
   const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs`, {
     method: "POST",
@@ -1957,7 +2453,8 @@ export async function addEnvReviewer(
     credentials: "include",
     body: JSON.stringify(input),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to add env reviewer: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to add env reviewer: ${res.status}`);
   return normalizeEnvReviewState(await res.json().catch(() => null));
 }
 
@@ -1968,11 +2465,18 @@ export async function removeEnvReviewer(
   sessionId: string,
 ): Promise<EnvReviewState> {
   const params = new URLSearchParams({ sessionId });
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}?${params}`, {
-    method: "DELETE",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to remove env reviewer: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}?${params}`,
+    {
+      method: "DELETE",
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to remove env reviewer: ${res.status}`,
+    );
   return normalizeEnvReviewState(await res.json().catch(() => null));
 }
 
@@ -1982,13 +2486,20 @@ export async function cancelEnvReviewRun(
   runId: string,
   input: { sessionId: string },
 ): Promise<EnvReviewState> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/runs/${encodeURIComponent(runId)}/cancel`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to cancel env review: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/runs/${encodeURIComponent(runId)}/cancel`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(input),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to cancel env review: ${res.status}`,
+    );
   return normalizeEnvReviewState(await res.json().catch(() => null));
 }
 
@@ -1999,35 +2510,64 @@ export async function fetchEnvReviewMessages(
   sessionId: string,
 ): Promise<ThreadMessage[]> {
   const params = new URLSearchParams({ sessionId });
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/messages?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch env reviewer messages: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/messages?${params}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Environment review transcript",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch env reviewer messages: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
   return isRecord(body)
-    ? normalizeArrayResponse(body.messages).map(normalizeThreadMessage).filter(isPresent)
+    ? normalizeArrayResponse(body.messages)
+        .map(normalizeThreadMessage)
+        .filter(isPresent)
     : [];
 }
 
 export async function sendEnvReviewMessage(
   hubUrl: string,
   envSlug: string,
-  threadId: string,
-  input: { sessionId: string; text: string },
-): Promise<{ run: EnvReviewRun | null; messages: ThreadMessage[]; state: EnvReviewState }> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/messages`, {
+  threadId: string | null,
+  input: {
+    sessionId: string;
+    text: string;
+    requestId?: string;
+    expectedRoundId?: string;
+  },
+): Promise<{
+  run: EnvReviewRun | null;
+  messages: ThreadMessage[];
+  state: EnvReviewState;
+}> {
+  const path = threadId
+    ? `/api/envs/${envSlug}/review/tabs/${encodeURIComponent(threadId)}/messages`
+    : `/api/envs/${envSlug}/review/messages`;
+  const res = await fetch(`${hubUrl}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify(input),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to send env reviewer message: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to send env reviewer message: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  if (!isRecord(body)) throw new Error("Malformed env reviewer message response");
+  if (!isRecord(body))
+    throw new Error("Malformed env reviewer message response");
   return {
     run: normalizeEnvReviewRun(body.run),
-    messages: normalizeArrayResponse(body.messages).map(normalizeThreadMessage).filter(isPresent),
+    messages: normalizeArrayResponse(body.messages)
+      .map(normalizeThreadMessage)
+      .filter(isPresent),
     state: normalizeEnvReviewState(body.state),
   };
 }
@@ -2038,21 +2578,33 @@ export async function fetchEnvReviewRun(
   runId: string,
   sessionId: string,
   afterSeq?: number,
+  signal?: AbortSignal,
 ): Promise<{ run: EnvReviewRun; events: EnvReviewRunEvent[] }> {
   const params = new URLSearchParams({ sessionId });
   if (afterSeq != null) params.set("afterSeq", String(afterSeq));
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/runs/${encodeURIComponent(runId)}?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch env review run: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/envs/${envSlug}/review/runs/${encodeURIComponent(runId)}?${params}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+      signal,
+    },
+    "Environment review run",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch env review run: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
   const run = isRecord(body) ? normalizeEnvReviewRun(body.run) : null;
   if (!run) throw new Error("Malformed env review run response");
   return {
     run,
     events: isRecord(body)
-      ? normalizeArrayResponse(body.events).map(normalizeEnvReviewRunEvent).filter(isPresent)
+      ? normalizeArrayResponse(body.events)
+          .map(normalizeEnvReviewRunEvent)
+          .filter(isPresent)
       : [],
   };
 }
@@ -2066,18 +2618,63 @@ export interface ReviewSkillInvocationDetail {
 export async function invokeReviewSkill(
   hubUrl: string,
   envSlug: string,
-  parentThreadId: string,
   skillId: string,
-  input: { sessionId: string; requestId: string; overviewMode?: "auto" | "manual" },
-): Promise<{ kind: "preset"; run: EnvReviewRun } | ({ kind: "fanout" } & ReviewSkillInvocationDetail)> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/tabs/${encodeURIComponent(parentThreadId)}/skills/${encodeURIComponent(skillId)}/invoke`, {
+  input: {
+    sessionId: string;
+    requestId: string;
+    overviewMode?: "auto" | "manual";
+  },
+): Promise<{ kind: "skill_root" } & ReviewSkillInvocationDetail> {
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/skills/${encodeURIComponent(skillId)}/invoke`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to invoke Review skill: ${res.status}`);
-  return await res.json() as any;
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to invoke Review skill: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (isRecord(body) && body.kind === "skill_root" && isRecord(body.invocation)) {
+    return {
+      ...body,
+      invocation: body.invocation,
+    } as unknown as { kind: "skill_root" } & ReviewSkillInvocationDetail;
+  }
+  throw new Error("Malformed Review skill invocation response");
+}
+
+export async function rerunReviewSkillInvocation(
+  hubUrl: string,
+  envSlug: string,
+  invocationId: string,
+  input: { sessionId: string; requestId: string },
+): Promise<{ kind: "skill_root" } & ReviewSkillInvocationDetail> {
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/rerun`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ ...input, expectedRoundId: invocationId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to re-review changes: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation))
+    throw new Error("Malformed Review skill invocation response");
+  return {
+    ...body,
+    invocation: body.invocation,
+  } as unknown as { kind: "skill_root" } & ReviewSkillInvocationDetail;
 }
 
 export async function fetchReviewSkillInvocations(
@@ -2085,16 +2682,27 @@ export async function fetchReviewSkillInvocations(
   envSlug: string,
   sessionId: string,
   options: { cursor?: string | null; limit?: number } = {},
-): Promise<{ invocations: Array<Record<string, unknown>>; nextCursor: string | null }> {
+): Promise<{
+  invocations: Array<Record<string, unknown>>;
+  nextCursor: string | null;
+}> {
   const params = new URLSearchParams({ sessionId });
   if (options.cursor) params.set("cursor", options.cursor);
   if (options.limit) params.set("limit", String(options.limit));
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Review skill history: ${res.status}`);
-  return await res.json() as any;
+  const res = await fetchApiRead(
+    `${hubUrl}/api/envs/${envSlug}/review/skill-invocations?${params}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Review skill history",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch Review skill history: ${res.status}`,
+    );
+  return normalizeInvocationHistory(await res.json().catch(() => null));
 }
 
 export async function fetchReviewSkillInvocation(
@@ -2104,29 +2712,56 @@ export async function fetchReviewSkillInvocation(
   invocationId: string,
 ): Promise<ReviewSkillInvocationDetail> {
   const params = new URLSearchParams({ sessionId });
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Review skill invocation: ${res.status}`);
-  return await res.json() as ReviewSkillInvocationDetail;
+  const res = await fetchApiRead(
+    `${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}?${params}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Review skill invocation",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch Review skill invocation: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation))
+    throw new Error("Malformed Review skill invocation response");
+  return {
+    ...body,
+    invocation: body.invocation,
+  } as unknown as ReviewSkillInvocationDetail;
 }
 
 export async function updateReviewSkillControls(
   hubUrl: string,
   envSlug: string,
   invocationId: string,
-  input: { sessionId: string; overviewMode: "auto" | "manual"; includedMessageIds: string[] },
+  input: {
+    sessionId: string;
+    overviewMode: "auto" | "manual";
+    includedMessageIds: string[];
+  },
 ): Promise<ReviewSkillInvocation> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/controls`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to update Overview controls: ${res.status}`);
-  const body = await res.json() as { invocation: ReviewSkillInvocation };
-  return body.invocation;
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/controls`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ ...input, expectedRoundId: invocationId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to update Overview controls: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation))
+    throw new Error("Malformed Review skill invocation response");
+  return body.invocation as unknown as ReviewSkillInvocation;
 }
 
 export async function sendReviewSkillOverview(
@@ -2135,14 +2770,21 @@ export async function sendReviewSkillOverview(
   invocationId: string,
   input: { sessionId: string; guidance?: string | null },
 ): Promise<Record<string, unknown>> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/overview`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to send Review Overview: ${res.status}`);
-  return await res.json() as Record<string, unknown>;
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/overview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ ...input, expectedRoundId: invocationId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to send Review Overview: ${res.status}`,
+    );
+  return (await res.json()) as Record<string, unknown>;
 }
 
 export async function cancelReviewSkillInvocation(
@@ -2151,15 +2793,53 @@ export async function cancelReviewSkillInvocation(
   invocationId: string,
   sessionId: string,
 ): Promise<ReviewSkillInvocation> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/cancel`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ sessionId }),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to cancel Review skill invocation: ${res.status}`);
-  const body = await res.json() as { invocation: ReviewSkillInvocation };
-  return body.invocation;
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}/cancel`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ sessionId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to cancel Review skill invocation: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation))
+    throw new Error("Malformed Review skill invocation response");
+  return body.invocation as unknown as ReviewSkillInvocation;
+}
+
+export async function removeReviewSkillInvocation(
+  hubUrl: string,
+  envSlug: string,
+  invocationId: string,
+  sessionId: string,
+): Promise<{ parentThreadId: string; state: EnvReviewState }> {
+  const params = new URLSearchParams({ sessionId });
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/skill-invocations/${encodeURIComponent(invocationId)}?${params}`,
+    {
+      method: "DELETE",
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to remove Review round: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || typeof body.parentThreadId !== "string") {
+    throw new Error("Malformed Review round removal response");
+  }
+  return {
+    parentThreadId: body.parentThreadId,
+    state: normalizeEnvReviewState(body.state),
+  };
 }
 
 export async function markEnvReviewFeedback(
@@ -2169,15 +2849,24 @@ export async function markEnvReviewFeedback(
   status: "pending" | "sent" | "dismiss",
   input: { sessionId: string; deliveredText?: string | null },
 ): Promise<EnvReviewFeedback> {
-  const res = await fetch(`${hubUrl}/api/envs/${envSlug}/review/feedback/${encodeURIComponent(feedbackId)}/${status}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to update env review feedback: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/envs/${envSlug}/review/feedback/${encodeURIComponent(feedbackId)}/${status}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(input),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to update env review feedback: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  const feedback = isRecord(body) ? normalizeEnvReviewFeedback(body.feedback) : null;
+  const feedback = isRecord(body)
+    ? normalizeEnvReviewFeedback(body.feedback)
+    : null;
   if (!feedback) throw new Error("Malformed env review feedback response");
   return feedback;
 }
@@ -2186,20 +2875,21 @@ export async function createPlan(
   hubUrl: string,
   repoId: string,
   title?: string,
-): Promise<Artifact> {
+): Promise<PlanArtifact> {
   const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify({ title }),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to create plan: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to create plan: ${res.status}`);
   const body = await res.json().catch(() => null);
   const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
-  if (!artifact) {
+  if (!artifact || artifact.type !== "plan") {
     throw new Error("Malformed plan response");
   }
-  return artifact;
+  return artifact as PlanArtifact;
 }
 
 export async function savePlan(
@@ -2207,21 +2897,31 @@ export async function savePlan(
   repoId: string,
   id: string,
   markdown: string,
-): Promise<Artifact> {
+): Promise<PlanArtifact & { changed: boolean }> {
   const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify({ markdown }),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to save plan: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to save plan: ${res.status}`);
   const body = await res.json().catch(() => null);
   const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
-  if (!artifact) {
+  if (!artifact || artifact.type !== "plan") {
     throw new Error("Malformed save plan response");
   }
-  return artifact;
+  return {
+    ...(artifact as PlanArtifact),
+    changed: isRecord(body) && body.changed === true,
+  } as PlanArtifact & { changed: boolean };
 }
+
+export type PlanMutationResult = PlanArtifact & {
+  cleanupPending?: boolean;
+  cleanupCode?: "runtime_cleanup_deferred";
+  cleanupWarning?: string;
+};
 
 export async function updatePlanStatus(
   hubUrl: string,
@@ -2229,20 +2929,38 @@ export async function updatePlanStatus(
   id: string,
   status: PlanStatus,
   expectedVersion?: number | null,
-): Promise<Artifact> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/artifacts/${id}/status`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ status, expectedVersion }),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to update plan status: ${res.status}`);
+): Promise<PlanMutationResult> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/artifacts/${id}/status`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ status, expectedVersion }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to update plan status: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
   const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
-  if (!artifact) {
+  if (!artifact || artifact.type !== "plan") {
     throw new Error("Malformed plan status response");
   }
-  return artifact;
+  return {
+    ...(artifact as PlanArtifact),
+    ...(isRecord(body) && body.cleanupPending === true
+      ? { cleanupPending: true }
+      : {}),
+    ...(isRecord(body) && body.cleanupCode === "runtime_cleanup_deferred"
+      ? { cleanupCode: body.cleanupCode }
+      : {}),
+    ...(isRecord(body) && typeof body.cleanupWarning === "string"
+      ? { cleanupWarning: body.cleanupWarning }
+      : {}),
+  };
 }
 
 export async function discardPlan(
@@ -2250,20 +2968,32 @@ export async function discardPlan(
   repoId: string,
   id: string,
   expectedVersion?: number | null,
-): Promise<Artifact> {
+): Promise<PlanMutationResult> {
   const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${id}`, {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify({ expectedVersion }),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to discard plan: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to discard plan: ${res.status}`);
   const body = await res.json().catch(() => null);
   const artifact = isRecord(body) ? normalizeArtifact(body.artifact) : null;
-  if (!artifact) {
+  if (!artifact || artifact.type !== "plan") {
     throw new Error("Malformed discard plan response");
   }
-  return artifact;
+  return {
+    ...(artifact as PlanArtifact),
+    ...(isRecord(body) && body.cleanupPending === true
+      ? { cleanupPending: true }
+      : {}),
+    ...(isRecord(body) && body.cleanupCode === "runtime_cleanup_deferred"
+      ? { cleanupCode: body.cleanupCode }
+      : {}),
+    ...(isRecord(body) && typeof body.cleanupWarning === "string"
+      ? { cleanupWarning: body.cleanupWarning }
+      : {}),
+  };
 }
 
 export async function fetchPlanContributions(
@@ -2271,50 +3001,95 @@ export async function fetchPlanContributions(
   repoId: string,
   artifactId: string,
 ): Promise<PlanContribution[]> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch contributions: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Plan contributions",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch contributions: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
   return isRecord(body)
-    ? normalizeArrayResponse(body.contributions).map(normalizePlanContribution).filter(isPresent)
+    ? normalizeArrayResponse(body.contributions)
+        .map(normalizePlanContribution)
+        .filter(isPresent)
     : [];
 }
 
 function normalizePlanWriterState(payload: unknown): PlanWriterState | null {
   if (!isRecord(payload)) return null;
-  const lifecycle = payload.lifecycle === "not_running" || payload.lifecycle === "starting" || payload.lifecycle === "running"
-    ? payload.lifecycle
-    : null;
-  const provider: PlanWriterProvider | null = payload.provider === "claude-code" || payload.provider === "codex"
-    ? payload.provider
-    : null;
+  const lifecycle =
+    payload.lifecycle === "not_running" ||
+    payload.lifecycle === "starting" ||
+    payload.lifecycle === "running"
+      ? payload.lifecycle
+      : null;
+  const provider: PlanWriterProvider | null =
+    payload.provider === "claude-code" ||
+    payload.provider === "codex" ||
+    payload.provider === "opencode"
+      ? payload.provider
+      : null;
   const effort = normalizePlannerEffortId(payload.effort);
-  const synchronization = isRecord(payload.synchronization) ? payload.synchronization : null;
-  const syncState = synchronization?.state === "up_to_date"
-    || synchronization?.state === "saving"
-    || synchronization?.state === "sync_failed"
-    ? synchronization.state
+  const synchronization = isRecord(payload.synchronization)
+    ? payload.synchronization
     : null;
-  if (!lifecycle || !syncState || typeof payload.editable !== "boolean") return null;
+  const startup = isRecord(payload.startup) ? payload.startup : null;
+  const startupStage =
+    startup?.stage === "reserving" || startup?.stage === "launching"
+      ? startup.stage
+      : null;
+  const startupUpdatedAt = readString(startup?.updatedAt);
+  const syncState =
+    synchronization?.state === "up_to_date" ||
+    synchronization?.state === "saving" ||
+    synchronization?.state === "sync_failed"
+      ? synchronization.state
+      : null;
+  if (!lifecycle || !syncState || typeof payload.editable !== "boolean")
+    return null;
   return {
     lifecycle,
-    generation: Number.isInteger(payload.generation) ? payload.generation as number : null,
+    threadId: readNullableString(payload.threadId),
+    generation: Number.isInteger(payload.generation)
+      ? (payload.generation as number)
+      : null,
     provider,
     model: readNullableString(payload.model),
     effort,
     basisCommit: readNullableString(payload.basisCommit),
     terminalId: readNullableString(payload.terminalId),
-    ...(payload.codexAuthMode === "subscription" || payload.codexAuthMode === "api-key"
+    ...(payload.codexAuthMode === "subscription" ||
+    payload.codexAuthMode === "api-key"
       ? { codexAuthMode: payload.codexAuthMode }
       : {}),
-    ...(readNullableString(payload.stopReason) ? { stopReason: readNullableString(payload.stopReason) as PlanWriterState["stopReason"] } : {}),
-    ...(readNullableString(payload.startupError) ? { startupError: readNullableString(payload.startupError) ?? undefined } : {}),
-    ...(readNullableString(payload.cleanupError) ? { cleanupError: readNullableString(payload.cleanupError) ?? undefined } : {}),
+    ...(readNullableString(payload.stopReason)
+      ? {
+          stopReason: readNullableString(
+            payload.stopReason,
+          ) as PlanWriterState["stopReason"],
+        }
+      : {}),
+    ...(readNullableString(payload.startupError)
+      ? { startupError: readNullableString(payload.startupError) ?? undefined }
+      : {}),
+    ...(readNullableString(payload.cleanupError)
+      ? { cleanupError: readNullableString(payload.cleanupError) ?? undefined }
+      : {}),
+    ...(startupStage && startupUpdatedAt
+      ? { startup: { stage: startupStage, updatedAt: startupUpdatedAt } }
+      : {}),
     synchronization: {
       state: syncState,
-      ...(readNullableString(synchronization?.error) ? { error: readNullableString(synchronization?.error) ?? undefined } : {}),
+      ...(readNullableString(synchronization?.error)
+        ? { error: readNullableString(synchronization?.error) ?? undefined }
+        : {}),
     },
     editable: payload.editable,
   };
@@ -2324,12 +3099,21 @@ export async function fetchPlanWriter(
   hubUrl: string,
   repoId: string,
   artifactId: string,
+  signal?: AbortSignal,
 ): Promise<PlanWriterState> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Scribe: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer`,
+    {
+      credentials: "include",
+      cache: "no-store",
+      redirect: "manual",
+      signal,
+    },
+    "Scribe",
+  );
+  await throwIfBrowserAuthenticationRequired(res);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to fetch Scribe: ${res.status}`);
   const body = await res.json().catch(() => null);
   const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
   if (!writer) throw new Error("Malformed Scribe response");
@@ -2340,38 +3124,69 @@ export async function startPlanWriter(
   hubUrl: string,
   repoId: string,
   artifactId: string,
-  input: { provider?: PlanWriterProvider; model?: string; effort?: PlannerEffort } = {},
+  input: { routeKey?: string; effort?: PlannerEffort } = {},
 ): Promise<PlanWriterState> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer/start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(input),
+    },
+  );
   const body = await res.json().catch(() => null);
-  if (!res.ok) throw await parseApiError(new Response(JSON.stringify(body), { status: res.status, headers: { "Content-Type": "application/json" } }), `Failed to start Scribe: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(
+      new Response(JSON.stringify(body), {
+        status: res.status,
+        headers: { "Content-Type": "application/json" },
+      }),
+      `Failed to start Scribe: ${res.status}`,
+    );
   const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
   if (!writer) throw new Error("Malformed Scribe response");
   return writer;
 }
+
+export type PlanWriterMutationResult = PlanWriterState & {
+  cleanupPending?: boolean;
+  cleanupCode?: "runtime_cleanup_deferred";
+  cleanupWarning?: string;
+};
 
 export async function stopPlanWriter(
   hubUrl: string,
   repoId: string,
   artifactId: string,
   expectedGeneration: number,
-): Promise<PlanWriterState> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer/stop`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ expectedGeneration }),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to stop Scribe: ${res.status}`);
+): Promise<PlanWriterMutationResult> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/live-writer/stop`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ expectedGeneration }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to abandon Scribe: ${res.status}`);
   const body = await res.json().catch(() => null);
   const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
   if (!writer) throw new Error("Malformed Scribe response");
-  return writer;
+  return {
+    ...writer,
+    ...(isRecord(body) && body.cleanupPending === true
+      ? { cleanupPending: true }
+      : {}),
+    ...(isRecord(body) && body.cleanupCode === "runtime_cleanup_deferred"
+      ? { cleanupCode: body.cleanupCode }
+      : {}),
+    ...(isRecord(body) && typeof body.cleanupWarning === "string"
+      ? { cleanupWarning: body.cleanupWarning }
+      : {}),
+  };
 }
 
 export async function fetchAgentSkills(
@@ -2380,21 +3195,34 @@ export async function fetchAgentSkills(
   surface: "plan" | "review",
 ): Promise<AgentSkillDefinition[]> {
   const params = new URLSearchParams({ surface });
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch ${surface} skills: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/skills?${params}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    `${surface === "plan" ? "Plan" : "Review"} skills`,
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch ${surface} skills: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
   return isRecord(body)
-    ? normalizeArrayResponse(body.skills).map(normalizeAgentSkill).filter(isPresent)
+    ? normalizeArrayResponse(body.skills)
+        .map(normalizeAgentSkill)
+        .filter(isPresent)
     : [];
 }
 
 export async function createAgentSkill(
   hubUrl: string,
   repoId: string,
-  input: Omit<AgentSkillDefinition, "id" | "origin" | "customized" | "createdAt" | "updatedAt">,
+  input: Omit<
+    AgentSkillDefinition,
+    "id" | "origin" | "customized" | "createdAt" | "updatedAt"
+  >,
 ): Promise<AgentSkillDefinition> {
   const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills`, {
     method: "POST",
@@ -2402,7 +3230,8 @@ export async function createAgentSkill(
     credentials: "include",
     body: JSON.stringify(input),
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to create skill: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to create skill: ${res.status}`);
   const body = await res.json().catch(() => null);
   const skill = isRecord(body) ? normalizeAgentSkill(body.skill) : null;
   if (!skill) throw new Error("Malformed skill response");
@@ -2416,13 +3245,17 @@ export async function updateAgentSkill(
   skillId: string,
   input: Partial<AgentSkillDefinition>,
 ): Promise<AgentSkillDefinition> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills/${surface}/${encodeURIComponent(skillId)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to save skill: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/skills/${surface}/${encodeURIComponent(skillId)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(input),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to save skill: ${res.status}`);
   const body = await res.json().catch(() => null);
   const skill = isRecord(body) ? normalizeAgentSkill(body.skill) : null;
   if (!skill) throw new Error("Malformed skill response");
@@ -2435,23 +3268,39 @@ export async function deleteAgentSkill(
   surface: "plan" | "review",
   skillId: string,
 ): Promise<AgentSkillDefinition | null> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/skills/${surface}/${encodeURIComponent(skillId)}`, {
-    method: "DELETE",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to delete skill: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/skills/${surface}/${encodeURIComponent(skillId)}`,
+    {
+      method: "DELETE",
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to delete skill: ${res.status}`);
   const body = await res.json().catch(() => null);
   return isRecord(body) ? normalizeAgentSkill(body.skill) : null;
 }
 
-export async function fetchRepoPlanWriterSettings(hubUrl: string, repoId: string): Promise<RepoPlanWriterSettings> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plan-writer-settings`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Scribe Settings: ${res.status}`);
+export async function fetchRepoPlanWriterSettings(
+  hubUrl: string,
+  repoId: string,
+): Promise<RepoPlanWriterSettings> {
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plan-writer-settings`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Scribe Settings",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch Scribe Settings: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Scribe Settings response");
+  if (!isRecord(body) || !isRecord(body.settings))
+    throw new Error("Malformed Scribe Settings response");
   return body.settings as unknown as RepoPlanWriterSettings;
 }
 
@@ -2460,15 +3309,23 @@ export async function updateRepoPlanWriterSettings(
   repoId: string,
   input: Pick<RepoPlanWriterSettings, "routeKey" | "effort" | "planFormat">,
 ): Promise<RepoPlanWriterSettings> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plan-writer-settings`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to save Scribe Settings: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plan-writer-settings`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(input),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to save Scribe Settings: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  if (!isRecord(body) || !isRecord(body.settings)) throw new Error("Malformed Scribe Settings response");
+  if (!isRecord(body) || !isRecord(body.settings))
+    throw new Error("Malformed Scribe Settings response");
   return body.settings as unknown as RepoPlanWriterSettings;
 }
 
@@ -2478,110 +3335,304 @@ export interface PlanSkillInvocationDetail {
   runs: PlannerRun[];
 }
 
+export type PlanSkillInvokeResult =
+  { kind: "skill_root" } & PlanSkillInvocationDetail;
+
 export async function invokePlanSkill(
   hubUrl: string,
   repoId: string,
   planArtifactId: string,
   skillId: string,
   requestId: string,
-): Promise<{ kind: "fanout" } & PlanSkillInvocationDetail> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skills/${encodeURIComponent(skillId)}/invoke`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ requestId }),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to invoke Plan skill: ${res.status}`);
-  return await res.json() as { kind: "fanout" } & PlanSkillInvocationDetail;
+): Promise<PlanSkillInvokeResult> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skills/${encodeURIComponent(skillId)}/invoke`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ requestId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to invoke Plan skill: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body))
+    throw new Error("Malformed Plan skill invocation response");
+  if (body.kind === "skill_root" && isRecord(body.invocation)) {
+    return {
+      ...body,
+      invocation: normalizePlanSkillInvocation(body.invocation),
+    } as unknown as PlanSkillInvokeResult;
+  }
+  throw new Error("Malformed Plan skill invocation response");
+}
+
+export async function fetchLatestPlanSkillInvocation(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  parentThreadId: string,
+): Promise<PlanSkillInvocationDetail | null> {
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations/latest`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Latest Plan Skill round",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch Plan skill invocation: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body))
+    throw new Error("Malformed Plan skill invocation response");
+  if (body.invocation === null) return null;
+  if (!isRecord(body.invocation))
+    throw new Error("Malformed Plan skill invocation response");
+  return {
+    ...body,
+    invocation: normalizePlanSkillInvocation(body.invocation),
+  } as unknown as PlanSkillInvocationDetail;
 }
 
 export async function fetchPlanSkillInvocations(
   hubUrl: string,
   repoId: string,
   planArtifactId: string,
+  parentThreadId: string,
   options: { cursor?: string | null; limit?: number } = {},
-): Promise<{ invocations: Array<Record<string, unknown>>; nextCursor: string | null }> {
+): Promise<{
+  invocations: SkillInvocationSummary[];
+  nextCursor: string | null;
+}> {
   const params = new URLSearchParams();
   if (options.cursor) params.set("cursor", options.cursor);
   if (options.limit) params.set("limit", String(options.limit));
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan skill history: ${res.status}`);
-  return await res.json() as any;
+  const query = params.size > 0 ? `?${params}` : "";
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations${query}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Plan skill history",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch Plan skill history: ${res.status}`,
+    );
+  const history = normalizeInvocationHistory(
+    await res.json().catch(() => null),
+  );
+  return {
+    invocations: history.invocations as unknown as SkillInvocationSummary[],
+    nextCursor: history.nextCursor,
+  };
 }
 
 export async function fetchPlanSkillInvocation(
   hubUrl: string,
   repoId: string,
   planArtifactId: string,
+  parentThreadId: string,
   invocationId: string,
 ): Promise<PlanSkillInvocationDetail> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations/${encodeURIComponent(invocationId)}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch Plan skill invocation: ${res.status}`);
-  return await res.json() as PlanSkillInvocationDetail;
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations/${encodeURIComponent(invocationId)}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Plan skill invocation",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch Plan skill invocation: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation)) {
+    throw new Error("Malformed Plan skill invocation response");
+  }
+  return {
+    ...body,
+    invocation: normalizePlanSkillInvocation(body.invocation),
+  } as unknown as PlanSkillInvocationDetail;
 }
 
 export async function cancelPlanSkillInvocation(
   hubUrl: string,
   repoId: string,
   planArtifactId: string,
+  parentThreadId: string,
   invocationId: string,
 ): Promise<PlanSkillInvocation> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations/${encodeURIComponent(invocationId)}/cancel`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to cancel Plan skill invocation: ${res.status}`);
-  const body = await res.json() as { invocation: PlanSkillInvocation };
-  return body.invocation;
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations/${encodeURIComponent(invocationId)}/cancel`,
+    {
+      method: "POST",
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to cancel Plan skill invocation: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation))
+    throw new Error("Malformed Plan skill invocation response");
+  return normalizePlanSkillInvocation(
+    body.invocation,
+  ) as unknown as PlanSkillInvocation;
 }
 
-export async function forwardPlanSkillReports(
+export async function rerunPlanSkillInvocation(
   hubUrl: string,
   repoId: string,
   planArtifactId: string,
+  parentThreadId: string,
   invocationId: string,
-  input: { requestId: string; messageIds: string[]; guidance?: string | null },
-): Promise<{ contributions: PlanContribution[] }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/skill-invocations/${encodeURIComponent(invocationId)}/forward`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to forward Plan skill reports: ${res.status}`);
-  return await res.json() as { contributions: PlanContribution[] };
+  requestId: string,
+): Promise<PlanSkillInvocationDetail> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations/${encodeURIComponent(invocationId)}/rerun`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ requestId, expectedRoundId: invocationId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to rerun Plan skill: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation)) {
+    throw new Error("Malformed Plan skill invocation response");
+  }
+  return {
+    ...body,
+    invocation: normalizePlanSkillInvocation(body.invocation),
+  } as unknown as PlanSkillInvocationDetail;
 }
 
-export async function createPlanContribution(
+export async function updatePlanSkillControls(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  parentThreadId: string,
+  invocationId: string,
+  input: {
+    overviewMode: "auto" | "manual";
+    includedMessageIds: string[];
+  },
+): Promise<PlanSkillInvocationDetail> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations/${encodeURIComponent(invocationId)}/controls`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ ...input, expectedRoundId: invocationId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to update Overview controls: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation))
+    throw new Error("Malformed Plan Skill response");
+  return {
+    ...body,
+    invocation: normalizePlanSkillInvocation(body.invocation),
+  } as unknown as PlanSkillInvocationDetail;
+}
+
+export async function createPlanSkillOverview(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  parentThreadId: string,
+  invocationId: string,
+  guidance?: string | null,
+): Promise<PlanSkillInvocationDetail> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations/${encodeURIComponent(invocationId)}/overview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ expectedRoundId: invocationId, guidance }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to create Overview: ${res.status}`);
+  const body = await res.json().catch(() => null);
+  if (!isRecord(body) || !isRecord(body.invocation))
+    throw new Error("Malformed Plan Skill response");
+  return {
+    ...body,
+    invocation: normalizePlanSkillInvocation(body.invocation),
+  } as unknown as PlanSkillInvocationDetail;
+}
+
+export async function sharePlanSkillOverview(
+  hubUrl: string,
+  repoId: string,
+  planArtifactId: string,
+  parentThreadId: string,
+  invocationId: string,
+): Promise<void> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${planArtifactId}/reviewers/${encodeURIComponent(parentThreadId)}/skill-invocations/${encodeURIComponent(invocationId)}/share`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ expectedRoundId: invocationId }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to share Overview: ${res.status}`);
+}
+
+export async function createScribeHandoff(
   hubUrl: string,
   repoId: string,
   artifactId: string,
   input: {
-    text: string;
-    provider: string;
-    model: string;
-    skill?: string;
-    sourceRunId?: string;
-    sourceThreadId?: string;
+    requestId: string;
+    sources: Array<{ threadId: string; messageId: string }>;
+    content: string;
   },
-): Promise<PlanContribution> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to create contribution: ${res.status}`);
+): Promise<{ contribution: PlanContribution; created: boolean }> {
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/scribe-handoffs`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(input),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to share context with Scribe: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
-  if (!contribution) throw new Error("Malformed contribution response");
-  return contribution;
+  const contribution = isRecord(body)
+    ? normalizePlanContribution(body.contribution)
+    : null;
+  if (!contribution) throw new Error("Malformed Scribe handoff response");
+  return { contribution, created: isRecord(body) && body.created === true };
 }
 
 export async function dismissPlanContribution(
@@ -2590,13 +3641,22 @@ export async function dismissPlanContribution(
   artifactId: string,
   contributionId: string,
 ): Promise<PlanContribution> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions/${contributionId}/dismiss`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to dismiss contribution: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions/${contributionId}/dismiss`,
+    {
+      method: "POST",
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to dismiss contribution: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
+  const contribution = isRecord(body)
+    ? normalizePlanContribution(body.contribution)
+    : null;
   if (!contribution) throw new Error("Malformed contribution response");
   return contribution;
 }
@@ -2607,41 +3667,24 @@ export async function incorporatePlanContribution(
   artifactId: string,
   contributionId: string,
 ): Promise<PlanContribution> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions/${contributionId}/incorporate`, {
-    method: "POST",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to mark contribution incorporated: ${res.status}`);
-  const body = await res.json().catch(() => null);
-  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
-  if (!contribution) throw new Error("Malformed contribution response");
-  return contribution;
-}
-
-export async function sendReviewerMessageToWriter(
-  hubUrl: string,
-  repoId: string,
-  artifactId: string,
-  threadId: string,
-  messageId: string,
-): Promise<{ contribution: PlanContribution; created: boolean }> {
   const res = await fetch(
-    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages/${messageId}/send-to-writer`,
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/contributions/${contributionId}/incorporate`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       credentials: "include",
-      body: "{}",
     },
   );
-  if (!res.ok) throw await parseApiError(res, `Failed to share context with Scribe: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to mark contribution incorporated: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  const contribution = isRecord(body) ? normalizePlanContribution(body.contribution) : null;
-  if (!contribution) throw new Error("Malformed send-to-writer response");
-  return {
-    contribution,
-    created: isRecord(body) ? body.created === true : false,
-  };
+  const contribution = isRecord(body)
+    ? normalizePlanContribution(body.contribution)
+    : null;
+  if (!contribution) throw new Error("Malformed contribution response");
+  return contribution;
 }
 
 export async function fetchLatestPlannerRun(
@@ -2650,20 +3693,69 @@ export async function fetchLatestPlannerRun(
   artifactId: string,
   role: "reviewer",
   threadId: string,
+  signal?: AbortSignal,
 ): Promise<{ run: PlannerRun | null; events: PlannerRunEvent[] }> {
   const params = new URLSearchParams();
   params.set("role", role);
   if (threadId) params.set("threadId", threadId);
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/latest?${params}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch latest planner run: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/latest?${params}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+      signal,
+    },
+    "Latest reviewer run",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch latest planner run: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  const run = isRecord(body) && body.run != null ? normalizePlannerRun(body.run) : null;
+  const run =
+    isRecord(body) && body.run != null ? normalizePlannerRun(body.run) : null;
   return {
     run,
-    events: isRecord(body) ? normalizeArrayResponse(body.events).map(normalizePlannerRunEvent).filter(isPresent) : [],
+    events: isRecord(body)
+      ? normalizeArrayResponse(body.events)
+          .map(normalizePlannerRunEvent)
+          .filter(isPresent)
+      : [],
+  };
+}
+
+export async function fetchPlannerRun(
+  hubUrl: string,
+  repoId: string,
+  artifactId: string,
+  runId: string,
+  afterSeq?: number,
+  signal?: AbortSignal,
+): Promise<{ run: PlannerRun; events: PlannerRunEvent[] }> {
+  const params = new URLSearchParams();
+  if (afterSeq !== undefined) params.set("afterSeq", String(afterSeq));
+  const query = params.size > 0 ? `?${params}` : "";
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/runs/${encodeURIComponent(runId)}${query}`,
+    { credentials: "include", cache: "no-store", signal },
+    "Reviewer run",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch planner run: ${res.status}`,
+    );
+  const body = await res.json().catch(() => null);
+  const run = isRecord(body) ? normalizePlannerRun(body.run) : null;
+  if (!run) throw new Error("Malformed planner run response");
+  return {
+    run,
+    events: isRecord(body)
+      ? normalizeArrayResponse(body.events)
+          .map(normalizePlannerRunEvent)
+          .filter(isPresent)
+      : [],
   };
 }
 
@@ -2672,14 +3764,21 @@ export async function fetchPlanReviewers(
   repoId: string,
   artifactId: string,
 ): Promise<ReviewerRegistryEntry[]> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch reviewers: ${res.status}`);
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Plan reviewers",
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to fetch reviewers: ${res.status}`);
   const body = await res.json().catch(() => null);
   return isRecord(body)
-    ? normalizeArrayResponse(body.reviewers).map(normalizeReviewerRegistryEntry).filter(isPresent)
+    ? normalizeArrayResponse(body.reviewers)
+        .map(normalizeReviewerRegistryEntry)
+        .filter(isPresent)
     : [];
 }
 
@@ -2689,15 +3788,21 @@ export async function addPlanReviewer(
   artifactId: string,
   input: { provider: string; model: string; effort: PlannerEffort },
 ): Promise<{ reviewer: ReviewerRegistryEntry; run?: PlannerRun }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to add reviewer: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(input),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to add reviewer: ${res.status}`);
   const body = await res.json().catch(() => null);
-  const reviewer = isRecord(body) ? normalizeReviewerRegistryEntry(body.reviewer) : null;
+  const reviewer = isRecord(body)
+    ? normalizeReviewerRegistryEntry(body.reviewer)
+    : null;
   if (!reviewer) {
     throw new Error("Malformed reviewer response");
   }
@@ -2714,11 +3819,15 @@ export async function removePlanReviewer(
   artifactId: string,
   threadId: string,
 ): Promise<void> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}`, {
-    method: "DELETE",
-    credentials: "include",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to remove reviewer: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}`,
+    {
+      method: "DELETE",
+      credentials: "include",
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(res, `Failed to remove reviewer: ${res.status}`);
 }
 
 export async function fetchReviewerMessages(
@@ -2726,16 +3835,54 @@ export async function fetchReviewerMessages(
   repoId: string,
   artifactId: string,
   threadId: string,
-): Promise<ThreadMessage[]> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to fetch reviewer messages: ${res.status}`);
+): Promise<{
+  messages: ThreadMessage[];
+  runAttributions: Record<string, ReviewerRunAttribution>;
+}> {
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Reviewer transcript",
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to fetch reviewer messages: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
-  return isRecord(body)
-    ? normalizeArrayResponse(body.messages).map(normalizeThreadMessage).filter(isPresent)
-    : [];
+  const runAttributions: Record<string, ReviewerRunAttribution> = {};
+  if (isRecord(body) && isRecord(body.runAttributions)) {
+    for (const [runId, raw] of Object.entries(body.runAttributions)) {
+      if (
+        !isRecord(raw) ||
+        typeof raw.provider !== "string" ||
+        typeof raw.model !== "string"
+      )
+        continue;
+      const status = raw.status;
+      if (
+        status !== "queued" &&
+        status !== "running" &&
+        status !== "saving" &&
+        status !== "completed" &&
+        status !== "failed" &&
+        status !== "cancelled"
+      )
+        continue;
+      runAttributions[runId] = raw as unknown as ReviewerRunAttribution;
+    }
+  }
+  return {
+    messages: isRecord(body)
+      ? normalizeArrayResponse(body.messages)
+          .map(normalizeThreadMessage)
+          .filter(isPresent)
+      : [],
+    runAttributions,
+  };
 }
 
 export async function sendReviewerMessage(
@@ -2744,14 +3891,25 @@ export async function sendReviewerMessage(
   artifactId: string,
   threadId: string,
   text: string,
+  expectedRoundId?: string,
 ): Promise<{ run: PlannerRun | null; message: ThreadMessage }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ text }),
-  });
-  if (!res.ok) throw await parseApiError(res, `Failed to send reviewer message: ${res.status}`);
+  const res = await fetch(
+    `${hubUrl}/api/repos/${repoId}/plans/${artifactId}/reviewers/${threadId}/messages`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({
+        text,
+        ...(expectedRoundId ? { expectedRoundId } : {}),
+      }),
+    },
+  );
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to send reviewer message: ${res.status}`,
+    );
   const body = await res.json().catch(() => null);
   const message = isRecord(body) ? normalizeThreadMessage(body.message) : null;
   if (!message) throw new Error("Malformed reviewer message response");
@@ -2776,8 +3934,12 @@ export async function createRepo(
     }),
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-    throw new Error(readErrorMessage(body) || `Failed to create repo: ${res.status}`);
+    const body = await res
+      .json()
+      .catch(() => ({ error: `HTTP ${res.status}` }));
+    throw new Error(
+      readErrorMessage(body) || `Failed to create repo: ${res.status}`,
+    );
   }
   const repo = normalizeRepoMetaObject(await res.json().catch(() => null));
   if (!repo) {
@@ -2807,13 +3969,16 @@ export interface GitHubRepositoriesResponse {
   repositorySelection: "all" | "selected" | "unknown";
 }
 
-function normalizeGitHubRepositorySelection(payload: unknown): GitHubRepositorySelection | null {
+function normalizeGitHubRepositorySelection(
+  payload: unknown,
+): GitHubRepositorySelection | null {
   if (!isRecord(payload)) return null;
   const repositoryId = readIntegerOr(payload.repositoryId, 0);
   const installationId = readIntegerOr(payload.installationId, 0);
   const fullName = readString(payload.fullName);
   const repoUrl = readString(payload.repoUrl);
-  if (repositoryId <= 0 || installationId <= 0 || !fullName || !repoUrl) return null;
+  if (repositoryId <= 0 || installationId <= 0 || !fullName || !repoUrl)
+    return null;
   return {
     repositoryId,
     installationId,
@@ -2824,19 +3989,25 @@ function normalizeGitHubRepositorySelection(payload: unknown): GitHubRepositoryS
   };
 }
 
-function normalizeGitHubRepositoryWarning(payload: unknown): GitHubRepositoryWarning | null {
+function normalizeGitHubRepositoryWarning(
+  payload: unknown,
+): GitHubRepositoryWarning | null {
   if (!isRecord(payload)) return null;
   const code = readString(payload.code);
   const message = readString(payload.message);
   if (!code || !message) return null;
   return {
-    ...(typeof payload.installationId === "number" ? { installationId: payload.installationId } : {}),
+    ...(typeof payload.installationId === "number"
+      ? { installationId: payload.installationId }
+      : {}),
     code,
     message,
   };
 }
 
-export async function fetchGitHubRepositories(hubUrl: string): Promise<GitHubRepositoriesResponse> {
+export async function fetchGitHubRepositories(
+  hubUrl: string,
+): Promise<GitHubRepositoriesResponse> {
   const res = await fetch(`${hubUrl}/api/github/repositories`, {
     credentials: "include",
     cache: "no-store",
@@ -2844,10 +4015,13 @@ export async function fetchGitHubRepositories(hubUrl: string): Promise<GitHubRep
   const body = await res.json().catch(() => null);
   if (!res.ok) {
     if (isRecord(body)) {
-      const error = buildApiActionError({
-        error: readString(body.error) ?? undefined,
-        code: readString(body.code) ?? undefined,
-      }, `Failed to fetch GitHub repositories: ${res.status}`);
+      const error = buildApiActionError(
+        {
+          error: readString(body.error) ?? undefined,
+          code: readString(body.code) ?? undefined,
+        },
+        `Failed to fetch GitHub repositories: ${res.status}`,
+      );
       throw error;
     }
     throw new Error(`Failed to fetch GitHub repositories: ${res.status}`);
@@ -2862,17 +4036,23 @@ export async function fetchGitHubRepositories(hubUrl: string): Promise<GitHubRep
     warnings: normalizeArrayResponse<unknown>(body.warnings)
       .map(normalizeGitHubRepositoryWarning)
       .filter(isPresent),
-    repositorySelection: body.repositorySelection === "all" || body.repositorySelection === "selected"
-      ? body.repositorySelection
-      : "unknown",
+    repositorySelection:
+      body.repositorySelection === "all" ||
+      body.repositorySelection === "selected"
+        ? body.repositorySelection
+        : "unknown",
   };
 }
 
 export async function fetchRepos(hubUrl: string): Promise<RepoMeta[]> {
-  const res = await fetch(`${hubUrl}/api/repos`, {
-    credentials: "include",
-    cache: "no-store",
-  });
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Repository list",
+  );
   if (!res.ok) throw new Error(`Failed to fetch repos: ${res.status}`);
   return normalizeStrictArrayResponse(
     await res.json().catch(() => null),
@@ -2881,11 +4061,18 @@ export async function fetchRepos(hubUrl: string): Promise<RepoMeta[]> {
   );
 }
 
-export async function fetchRepo(hubUrl: string, repoId: string): Promise<RepoMeta> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
+export async function fetchRepo(
+  hubUrl: string,
+  repoId: string,
+): Promise<RepoMeta> {
+  const res = await fetchApiRead(
+    `${hubUrl}/api/repos/${repoId}`,
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+    "Repository",
+  );
   if (!res.ok) throw new Error(`Failed to fetch repo: ${res.status}`);
   const repo = normalizeRepoMetaObject(await res.json().catch(() => null));
   if (!repo) {
@@ -2913,24 +4100,9 @@ export interface RepoMcpServerInput {
   enabled: boolean;
 }
 
-export type CloudflareMcpConnectionStatus = "not_connected" | "connected" | "reauth_required";
-
-export interface RepoCloudflareMcpStatus {
-  integrationId: string;
-  serverId: string;
-  label: string;
-  mcpUrl: string;
-  status: CloudflareMcpConnectionStatus;
-  connected: boolean;
-  enabled: boolean;
-  scopes: string[];
-  expiresAt: number | null;
-  account: { id: string | null; name: string | null } | null;
-  lastAuthError: string | null;
-  lastAuthErrorAt: string | null;
-}
-
-function normalizeRepoSessionEnvVar(payload: unknown): RepoSessionEnvVar | null {
+function normalizeRepoSessionEnvVar(
+  payload: unknown,
+): RepoSessionEnvVar | null {
   if (!isRecord(payload)) return null;
   const name = readString(payload.name);
   const updatedAt = readString(payload.updatedAt);
@@ -2948,7 +4120,11 @@ export async function fetchRepoSessionEnv(
   });
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to fetch session env: ${res.status}`);
+    throw new Error(
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `Failed to fetch session env: ${res.status}`,
+    );
   }
   if (!isRecord(body)) {
     throw new Error("Malformed session env response");
@@ -2972,7 +4148,11 @@ export async function patchRepoSessionEnv(
   });
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to update session env: ${res.status}`);
+    throw new Error(
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `Failed to update session env: ${res.status}`,
+    );
   }
   if (!isRecord(body)) {
     throw new Error("Malformed session env response");
@@ -2987,7 +4167,8 @@ function normalizeRepoMcpServer(payload: unknown): RepoMcpServer | null {
   const id = readString(payload.id);
   const label = readString(payload.label);
   const url = readString(payload.url);
-  if (!id || !label || !url || typeof payload.enabled !== "boolean") return null;
+  if (!id || !label || !url || typeof payload.enabled !== "boolean")
+    return null;
   return {
     id,
     label,
@@ -3006,7 +4187,11 @@ export async function fetchRepoMcpServers(
   });
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to fetch MCP servers: ${res.status}`);
+    throw new Error(
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `Failed to fetch MCP servers: ${res.status}`,
+    );
   }
   if (!isRecord(body)) {
     throw new Error("Malformed MCP servers response");
@@ -3030,7 +4215,11 @@ export async function putRepoMcpServers(
   });
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to update MCP servers: ${res.status}`);
+    throw new Error(
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `Failed to update MCP servers: ${res.status}`,
+    );
   }
   if (!isRecord(body)) {
     throw new Error("Malformed MCP servers response");
@@ -3038,116 +4227,6 @@ export async function putRepoMcpServers(
   return normalizeArrayResponse<unknown>(body.servers)
     .map(normalizeRepoMcpServer)
     .filter(isPresent);
-}
-
-function normalizeRepoCloudflareMcpStatus(payload: unknown): RepoCloudflareMcpStatus | null {
-  if (!isRecord(payload)) return null;
-  const integrationId = readString(payload.integrationId);
-  const serverId = readString(payload.serverId);
-  const label = readString(payload.label);
-  const mcpUrl = readString(payload.mcpUrl);
-  const status = payload.status === "not_connected" || payload.status === "connected" || payload.status === "reauth_required"
-    ? payload.status
-    : null;
-  if (!integrationId || !serverId || !label || !mcpUrl || !status) return null;
-  const account = isRecord(payload.account)
-    ? {
-      id: readNullableString(payload.account.id),
-      name: readNullableString(payload.account.name),
-    }
-    : null;
-  return {
-    integrationId,
-    serverId,
-    label,
-    mcpUrl,
-    status,
-    connected: readBooleanOr(payload.connected),
-    enabled: readBooleanOr(payload.enabled),
-    scopes: normalizeArrayResponse<unknown>(payload.scopes).filter((scope): scope is string => typeof scope === "string"),
-    expiresAt: typeof payload.expiresAt === "number" && Number.isFinite(payload.expiresAt) ? payload.expiresAt : null,
-    account,
-    lastAuthError: readNullableString(payload.lastAuthError),
-    lastAuthErrorAt: readNullableString(payload.lastAuthErrorAt),
-  };
-}
-
-function readRepoCloudflareMcpStatusBody(body: unknown): RepoCloudflareMcpStatus {
-  if (!isRecord(body)) {
-    throw new Error("Malformed Cloudflare MCP response");
-  }
-  const integration = normalizeRepoCloudflareMcpStatus(body.integration);
-  if (!integration) {
-    throw new Error("Malformed Cloudflare MCP response");
-  }
-  return integration;
-}
-
-export async function fetchRepoCloudflareMcpStatus(
-  hubUrl: string,
-  repoId: string,
-): Promise<RepoCloudflareMcpStatus> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to fetch Cloudflare MCP status: ${res.status}`);
-  }
-  return readRepoCloudflareMcpStatusBody(body);
-}
-
-export async function connectRepoCloudflareMcp(
-  hubUrl: string,
-  repoId: string,
-): Promise<{ authorizeUrl: string; expiresAt: number }> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp/connect`, {
-    method: "POST",
-    credentials: "include",
-    cache: "no-store",
-  });
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to start Cloudflare MCP connection: ${res.status}`);
-  }
-  if (!isRecord(body) || typeof body.authorizeUrl !== "string" || typeof body.expiresAt !== "number") {
-    throw new Error("Malformed Cloudflare MCP connect response");
-  }
-  return { authorizeUrl: body.authorizeUrl, expiresAt: body.expiresAt };
-}
-
-export async function setRepoCloudflareMcpEnabled(
-  hubUrl: string,
-  repoId: string,
-  enabled: boolean,
-): Promise<RepoCloudflareMcpStatus> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp/${enabled ? "enable" : "disable"}`, {
-    method: "POST",
-    credentials: "include",
-    cache: "no-store",
-  });
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to update Cloudflare MCP: ${res.status}`);
-  }
-  return readRepoCloudflareMcpStatusBody(body);
-}
-
-export async function disconnectRepoCloudflareMcp(
-  hubUrl: string,
-  repoId: string,
-): Promise<RepoCloudflareMcpStatus> {
-  const res = await fetch(`${hubUrl}/api/repos/${repoId}/cloudflare-mcp/disconnect`, {
-    method: "POST",
-    credentials: "include",
-    cache: "no-store",
-  });
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Failed to disconnect Cloudflare MCP: ${res.status}`);
-  }
-  return readRepoCloudflareMcpStatusBody(body);
 }
 
 // ── Setup / Settings helpers ─────────────────────────────────────
@@ -3166,14 +4245,29 @@ export interface SetupStatus {
   hasClaudeSubscription: boolean;
   hasAnthropicKey: boolean;
   hasChatGPTAuth: boolean;
-  chatgptAuthStatus: "missing" | "connected" | "refreshing" | "needs_reconnect" | "temporarily_unavailable";
+  chatgptAuthStatus:
+    | "missing"
+    | "connected"
+    | "refreshing"
+    | "needs_reconnect"
+    | "temporarily_unavailable";
   hasOpenAIKey: boolean;
-  codexRouteStatus: "available" | "backend_offline" | "runtime_update_required" | "environment_not_connected" | "authentication_unavailable" | "direct_api" | "unavailable";
+  codexRouteStatus:
+    | "available"
+    | "backend_offline"
+    | "runtime_update_required"
+    | "environment_not_connected"
+    | "authentication_unavailable"
+    | "direct_api"
+    | "unavailable";
   openaiPlannerConfigured: boolean;
   openaiPlannerAvailable: boolean;
   openaiPlannerRoute: "api-key" | "subscription-app-server" | null;
   openaiPlannerReason: string | null;
-  codexBackendReadiness: { cf: SetupStatus["codexRouteStatus"]; host: SetupStatus["codexRouteStatus"] };
+  codexBackendReadiness: {
+    cf: SetupStatus["codexRouteStatus"];
+    host: SetupStatus["codexRouteStatus"];
+  };
   hostRegistered: boolean;
   enabledHarnesses: EnvHarness[];
   protectionMode: "public" | "cf-access";
@@ -3189,7 +4283,6 @@ export interface SetupStatus {
   githubAppManageUrl: string;
   githubAppPublicHubDisabled: boolean;
   buildDiagnostics: UpdateBuildDiagnostics;
-  selfUpdateRepo: HubUpdateRepoState;
   dashboardOnboarding: {
     dismissed: boolean;
     executionReady: boolean;
@@ -3209,13 +4302,24 @@ function normalizeAuthConnectStatus(value: unknown): AuthConnectStatus {
     throw new Error("Malformed authentication connection status response");
   }
   const status = value.status;
-  if (status !== "pending" && status !== "success" && status !== "error" && status !== "expired") {
+  if (
+    status !== "pending" &&
+    status !== "success" &&
+    status !== "error" &&
+    status !== "expired"
+  ) {
     throw new Error("Malformed authentication connection status response");
   }
-  const providers: Partial<Record<AuthConnectProvider, AuthConnectProviderStatus>> = {};
+  const providers: Partial<
+    Record<AuthConnectProvider, AuthConnectProviderStatus>
+  > = {};
   for (const provider of ["codex", "claude"] as const) {
     const providerStatus = value.providers[provider];
-    if (providerStatus === "pending" || providerStatus === "success" || providerStatus === "error") {
+    if (
+      providerStatus === "pending" ||
+      providerStatus === "success" ||
+      providerStatus === "error"
+    ) {
       providers[provider] = providerStatus;
     }
   }
@@ -3241,14 +4345,15 @@ export async function approveAuthConnect(
     cache: "no-store",
     body: JSON.stringify(input),
   });
-  if (!response.ok) throw await parseApiError(response, "Connection approval failed.");
+  if (!response.ok)
+    throw await parseApiError(response, "Connection approval failed.");
   const body = await response.json().catch(() => null);
   if (
-    !isRecord(body)
-    || typeof body.envelope !== "string"
-    || !body.envelope
-    || typeof body.connection_id !== "string"
-    || !/^[A-Za-z0-9_-]{16,128}$/.test(body.connection_id)
+    !isRecord(body) ||
+    typeof body.envelope !== "string" ||
+    !body.envelope ||
+    typeof body.connection_id !== "string" ||
+    !/^[A-Za-z0-9_-]{16,128}$/.test(body.connection_id)
   ) {
     throw new Error("Malformed authentication connection approval response");
   }
@@ -3263,17 +4368,18 @@ export async function fetchAuthConnectStatus(
     `${hubUrl}/api/cli/auth-connect-status?connection_id=${encodeURIComponent(connectionId)}`,
     { credentials: "include", cache: "no-store" },
   );
-  if (!response.ok) throw await parseApiError(response, "Failed to check the connection status.");
+  if (!response.ok)
+    throw await parseApiError(
+      response,
+      "Failed to check the connection status.",
+    );
   return normalizeAuthConnectStatus(await response.json().catch(() => null));
 }
 
 export type ExecutionSelection =
-  | { target: "cf" }
-  | { target: "host"; machineId: string };
+  { target: "cf" } | { target: "host"; machineId: string };
 export type HostIncompatibilityCode =
-  | "runner_protocol"
-  | "runtime_auth_protocol"
-  | "runtime_image";
+  "runner_protocol" | "runtime_auth_protocol" | "runtime_image";
 export type ExecutionHostStatus =
   | { state: "not_connected" }
   | {
@@ -3293,20 +4399,34 @@ export interface ExecutionStatus {
   executionReady: boolean;
 }
 
-function normalizeExecutionHostStatus(value: unknown): ExecutionHostStatus | null {
+export const EXECUTION_STATUS_CHANGED_EVENT = "tiller:execution-status-changed";
+
+function publishExecutionStatusChanged(status: ExecutionStatus): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent<ExecutionStatus>(EXECUTION_STATUS_CHANGED_EVENT, {
+      detail: status,
+    }),
+  );
+}
+
+function normalizeExecutionHostStatus(
+  value: unknown,
+): ExecutionHostStatus | null {
   if (!isRecord(value)) return null;
   if (value.state === "not_connected") return { state: "not_connected" };
-  const machineId = typeof value.machineId === "string" ? value.machineId.trim() : "";
-  const displayName = typeof value.displayName === "string" ? value.displayName.trim() : "";
+  const machineId =
+    typeof value.machineId === "string" ? value.machineId.trim() : "";
+  const displayName =
+    typeof value.displayName === "string" ? value.displayName.trim() : "";
   if (!machineId || !displayName) return null;
-  if (value.state === "ready") return { state: "ready", machineId, displayName };
+  if (value.state === "ready")
+    return { state: "ready", machineId, displayName };
   if (
-    value.state === "incompatible"
-    && (
-      value.code === "runner_protocol"
-      || value.code === "runtime_auth_protocol"
-      || value.code === "runtime_image"
-    )
+    value.state === "incompatible" &&
+    (value.code === "runner_protocol" ||
+      value.code === "runtime_auth_protocol" ||
+      value.code === "runtime_image")
   ) {
     return { state: "incompatible", machineId, displayName, code: value.code };
   }
@@ -3317,19 +4437,21 @@ function normalizeExecutionStatus(value: unknown): ExecutionStatus {
   if (!isRecord(value) || !isRecord(value.selected)) {
     throw new Error("Malformed execution status response");
   }
-  const selected: ExecutionSelection | null = value.selected.target === "cf"
-    ? { target: "cf" }
-    : value.selected.target === "host" && typeof value.selected.machineId === "string"
-      ? { target: "host", machineId: value.selected.machineId }
-      : null;
+  const selected: ExecutionSelection | null =
+    value.selected.target === "cf"
+      ? { target: "cf" }
+      : value.selected.target === "host" &&
+          typeof value.selected.machineId === "string"
+        ? { target: "host", machineId: value.selected.machineId }
+        : null;
   const candidate = normalizeExecutionHostStatus(value.candidate);
   let selectedHost: SelectedHostStatus | null = null;
   if (value.selectedHost !== null && value.selectedHost !== undefined) {
     if (
-      isRecord(value.selectedHost)
-      && value.selectedHost.state === "offline"
-      && typeof value.selectedHost.machineId === "string"
-      && typeof value.selectedHost.displayName === "string"
+      isRecord(value.selectedHost) &&
+      value.selectedHost.state === "offline" &&
+      typeof value.selectedHost.machineId === "string" &&
+      typeof value.selectedHost.displayName === "string"
     ) {
       selectedHost = {
         state: "offline",
@@ -3344,23 +4466,29 @@ function normalizeExecutionStatus(value: unknown): ExecutionStatus {
   if (!selected || !candidate || typeof value.executionReady !== "boolean") {
     throw new Error("Malformed execution status response");
   }
-  return { selected, selectedHost, candidate, executionReady: value.executionReady };
+  return {
+    selected,
+    selectedHost,
+    candidate,
+    executionReady: value.executionReady,
+  };
 }
 
-export async function fetchExecutionStatus(hubUrl: string): Promise<ExecutionStatus> {
+export async function fetchExecutionStatus(
+  hubUrl: string,
+): Promise<ExecutionStatus> {
   const response = await fetch(`${hubUrl}/api/execution/status`, {
     credentials: "include",
     cache: "no-store",
   });
-  if (!response.ok) throw await parseApiError(response, "Failed to load execution status.");
+  if (!response.ok)
+    throw await parseApiError(response, "Failed to load execution status.");
   return normalizeExecutionStatus(await response.json().catch(() => null));
 }
 
 export async function setExecutionBackend(
   hubUrl: string,
-  selection:
-    | { target: "cf" }
-    | { target: "host"; expectedMachineId: string },
+  selection: { target: "cf" } | { target: "host"; expectedMachineId: string },
 ): Promise<ExecutionStatus> {
   const response = await fetch(`${hubUrl}/api/settings/execution-backend`, {
     method: "PUT",
@@ -3371,17 +4499,22 @@ export async function setExecutionBackend(
   });
   const body = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = isRecord(body) && typeof body.message === "string"
-      ? body.message
-      : isRecord(body) && typeof body.error === "string"
-        ? body.error
-        : "Failed to change execution backend.";
+    const message =
+      isRecord(body) && typeof body.message === "string"
+        ? body.message
+        : isRecord(body) && typeof body.error === "string"
+          ? body.error
+          : "Failed to change execution backend.";
     throw new Error(message);
   }
-  return normalizeExecutionStatus(body);
+  const status = normalizeExecutionStatus(body);
+  publishExecutionStatusChanged(status);
+  return status;
 }
 
-async function throwIfBrowserAuthenticationRequired(response: Response): Promise<void> {
+async function throwIfBrowserAuthenticationRequired(
+  response: Response,
+): Promise<void> {
   if (response.type === "opaqueredirect" || response.status === 401) {
     throw new ApiAuthenticationError(
       "Your Cloudflare Access session has expired.",
@@ -3391,13 +4524,21 @@ async function throwIfBrowserAuthenticationRequired(response: Response): Promise
 
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   const responseUrl = response.url.toLowerCase();
-  if (responseUrl.includes("/cdn-cgi/access/") || contentType.includes("text/html")) {
-    const raw = await response.clone().text().catch(() => "");
+  if (
+    responseUrl.includes("/cdn-cgi/access/") ||
+    contentType.includes("text/html")
+  ) {
+    const raw = await response
+      .clone()
+      .text()
+      .catch(() => "");
     const looksLikeAccessLogin =
-      responseUrl.includes("/cdn-cgi/access/")
-      || /Cloudflare Access/i.test(raw)
-      || /Sign in ・ Cloudflare Access/i.test(raw);
-    if (looksLikeAccessLogin || contentType.includes("text/html")) {
+      responseUrl.includes("/cdn-cgi/access/") ||
+      /Cloudflare Access/i.test(raw) ||
+      /Sign in ・ Cloudflare Access/i.test(raw);
+    // A proxy or rolling deploy can also return a generic HTML error page.
+    // Reload only when the response is positively identified as Access auth.
+    if (looksLikeAccessLogin) {
       throw new ApiAuthenticationError(
         "Your Cloudflare Access session has expired.",
         response.status || null,
@@ -3407,24 +4548,34 @@ async function throwIfBrowserAuthenticationRequired(response: Response): Promise
 }
 
 export async function fetchSetupStatus(hubUrl: string): Promise<SetupStatus> {
-  const res = await fetch(`${hubUrl}/api/setup/status`, {
-    headers: { Accept: "application/json" },
-    credentials: "include",
-    cache: "no-store",
-    redirect: "manual",
-  });
+  const res = await fetchApiRead(
+    `${hubUrl}/api/setup/status`,
+    {
+      headers: { Accept: "application/json" },
+      credentials: "include",
+      cache: "no-store",
+      redirect: "manual",
+    },
+    "Setup status",
+  );
   await throwIfBrowserAuthenticationRequired(res);
   if (!res.ok) throw new Error(`Failed to fetch setup status: ${res.status}`);
   return normalizeSetupStatus(await res.json().catch(() => null));
 }
 
-export async function dismissDashboardOnboarding(hubUrl: string): Promise<void> {
+export async function dismissDashboardOnboarding(
+  hubUrl: string,
+): Promise<void> {
   const response = await fetch(`${hubUrl}/api/setup/onboarding/dismiss`, {
     method: "POST",
     credentials: "include",
     cache: "no-store",
   });
-  if (!response.ok) throw await parseApiError(response, "Failed to dismiss dashboard onboarding.");
+  if (!response.ok)
+    throw await parseApiError(
+      response,
+      "Failed to dismiss dashboard onboarding.",
+    );
 }
 
 export interface VerifyModelAuthResult {
@@ -3436,24 +4587,33 @@ export interface VerifyModelAuthResult {
   note?: string;
 }
 
+export type VerifiableModelAuthKey = "ANTHROPIC_API_KEY" | "OPENAI_API_KEY";
+
 export async function verifyModelAuth(
   hubUrl: string,
+  key?: VerifiableModelAuthKey,
 ): Promise<{ ok: boolean; error?: string; results: VerifyModelAuthResult[] }> {
   const res = await fetch(`${hubUrl}/api/setup/verify-model-auth`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
     credentials: "include",
+    body: JSON.stringify(key ? { key } : {}),
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
   if (!res.ok) {
-    throw new Error(readErrorMessage(body) || `Credential verification failed: ${res.status}`);
+    throw new Error(
+      readErrorMessage(body) || `Credential verification failed: ${res.status}`,
+    );
   }
   return {
     ok: isRecord(body) && body.ok === true,
-    ...(isRecord(body) && typeof body.error === "string" ? { error: body.error } : {}),
+    ...(isRecord(body) && typeof body.error === "string"
+      ? { error: body.error }
+      : {}),
     results: isRecord(body)
       ? normalizeArrayResponse(body.results)
-        .map((result) => normalizeVerifyModelAuthResult(result))
-        .filter(isPresent)
+          .map((result) => normalizeVerifyModelAuthResult(result))
+          .filter(isPresent)
       : [],
   };
 }
@@ -3469,7 +4629,8 @@ export async function submitSetup(
     body: JSON.stringify({ secrets }),
   });
   const payload = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(readErrorMessage(payload) || `Setup failed: ${res.status}`);
+  if (!res.ok)
+    throw new Error(readErrorMessage(payload) || `Setup failed: ${res.status}`);
   const body = normalizeSetupMutationResult(payload);
   if (!body) throw new Error("Malformed setup response");
   return body;
@@ -3488,7 +4649,10 @@ export async function saveBillingMode(
     body: JSON.stringify({ settings: { [key]: mode } }),
   });
   const payload = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(readErrorMessage(payload) || `Failed to save billing mode: ${res.status}`);
+  if (!res.ok)
+    throw new Error(
+      readErrorMessage(payload) || `Failed to save billing mode: ${res.status}`,
+    );
   const body = normalizeSetupMutationResult(payload);
   if (!body) throw new Error("Malformed billing mode response");
   return body;
@@ -3511,7 +4675,11 @@ export async function saveGitHubAppConfig(
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
   if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `GitHub App setup failed: ${res.status}`);
+    throw new Error(
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `GitHub App setup failed: ${res.status}`,
+    );
   }
   if (isRecord(body) && isRecord(body.status)) {
     return normalizeSetupStatus(body.status);
@@ -3539,7 +4707,10 @@ export interface GitHubAccessTestResult {
   manageUrl: string | null;
 }
 
-export async function testGitHubAppAccess(hubUrl: string, selection: GitHubRepositorySelection): Promise<GitHubAccessTestResult> {
+export async function testGitHubAppAccess(
+  hubUrl: string,
+  selection: GitHubRepositorySelection,
+): Promise<GitHubAccessTestResult> {
   const res = await fetch(`${hubUrl}/api/github/test-access`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3552,24 +4723,33 @@ export async function testGitHubAppAccess(hubUrl: string, selection: GitHubRepos
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
   if (!res.ok) {
-    throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `GitHub App access test failed: ${res.status}`);
+    throw new Error(
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `GitHub App access test failed: ${res.status}`,
+    );
   }
-  if (!isRecord(body) || typeof body.status !== "string" || typeof body.ok !== "boolean") {
+  if (
+    !isRecord(body) ||
+    typeof body.status !== "string" ||
+    typeof body.ok !== "boolean"
+  ) {
     throw new Error("Malformed GitHub App access test response");
   }
   return {
     ok: body.ok,
-    status: (
-      body.status === "ready"
-      || body.status === "not_configured"
-      || body.status === "missing_installation"
-      || body.status === "repo_not_selected"
-      || body.status === "missing_permissions"
-      || body.status === "invalid_repo"
-      || body.status === "invalid_config"
-      || body.status === "github_error"
-      || body.status === "public_hub_disabled"
-    ) ? body.status : "github_error",
+    status:
+      body.status === "ready" ||
+      body.status === "not_configured" ||
+      body.status === "missing_installation" ||
+      body.status === "repo_not_selected" ||
+      body.status === "missing_permissions" ||
+      body.status === "invalid_repo" ||
+      body.status === "invalid_config" ||
+      body.status === "github_error" ||
+      body.status === "public_hub_disabled"
+        ? body.status
+        : "github_error",
     message: readStringOr(body.message, "GitHub App access test failed."),
     repo: readNullableString(body.repo),
     installUrl: readNullableString(body.installUrl),
@@ -3577,12 +4757,20 @@ export async function testGitHubAppAccess(hubUrl: string, selection: GitHubRepos
   };
 }
 
-export async function checkForUpdate(hubUrl: string): Promise<UpdateCheckResult> {
-  const res = await fetch(`${hubUrl}/api/update/check`, {
+export async function checkForUpdate(
+  hubUrl: string,
+  options: { forceRefresh?: boolean } = {},
+): Promise<UpdateCheckResult> {
+  const refreshQuery = options.forceRefresh ? "?refresh=1" : "";
+  const res = await fetch(`${hubUrl}/api/update/check${refreshQuery}`, {
     credentials: "include",
     cache: "no-store",
   });
-  if (!res.ok) throw await parseApiError(res, `Failed to check for updates: ${res.status}`);
+  if (!res.ok)
+    throw await parseApiError(
+      res,
+      `Failed to check for updates: ${res.status}`,
+    );
   const result = normalizeUpdateCheckResult(await res.json().catch(() => null));
   if (!result) {
     throw new Error("Malformed update check response");
@@ -3602,7 +4790,7 @@ export async function checkPredeployCleanSlate(
     credentials: "include",
     cache: "no-store",
   });
-  const body = await res.json().catch(() => null) as unknown;
+  const body = (await res.json().catch(() => null)) as unknown;
   if (res.status !== 200 && res.status !== 409) {
     throw new ApiActionError(
       isRecord(body) && typeof body.error === "string"
@@ -3611,14 +4799,18 @@ export async function checkPredeployCleanSlate(
       `Failed to verify maintenance readiness: ${res.status}`,
     );
   }
-  if (!isRecord(body) || typeof body.ok !== "boolean" || !Array.isArray(body.blockers)) {
+  if (
+    !isRecord(body) ||
+    typeof body.ok !== "boolean" ||
+    !Array.isArray(body.blockers)
+  ) {
     throw new Error("Malformed maintenance readiness response");
   }
   const blockers = body.blockers.map((blocker) => {
     if (
-      !isRecord(blocker)
-      || typeof blocker.kind !== "string"
-      || typeof blocker.resourceId !== "string"
+      !isRecord(blocker) ||
+      typeof blocker.kind !== "string" ||
+      typeof blocker.resourceId !== "string"
     ) {
       throw new Error("Malformed maintenance readiness blocker");
     }
@@ -3633,76 +4825,10 @@ export async function checkPredeployCleanSlate(
   return { ok: body.ok, blockers };
 }
 
-export async function applyUpdate(
-  hubUrl: string,
-): Promise<UpdateApplyResult> {
-  const res = await fetch(`${hubUrl}/api/update/apply`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-  });
-  const payload = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(readErrorMessage(payload) || `Failed to apply update: ${res.status}`);
-  const body = normalizeUpdateApplyResult(payload);
-  if (!body) throw new Error("Malformed update response");
-  return body;
-}
-
-export async function applyCloudflareRepairUpdate(
-  hubUrl: string,
-  apiToken: string,
-): Promise<{ ok: boolean; error?: string }> {
-  const res = await fetch(`${hubUrl}/api/update/repair/cloudflare-redeploy`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ apiToken }),
-  });
-  const payload = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(readErrorMessage(payload) || `Failed to apply repair update: ${res.status}`);
-  if (!isRecord(payload) || typeof payload.ok !== "boolean") {
-    throw new Error("Malformed repair update response");
-  }
-  return {
-    ok: payload.ok,
-    ...(readString(payload.error) ? { error: readString(payload.error) ?? undefined } : {}),
-  };
-}
-
-export async function detectSelfUpdateRepo(hubUrl: string): Promise<HubUpdateRepoState> {
-  const res = await fetch(`${hubUrl}/api/update/hub-repo/detect`, {
-    method: "POST",
-    credentials: "include",
-    cache: "no-store",
-  });
-  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Self-update repo detection failed: ${res.status}`);
-  return normalizeHubUpdateRepoState(body);
-}
-
-export async function selectSelfUpdateRepo(
-  hubUrl: string,
-  candidate: HubUpdateRepoCandidate,
-): Promise<HubUpdateRepoState> {
-  const res = await fetch(`${hubUrl}/api/update/hub-repo/select`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({
-      repoId: candidate.repoId,
-      installationId: candidate.installationId,
-      fullName: candidate.fullName,
-      branch: candidate.branch,
-    }),
-  });
-  const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(isRecord(body) && typeof body.error === "string" ? body.error : `Self-update repo selection failed: ${res.status}`);
-  return normalizeHubUpdateRepoState(body);
-}
-
 // ── WebSocket helper ──────────────────────────────────────────────
 
 const BACKOFF_STEPS = [1, 2, 5, 10, 30]; // seconds
+const STABLE_CONNECTION_MS = 30_000;
 
 /** Minimal message shape forwarded to the live callback and SessionView. */
 export type LiveMessage = {
@@ -3717,11 +4843,19 @@ export interface WsHandlers {
   onConnected?: () => void;
   onDisconnected?: () => void;
   onReconnectExhausted?: () => void;
-  onCapabilities?: (capabilities: Extract<WsServerMessage, { type: "capabilities" }>) => void;
+  onCapabilities?: (
+    capabilities: Extract<WsServerMessage, { type: "capabilities" }>,
+  ) => void;
   onMachineUpdated?: (machine: StoredMachine) => void;
-  onMessage?: (msg: Extract<WsServerMessage, { type: "message-received" }>) => void;
-  onTerminalInputAck?: (msg: Extract<WsServerMessage, { type: "terminal-input-ack" }>) => void;
-  onTerminalControlAck?: (msg: Extract<WsServerMessage, { type: "terminal-control-ack" }>) => void;
+  onMessage?: (
+    msg: Extract<WsServerMessage, { type: "message-received" }>,
+  ) => void;
+  onTerminalInputAck?: (
+    msg: Extract<WsServerMessage, { type: "terminal-input-ack" }>,
+  ) => void;
+  onTerminalControlAck?: (
+    msg: Extract<WsServerMessage, { type: "terminal-control-ack" }>,
+  ) => void;
   onSessionUpdated?: (session: StoredSession) => void;
   onSessionDeleted?: (sessionId: string) => void;
   onPermissionCreated?: (permission: StoredPermission) => void;
@@ -3758,7 +4892,10 @@ export function createReconnectingWebSocket(
   let retryCount = 0;
   let retryTimeout: ReturnType<typeof setTimeout> | null = null;
   let active = true;
-  let currentSocket: { close: () => void; send: (data: unknown) => boolean } | null = null;
+  let currentSocket: {
+    close: () => void;
+    send: (data: unknown) => boolean;
+  } | null = null;
   let connectionGeneration = 0;
 
   function connect() {
@@ -3766,7 +4903,14 @@ export function createReconnectingWebSocket(
     const wsUrl = hubUrl.replace(/^http/, "ws").replace(/\/$/, "");
     const ws = new WebSocket(`${wsUrl}/parties/hub/hub`);
     let pingInterval: ReturnType<typeof setInterval> | null = null;
+    let stableConnectionTimeout: ReturnType<typeof setTimeout> | null = null;
     const isCurrent = () => active && generation === connectionGeneration;
+    const clearConnectionTimers = () => {
+      if (pingInterval) clearInterval(pingInterval);
+      if (stableConnectionTimeout) clearTimeout(stableConnectionTimeout);
+      pingInterval = null;
+      stableConnectionTimeout = null;
+    };
 
     ws.addEventListener("open", () => {
       if (!isCurrent()) {
@@ -3778,7 +4922,10 @@ export function createReconnectingWebSocket(
           ws.send(JSON.stringify({ type: "ping" }));
         }
       }, 30_000);
-      retryCount = 0;
+      stableConnectionTimeout = setTimeout(() => {
+        stableConnectionTimeout = null;
+        if (isCurrent() && ws.readyState === WebSocket.OPEN) retryCount = 0;
+      }, STABLE_CONNECTION_MS);
       handlers.onConnected?.();
     });
 
@@ -3866,8 +5013,7 @@ export function createReconnectingWebSocket(
     });
 
     ws.addEventListener("close", (event) => {
-      if (pingInterval) clearInterval(pingInterval);
-      pingInterval = null;
+      clearConnectionTimers();
       if (!isCurrent()) return;
       currentSocket = null;
       handlers.onDisconnected?.();
@@ -3880,7 +5026,8 @@ export function createReconnectingWebSocket(
         handlers.onReconnectExhausted?.();
         return;
       }
-      const step = BACKOFF_STEPS[Math.min(retryCount, BACKOFF_STEPS.length - 1)];
+      const step =
+        BACKOFF_STEPS[Math.min(retryCount, BACKOFF_STEPS.length - 1)];
       const delay = step * (0.5 + Math.random() * 0.5) * 1000;
       retryCount++;
       retryTimeout = setTimeout(() => {
@@ -3890,7 +5037,10 @@ export function createReconnectingWebSocket(
     });
 
     currentSocket = {
-      close: () => ws.close(),
+      close: () => {
+        clearConnectionTimers();
+        ws.close();
+      },
       send: (data) => {
         if (ws.readyState !== WebSocket.OPEN) {
           return false;

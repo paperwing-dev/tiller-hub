@@ -27,6 +27,8 @@ describe("harness catalog", () => {
     expect(listHarnessModels("opencode").map(({ id, efforts }) => [id, efforts])).toEqual([
       ["gpt-5.6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]],
       ["gpt-5.5", ["low", "medium", "high", "xhigh"]],
+      ["claude-opus-5", ["low", "medium", "high", "xhigh", "max"]],
+      ["claude-fable-5", ["low", "medium", "high", "xhigh", "max"]],
       ["kimi-k2.7-code", ["low", "medium", "high"]],
     ]);
     expect(getHarnessDefault("codex")).toEqual({ model: "gpt-5.6-sol", effort: "xhigh" });
@@ -95,6 +97,34 @@ describe("harness catalog", () => {
       },
       {
         harness: "opencode",
+        id: "claude-opus-5",
+        credential: "anthropic-api-key",
+        binding: {
+          kind: "opencode",
+          provider: "anthropic",
+          providerAlias: "tiller-anthropic",
+          providerLabel: "Anthropic",
+          modelAlias: "claude-opus-5",
+          model: "claude-opus-5",
+          baseUrl: "https://api.anthropic.com/v1",
+        },
+      },
+      {
+        harness: "opencode",
+        id: "claude-fable-5",
+        credential: "anthropic-api-key",
+        binding: {
+          kind: "opencode",
+          provider: "anthropic",
+          providerAlias: "tiller-anthropic",
+          providerLabel: "Anthropic",
+          modelAlias: "claude-fable-5",
+          model: "claude-fable-5",
+          baseUrl: "https://api.anthropic.com/v1",
+        },
+      },
+      {
+        harness: "opencode",
         id: "kimi-k2.7-code",
         credential: "workers-ai",
         binding: {
@@ -107,6 +137,23 @@ describe("harness catalog", () => {
           baseUrl: null,
         },
       },
+    ]);
+  });
+
+  it("owns non-zero context and output limits for every model", () => {
+    expect(HARNESS_MODEL_CATALOG.every(({ limits }) => (
+      Number.isSafeInteger(limits.context)
+      && limits.context > 0
+      && Number.isSafeInteger(limits.output)
+      && limits.output > 0
+      && (limits.input === undefined || (Number.isSafeInteger(limits.input) && limits.input > 0))
+    ))).toBe(true);
+    expect(listHarnessModels("opencode").map(({ id, limits }) => ({ id, limits }))).toEqual([
+      { id: "gpt-5.6-sol", limits: { context: 1_050_000, input: 922_000, output: 128_000 } },
+      { id: "gpt-5.5", limits: { context: 1_050_000, input: 922_000, output: 128_000 } },
+      { id: "claude-opus-5", limits: { context: 1_000_000, output: 128_000 } },
+      { id: "claude-fable-5", limits: { context: 1_000_000, output: 128_000 } },
+      { id: "kimi-k2.7-code", limits: { context: 262_144, output: 262_144 } },
     ]);
   });
 
@@ -140,6 +187,11 @@ describe("harness catalog", () => {
     expect(validateHarnessSettings("opencode", {
       model: "gpt-5.5",
       effort: "high",
+      fastMode: true,
+    })).toBeNull();
+    expect(validateHarnessSettings("opencode", {
+      model: "claude-opus-5",
+      effort: "max",
       fastMode: true,
     })).toBeNull();
     expect(validateHarnessSettings("codex", {
@@ -244,6 +296,23 @@ describe("harness catalog", () => {
       requirement: "openai-api-key",
       message: "GPT-5.6 Sol requires OpenAI API mode.",
     });
+    const openCodeOpus = getHarnessModel("opencode", "claude-opus-5")!;
+    expect(resolveHarnessModelAvailability(openCodeOpus, "host", {
+      claudeBillingMode: "subscription",
+      hasClaudeSubscription: true,
+    })).toMatchObject({
+      available: false,
+      requirement: "anthropic-api-key",
+      message: "Opus 5 requires Claude API mode.",
+    });
+    expect(resolveHarnessModelAvailability(openCodeOpus, "cf", {
+      claudeBillingMode: "api",
+      hasAnthropicKey: true,
+    })).toMatchObject({
+      available: true,
+      requirement: "anthropic-api-key",
+      message: null,
+    });
     const kimi = getHarnessModel("opencode", "kimi-k2.7-code")!;
     expect(resolveHarnessModelAvailability(kimi, "cf", { workersAiConfigured: true })).toMatchObject({
       available: true,
@@ -256,10 +325,15 @@ describe("harness catalog", () => {
       openaiBillingMode: "api",
       hasOpenAIKey: true,
     })).toBe(true);
+    expect(hasAvailableHarnessModel(["opencode"], "host", {
+      claudeBillingMode: "api",
+      hasAnthropicKey: true,
+    })).toBe(true);
     expect(hasAvailableHarnessModel(["opencode"], "cf", { workersAiConfigured: true })).toBe(true);
     expect(hasAvailableHarnessModel(["opencode"], "cf", {})).toBe(false);
     expect(listHarnessModelRequirementMessages(["opencode"], "cf", {})).toEqual([
       "Select a billing mode for OpenAI in Global Settings.",
+      "Select a billing mode for Claude in Global Settings.",
       "Requires Workers AI.",
     ]);
   });
@@ -282,6 +356,7 @@ describe("harness catalog", () => {
     expect(getPlannerModelCredentialRequirement("claude-code", "opus")).toBe("claude-auth");
     expect(getPlannerModelCredentialRequirement("claude-code", "claude-fable-5")).toBe("anthropic-api-key");
     expect(getPlannerModelCredentialRequirement("codex", "gpt-5.6-sol")).toBe("codex-auth");
+    expect(getPlannerModelCredentialRequirement("opencode", "claude-opus-5")).toBe("anthropic-api-key");
     expect(getPlannerModelCredentialRequirement("opencode", "@cf/moonshotai/kimi-k2.7-code")).toBe("workers-ai");
     expect(getPlannerModelCredentialRequirement("claude-code", "unknown")).toBeNull();
   });

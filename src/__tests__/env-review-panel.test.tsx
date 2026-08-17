@@ -7,18 +7,22 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  fetchState: vi.fn(),
-  fetchProviders: vi.fn(),
-  fetchSkills: vi.fn(),
-  fetchInvocations: vi.fn(),
-  fetchInvocation: vi.fn(),
-  fetchMessages: vi.fn(),
-  fetchRun: vi.fn(),
   addReviewer: vi.fn(),
+  cancelInvocation: vi.fn(),
+  fetchInvocation: vi.fn(),
+  fetchInvocations: vi.fn(),
+  fetchMessages: vi.fn(),
+  fetchProviders: vi.fn(),
+  fetchRun: vi.fn(),
+  fetchSkills: vi.fn(),
+  fetchState: vi.fn(),
   invokeSkill: vi.fn(),
-  updateControls: vi.fn(),
+  markFeedback: vi.fn(),
+  removeInvocation: vi.fn(),
+  rerunSkill: vi.fn(),
+  sendMessage: vi.fn(),
   sendOverview: vi.fn(),
-  updateSkill: vi.fn(),
+  updateControls: vi.fn(),
 }));
 
 vi.mock("../api", async () => {
@@ -27,41 +31,30 @@ vi.mock("../api", async () => {
     ...actual,
     addEnvReviewer: mocks.addReviewer,
     cancelEnvReviewRun: vi.fn(),
+    cancelReviewSkillInvocation: mocks.cancelInvocation,
+    fetchAgentSkills: mocks.fetchSkills,
     fetchEnvReviewMessages: mocks.fetchMessages,
     fetchEnvReviewRun: mocks.fetchRun,
     fetchEnvReviewState: mocks.fetchState,
-    fetchAgentSkills: mocks.fetchSkills,
     fetchPlannerProviders: mocks.fetchProviders,
-    fetchReviewSkillInvocations: mocks.fetchInvocations,
     fetchReviewSkillInvocation: mocks.fetchInvocation,
+    fetchReviewSkillInvocations: mocks.fetchInvocations,
     invokeReviewSkill: mocks.invokeSkill,
-    markEnvReviewFeedback: vi.fn(),
+    markEnvReviewFeedback: mocks.markFeedback,
     removeEnvReviewer: vi.fn(),
-    sendEnvReviewMessage: vi.fn(),
+    removeReviewSkillInvocation: mocks.removeInvocation,
+    rerunReviewSkillInvocation: mocks.rerunSkill,
+    sendEnvReviewMessage: mocks.sendMessage,
     sendReviewSkillOverview: mocks.sendOverview,
     updateReviewSkillControls: mocks.updateControls,
-    updateAgentSkill: mocks.updateSkill,
   };
 });
 
-import EnvReviewPanel from "../EnvReviewPanel";
-import { ApiActionError, type EnvReviewTab } from "../api";
-
-const emptyState = {
-  session: {
-    envSlug: "env-1",
-    repoId: "repo-1",
-    mainSessionId: "session-1",
-    latestPreparationOpId: null,
-    latestPreparation: null,
-    latestChangeSummary: null,
-    createdAt: "2026-07-09T00:00:00.000Z",
-    updatedAt: "2026-07-09T00:00:00.000Z",
-  },
-  tabs: [],
-  runs: [],
-  feedback: [],
-};
+import EnvReviewPanel, {
+  formatFeedbackForHarness,
+  formatReviewBasis,
+  formatReviewBasisSummary,
+} from "../EnvReviewPanel";
 
 const providerCapabilities = {
   writer: true,
@@ -72,88 +65,41 @@ const providerCapabilities = {
   checklist: false,
 };
 
-const providers = [
-  {
-    id: "codex",
-    displayName: "Codex",
-    available: true,
-    authStatus: "available" as const,
-    disabledReasons: [],
-    capabilities: providerCapabilities,
-    models: [{ id: "gpt-5.5", displayName: "GPT 5.5", available: true, authStatus: "available" as const }],
-    efforts: [
-      { id: "low" as const, displayName: "Low" },
-      { id: "medium" as const, displayName: "Medium" },
-      { id: "high" as const, displayName: "High" },
-      { id: "xhigh" as const, displayName: "Extra High" },
-    ],
-    defaultEffort: "xhigh" as const,
-  },
-  {
-    id: "claude-code",
-    displayName: "Claude Code",
-    available: true,
-    authStatus: "available" as const,
-    disabledReasons: [],
-    capabilities: providerCapabilities,
-    models: [{ id: "sonnet", displayName: "Claude Sonnet 4.6", available: true, authStatus: "available" as const }],
-    efforts: [
-      { id: "low" as const, displayName: "Low" },
-      { id: "medium" as const, displayName: "Medium" },
-      { id: "high" as const, displayName: "High" },
-      { id: "xhigh" as const, displayName: "Extra High" },
-      { id: "max" as const, displayName: "Max" },
-    ],
-    defaultEffort: "high" as const,
-  },
-  {
-    id: "opencode",
-    displayName: "OpenCode",
-    available: true,
-    authStatus: "available" as const,
-    disabledReasons: [],
-    capabilities: providerCapabilities,
-    models: [{ id: "kimi", displayName: "Kimi K2.7 Code", available: true, authStatus: "available" as const }],
-    efforts: [
-      { id: "low" as const, displayName: "Low" },
-      { id: "medium" as const, displayName: "Medium" },
-      { id: "high" as const, displayName: "High" },
-    ],
-    defaultEffort: "high" as const,
-  },
-];
+const providers = [{
+  id: "codex",
+  displayName: "Codex",
+  available: true,
+  authStatus: "available" as const,
+  disabledReasons: [],
+  capabilities: providerCapabilities,
+  models: [{ id: "gpt-5.5", displayName: "GPT 5.5", available: true, authStatus: "available" as const }],
+  efforts: [
+    { id: "low" as const, displayName: "Low" },
+    { id: "medium" as const, displayName: "Medium" },
+    { id: "high" as const, displayName: "High" },
+    { id: "xhigh" as const, displayName: "Extra High" },
+  ],
+  defaultEffort: "xhigh" as const,
+}];
 
-const skillRoutes = [
-  {
-    key: "codex:gpt-5.5",
-    label: "GPT-5.5",
-    harness: "codex" as const,
-    provider: "codex",
-    model: "gpt-5.5",
-    modelId: "gpt-5.5",
-    supportedEfforts: ["low", "medium", "high", "xhigh"] as const,
-    defaultEffort: "xhigh" as const,
-    available: true,
-  },
-  {
-    key: "opencode:kimi-k2.7-code",
-    label: "Kimi K2.7 Code",
-    harness: "opencode" as const,
-    provider: "opencode",
-    model: "kimi",
-    modelId: "kimi-k2.7-code",
-    supportedEfforts: ["low", "medium", "high"] as const,
-    defaultEffort: "high" as const,
-    available: true,
-  },
-];
+const skillRoutes = [{
+  key: "codex:gpt-5.5",
+  label: "GPT-5.5",
+  harness: "codex" as const,
+  provider: "codex",
+  model: "gpt-5.5",
+  modelId: "gpt-5.5",
+  supportedEfforts: ["low", "medium", "high", "xhigh"] as const,
+  defaultEffort: "xhigh" as const,
+  available: true,
+}];
 
 const codeReviewSkill = {
   id: "code-review",
   surface: "review" as const,
   command: "code-review",
   label: "Code Review",
-  description: "Three focused reviews.",
+  description: "Three focused implementation reviews.",
   sharedInstructions: "Review the frozen workspace.",
   overviewInstructions: "Deduplicate findings.",
   overviewMode: "auto" as const,
@@ -161,7 +107,7 @@ const codeReviewSkill = {
     id: `agent-${index + 1}`,
     label,
     instructions: `Instructions for ${label}.`,
-    routeKey: "opencode:kimi-k2.7-code",
+    routeKey: "codex:gpt-5.5",
     effort: "high" as const,
     reportMode: "auto" as const,
   })),
@@ -171,41 +117,75 @@ const codeReviewSkill = {
   updatedAt: null,
 };
 
-const idleParent = {
-  threadId: "parent-1",
+const focusedSkill = {
+  ...codeReviewSkill,
+  id: "focused-review",
+  command: "focused-review",
+  label: "Focused Review",
+  description: "One focused implementation review.",
+  overviewInstructions: "",
+  overviewMode: "manual" as const,
+  agents: [{ ...codeReviewSkill.agents[0]!, label: "Focused Reviewer" }],
+};
+
+const baseTab = {
   envSlug: "env-1",
   repoId: "repo-1",
   mainSessionId: "session-1",
   provider: "codex",
   model: "gpt-5.5",
   effort: "xhigh" as const,
-  roleLabel: "Reviewer",
-  taskKind: "correctness" as const,
+  taskKind: "custom" as const,
   customTask: null,
-  status: "idle" as const,
   latestRunId: null,
   removedAt: null,
-  createdAt: "2026-07-09T00:00:00.000Z",
-  updatedAt: "2026-07-09T00:00:00.000Z",
-  skillInvocationId: null,
-  skillAgentId: null,
+  createdAt: "2026-08-12T00:00:00.000Z",
+  updatedAt: "2026-08-12T00:00:00.000Z",
 };
 
-function makeFanoutDetail(options: { overviewMode?: "auto" | "manual"; overviewRunId?: string | null } = {}) {
-  const tabs = codeReviewSkill.agents.map((agent, index) => ({
-    ...idleParent,
-    threadId: `child-${index + 1}`,
-    provider: "opencode",
-    model: "kimi",
-    effort: "high" as const,
-    roleLabel: agent.label,
+const genericTab = {
+  ...baseTab,
+  threadId: "generic-1",
+  roleLabel: "Reviewer",
+  status: "idle" as const,
+  skillInvocationId: null,
+  skillAgentId: null,
+  nodeKind: "generic" as const,
+  skillRootThreadId: null,
+};
+
+function skillTabs(single = false) {
+  const root = {
+    ...baseTab,
+    threadId: single ? "focused-root" : "code-review-root",
+    roleLabel: single ? "Focused Review" : "Code Review",
     status: "ready" as const,
-    latestRunId: `child-run-${index + 1}`,
-    skillInvocationId: "invocation-1",
-    skillAgentId: agent.id,
-  }));
-  const runs: any[] = tabs.map((tab, index) => ({
-    runId: `child-run-${index + 1}`,
+    latestRunId: single ? "focused-initial" : null,
+    skillInvocationId: single ? "focused-round" : "code-review-round",
+    skillAgentId: single ? "agent-1" : null,
+    nodeKind: "skill_root" as const,
+    skillRootThreadId: single ? "focused-root" : "code-review-root",
+  };
+  if (single) return [root];
+  return [
+    root,
+    ...codeReviewSkill.agents.map((agent, index) => ({
+      ...baseTab,
+      threadId: `report-${index + 1}`,
+      roleLabel: agent.label,
+      status: "ready" as const,
+      latestRunId: `report-run-${index + 1}`,
+      skillInvocationId: "code-review-round",
+      skillAgentId: agent.id,
+      nodeKind: "report" as const,
+      skillRootThreadId: "code-review-root",
+    })),
+  ];
+}
+
+function runFor(tab: ReturnType<typeof skillTabs>[number], role: "root_initial" | "report_initial") {
+  return {
+    runId: tab.latestRunId,
     threadId: tab.threadId,
     envSlug: "env-1",
     repoId: "repo-1",
@@ -216,592 +196,600 @@ function makeFanoutDetail(options: { overviewMode?: "auto" | "manual"; overviewR
     roleLabel: tab.roleLabel,
     taskKind: "custom" as const,
     customTask: null,
+    recipeInstructions: null,
     status: "ready" as const,
-    prompt: "Review the frozen workspace.",
+    preparationOpId: "snapshot-op",
     preparation: null,
     changeContext: null,
     planBasis: null,
+    prompt: "Review the implementation.",
     runtime: null,
+    startedAt: "2026-08-12T00:00:00.000Z",
+    queuedAt: "2026-08-12T00:00:00.000Z",
+    completedAt: "2026-08-12T00:01:00.000Z",
     error: null,
-    skillInvocationId: "invocation-1",
+    lastContactAt: null,
+    skillInvocationId: tab.skillInvocationId,
     skillAgentId: tab.skillAgentId,
-    skillRunRole: "child_initial" as const,
-  }));
-  const overviewRunId = options.overviewRunId ?? null;
-  if (overviewRunId) {
-    runs.push({
-      ...runs[0]!,
-      runId: overviewRunId,
-      threadId: "parent-1",
-      roleLabel: "Overview",
-      skillAgentId: null,
-      skillRunRole: "overview",
-    });
-  }
-  return {
-    kind: "fanout" as const,
-    invocation: {
-      invocationId: "invocation-1",
-      envSlug: "env-1",
-      repoId: "repo-1",
-      mainSessionId: "session-1",
-      parentThreadId: "parent-1",
-      definitionSnapshot: codeReviewSkill,
-      preparationOpId: "op-1",
-      status: overviewRunId ? "completed" as const : "active" as const,
-      overviewMode: options.overviewMode ?? "auto",
-      includedMessageIds: ["message-1"],
-      overviewRunId,
-      error: null,
-      cancelledAt: null,
-      createdAt: "2026-07-09T00:00:00.000Z",
-      updatedAt: "2026-07-09T00:00:00.000Z",
-    },
-    tabs,
-    runs,
+    skillRunRole: role,
+    skillDefinitionSnapshot: singleDefinition(role),
+    frozenOverview: null,
   };
 }
 
-function renderPanel(options: {
-  connected?: boolean;
-  onSend?: (text: string) => Promise<{ ok: boolean; error?: string }>;
-  onLayoutChange?: () => void;
-} = {}) {
+function singleDefinition(role: string) {
+  return role === "root_initial" ? focusedSkill : codeReviewSkill;
+}
+
+function emptyState() {
+  return {
+    session: {
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      latestPreparationOpId: null,
+      latestPreparation: null,
+      latestChangeSummary: null,
+      createdAt: "2026-08-12T00:00:00.000Z",
+      updatedAt: "2026-08-12T00:00:00.000Z",
+    },
+    tabs: [],
+    runs: [],
+    feedback: [],
+  };
+}
+
+function multiDetail() {
+  const tabs = skillTabs(false);
+  const reports = tabs.slice(1);
+  return {
+    kind: "skill_root" as const,
+    invocation: {
+      invocationId: "code-review-round",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      parentThreadId: "code-review-root",
+      definitionSnapshot: codeReviewSkill,
+      preparationOpId: "snapshot-op",
+      status: "active" as const,
+      overviewMode: "auto" as const,
+      includedMessageIds: ["report-message-1"],
+      overviewRunId: null,
+      overviewRoute: { provider: "codex", model: "gpt-5.5", effort: "xhigh" as const },
+      error: null,
+      cancelledAt: null,
+      createdAt: "2026-08-12T00:00:00.000Z",
+      updatedAt: "2026-08-12T00:01:00.000Z",
+    },
+    tabs: reports,
+    runs: reports.map((tab) => runFor(tab, "report_initial")),
+  };
+}
+
+function singleDetail() {
+  const root = skillTabs(true)[0]!;
+  return {
+    kind: "skill_root" as const,
+    invocation: {
+      ...multiDetail().invocation,
+      invocationId: "focused-round",
+      parentThreadId: root.threadId,
+      definitionSnapshot: focusedSkill,
+      overviewMode: "manual" as const,
+      includedMessageIds: [],
+      overviewRoute: null,
+      status: "completed" as const,
+    },
+    tabs: [root],
+    runs: [runFor(root, "root_initial")],
+  };
+}
+
+function invocationSummary(detail: ReturnType<typeof multiDetail> | ReturnType<typeof singleDetail>) {
+  return {
+    invocationId: detail.invocation.invocationId,
+    parentThreadId: detail.invocation.parentThreadId,
+    command: detail.invocation.definitionSnapshot.command,
+    label: detail.invocation.definitionSnapshot.label,
+    status: detail.invocation.status,
+    agentCount: detail.invocation.definitionSnapshot.agents.length,
+    overviewMode: detail.invocation.overviewMode,
+    overviewRunId: detail.invocation.overviewRunId,
+    createdAt: detail.invocation.createdAt,
+    updatedAt: detail.invocation.updatedAt,
+  };
+}
+
+function stateWithTabs(tabs: ReturnType<typeof skillTabs>) {
+  return {
+    ...emptyState(),
+    tabs,
+    runs: tabs.filter((tab) => tab.latestRunId).map((tab) => runFor(
+      tab,
+      tab.nodeKind === "report" ? "report_initial" : "root_initial",
+    )),
+  };
+}
+
+function renderPanel() {
   return render(
     <EnvReviewPanel
       envSlug="env-1"
       repoId="repo-1"
       sessionId="session-1"
       hubUrl="https://hub.test"
-      harnessInputReady={options.connected ?? true}
-      onSendToHarness={options.onSend ?? vi.fn(async () => ({ ok: true }))}
-      onLayoutChange={options.onLayoutChange}
+      harnessInputReady
+      onSendToHarness={vi.fn(async () => ({ ok: true }))}
     />,
   );
 }
 
-function threadMessage(id: string, text: string) {
-  return {
-    id,
-    threadId: "parent-1",
-    seq: Number(id.replace(/\D/g, "")) || 1,
-    senderSessionId: "assistant",
-    kind: "chat" as const,
-    body: { role: "assistant", text },
-    createdAt: "2026-07-09T00:00:00.000Z",
-  };
-}
-
-function reviewRunFor(
-  tab: Pick<EnvReviewTab, "threadId" | "provider" | "model" | "effort" | "roleLabel" | "taskKind" | "customTask" | "skillInvocationId" | "skillAgentId">,
-  status: "preparing" | "queued" | "running" | "ready" | "failed" | "cancelled",
-  runId: string,
-) {
-  return {
-    runId,
-    threadId: tab.threadId,
-    envSlug: "env-1",
-    repoId: "repo-1",
-    mainSessionId: "session-1",
-    provider: tab.provider,
-    model: tab.model,
-    effort: tab.effort,
-    roleLabel: tab.roleLabel,
-    taskKind: tab.taskKind,
-    customTask: tab.customTask,
-    recipeInstructions: null,
-    status,
-    preparationOpId: "op-1",
-    preparation: null,
-    changeContext: null,
-    planBasis: null,
-    prompt: "Review the implementation.",
-    runtime: null,
-    startedAt: "2026-07-09T00:00:01.000Z",
-    queuedAt: "2026-07-09T00:00:01.000Z",
-    completedAt: status === "ready" || status === "failed" || status === "cancelled"
-      ? "2026-07-09T00:00:02.000Z"
-      : null,
-    error: status === "failed" ? "Reviewer failed." : null,
-    lastContactAt: null,
-    skillInvocationId: tab.skillInvocationId,
-    skillAgentId: tab.skillAgentId,
-    skillRunRole: null,
-    skillDefinitionSnapshot: null,
-    frozenOverview: null,
-  };
-}
-
-async function openSkillCommand(command = "code-review") {
+async function invokeSlash(command: string) {
   const composer = await screen.findByRole("textbox", { name: "Message" });
   fireEvent.change(composer, { target: { value: `/${command}` } });
-  return screen.findByRole("button", { name: new RegExp(`/${command}`, "i") });
+  fireEvent.click(await screen.findByRole("button", { name: new RegExp(`/${command}`, "i") }));
 }
 
-describe("EnvReviewPanel actions", () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    HTMLElement.prototype.scrollTo = vi.fn();
-    window.localStorage.clear();
-    window.sessionStorage.clear();
-    mocks.fetchState.mockResolvedValue(emptyState);
-    mocks.fetchProviders.mockResolvedValue({ providers, skillRoutes });
-    mocks.fetchSkills.mockResolvedValue([codeReviewSkill]);
-    mocks.fetchInvocations.mockResolvedValue({ invocations: [], nextCursor: null });
-    mocks.fetchMessages.mockResolvedValue([]);
-    mocks.fetchRun.mockRejectedValue(new Error("run polling not configured"));
-    mocks.addReviewer.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
-    mocks.fetchInvocation.mockResolvedValue(makeFanoutDetail());
-    mocks.updateControls.mockImplementation(async (_hub, _env, _invocationId, input) => ({
-      ...makeFanoutDetail({ overviewMode: input.overviewMode }).invocation,
-      includedMessageIds: input.includedMessageIds,
-    }));
-    mocks.sendOverview.mockResolvedValue({});
-    mocks.updateSkill.mockImplementation(async (_hub, _repo, _surface, _id, draft) => ({
-      ...codeReviewSkill,
-      ...draft,
-      customized: true,
-    }));
-    mocks.invokeSkill.mockResolvedValue({
-      kind: "fanout",
-      invocation: {
-        invocationId: "invocation-1",
-        envSlug: "env-1",
-        repoId: "repo-1",
-        mainSessionId: "session-1",
-        parentThreadId: "parent-1",
-        definitionSnapshot: codeReviewSkill,
-        preparationOpId: "op-1",
-        status: "active",
-        overviewMode: "auto",
-        includedMessageIds: [],
-        overviewRunId: null,
-        error: null,
-        cancelledAt: null,
-        createdAt: "2026-07-09T00:00:00.000Z",
-        updatedAt: "2026-07-09T00:00:00.000Z",
+beforeEach(() => {
+  vi.resetAllMocks();
+  HTMLElement.prototype.scrollTo = vi.fn();
+  window.localStorage.clear();
+  window.sessionStorage.clear();
+  Object.defineProperty(document, "hidden", { configurable: true, value: false });
+  Object.defineProperty(navigator, "onLine", { configurable: true, value: true });
+  mocks.fetchState.mockResolvedValue(emptyState());
+  mocks.fetchProviders.mockResolvedValue({ providers, skillRoutes });
+  mocks.fetchSkills.mockResolvedValue([codeReviewSkill, focusedSkill]);
+  mocks.fetchInvocations.mockResolvedValue({ invocations: [], nextCursor: null });
+  mocks.fetchMessages.mockResolvedValue([]);
+  mocks.fetchRun.mockRejectedValue(new Error("run polling not configured"));
+  mocks.addReviewer.mockResolvedValue({ ...emptyState(), tabs: [genericTab] });
+  mocks.markFeedback.mockResolvedValue({});
+  mocks.removeInvocation.mockResolvedValue({ parentThreadId: "code-review-root", state: emptyState() });
+  mocks.cancelInvocation.mockResolvedValue({
+    ...multiDetail().invocation,
+    status: "cancelled",
+    cancelledAt: "2026-08-12T00:02:00.000Z",
+  });
+  mocks.updateControls.mockResolvedValue(multiDetail().invocation);
+  mocks.sendOverview.mockResolvedValue({});
+});
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+describe("review basis copy", () => {
+  const snapshot = {
+    snapshotId: "snapshot-1",
+    source: "live-harness" as const,
+    mode: "full" as const,
+    stale: false,
+    createdAt: "2026-08-09T04:07:00.000Z",
+    snapshotHash: "hash-1",
+    baseCommitSha: null,
+    githubDeletedPaths: [],
+    r2Key: "snapshots/snapshot-1.tar",
+  };
+
+  it("labels a current live snapshot without a stale warning", () => {
+    expect(formatReviewBasis(snapshot)).toContain("Review basis: live workspace snapshot captured");
+    expect(formatReviewBasis(snapshot)).not.toContain("latest changes from the live workspace");
+  });
+
+  it("warns only when a saved snapshot is stale", () => {
+    expect(formatReviewBasis({ ...snapshot, source: "saved-workspace", stale: true }))
+      .toContain("It may not include the latest changes from the live workspace.");
+  });
+
+  it("reduces visible review metadata to the changed-file count", () => {
+    const run = {
+      ...runFor(skillTabs(true)[0]!, "root_initial"),
+      preparation: { snapshot },
+      changeContext: {
+        summary: { total: 4, added: 1, modified: 2, deleted: 1, omitted: 0, truncated: 0 },
       },
-      tabs: [],
-      runs: [],
-    });
+    };
+    expect(formatReviewBasisSummary(run as any)).toBe("4 files changed");
+    expect(formatReviewBasisSummary({
+      ...run,
+      preparation: { snapshot: { ...snapshot, stale: true } },
+    } as any)).toBe("4 files changed · Snapshot may be out of date");
+  });
+});
+
+describe("Implementation Review workspace", () => {
+  it("opens on a lazy home with a central composer and right-side reviewer rail", async () => {
+    renderPanel();
+    expect(await screen.findByText("Ask a code-aware question or type / to run a Review skill.")).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Reviewers" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add reviewer" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reviewer skill settings" })).toBeInTheDocument();
   });
 
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-    vi.unstubAllGlobals();
-  });
-
-  it("adds a reviewer with the selected reasoning effort", async () => {
+  it("adds a reusable generic reviewer with the selected default model and effort", async () => {
     const user = userEvent.setup({ pointerEventsCheck: 0 });
     renderPanel();
-
     await user.click(await screen.findByRole("button", { name: "Add reviewer" }));
-    const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByLabelText("Model")).toHaveTextContent("GPT 5.5");
-    expect(within(dialog).getByLabelText("Effort")).toHaveTextContent("Extra High");
-
-    await user.click(within(dialog).getByLabelText("Effort"));
-    await user.click(await screen.findByRole("option", { name: "Low" }));
-    await user.click(within(dialog).getByRole("button", { name: "Add reviewer" }));
+    const popover = await screen.findByText("Start a reusable reviewer conversation or launch a saved skill.");
+    const surface = popover.closest("div")?.parentElement ?? document.body;
+    await user.click(within(surface).getByRole("button", { name: "Add reviewer" }));
 
     await waitFor(() => expect(mocks.addReviewer).toHaveBeenCalledWith(
       "https://hub.test",
       "env-1",
-      {
-        sessionId: "session-1",
-        provider: "codex",
-        model: "gpt-5.5",
-        effort: "low",
-      },
+      { sessionId: "session-1", provider: "codex", model: "gpt-5.5", effort: "xhigh" },
     ));
   });
 
-  it("shows thinking and concrete model activity for an active run", async () => {
-    const activeTab = {
-      ...idleParent,
-      status: "running" as const,
-      latestRunId: "run-private",
-    };
-    const activeRun = {
-      runId: "run-private",
-      threadId: activeTab.threadId,
-      envSlug: "env-1",
-      repoId: "repo-1",
-      mainSessionId: "session-1",
-      provider: "codex",
-      model: "gpt-5.5",
-      effort: "xhigh" as const,
-      roleLabel: "Reviewer",
-      taskKind: "correctness" as const,
-      customTask: null,
-      status: "running" as const,
-      prompt: "Review privately.",
-      preparation: null,
-      changeContext: null,
-      planBasis: null,
-      runtime: null,
-      error: null,
-    };
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [activeTab], runs: [activeRun] });
-    mocks.fetchRun.mockResolvedValue({
-      run: activeRun,
-      events: [
-        { runId: "run-private", seq: 1, type: "model_activity", message: "Thinking" },
-        { runId: "run-private", seq: 2, type: "model_activity", message: "Read: packages/hub/src/EnvReviewPanel.tsx" },
-      ],
-    });
-
-    renderPanel();
-
-    expect(await screen.findByText("Reviewer is working...")).toBeInTheDocument();
-    await waitFor(() => expect(mocks.fetchRun).toHaveBeenCalled());
-    expect(await screen.findAllByText("Read: packages/hub/src/EnvReviewPanel.tsx")).toHaveLength(2);
-    expect(screen.getByText("Activity")).toBeInTheDocument();
-  });
-
-  it("uses the shared new-result indicator and keeps a viewed marker after opening it", async () => {
+  it("lists saved skills with descriptions and agent counts in the plus menu", async () => {
     const user = userEvent.setup({ pointerEventsCheck: 0 });
-    const readyTab = {
-      ...idleParent,
-      threadId: "ready-1",
-      roleLabel: "Tests Reviewer",
-      status: "ready" as const,
-      latestRunId: "ready-run-1",
-    };
-    const readyRun = reviewRunFor(readyTab, "ready", "ready-run-1");
-    mocks.fetchState.mockResolvedValue({
-      ...emptyState,
-      tabs: [idleParent, readyTab],
-      runs: [readyRun],
-    });
-
     renderPanel();
-
-    const newResultTab = await screen.findByRole("button", { name: "Tests Reviewer, New result" });
-    expect(newResultTab.querySelector('[data-agent-tab-status="finished"]')).toHaveClass("bg-kumo-info");
-    expect(screen.getByRole("button", { name: "Reviewer, Ready" })
-      .querySelector('[data-agent-tab-status="idle"]')).not.toBeNull();
-
-    await user.click(newResultTab);
-
-    const viewedTab = await screen.findByRole("button", { name: "Tests Reviewer, Viewed" });
-    expect(viewedTab.querySelector('[data-agent-tab-status="viewed"]')).toHaveClass("text-kumo-subtle");
+    await user.click(await screen.findByRole("button", { name: "Add reviewer" }));
+    expect(await screen.findByText("Three focused implementation reviews.")).toBeInTheDocument();
+    expect(screen.getByText("3 agents")).toBeInTheDocument();
+    expect(screen.getByText("1 agent")).toBeInTheDocument();
   });
 
-  it("invokes the editable Code Review skill with the selected idle reviewer as parent", async () => {
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
+  it("launches a slash skill directly without creating a generic reviewer", async () => {
+    const detail = multiDetail();
+    const tabs = skillTabs(false);
+    mocks.invokeSkill.mockResolvedValue(detail);
+    mocks.fetchInvocation.mockResolvedValue(detail);
+    mocks.fetchState
+      .mockResolvedValueOnce(emptyState())
+      .mockResolvedValue(stateWithTabs(tabs));
+    mocks.fetchInvocations
+      .mockResolvedValueOnce({ invocations: [], nextCursor: null })
+      .mockResolvedValue({ invocations: [invocationSummary(detail)], nextCursor: null });
     renderPanel();
 
-    expect(screen.queryByRole("button", { name: "/code-review" })).not.toBeInTheDocument();
-    const reviewButton = await openSkillCommand();
-    await waitFor(() => expect(reviewButton).toBeEnabled());
-    fireEvent.click(reviewButton);
+    await invokeSlash("code-review");
 
     await waitFor(() => expect(mocks.invokeSkill).toHaveBeenCalledWith(
       "https://hub.test",
       "env-1",
-      "parent-1",
       "code-review",
-      expect.objectContaining({
-        sessionId: "session-1",
-        requestId: expect.any(String),
-        overviewMode: "auto",
-      }),
+      expect.objectContaining({ sessionId: "session-1", overviewMode: "auto" }),
     ));
-    expect(screen.queryByRole("button", { name: "Code Review" })).not.toBeInTheDocument();
+    expect(mocks.addReviewer).not.toHaveBeenCalled();
   });
 
-  it("opens a fanout on the prototype Overview row and lazy-loads child transcripts", async () => {
+  it("launches the same root contract from the plus menu", async () => {
     const user = userEvent.setup({ pointerEventsCheck: 0 });
-    const detail = makeFanoutDetail();
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
-    mocks.invokeSkill.mockResolvedValue(detail);
+    const detail = multiDetail();
+    mocks.invokeSkill.mockImplementation(async () => {
+      mocks.fetchState.mockResolvedValue(stateWithTabs(skillTabs(false)));
+      mocks.fetchInvocations.mockResolvedValue({ invocations: [invocationSummary(detail)], nextCursor: null });
+      return detail;
+    });
+    mocks.fetchInvocation.mockResolvedValue(detail);
+    mocks.fetchState.mockResolvedValue(emptyState());
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [], nextCursor: null });
+    renderPanel();
+
+    await user.click(await screen.findByRole("button", { name: "Add reviewer" }));
+    const description = await screen.findByText("Three focused implementation reviews.");
+    await user.click(description.closest("button")!);
+
+    await waitFor(() => expect(mocks.invokeSkill).toHaveBeenCalledWith(
+      "https://hub.test",
+      "env-1",
+      "code-review",
+      expect.objectContaining({ sessionId: "session-1", overviewMode: "auto" }),
+    ));
+  });
+
+  it("shows a multi-agent skill as an Overview root with Reports collapsed initially", async () => {
+    const detail = multiDetail();
+    const tabs = skillTabs(false);
+    mocks.fetchState.mockResolvedValue(stateWithTabs(tabs));
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [invocationSummary(detail)], nextCursor: null });
     mocks.fetchInvocation.mockResolvedValue(detail);
     renderPanel();
 
-    await user.click(await openSkillCommand());
-
-    const nestedRow = await screen.findByTestId("review-skill-tab-row");
-    expect(screen.queryByText("Skill history")).not.toBeInTheDocument();
-    expect(nestedRow).toHaveTextContent("/code-review");
-    expect(within(nestedRow).getByRole("button", { name: "Overview, Working" })).toBeInTheDocument();
-    expect(within(nestedRow).getByRole("button", { name: /Bug Reviewer, New result/ })).toBeInTheDocument();
+    const rail = await screen.findByRole("tree", { name: "Reviewer conversations" });
+    expect(within(rail).getByRole("treeitem", { name: "Code Review" })).toBeInTheDocument();
+    expect(within(rail).queryByRole("treeitem", { name: "Bug Reviewer" })).not.toBeInTheDocument();
+    fireEvent.click(within(rail).getByRole("button", { name: "Expand Code Review Reports" }));
+    expect(within(rail).getByRole("treeitem", { name: "Bug Reviewer" })).toBeInTheDocument();
+    expect(within(rail).getByRole("treeitem", { name: "Simplification Reviewer" })).toBeInTheDocument();
+    fireEvent.click(within(rail).getByRole("treeitem", { name: "Code Review" }));
+    for (const control of rail.querySelectorAll<HTMLButtonElement>('button:not([role="treeitem"])')) {
+      expect(control.tabIndex).toBe(-1);
+    }
     expect(await screen.findByText("1 of 3 agent responses included.")).toBeInTheDocument();
+    expect(screen.queryByText("Results")).not.toBeInTheDocument();
+  });
 
-    const detailLoads = mocks.fetchInvocation.mock.calls.length;
-    await user.click(within(nestedRow).getByRole("button", { name: /Bug Reviewer, New result/ }));
-    await waitFor(() => expect(mocks.fetchMessages).toHaveBeenCalledWith(
+  it("stops an active multi-agent review from the Plan-style row menu", async () => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    const readyDetail = multiDetail();
+    const detail = {
+      ...readyDetail,
+      runs: readyDetail.runs.map((run, index) => index === 0
+        ? { ...run, status: "running" as const }
+        : run),
+    };
+    const tabs = skillTabs(false).map((tab, index) => index === 1
+      ? { ...tab, status: "running" as const }
+      : tab);
+    mocks.fetchState.mockResolvedValue(stateWithTabs(tabs));
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [invocationSummary(detail)], nextCursor: null });
+    mocks.fetchInvocation.mockResolvedValue(detail);
+    renderPanel();
+
+    const root = await screen.findByRole("treeitem", { name: "Code Review" });
+    await user.click(root);
+    const runStatus = await screen.findByTestId("reviewer-run-status");
+    expect(runStatus.closest(".tiller-skill-composer")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "Actions for Code Review" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Stop review" }));
+
+    await waitFor(() => expect(mocks.cancelInvocation).toHaveBeenCalledWith(
       "https://hub.test",
       "env-1",
-      "child-1",
+      "code-review-round",
       "session-1",
     ));
-    await user.click(within(nestedRow).getByRole("button", { name: "Overview, Working" }));
-    expect(await screen.findByText("1 of 3 agent responses included.")).toBeInTheDocument();
-    expect(mocks.fetchInvocation).toHaveBeenCalledTimes(detailLoads);
   });
 
-  it("restores an active fanout directly without rendering a history strip", async () => {
-    const detail = makeFanoutDetail();
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
+  it("stops the active round even while an older round is selected", async () => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    const currentDetail = {
+      ...multiDetail(),
+      invocation: {
+        ...multiDetail().invocation,
+        invocationId: "code-review-round-current",
+      },
+    };
+    const olderDetail = {
+      ...multiDetail(),
+      invocation: {
+        ...multiDetail().invocation,
+        invocationId: "code-review-round-older",
+        status: "completed" as const,
+        createdAt: "2026-08-11T00:00:00.000Z",
+      },
+    };
+    mocks.fetchState.mockResolvedValue(stateWithTabs(skillTabs(false)));
     mocks.fetchInvocations.mockResolvedValue({
-      invocations: [{
-        invocationId: "invocation-1",
-        parentThreadId: "parent-1",
-        label: "Code Review",
-        status: "active",
-        createdAt: "2026-07-09T00:00:00.000Z",
-      }],
+      invocations: [invocationSummary(currentDetail), invocationSummary(olderDetail)],
       nextCursor: null,
     });
+    mocks.fetchInvocation.mockImplementation(async (_hubUrl, _envSlug, _sessionId, invocationId) => (
+      invocationId === "code-review-round-older" ? olderDetail : currentDetail
+    ));
+    renderPanel();
+
+    await user.click(await screen.findByRole("treeitem", { name: "Code Review" }));
+    const history = await screen.findByRole("combobox", { name: "Implementation Review round history" });
+    await user.selectOptions(history, "code-review-round-older");
+    await waitFor(() => expect(mocks.fetchInvocation).toHaveBeenCalledWith(
+      "https://hub.test",
+      "env-1",
+      "session-1",
+      "code-review-round-older",
+    ));
+    await user.click(await screen.findByRole("button", { name: "Actions for Code Review" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Stop review" }));
+
+    await waitFor(() => expect(mocks.cancelInvocation).toHaveBeenCalledWith(
+      "https://hub.test",
+      "env-1",
+      "code-review-round-current",
+      "session-1",
+    ));
+    expect(mocks.removeInvocation).not.toHaveBeenCalled();
+  });
+
+  it("removes a finished multi-agent review from the same row menu", async () => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    const active = multiDetail();
+    const detail = {
+      ...active,
+      invocation: { ...active.invocation, status: "completed" as const },
+    };
+    const tabs = skillTabs(false);
+    mocks.fetchState.mockResolvedValue(stateWithTabs(tabs));
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [invocationSummary(detail)], nextCursor: null });
     mocks.fetchInvocation.mockResolvedValue(detail);
     renderPanel();
 
-    const nestedRow = await screen.findByTestId("review-skill-tab-row");
-    expect(nestedRow).toHaveTextContent("/code-review");
-    expect(within(nestedRow).getByRole("button", { name: "Cancel fanout" })).toBeInTheDocument();
-    expect(screen.queryByText("Skill history")).not.toBeInTheDocument();
-  });
+    await user.click(await screen.findByRole("treeitem", { name: "Code Review" }));
+    await user.click(await screen.findByRole("button", { name: "Actions for Code Review" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Remove review" }));
 
-  it("sends Manual Overview guidance through the existing action and freezes the view", async () => {
-    const user = userEvent.setup({ pointerEventsCheck: 0 });
-    const collecting = makeFanoutDetail({ overviewMode: "manual" });
-    const frozen = makeFanoutDetail({ overviewMode: "manual", overviewRunId: "overview-run-1" });
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
-    mocks.invokeSkill.mockResolvedValue(collecting);
-    mocks.fetchInvocation.mockResolvedValueOnce(collecting).mockResolvedValue(frozen);
-    renderPanel();
-
-    await user.click(await openSkillCommand());
-    const guidance = await screen.findByRole("textbox", { name: "Overview guidance" });
-    await user.type(guidance, "Prioritize lifecycle bugs.");
-    await user.click(screen.getByRole("button", { name: "Send to reviewer" }));
-
-    await waitFor(() => expect(mocks.sendOverview).toHaveBeenCalledWith(
+    await waitFor(() => expect(mocks.removeInvocation).toHaveBeenCalledWith(
       "https://hub.test",
       "env-1",
-      "invocation-1",
-      { sessionId: "session-1", guidance: "Prioritize lifecycle bugs." },
+      "code-review-round",
+      "session-1",
     ));
-    expect(await screen.findByText("Frozen manual Overview · ready")).toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "Overview guidance" })).not.toBeInTheDocument();
   });
 
-  it("reuses the Review launch request id after an ambiguous failure", async () => {
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
-    mocks.invokeSkill
-      .mockRejectedValueOnce(new Error("Network response was lost"))
-      .mockResolvedValueOnce({
-        kind: "fanout",
-        invocation: {
-          invocationId: "invocation-1",
-          envSlug: "env-1",
-          repoId: "repo-1",
-          mainSessionId: "session-1",
-          parentThreadId: "parent-1",
-          definitionSnapshot: codeReviewSkill,
-          preparationOpId: "op-1",
-          status: "active",
-          overviewMode: "auto",
-          includedMessageIds: [],
-          overviewRunId: null,
-          error: null,
-          cancelledAt: null,
-          createdAt: "2026-07-09T00:00:00.000Z",
-          updatedAt: "2026-07-09T00:00:00.000Z",
+  it("trusts a terminal invocation list row over stale active detail", async () => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    const staleDetail = multiDetail();
+    const terminalSummary = {
+      ...invocationSummary(staleDetail),
+      status: "cancelled" as const,
+    };
+    mocks.fetchState.mockResolvedValue(stateWithTabs(skillTabs(false)));
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [terminalSummary], nextCursor: null });
+    mocks.fetchInvocation.mockResolvedValue(staleDetail);
+    renderPanel();
+
+    await user.click(await screen.findByRole("treeitem", { name: "Code Review" }));
+    await user.click(await screen.findByRole("button", { name: "Actions for Code Review" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Remove review" }));
+
+    await waitFor(() => expect(mocks.removeInvocation).toHaveBeenCalledWith(
+      "https://hub.test",
+      "env-1",
+      "code-review-round",
+      "session-1",
+    ));
+    expect(mocks.cancelInvocation).not.toHaveBeenCalled();
+  });
+
+  it("shows a single-agent skill as one standalone skill-named conversation", async () => {
+    const detail = singleDetail();
+    const tabs = skillTabs(true);
+    mocks.fetchState.mockResolvedValue(stateWithTabs(tabs));
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [invocationSummary(detail)], nextCursor: null });
+    mocks.fetchInvocation.mockResolvedValue(detail);
+    mocks.fetchMessages.mockResolvedValue([{
+      id: "focused-message",
+      threadId: "focused-root",
+      seq: 1,
+      senderSessionId: "assistant",
+      kind: "chat",
+      body: { role: "assistant", runId: "focused-initial", text: "Focused finding." },
+      createdAt: "2026-08-12T00:01:00.000Z",
+    }]);
+    renderPanel();
+
+    const focusedReview = await screen.findByRole("treeitem", { name: "Focused Review" });
+    expect(focusedReview).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Expand Focused Review/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Overview synthesis mode" })).not.toBeInTheDocument();
+    fireEvent.click(focusedReview);
+    expect(await screen.findByText("Focused finding.")).toBeInTheDocument();
+  });
+
+  it("keeps the changed-file count in the selected reviewer header", async () => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    const detail = singleDetail();
+    const tabs = skillTabs(true);
+    const run = {
+      ...detail.runs[0]!,
+      preparation: {
+        snapshot: {
+          snapshotId: "snapshot-1",
+          source: "live-harness" as const,
+          mode: "full" as const,
+          stale: false,
+          createdAt: "2026-08-09T04:07:00.000Z",
+          snapshotHash: "hash-1",
+          baseCommitSha: null,
+          githubDeletedPaths: [],
+          r2Key: "snapshots/snapshot-1.tar",
         },
-        tabs: [],
-        runs: [],
-      });
-    renderPanel();
-    const reviewButton = await openSkillCommand();
-    await waitFor(() => expect(reviewButton).toBeEnabled());
-    fireEvent.click(reviewButton);
-    await waitFor(() => expect(mocks.invokeSkill).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(reviewButton).toBeEnabled());
-    fireEvent.click(reviewButton);
-    await waitFor(() => expect(mocks.invokeSkill).toHaveBeenCalledTimes(2));
-
-    expect(mocks.invokeSkill.mock.calls[1][4].requestId).toBe(mocks.invokeSkill.mock.calls[0][4].requestId);
-  });
-
-  it("uses a new Review launch request id after a definitive terminal failure", async () => {
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
-    mocks.invokeSkill
-      .mockRejectedValueOnce(new ApiActionError({
-        error: "Skill setup failed.",
-        code: "skill_invocation_terminal",
-      }, "Skill setup failed."))
-      .mockResolvedValueOnce({
-        kind: "fanout",
-        invocation: {
-          invocationId: "invocation-2",
-          envSlug: "env-1",
-          repoId: "repo-1",
-          mainSessionId: "session-1",
-          parentThreadId: "parent-1",
-          definitionSnapshot: codeReviewSkill,
-          preparationOpId: "op-2",
-          status: "active",
-          overviewMode: "auto",
-          includedMessageIds: [],
-          overviewRunId: null,
-          error: null,
-          cancelledAt: null,
-          createdAt: "2026-07-09T00:00:00.000Z",
-          updatedAt: "2026-07-09T00:00:00.000Z",
-        },
-        tabs: [],
-        runs: [],
-      });
-    renderPanel();
-    const reviewButton = await openSkillCommand();
-    await waitFor(() => expect(reviewButton).toBeEnabled());
-    fireEvent.click(reviewButton);
-    await waitFor(() => expect(mocks.invokeSkill).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(reviewButton).toBeEnabled());
-    fireEvent.click(reviewButton);
-    await waitFor(() => expect(mocks.invokeSkill).toHaveBeenCalledTimes(2));
-
-    expect(mocks.invokeSkill.mock.calls[1][4].requestId).not.toBe(mocks.invokeSkill.mock.calls[0][4].requestId);
-  });
-
-  it("requires an idle selected reviewer and removes the standalone launcher", async () => {
-    renderPanel();
-    expect(await screen.findByRole("textbox", { name: "Message" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "/code-review" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Code Review" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Code Review settings" })).not.toBeInTheDocument();
-  });
-
-  it("edits the built-in through the shared Review Skills editor without launching it", async () => {
-    const user = userEvent.setup({ pointerEventsCheck: 0 });
-    renderPanel();
-    await user.click(await screen.findByRole("button", { name: "Review Skills" }));
-    expect(await screen.findByRole("heading", { name: "Review Skills" })).toBeInTheDocument();
-    await user.click(screen.getByLabelText("Bug Reviewer reasoning"));
-    await user.click(await screen.findByRole("option", { name: "Low" }));
-    await user.click(screen.getByRole("button", { name: "Save skill" }));
-
-    await waitFor(() => expect(mocks.updateSkill).toHaveBeenCalled());
-    expect(mocks.updateSkill.mock.calls[0][4].agents[0].effort).toBe("low");
-    expect(mocks.invokeSkill).not.toHaveBeenCalled();
-  });
-
-  it("uses the prototype Review skill editor hierarchy without changing the surrounding panel", async () => {
-    const user = userEvent.setup({ pointerEventsCheck: 0 });
-    renderPanel();
-    await user.click(await screen.findByRole("button", { name: "Review Skills" }));
-
-    expect(await screen.findByRole("heading", { name: "Review Skills" })).toBeInTheDocument();
-    expect(screen.getByText("One slash command configures the agent experience used when invoked.")).toBeInTheDocument();
-    expect(screen.getByText("Three focused reviews.")).toBeInTheDocument();
-    expect(screen.getByText("3 agents")).toBeInTheDocument();
-    expect(screen.getByLabelText("Shared goal")).toHaveValue("Review the frozen workspace.");
-    expect(screen.getByLabelText("Reviewer instructions")).toHaveValue("Deduplicate findings.");
-    expect(screen.getByRole("group", { name: "Bug Reviewer default report mode" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reset" })).toBeInTheDocument();
-
-    const addAgent = screen.getByRole("button", { name: "Add agent" });
-    await user.click(addAgent);
-    expect(screen.getAllByLabelText(/Agent \d label/)).toHaveLength(4);
-    expect(addAgent).toBeDisabled();
-  });
-
-  it("uses stable route keys and clamps reasoning when the child model changes", async () => {
-    const user = userEvent.setup({ pointerEventsCheck: 0 });
-    renderPanel();
-    await user.click(await screen.findByRole("button", { name: "Review Skills" }));
-    const modelSelect = await screen.findByLabelText("Bug Reviewer model");
-    const reasoningSelect = screen.getByLabelText("Bug Reviewer reasoning");
-    expect(modelSelect).toHaveTextContent("Kimi K2.7 Code");
-    await user.click(modelSelect);
-    await user.click(await screen.findByRole("option", { name: "GPT-5.5" }));
-    expect(reasoningSelect).toHaveTextContent("High");
-    await user.click(reasoningSelect);
-    await user.click(await screen.findByRole("option", { name: "Extra High" }));
-    await user.click(modelSelect);
-    await user.click(await screen.findByRole("option", { name: "Kimi K2.7 Code" }));
-    expect(reasoningSelect).toHaveTextContent("High");
-  });
-
-  it("does not expose a deployment action in the reviewers header", () => {
+      },
+      changeContext: {
+        summary: { total: 4, added: 1, modified: 2, deleted: 1, omitted: 0, truncated: 0 },
+      },
+    };
+    const nextDetail = { ...detail, runs: [run] };
+    mocks.fetchState.mockResolvedValue({ ...stateWithTabs(tabs), runs: [run] });
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [invocationSummary(nextDetail)], nextCursor: null });
+    mocks.fetchInvocation.mockResolvedValue(nextDetail);
     renderPanel();
 
-    expect(screen.queryByRole("button", { name: /deploy/i })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("treeitem", { name: "Focused Review" }));
+    expect(await screen.findByText(/4 files changed/)).toBeInTheDocument();
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
   });
 
-  it("uses a binary reviewer drawer and announces both layout changes", () => {
-    const onLayoutChange = vi.fn();
-    renderPanel({ onLayoutChange });
-    expect(screen.getByTestId("env-review-panel").style.height).toBe("320px");
-    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
-    onLayoutChange.mockClear();
-
-    fireEvent.click(screen.getByRole("button", { name: "Reviewers" }));
-    expect(screen.getByTestId("env-review-panel").style.height).toBe("");
-    expect(screen.queryByRole("region", { name: "Reviewers" })).not.toBeInTheDocument();
-    expect(onLayoutChange).toHaveBeenCalledTimes(1);
-
-    fireEvent.click(screen.getByRole("button", { name: "Reviewers" }));
-    expect(screen.getByTestId("env-review-panel").style.height).toBe("320px");
-    expect(screen.getByRole("region", { name: "Reviewers" })).toBeInTheDocument();
-    expect(onLayoutChange).toHaveBeenCalledTimes(2);
-    expect(window.localStorage.getItem("tiller:implementor-reviewers-height")).toBeNull();
-  });
-
-  it("only follows transcript updates while already near the bottom", async () => {
-    mocks.fetchState.mockResolvedValue({ ...emptyState, tabs: [idleParent] });
-    mocks.fetchMessages.mockResolvedValue([threadMessage("message-1", "First review")]);
-    const rendered = renderPanel();
-    expect(await screen.findByText("First review")).toBeInTheDocument();
-
-    const transcript = screen.getByLabelText("Implementor reviewer conversation");
-    const scrollTo = vi.fn();
-    Object.defineProperties(transcript, {
-      clientHeight: { configurable: true, value: 200 },
-      scrollHeight: { configurable: true, value: 800 },
-      scrollTo: { configurable: true, value: scrollTo },
+  it("creates a generic reviewer from plain prose on the lazy home", async () => {
+    const run = {
+      ...runFor({ ...genericTab, latestRunId: "generic-run" } as any, "root_initial"),
+      skillInvocationId: null,
+      skillAgentId: null,
+      skillRunRole: null,
+      status: "preparing" as const,
+    };
+    mocks.sendMessage.mockResolvedValue({
+      run,
+      messages: [],
+      state: { ...emptyState(), tabs: [{ ...genericTab, latestRunId: run.runId, status: "preparing" }], runs: [run] },
     });
-    transcript.scrollTop = 100;
-    fireEvent.scroll(transcript);
+    renderPanel();
+    const composer = await screen.findByRole("textbox", { name: "Message" });
+    fireEvent.change(composer, { target: { value: "Check the implementation." } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    mocks.fetchMessages.mockResolvedValue([
-      threadMessage("message-1", "First review"),
-      threadMessage("message-2", "Second review"),
-    ]);
-    rendered.rerender(
-      <EnvReviewPanel
-        envSlug="env-1"
-        repoId="repo-1"
-        sessionId="session-2"
-        hubUrl="https://hub.test"
-        harnessInputReady
-        onSendToHarness={vi.fn(async () => ({ ok: true }))}
-      />,
-    );
-    expect(await screen.findByText("Second review")).toBeInTheDocument();
-    expect(scrollTo).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledWith(
+      "https://hub.test",
+      "env-1",
+      null,
+      expect.objectContaining({
+        sessionId: "session-1",
+        text: "Check the implementation.",
+        requestId: expect.any(String),
+      }),
+    ));
+  });
 
-    transcript.scrollTop = 590;
-    fireEvent.scroll(transcript);
-    mocks.fetchMessages.mockResolvedValue([
-      threadMessage("message-1", "First review"),
-      threadMessage("message-2", "Second review"),
-      threadMessage("message-3", "Third review"),
-    ]);
-    rendered.rerender(
-      <EnvReviewPanel
-        envSlug="env-1"
-        repoId="repo-1"
-        sessionId="session-3"
-        hubUrl="https://hub.test"
-        harnessInputReady
-        onSendToHarness={vi.fn(async () => ({ ok: true }))}
-      />,
-    );
-    expect(await screen.findByText("Third review")).toBeInTheDocument();
-    expect(scrollTo).toHaveBeenLastCalledWith({ top: 800, behavior: "auto" });
+  it("binds Report follow-ups to the selected immutable round", async () => {
+    const detail = multiDetail();
+    const tabs = skillTabs(false);
+    mocks.fetchState.mockResolvedValue(stateWithTabs(tabs));
+    mocks.fetchInvocations.mockResolvedValue({ invocations: [invocationSummary(detail)], nextCursor: null });
+    mocks.fetchInvocation.mockResolvedValue(detail);
+    mocks.fetchMessages.mockResolvedValue([]);
+    mocks.sendMessage.mockResolvedValue({ run: null, messages: [], state: stateWithTabs(tabs) });
+    renderPanel();
+    const rail = await screen.findByRole("tree", { name: "Reviewer conversations" });
+    fireEvent.click(within(rail).getByRole("button", { name: "Expand Code Review Reports" }));
+    fireEvent.click(within(rail).getByRole("treeitem", { name: "Bug Reviewer" }));
+    const composer = await screen.findByRole("textbox", { name: "Message" });
+    fireEvent.change(composer, { target: { value: "Verify the remaining issue." } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledWith(
+      "https://hub.test",
+      "env-1",
+      "report-1",
+      {
+        sessionId: "session-1",
+        text: "Verify the remaining issue.",
+        expectedRoundId: "code-review-round",
+      },
+    ));
+  });
+
+  it("uses resizing instead of a separate collapse control", async () => {
+    renderPanel();
+    expect(await screen.findByRole("separator", { name: "Resize terminal and Review" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Review" })).toBeInTheDocument();
+  });
+});
+
+describe("implementation handoff formatting", () => {
+  it("attributes ordinary feedback to its reviewer route", () => {
+    expect(formatFeedbackForHarness({
+      roleLabel: "Bug Reviewer",
+      provider: "codex",
+      model: "gpt-5.5",
+      metadata: null,
+    } as any, "Fix the race.")).toContain("Bug Reviewer (codex/gpt-5.5)");
+  });
+
+  it("attributes a synthesized Overview to all frozen Report routes", () => {
+    const text = formatFeedbackForHarness({
+      roleLabel: "Code Review Overview",
+      provider: "codex",
+      model: "gpt-5.5",
+      metadata: {
+        reviewHandoff: {
+          schemaVersion: 1,
+          kind: "fanout_overview",
+          skillLabel: "Code Review",
+          reviewerCount: 2,
+          models: [
+            { provider: "codex", model: "gpt-5.5" },
+            { provider: "opencode", model: "kimi" },
+          ],
+        },
+      },
+    } as any, "Fix the race.");
+    expect(text).toContain("synthesized from 2 reviewers (codex/gpt-5.5 and opencode/kimi)");
   });
 });

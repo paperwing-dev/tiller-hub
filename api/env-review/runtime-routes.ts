@@ -1,11 +1,16 @@
 import { Hono } from "hono";
 import type { HonoEnv } from "../types";
+import { specializedServiceAuthMiddleware } from "../auth";
 import { getEnvReviewStub, getThreadStub } from "../helpers";
 import { appendThreadMessage } from "../planner/runtime";
 import { verifyEnvReviewRunToken } from "./runtime-token";
 import { cleanupEnvReviewRunRuntime, envReviewJobSlug } from "./dispatch";
 import type { EnvReviewRun } from "./types";
-import { ENV_REVIEW_SNAPSHOT_CONTENT_TYPE } from "./snapshots";
+import {
+  buildReviewInspectionKey,
+  ENV_REVIEW_INSPECTION_CONTENT_TYPE,
+  ENV_REVIEW_SNAPSHOT_CONTENT_TYPE,
+} from "./snapshots";
 import { assignSkillOverview, finalizeSuccessfulReviewOutput } from "./skill-orchestration";
 import {
   codexRuntimeAuthAccountChangedResponse,
@@ -25,6 +30,11 @@ const RUN_TOKEN_HEADER = "X-Tiller-Env-Review-Run-Token";
 const MAX_EVENT_MESSAGE_CHARS = 2_000;
 
 const envReviewRuntimeRoutes = new Hono<HonoEnv>();
+
+envReviewRuntimeRoutes.use(
+  "/api/env-review-runtime/*",
+  specializedServiceAuthMiddleware,
+);
 
 function truncate(value: string, maxChars: number): string {
   return value.length > maxChars ? `${value.slice(0, maxChars)}...` : value;
@@ -115,7 +125,10 @@ envReviewRuntimeRoutes.post("/api/env-review-runtime/envs/:slug/runs/:runId/runt
 });
 
 async function maybeAssignAutomaticOverview(c: any, run: EnvReviewRun): Promise<void> {
-  if (!run.skillInvocationId || run.skillRunRole !== "child_initial") return;
+  if (
+    !run.skillInvocationId
+    || (run.skillRunRole !== "report_initial" && run.skillRunRole !== "report_followup")
+  ) return;
   const review = getEnvReviewStub(c.env, run.envSlug);
   try {
     await assignSkillOverview({
@@ -151,6 +164,9 @@ envReviewRuntimeRoutes.get("/api/env-review-runtime/envs/:slug/runs/:runId/conte
       effort: run.effort,
       roleLabel: run.roleLabel,
       status: run.status,
+      // Overview is a synthesis pass over frozen child reports. Its prompt
+      // explicitly forbids re-reviewing the workspace, unlike every leaf run.
+      requiresRepositoryInspection: run.skillRunRole !== "overview",
     },
     prompt: run.prompt,
     preparation,
@@ -177,6 +193,25 @@ envReviewRuntimeRoutes.get("/api/env-review-runtime/envs/:slug/runs/:runId/works
   return new Response(object.body, {
     headers: {
       "Content-Type": ENV_REVIEW_SNAPSHOT_CONTENT_TYPE,
+      "Cache-Control": "no-store",
+    },
+  });
+});
+
+envReviewRuntimeRoutes.get("/api/env-review-runtime/envs/:slug/runs/:runId/inspection.tar", async (c) => {
+  const loaded = await loadAuthorizedRun(c);
+  if (!loaded.ok) return loaded.response;
+  const snapshot = loaded.run.preparation?.snapshot ?? null;
+  if (!snapshot) {
+    return c.json({ error: "Reviewer needs a fresh snapshot. Start a fresh reviewer run." }, 409);
+  }
+  const object = await c.env.BUCKET.get(buildReviewInspectionKey(loaded.run.envSlug, snapshot.snapshotId));
+  if (!object?.body) {
+    return c.json({ error: "Complete review change material is unavailable. Start a fresh reviewer run." }, 409);
+  }
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": ENV_REVIEW_INSPECTION_CONTENT_TYPE,
       "Cache-Control": "no-store",
     },
   });
@@ -216,7 +251,7 @@ envReviewRuntimeRoutes.post("/api/env-review-runtime/envs/:slug/runs/:runId/even
     }
     await review.appendRunEvent({
       runId: run.runId,
-      type: "model_activity",
+      type: event.type,
       message: event.message,
     });
   }
@@ -229,7 +264,7 @@ envReviewRuntimeRoutes.post("/api/env-review-runtime/envs/:slug/runs/:runId/resu
   const { run } = loaded;
   const review = getEnvReviewStub(c.env, run.envSlug);
   if (!isActiveRun(run)) {
-    if (run.status === "ready" && run.skillInvocationId && run.skillRunRole === "child_initial") {
+    if (run.status === "ready" && run.skillInvocationId && run.skillRunRole === "report_initial") {
       await maybeAssignAutomaticOverview(c, run);
     }
     return c.json({ ok: true, ignored: true, runStatus: run.status });

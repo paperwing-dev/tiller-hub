@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import type { HonoEnv } from "../types";
+import { specializedServiceAuthMiddleware } from "../auth";
 import { getSecret } from "../setup/config";
 import { OPENCODE_PROXY_TOKEN_KEY } from "../env/container-auth";
 import { getHarnessModel, KIMI_K2_7_CODE } from "../../shared/harness-catalog";
@@ -407,6 +408,8 @@ function createOpenAiChatCompletionStream(source: ReadableStream, includeUsage: 
 }
 
 const opencodeRoutes = new Hono<HonoEnv>();
+
+opencodeRoutes.use("/api/opencode/*", specializedServiceAuthMiddleware);
 
 opencodeRoutes.get("/api/opencode/v1/models", async (c) => {
   const authError = await requireProxyAuth(c);

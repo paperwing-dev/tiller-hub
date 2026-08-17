@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { vi } from "vitest";
 import {
+  classifyRunnerInspection,
   isLocalOnlyRunnerBackendMode,
   runRunnerMutationWithGenerationReconciliation,
 } from "../env/runner-backend";
+
+describe("runner inspection classification", () => {
+  it("keeps live, stopped, absent, and unknown states distinct", () => {
+    expect(classifyRunnerInspection("running")).toEqual({ state: "live", status: "running" });
+    expect(classifyRunnerInspection("exited")).toEqual({ state: "stopped", status: "exited" });
+    expect(classifyRunnerInspection("not_found")).toEqual({ state: "absent", status: "not_found" });
+    expect(classifyRunnerInspection("mystery")).toEqual({ state: "unknown", status: "mystery" });
+  });
+});
 
 describe("isLocalOnlyRunnerBackendMode", () => {
   it("recognizes the contributor-only localhost override", () => {

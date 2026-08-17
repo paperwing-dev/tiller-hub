@@ -4,7 +4,8 @@ export const MAX_REVIEWER_RUNTIME_EVENT_MESSAGE_CHARS = 2_000;
 
 export type ReviewerRuntimeEvent =
   | { type: "runtime_startup"; message: typeof REVIEWER_RUNTIME_STARTUP_MESSAGE }
-  | { type: "model_activity"; message: string };
+  | { type: "model_activity"; message: string }
+  | { type: "model_commentary"; message: string };
 
 export type ReviewerRuntimeEventBatchResult =
   | { ok: true; events: ReviewerRuntimeEvent[] }
@@ -39,9 +40,9 @@ export function parseReviewerRuntimeEventBatch(body: unknown): ReviewerRuntimeEv
       events.push({ type, message: REVIEWER_RUNTIME_STARTUP_MESSAGE });
       continue;
     }
-    if (type === "model_activity") {
+    if (type === "model_activity" || type === "model_commentary") {
       if (typeof candidate.message !== "string" || !candidate.message.trim()) {
-        return { ok: false, error: "model_activity requires a message" };
+        return { ok: false, error: `${type} requires a message` };
       }
       events.push({ type, message: truncate(candidate.message.trim()) });
       continue;

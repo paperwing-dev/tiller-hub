@@ -2,19 +2,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   startSandbox,
-  stopSandbox,
+  prepareWorkspaceStop,
+  schedulePreparedTermination,
+  getStatus,
   getIdleTimeoutMinutes,
 } = vi.hoisted(() => ({
   startSandbox: vi.fn(),
-  stopSandbox: vi.fn(),
+  prepareWorkspaceStop: vi.fn(),
+  schedulePreparedTermination: vi.fn(),
+  getStatus: vi.fn(),
   getIdleTimeoutMinutes: vi.fn(),
 }));
 
 vi.mock("../helpers", () => ({
   getSandboxStub: vi.fn(() => ({
     startSandbox,
-    stopSandbox,
-    getStatus: vi.fn(),
+    prepareWorkspaceStop,
+    schedulePreparedTermination,
+    getStatus,
     destroySandbox: vi.fn(),
     fetch: vi.fn(),
   })),
@@ -51,6 +56,18 @@ describe("lifecycle op-id propagation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getIdleTimeoutMinutes.mockResolvedValue(15);
+    getStatus.mockResolvedValue("running");
+    prepareWorkspaceStop.mockResolvedValue({
+      status: "prepared",
+      receipt: {
+        envSlug: "demo-env",
+        incarnationId: "incarnation-1",
+        startOperationId: "start-op-2",
+        stopOperationId: "stop-op-2",
+        workspaceLastSyncedAt: "2026-04-10T00:00:05.000Z",
+      },
+    });
+    schedulePreparedTermination.mockResolvedValue({ status: "scheduled" });
   });
 
   it("uses one fenced operation id on the host wire while validating lifecycle ids", async () => {
@@ -192,6 +209,12 @@ describe("lifecycle op-id propagation", () => {
 
   it("injects the start op id into cloudflare sandbox env vars and forwards the stop op id", async () => {
     const backend = createCloudflareRunnerBackend({} as any);
+    const stopScope = {
+      envSlug: "demo-env",
+      incarnationId: "incarnation-1",
+      startOperationId: "start-op-2",
+      stopOperationId: "stop-op-2",
+    };
 
     await backend.start(
       createMeta({ backend: "cf" }),
@@ -199,8 +222,20 @@ describe("lifecycle op-id propagation", () => {
       { startOpId: " start-op-2 " },
     );
     await expect(
-      backend.stop(createMeta({ backend: "cf" }), { stopOpId: "stop-op-2" }),
-    ).resolves.toEqual({ callbackExpected: true });
+      backend.stop(createMeta({ backend: "cf" }), {
+        stopOpId: "stop-op-2",
+        stopScope,
+      }),
+    ).resolves.toEqual({
+      callbackExpected: true,
+      workspaceStopReceipt: {
+        ...stopScope,
+        workspaceLastSyncedAt: "2026-04-10T00:00:05.000Z",
+      },
+    });
+    await expect(
+      backend.schedulePreparedStop!(createMeta({ backend: "cf" }), stopScope),
+    ).resolves.toEqual({ status: "scheduled" });
 
     expect(getIdleTimeoutMinutes).toHaveBeenCalled();
     expect(startSandbox).toHaveBeenCalledWith(
@@ -210,8 +245,30 @@ describe("lifecycle op-id propagation", () => {
         TILLER_LIFECYCLE_START_OP_ID: "start-op-2",
       },
       15,
-      "start-op-2",
+      {
+        envSlug: "demo-env",
+        incarnationId: "incarnation-1",
+        startOperationId: "start-op-2",
+      },
     );
-    expect(stopSandbox).toHaveBeenCalledWith("stop-op-2");
+    expect(prepareWorkspaceStop).toHaveBeenCalledWith(stopScope, null);
+    expect(schedulePreparedTermination).toHaveBeenCalledWith(stopScope);
+  });
+
+  it("uses actual Cloudflare container state instead of persisted metadata errors", async () => {
+    const backend = createCloudflareRunnerBackend({} as any);
+    const failedMeta = createMeta({ backend: "cf", status: "failed", error: "stale metadata error" });
+
+    getStatus.mockResolvedValueOnce("running");
+    await expect(backend.inspect!(failedMeta)).resolves.toEqual({
+      state: "live",
+      status: "running",
+    });
+
+    getStatus.mockResolvedValueOnce("stopped");
+    await expect(backend.inspect!(failedMeta)).resolves.toEqual({
+      state: "absent",
+      status: "stopped",
+    });
   });
 });

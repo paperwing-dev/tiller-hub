@@ -7,9 +7,9 @@ import {
 } from "../env-runtime";
 
 describe("env-runtime", () => {
-  it("treats only running envs as live-session selectable", () => {
+  it("treats starting and running envs as live-session selectable", () => {
     expect(shouldSelectLiveSessionForEnvStatus("running")).toBe(true);
-    expect(shouldSelectLiveSessionForEnvStatus("starting")).toBe(false);
+    expect(shouldSelectLiveSessionForEnvStatus("starting")).toBe(true);
     expect(shouldSelectLiveSessionForEnvStatus("failed")).toBe(false);
   });
 

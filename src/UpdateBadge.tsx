@@ -24,46 +24,52 @@ export function describeUpdateButtonState({
 }): {
   description: string;
   enabled: boolean;
+  highlighted: boolean;
 } {
   if (isChecking) {
     return {
       description: 'Checking for updates',
       enabled: false,
+      highlighted: false,
     };
   }
 
-  const maintenanceAction = status?.kind === 'installer-maintenance'
+  const maintenanceAction = status?.kind === 'installer-managed'
     ? installerMaintenanceAction({
         updateAvailable: status.updateAvailable,
         latestVersion: status.stableRelease?.version ?? '',
       })
     : null;
 
-  if (issue && !maintenanceAction) {
+  if (issue && !maintenanceAction && status?.kind !== 'unmanaged') {
     return {
       description: `Update unavailable: ${issue}`,
-      enabled: false,
+      enabled: true,
+      highlighted: false,
     };
   }
 
   if (!status) {
     return {
       description: 'No update available',
-      enabled: false,
+      enabled: true,
+      highlighted: false,
     };
   }
 
-  if (status.buildDiagnostics.channel === 'development') {
+  if (status.currentRelease.channel === 'development') {
     return {
       description: 'Development build',
-      enabled: false,
+      enabled: true,
+      highlighted: false,
     };
   }
 
   if (dismissed) {
     return {
-      description: 'Update dismissed',
-      enabled: false,
+      description: 'Ignored until next update',
+      enabled: true,
+      highlighted: false,
     };
   }
 
@@ -71,26 +77,32 @@ export function describeUpdateButtonState({
     return {
       description: maintenanceAction.label,
       enabled: true,
+      highlighted: true,
+    };
+  }
+
+  if (status.kind === 'unmanaged') {
+    return {
+      description: status.updateAvailable
+        ? `Update requires a clean reinstall\nCurrent version: ${formatUpdateName(status.currentRelease)}`
+        : `Unmanaged installation\nCurrent version: ${formatUpdateName(status.currentRelease)}`,
+      enabled: true,
+      highlighted: true,
     };
   }
 
   if (!status.updateAvailable) {
     return {
-      description: `No update available\nCurrent version: ${formatUpdateName(status.currentUpdate)}`,
-      enabled: false,
-    };
-  }
-
-  if (status.kind === 'installer-maintenance') {
-    return {
-      description: 'Update unavailable',
-      enabled: false,
+      description: `No update available\nCurrent version: ${formatUpdateName(status.currentRelease)}`,
+      enabled: true,
+      highlighted: false,
     };
   }
 
   return {
-    description: `Update available: ${formatUpdateName(status.currentUpdate)} -> ${formatUpdateName(status.latestUpdate)}`,
+    description: 'Update unavailable',
     enabled: true,
+    highlighted: false,
   };
 }
 
@@ -122,10 +134,11 @@ export default function UpdateButton({
         onClick={state.enabled ? onOpen : undefined}
         disabled={!state.enabled}
         aria-label={state.description}
-        className={`h-6 rounded border px-2 text-[10px] font-medium uppercase tracking-wide transition-colors ${
-          state.enabled
+        data-highlighted={state.highlighted}
+        className={`tiller-update-button inline-flex h-7 items-center rounded border px-2 text-[10px] font-medium uppercase tracking-wide transition-colors ${
+          state.highlighted
             ? 'border-kumo-focus bg-kumo-info-tint text-kumo-link hover:bg-kumo-tint'
-            : 'border-kumo-line bg-kumo-base text-kumo-subtle disabled:cursor-default disabled:opacity-60'
+            : 'border-kumo-line bg-kumo-base text-kumo-subtle hover:bg-kumo-tint disabled:cursor-default disabled:opacity-60 disabled:hover:bg-kumo-base'
         }`}
       >
         Update

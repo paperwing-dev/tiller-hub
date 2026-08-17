@@ -35,14 +35,14 @@ describe("repo-status helpers", () => {
     ).toBe(false);
   });
 
-  it("describes pending GitHub default branch reads clearly", () => {
+  it("describes pending GitHub updates clearly", () => {
     expect(
       getRepoMainStatusLabel({
         scmModel: "github",
         gitStatus: "pending",
         githubDefaultBranchHeadSha: null,
       }),
-    ).toBe("Reading GitHub default branch");
+    ).toBe("Pulling updates from GitHub");
 
     expect(
       getRepoMainStatusDetail(detailInput({

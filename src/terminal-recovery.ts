@@ -47,7 +47,8 @@ export interface TerminalRecoveryOptions {
   onSequenceComplete(seq: number): void;
   onStateChange(state: TerminalRecoveryState): void;
   onSettled(lastSeq: number): void;
-  onStableWriteComplete?(): void;
+  /** Sequence represented by the last completed canonical screen checkpoint. */
+  getStableSequence?(): number | undefined;
   restoreStableScreen?(callback: () => void): void;
   onQueueUsage?(messages: number, bytes: number): void;
   now?: () => number;
@@ -144,6 +145,15 @@ export class TerminalRecoveryController {
 
   get pendingMessageCount(): number {
     return this.bySeq.size;
+  }
+
+  get isSettled(): boolean {
+    return (
+      this.state.status === "ready" &&
+      !this.writePending &&
+      !this.fetchPending &&
+      this.bySeq.size === 0
+    );
   }
 
   async startCold(): Promise<void> {
@@ -529,7 +539,6 @@ export class TerminalRecoveryController {
         this.pendingBytes -= next.bytes;
         this.reportQueueUsage();
         this.lastCompletedSeq = next.message.seq;
-        this.options.onStableWriteComplete?.();
         this.options.onSequenceComplete(this.lastCompletedSeq);
         if (this.recoveryRequested) {
           this.recoveryRequested = false;
@@ -556,6 +565,22 @@ export class TerminalRecoveryController {
     this.writePending = false;
     this.recoveryRequested = false;
     this.retryRequested = false;
+    const stableSequence = this.options.getStableSequence?.();
+    if (
+      stableSequence !== undefined &&
+      Number.isInteger(stableSequence) &&
+      stableSequence >= 0
+    ) {
+      this.lastCompletedSeq = stableSequence;
+      this.baselineKnown = true;
+    } else if (this.options.getStableSequence) {
+      // The screen will be reset, but there is no completed checkpoint to
+      // represent any partially written cold-mount records. Retry through the
+      // bounded latest-tail path instead of treating sequence zero (or a
+      // partial write) as a canonical rollback baseline.
+      this.lastCompletedSeq = 0;
+      this.baselineKnown = false;
+    }
     this.restorePhase = waitForWrite ? "waiting-for-write" : "idle";
     this.abortActiveFetch();
     this.clearDeadline();
@@ -599,7 +624,6 @@ export class TerminalRecoveryController {
     this.lastCompletedSeq = lastSeq;
     this.baselineKnown = true;
     this.discardBeforeOrAtBaseline();
-    this.options.onStableWriteComplete?.();
     this.options.onSequenceComplete(lastSeq);
   }
 

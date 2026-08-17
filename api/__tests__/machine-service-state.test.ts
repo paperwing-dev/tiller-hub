@@ -26,6 +26,7 @@ describe("machine service state helpers", () => {
           connectedAt: "2026-04-07T00:01:00.000Z",
           runnerCommandProtocol: 1,
           codexRuntimeAuthProtocol: 1,
+          reviewerIsolationProtocol: 1,
           dockerAvailable: true,
           runnerAvailable: true,
           claudeSubscription: false,
@@ -41,6 +42,7 @@ describe("machine service state helpers", () => {
         connectedAt: "2026-04-07T00:01:00.000Z",
         runnerCommandProtocol: 1,
         codexRuntimeAuthProtocol: 1,
+        reviewerIsolationProtocol: 1,
         dockerAvailable: true,
         runnerAvailable: true,
         claudeSubscription: false,
@@ -51,18 +53,21 @@ describe("machine service state helpers", () => {
     });
   });
 
-  it("accepts only the known runner command protocol capability", () => {
-    expect(parseMachineServiceState({
+  it("accepts only known runtime protocol capabilities", () => {
+    const parsed = parseMachineServiceState({
       host: {
         machineId: "host-1",
         displayName: "host-1",
         connectedAt: "2026-04-07T00:00:00.000Z",
         runnerCommandProtocol: 2,
+        reviewerIsolationProtocol: 2,
         dockerAvailable: true,
         runnerAvailable: true,
         claudeSubscription: true,
         transport: "session",
       },
-    }).host?.runnerCommandProtocol).toBeUndefined();
+    });
+    expect(parsed.host?.runnerCommandProtocol).toBeUndefined();
+    expect(parsed.host?.reviewerIsolationProtocol).toBeUndefined();
   });
 });

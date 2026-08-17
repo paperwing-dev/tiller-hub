@@ -1,6 +1,6 @@
 import { Server, type Connection, type ConnectionContext, type WSMessage } from "partyserver";
 import { ensureSchema } from "./schema";
-import { authenticateAccessRequest } from "./auth";
+import { authenticateWebSocketAuthorization } from "./auth";
 import * as Q from "./queries";
 import type { ThreadDO, ThreadMessage } from "./coordination";
 import {
@@ -9,7 +9,10 @@ import {
   parseMachineServiceState,
 } from "./machine-service-state";
 import { readOptionalConfigValue } from "./config-row";
-import { readTerminalScopeFromStoredSession } from "./session-attachment";
+import {
+  readManagedEnvSlugFromStoredSession,
+  readTerminalScopeFromStoredSession,
+} from "./session-attachment";
 import { classifyHostRuntimeCompatibility } from "./setup/runtime-compatibility";
 import { isLocalOnlyRunnerBackendMode } from "./env/runner-backend";
 import { HopMetricRecorder, safeTerminalIdentifier } from "./terminal-metrics";
@@ -29,6 +32,7 @@ import {
 import {
   readCanonicalWorkersDevAccessTrust,
 } from "./workers-dev-access/records";
+import { bytesToArrayBuffer } from "./bytes";
 import {
   EXECUTION_MIGRATION_KEY,
   EXECUTION_SELECTION_KEY,
@@ -57,33 +61,6 @@ import {
   type RepoMcpServer,
   type RepoMcpServersPutResult,
 } from "./mcp-servers";
-import {
-  CLOUDFLARE_API_MCP_SERVER_ID,
-  CLOUDFLARE_MCP_OAUTH_STATE_TTL_MS,
-  CLOUDFLARE_MCP_PROXY_TOKEN_TTL_MS,
-  CLOUDFLARE_MCP_REFRESH_BUFFER_MS,
-  CloudflareMcpUserError,
-  buildCloudflareMcpAuthorizeUrl,
-  buildStoredCloudflareMcpTokenFields,
-  cloudflareApiConnector,
-  createCloudflareMcpOAuthState,
-  createCloudflareMcpPkcePair,
-  createCloudflareMcpProxyToken,
-  createCloudflareMcpStatus,
-  exchangeCloudflareMcpOAuthCode,
-  fetchCloudflareMcpAccountMetadata,
-  hashCloudflareMcpProxyToken,
-  isCloudflareMcpReauthRequired,
-  refreshCloudflareMcpOAuthToken,
-  registerCloudflareMcpOAuthClient,
-  resolveConfiguredCloudflareMcpOAuthClient,
-  type CloudflareMcpAccessTokenResult,
-  type CloudflareMcpLaunchTokenValidation,
-  type CloudflareMcpOAuthClient,
-  type CloudflareMcpProxyAuditEvent,
-  type CloudflareMcpStatus,
-  type CloudflareMcpStoredSecrets,
-} from "./cloudflare-mcp";
 import type {
   Env,
   EnvMeta,
@@ -119,9 +96,23 @@ const MACHINE_INACTIVE_GRACE_SECONDS = 90;
 const HOST_HEALTH_LEASE_MS = 75_000;
 const RUNNER_REQUEST_TIMEOUT_MS = 15_000;
 const TERMINAL_OWNER_GRACE_MS = 750;
+const PLAN_WRITER_TERMINAL_OWNER_GRACE_MS = 5_000;
+const TERMINAL_OWNER_UNAVAILABLE_ERROR = "No active terminal owner for session";
+const SCOPED_WS_MESSAGE_TYPES: ReadonlySet<WsClientMessage["type"]> = new Set([
+  "ping",
+  "reconnect",
+  "message",
+  "terminal-input-ack",
+  "terminal-control-ack",
+  "session-alive",
+  "session-end",
+  "update-agent-state",
+  "update-todos",
+]);
+const MAX_TERMINAL_ACK_OWNER_ROUTES = 4_096;
 const SESSION_THREAD_PREFIX = "session:";
 const REPO_SESSION_ENV_DATA_KEY = "__private:repo_session_env:data_key:v1";
-const REPO_CLOUDFLARE_MCP_DATA_KEY = "__private:repo_cloudflare_mcp:data_key:v1";
+const LEGACY_REPO_CLOUDFLARE_MCP_DATA_KEY = "__private:repo_cloudflare_mcp:data_key:v1";
 
 interface PendingRunnerRequest {
   connectionId: string;
@@ -196,7 +187,7 @@ function legacyCleanupManifest(
 async function importAesKey(rawKeyBase64: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",
-    base64ToBytes(rawKeyBase64),
+    bytesToArrayBuffer(base64ToBytes(rawKeyBase64)),
     "AES-GCM",
     false,
     ["encrypt", "decrypt"],
@@ -218,12 +209,21 @@ export class HubDO extends Server<Env> {
   }>();
   private pendingRunnerRequests = new Map<string, PendingRunnerRequest>();
   private pendingTerminalDeliveries = new Map<string, PendingTerminalDelivery>();
+  private terminalAckOwnerRoutes = new Map<string, string>();
   private sessionAppendTails = new Map<string, Promise<void>>();
   private repoSessionEnvPatchQueues = new Map<string, Promise<void>>();
-  private cloudflareMcpRefreshQueues = new Map<string, Promise<CloudflareMcpAccessTokenResult>>();
+  private readonly terminalMetricsEnabled = this.env.TILLER_TERMINAL_METRICS === "1";
+  private readonly terminalAppendQueueMetrics = new HopMetricRecorder(
+    "hub_terminal_append_queue_wait",
+    this.terminalMetricsEnabled,
+  );
+  private readonly terminalCommitRoundTripMetrics = new HopMetricRecorder(
+    "hub_to_thread_commit_round_trip",
+    this.terminalMetricsEnabled,
+  );
   private readonly terminalBroadcastMetrics = new HopMetricRecorder(
-    "hub_terminal_broadcast",
-    this.env.TILLER_TERMINAL_METRICS === "1",
+    "hub_commit_to_broadcast",
+    this.terminalMetricsEnabled,
   );
 
   /** Lazy-init SQL — direct RPC stub calls bypass partyserver's onStart(). */
@@ -245,6 +245,7 @@ export class HubDO extends Server<Env> {
     console.time("[HubDO] onStart ensureSchema");
     const _ = this.db;
     console.timeEnd("[HubDO] onStart ensureSchema");
+    await this.ctx.storage.delete(LEGACY_REPO_CLOUDFLARE_MCP_DATA_KEY);
     // Handle ping/pong at the edge without waking the DO from hibernation
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}'),
@@ -255,13 +256,38 @@ export class HubDO extends Server<Env> {
   // ── WebSocket lifecycle hooks ─────────────────────────────────
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    let authorization;
     try {
-      await authenticateAccessRequest(ctx.request, this.env);
+      authorization = await authenticateWebSocketAuthorization(ctx.request, this.env);
     } catch (err) {
       console.warn("[HubDO] onConnect auth failed:", (err as Error).message);
       this.send(connection, { type: "error", message: "Unauthorized" });
       connection.close(4001, "Unauthorized");
       return;
+    }
+
+    if (authorization.kind === "environment") {
+      const session = Q.getSession(this.db, authorization.sessionId);
+      if (!session || readManagedEnvSlugFromStoredSession(session) !== authorization.envSlug) {
+        this.send(connection, { type: "error", message: "Runtime session scope mismatch" });
+        connection.close(4003, "Runtime session scope mismatch");
+        return;
+      }
+    }
+    if (authorization.kind === "planWriter") {
+      const session = Q.getSession(this.db, authorization.sessionId);
+      const scope = session ? readTerminalScopeFromStoredSession(session) : null;
+      if (
+        scope?.kind !== "plan-writer"
+        || scope.revokedAt
+        || scope.repoId !== authorization.repoId
+        || scope.planArtifactId !== authorization.planArtifactId
+        || scope.generation !== authorization.generation
+      ) {
+        this.send(connection, { type: "error", message: "Plan writer session scope mismatch" });
+        connection.close(4003, "Plan writer session scope mismatch");
+        return;
+      }
     }
 
     try {
@@ -274,8 +300,17 @@ export class HubDO extends Server<Env> {
     }
 
     console.log(`[HubDO] onConnect ok, t=${Date.now()}`);
-    connection.setState({} as WsConnectionState);
-    this.send(connection, { type: "capabilities", terminalFastLane: true });
+    connection.setState({
+      authorization,
+      ...(authorization.kind === "environment" || authorization.kind === "planWriter"
+        ? { sessionId: authorization.sessionId, sessionLifecycle: "owner" as const }
+        : {}),
+    } as WsConnectionState);
+    this.send(connection, {
+      type: "capabilities",
+      terminalFastLane: true,
+      terminalMetrics: this.terminalMetricsEnabled,
+    });
     await this.scheduleAlarm();
   }
 
@@ -289,6 +324,8 @@ export class HubDO extends Server<Env> {
       this.send(connection, { type: "error", message: "Invalid JSON" });
       return;
     }
+
+    if (!this.authorizeWsMessage(connection, data)) return;
 
     switch (data.type) {
       case "reconnect":
@@ -342,6 +379,34 @@ export class HubDO extends Server<Env> {
     }
   }
 
+  private authorizeWsMessage(connection: Connection, data: WsClientMessage): boolean {
+    const authorization = (connection.state as WsConnectionState | undefined)?.authorization;
+    if (!authorization) {
+      this.send(connection, { type: "error", message: "Connection authority is unavailable" });
+      connection.close(4001, "Unauthorized");
+      return false;
+    }
+    if (authorization.kind === "global") return true;
+    const sessionId = "sessionId" in data && typeof data.sessionId === "string"
+      ? data.sessionId
+      : null;
+    if (sessionId && sessionId !== authorization.sessionId) {
+      this.send(connection, { type: "error", message: "Scoped runtime cannot use another session" });
+      return false;
+    }
+    if (!SCOPED_WS_MESSAGE_TYPES.has(data.type)) {
+      this.send(connection, { type: "error", message: "Message is not allowed for a scoped runtime" });
+      return false;
+    }
+    if ("envSlug" in data && typeof data.envSlug === "string") {
+      if (authorization.kind !== "environment" || data.envSlug !== authorization.envSlug) {
+        this.send(connection, { type: "error", message: "Scoped runtime environment mismatch" });
+        return false;
+      }
+    }
+    return true;
+  }
+
   onClose(connection: Connection, _code: number, _reason: string, _wasClean: boolean): void {
     this.cleanupConnection(connection);
   }
@@ -379,7 +444,7 @@ export class HubDO extends Server<Env> {
       ...state,
       sessionId,
       sessionLifecycle: "owner",
-      sessionOwnerSeenAt: Date.now(),
+      terminalOwnerActive: rebound ? false : state.terminalOwnerActive,
       ...(rebound
         ? {
             terminalControllerConnectionId: undefined,
@@ -389,19 +454,25 @@ export class HubDO extends Server<Env> {
         : {}),
     } as WsConnectionState);
 
-    this.releaseControllersOnReplacedOwners(sessionId, connection.id);
+    // A heartbeat is not an ownership election. It claims only when the
+    // session currently has no open active owner.
+    this.claimSessionOwnerIfVacant(connection, sessionId);
+    if (rebound && state.terminalOwnerActive && state.sessionId) {
+      this.promoteStandbyOwner(state.sessionId, connection.id);
+    }
 
     Q.reviveSession(this.db, sessionId);
     const session = Q.getSession(this.db, sessionId);
     if (session) {
-      this.broadcastToAll({ type: "session-updated", session });
+      this.broadcastGlobal({ type: "session-updated", session });
     }
     this.flushPendingTerminalDeliveries(sessionId);
   }
 
   private handleSessionEnd(sessionId: string): void {
     Q.markSessionEnded(this.db, sessionId);
-    this.broadcastToAll({ type: "session-deleted", sessionId });
+    this.broadcastGlobal({ type: "session-deleted", sessionId });
+    this.closeScopedSessionConnections(sessionId, "Session ended");
   }
 
   private handleUpdateMetadata(
@@ -474,6 +545,9 @@ export class HubDO extends Server<Env> {
       });
       return;
     }
+    const machineBeforeHeartbeat = Q.getMachine(this.db, normalizedMachineId);
+    const newlyBoundConnection = state?.machineId !== normalizedMachineId;
+    const reactivatedMachine = machineBeforeHeartbeat?.active !== 1;
     Q.markMachineAlive(this.db, normalizedMachineId);
     connection.setState({
       ...state,
@@ -484,6 +558,7 @@ export class HubDO extends Server<Env> {
             machineServiceKeys: [],
             runnerCommandProtocol: undefined,
             codexRuntimeAuthProtocol: undefined,
+            reviewerIsolationProtocol: undefined,
             hostAdvertisementAt: undefined,
             hostDemoted: false,
           }
@@ -491,8 +566,8 @@ export class HubDO extends Server<Env> {
     } as WsConnectionState);
     const machine = Q.getMachine(this.db, normalizedMachineId);
 
-    if (machine) {
-      this.broadcastToAll({ type: "machine-updated", machine });
+    if (machine && (newlyBoundConnection || reactivatedMachine)) {
+      this.broadcastGlobal({ type: "machine-updated", machine });
     }
   }
 
@@ -507,6 +582,20 @@ export class HubDO extends Server<Env> {
       data.expectedVersion,
     );
     this.handleVersionedMachineResult(connection, result, data.machineId);
+  }
+
+  private demoteHostAdvertisement(connection: Connection): void {
+    const state = connection.state as WsConnectionState | undefined;
+    connection.setState({
+      ...state,
+      machineServiceKeys: (state?.machineServiceKeys ?? [])
+        .filter((key) => key !== "host"),
+      runnerCommandProtocol: undefined,
+      codexRuntimeAuthProtocol: undefined,
+      reviewerIsolationProtocol: undefined,
+      hostAdvertisementAt: undefined,
+      hostDemoted: true,
+    } as WsConnectionState);
   }
 
   private handleMachineUpdateRunnerState(
@@ -546,32 +635,37 @@ export class HubDO extends Server<Env> {
     }
     const liveRunnerCommandProtocol = liveHost?.runnerCommandProtocol;
     const liveCodexRuntimeAuthProtocol = liveHost?.codexRuntimeAuthProtocol;
+    const liveReviewerIsolationProtocol = liveHost?.reviewerIsolationProtocol;
     const healthyAdvertisement = Boolean(
       liveHost?.dockerAvailable
       && liveHost.runnerAvailable,
     );
-    if (serviceKeys.length > 0 && healthyAdvertisement) {
-      const healthyConnections = this.getHealthyRunnerConnections();
-      const competing = healthyConnections
-        .find(({ connection: candidate, machineId: candidateMachineId }) =>
-          candidate.id !== connection.id && candidateMachineId !== machineId);
-      if (competing) {
-        connection.setState({
-          ...state,
-          machineId,
-          role: "cli",
-          machineServiceKeys: [],
-          runnerCommandProtocol: undefined,
-          codexRuntimeAuthProtocol: undefined,
-          hostAdvertisementAt: undefined,
-          hostDemoted: false,
-        } as WsConnectionState);
-        this.send(connection, {
-          type: "error",
-          message: `Another execution machine is already connected (${competing.machineId}).`,
-        });
-        return;
-      }
+    const competingConnections = serviceKeys.length > 0 && healthyAdvertisement
+      ? this.getHealthyRunnerConnections()
+          .filter(({ connection: candidate, machineId: candidateMachineId }) =>
+            candidate.id !== connection.id && candidateMachineId !== machineId)
+      : [];
+    const selectedMachineId = this.readSelectedHostMachineId();
+    const selectedTakeover = competingConnections.length > 0
+      && selectedMachineId === machineId;
+    if (competingConnections.length > 0 && !selectedTakeover) {
+      const competing = competingConnections[0]!;
+      connection.setState({
+        ...state,
+        machineId,
+        role: "cli",
+        machineServiceKeys: [],
+        runnerCommandProtocol: undefined,
+        codexRuntimeAuthProtocol: undefined,
+        reviewerIsolationProtocol: undefined,
+        hostAdvertisementAt: undefined,
+        hostDemoted: false,
+      } as WsConnectionState);
+      this.send(connection, {
+        type: "error",
+        message: `Another execution machine is already connected (${competing.machineId}).`,
+      });
+      return;
     }
 
     const result = Q.updateMachineRunnerState(
@@ -587,20 +681,21 @@ export class HubDO extends Server<Env> {
 
     if (serviceKeys.length > 0 && healthyAdvertisement) {
       const advertisedAt = Date.now();
+      if (selectedTakeover) {
+        for (const { connection: candidate } of competingConnections) {
+          this.demoteHostAdvertisement(candidate);
+          this.send(candidate, {
+            type: "error",
+            message: `The selected execution machine connected (${machineId}); this machine is now on standby.`,
+          });
+        }
+      }
       // The newest healthy advertisement for a repeated UUID becomes active.
       for (const candidate of this.getConnections()) {
         if (candidate.id === connection.id) continue;
         const candidateState = candidate.state as WsConnectionState | undefined;
         if (candidateState?.machineId !== machineId) continue;
-        candidate.setState({
-          ...candidateState,
-          machineServiceKeys: (candidateState.machineServiceKeys ?? [])
-            .filter((key) => key !== "host"),
-          runnerCommandProtocol: undefined,
-          codexRuntimeAuthProtocol: undefined,
-          hostAdvertisementAt: undefined,
-          hostDemoted: true,
-        } as WsConnectionState);
+        this.demoteHostAdvertisement(candidate);
       }
       connection.setState({
         ...state,
@@ -609,6 +704,7 @@ export class HubDO extends Server<Env> {
         machineServiceKeys: [...new Set([...(state?.machineServiceKeys ?? []), ...serviceKeys])],
         runnerCommandProtocol: liveRunnerCommandProtocol,
         codexRuntimeAuthProtocol: liveCodexRuntimeAuthProtocol,
+        reviewerIsolationProtocol: liveReviewerIsolationProtocol,
         hostAdvertisementAt: advertisedAt,
         hostDemoted: false,
       } as WsConnectionState);
@@ -619,6 +715,7 @@ export class HubDO extends Server<Env> {
         machineServiceKeys: (state.machineServiceKeys ?? []).filter((key) => key !== "host"),
         runnerCommandProtocol: undefined,
         codexRuntimeAuthProtocol: undefined,
+        reviewerIsolationProtocol: undefined,
         hostAdvertisementAt: undefined,
         hostDemoted: false,
       } as WsConnectionState);
@@ -655,8 +752,19 @@ export class HubDO extends Server<Env> {
   ): void {
     const routeKey = `${sessionId}:${clientId}`;
     const state = (connection.state ?? {}) as WsConnectionState;
-    if (state.terminalAckRouteKey !== routeKey) {
-      connection.setState({ ...state, terminalAckRouteKey: routeKey } as WsConnectionState);
+    // The dashboard has one global socket. Its first resize/input selects the
+    // terminal whose live output should use that socket.
+    const bindGlobalViewer =
+      state.authorization?.kind === "global" &&
+      (state.sessionId !== sessionId || state.sessionLifecycle !== "viewer");
+    if (state.terminalAckRouteKey !== routeKey || bindGlobalViewer) {
+      connection.setState({
+        ...state,
+        terminalAckRouteKey: routeKey,
+        ...(bindGlobalViewer
+          ? { sessionId, sessionLifecycle: "viewer" as const }
+          : {}),
+      } as WsConnectionState);
     }
   }
 
@@ -672,6 +780,11 @@ export class HubDO extends Server<Env> {
     }
     if (
       typeof data.data !== "string" ||
+      (data.deliveryId !== undefined && (
+        typeof data.deliveryId !== "string"
+        || !data.deliveryId.trim()
+        || data.deliveryId.length > 256
+      )) ||
       !this.areOptionalTerminalDimensionsValid(data.cols, data.rows)
     ) {
       this.sendTerminalDeliveryFailure(connection, data, "Invalid terminal input");
@@ -697,12 +810,30 @@ export class HubDO extends Server<Env> {
       this.sendTerminalDeliveryFailure(connection, data, "Invalid resize dimensions");
       return;
     }
+    if (data.claim !== undefined && typeof data.claim !== "boolean") {
+      this.sendTerminalDeliveryFailure(connection, data, "Invalid terminal control");
+      return;
+    }
     this.deliverTerminalMessageOrWaitForOwner(connection, data);
   }
 
   private handleTerminalDetach(connection: Connection, sessionId: string, clientId: string): void {
     if (this.terminalMutationError(sessionId)) return;
+    this.clearPendingTerminalDeliveriesForClient(connection.id, sessionId, clientId);
     this.releaseTerminalController(connection.id, sessionId, clientId);
+    const state = (connection.state ?? {}) as WsConnectionState;
+    if (
+      state.authorization?.kind === "global" &&
+      state.sessionLifecycle === "viewer" &&
+      state.sessionId === sessionId
+    ) {
+      connection.setState({
+        ...state,
+        sessionId: undefined,
+        sessionLifecycle: undefined,
+        terminalAckRouteKey: undefined,
+      } as WsConnectionState);
+    }
   }
 
   private terminalMutationError(sessionId: string): string | null {
@@ -721,6 +852,29 @@ export class HubDO extends Server<Env> {
     return `${data.sessionId}:${data.clientId}:control:${data.controlSeq}`;
   }
 
+  private terminalAckKey(
+    data: TerminalInputMessage | TerminalControlMessage | TerminalInputAckMessage | TerminalControlAckMessage,
+  ): string {
+    if (data.type === "terminal-input" || data.type === "terminal-input-ack") {
+      return `${data.sessionId}:${data.clientId}:input:${data.inputSeq}`;
+    }
+    return `${data.sessionId}:${data.clientId}:control:${data.controlSeq}`;
+  }
+
+  private rememberTerminalAckOwner(
+    owner: Connection,
+    data: TerminalInputMessage | TerminalControlMessage,
+  ): void {
+    const key = this.terminalAckKey(data);
+    this.terminalAckOwnerRoutes.delete(key);
+    this.terminalAckOwnerRoutes.set(key, owner.id);
+    while (this.terminalAckOwnerRoutes.size > MAX_TERMINAL_ACK_OWNER_ROUTES) {
+      const oldest = this.terminalAckOwnerRoutes.keys().next().value;
+      if (oldest === undefined) break;
+      this.terminalAckOwnerRoutes.delete(oldest);
+    }
+  }
+
   private deliverTerminalMessageOrWaitForOwner(
     sender: Connection,
     data: TerminalInputMessage | TerminalControlMessage,
@@ -730,10 +884,10 @@ export class HubDO extends Server<Env> {
       this.sendTerminalDeliveryFailure(sender, data, terminalError);
       return;
     }
-    const owner = this.getLatestSessionOwnerConnection(data.sessionId);
+    const owner = this.getActiveSessionOwnerConnection(data.sessionId);
     if (owner) {
       if (!this.deliverTerminalMessage(owner, sender, data, false)) {
-        this.sendTerminalDeliveryFailure(sender, data, "Terminal owner delivery failed");
+        this.sendTerminalDeliveryFailure(sender, data, TERMINAL_OWNER_UNAVAILABLE_ERROR);
       }
       return;
     }
@@ -752,9 +906,24 @@ export class HubDO extends Server<Env> {
     }
 
     const timer = setTimeout(() => {
-      this.failPendingTerminalDelivery(key, "No active terminal owner for session");
-    }, TERMINAL_OWNER_GRACE_MS);
+      if (data.type === "terminal-control" && data.action === "resize") {
+        // Resize/claim is advisory: later input carries the latest dimensions,
+        // so an absent owner turns this expected reconnect race into a no-op.
+        this.acknowledgePendingTerminalResize(key);
+        return;
+      }
+      this.failPendingTerminalDelivery(key, TERMINAL_OWNER_UNAVAILABLE_ERROR);
+    }, this.terminalOwnerGraceMs(data));
     this.pendingTerminalDeliveries.set(key, { sender, message: data, timer });
+  }
+
+  private terminalOwnerGraceMs(data: TerminalInputMessage | TerminalControlMessage): number {
+    if (data.type !== "terminal-input") return TERMINAL_OWNER_GRACE_MS;
+    const session = Q.getSession(this.db, data.sessionId);
+    const scope = session ? readTerminalScopeFromStoredSession(session) : null;
+    return scope?.kind === "plan-writer"
+      ? PLAN_WRITER_TERMINAL_OWNER_GRACE_MS
+      : TERMINAL_OWNER_GRACE_MS;
   }
 
   private failPendingTerminalDelivery(key: string, error: string): void {
@@ -763,6 +932,14 @@ export class HubDO extends Server<Env> {
     this.pendingTerminalDeliveries.delete(key);
     clearTimeout(pending.timer);
     this.sendTerminalDeliveryFailure(pending.sender, pending.message, error);
+  }
+
+  private acknowledgePendingTerminalResize(key: string): void {
+    const pending = this.pendingTerminalDeliveries.get(key);
+    if (!pending || pending.message.type !== "terminal-control") return;
+    this.pendingTerminalDeliveries.delete(key);
+    clearTimeout(pending.timer);
+    this.sendTerminalDeliverySuccess(pending.sender, pending.message);
   }
 
   private sendTerminalDeliveryFailure(
@@ -805,7 +982,7 @@ export class HubDO extends Server<Env> {
       }
       return;
     }
-    const owner = this.getLatestSessionOwnerConnection(sessionId);
+    const owner = this.getActiveSessionOwnerConnection(sessionId);
     if (!owner) return;
 
     for (const [key, pending] of this.pendingTerminalDeliveries) {
@@ -816,7 +993,7 @@ export class HubDO extends Server<Env> {
         this.sendTerminalDeliveryFailure(
           pending.sender,
           pending.message,
-          "Terminal owner socket closed before input could be delivered",
+          TERMINAL_OWNER_UNAVAILABLE_ERROR,
         );
       }
     }
@@ -825,6 +1002,24 @@ export class HubDO extends Server<Env> {
   private clearPendingTerminalDeliveriesForConnection(connectionId: string): void {
     for (const [key, pending] of this.pendingTerminalDeliveries) {
       if (pending.sender.id !== connectionId) continue;
+      clearTimeout(pending.timer);
+      this.pendingTerminalDeliveries.delete(key);
+    }
+  }
+
+  private clearPendingTerminalDeliveriesForClient(
+    connectionId: string,
+    sessionId: string,
+    clientId: string,
+  ): void {
+    for (const [key, pending] of this.pendingTerminalDeliveries) {
+      if (
+        pending.sender.id !== connectionId ||
+        pending.message.sessionId !== sessionId ||
+        pending.message.clientId !== clientId
+      ) {
+        continue;
+      }
       clearTimeout(pending.timer);
       this.pendingTerminalDeliveries.delete(key);
     }
@@ -858,12 +1053,14 @@ export class HubDO extends Server<Env> {
             clientId: data.clientId,
             inputSeq: data.inputSeq,
             data: data.data,
+            ...(data.deliveryId ? { deliveryId: data.deliveryId } : {}),
             ...(data.cols !== undefined ? { cols: data.cols } : {}),
             ...(data.rows !== undefined ? { rows: data.rows } : {}),
           });
         } else {
           this.send(owner, data);
         }
+        this.rememberTerminalAckOwner(owner, data);
         return true;
       } catch {
         return false;
@@ -875,7 +1072,11 @@ export class HubDO extends Server<Env> {
         ownerState.terminalControllerConnectionId === sender.id &&
         ownerState.terminalControllerClientId === data.clientId;
       const unowned = !ownerState.terminalControllerConnectionId;
-      if (!unowned && !controllerMatches) {
+      const mayControl =
+        controllerMatches ||
+        data.claim === true ||
+        (data.claim === undefined && unowned);
+      if (!mayControl) {
         this.sendTerminalDeliverySuccess(sender, data);
         return true;
       }
@@ -885,6 +1086,7 @@ export class HubDO extends Server<Env> {
       } catch {
         return false;
       }
+      this.rememberTerminalAckOwner(owner, data);
       this.setTerminalController(owner, sender.id, data.clientId);
       return true;
     }
@@ -902,6 +1104,7 @@ export class HubDO extends Server<Env> {
           clientId: data.clientId,
           inputSeq: data.inputSeq,
           data: data.data,
+          ...(data.deliveryId ? { deliveryId: data.deliveryId } : {}),
           ...(data.cols !== undefined ? { cols: data.cols } : {}),
           ...(data.rows !== undefined ? { rows: data.rows } : {}),
           applyDimensions,
@@ -909,6 +1112,7 @@ export class HubDO extends Server<Env> {
       } catch {
         return false;
       }
+      this.rememberTerminalAckOwner(owner, data);
       if (data.data.length > 0) {
         this.setTerminalController(owner, sender.id, data.clientId);
       }
@@ -917,6 +1121,7 @@ export class HubDO extends Server<Env> {
 
     try {
       this.send(owner, data);
+      this.rememberTerminalAckOwner(owner, data);
       return true;
     } catch {
       return false;
@@ -975,23 +1180,52 @@ export class HubDO extends Server<Env> {
     }
   }
 
-  private releaseControllersOnReplacedOwners(sessionId: string, currentOwnerId: string): void {
+  private activateSessionOwner(connection: Connection, sessionId: string): void {
     for (const candidate of this.getConnections()) {
-      if (candidate.id === currentOwnerId) continue;
       const state = candidate.state as WsConnectionState | undefined;
       if (
         state?.sessionId !== sessionId ||
-        state.sessionLifecycle !== "owner" ||
-        !state.terminalControllerConnectionId
+        state.sessionLifecycle !== "owner"
       ) {
         continue;
       }
+      const active = candidate.id === connection.id;
       candidate.setState({
         ...state,
-        terminalControllerConnectionId: undefined,
-        terminalControllerClientId: undefined,
+        terminalOwnerActive: active,
+        ...(!active
+          ? {
+              terminalControllerConnectionId: undefined,
+              terminalControllerClientId: undefined,
+            }
+          : {}),
       } as WsConnectionState);
     }
+  }
+
+  private claimSessionOwnerIfVacant(connection: Connection, sessionId: string): boolean {
+    const active = this.getActiveSessionOwnerConnection(sessionId);
+    if (active && active.id !== connection.id) return false;
+    this.activateSessionOwner(connection, sessionId);
+    return true;
+  }
+
+  private promoteStandbyOwner(sessionId: string, excludedConnectionId: string): void {
+    const candidates = [...this.getConnections()].filter((candidate) => {
+      const state = candidate.state as WsConnectionState | undefined;
+      return (
+        candidate.id !== excludedConnectionId &&
+        candidate.readyState === WebSocket.OPEN &&
+        state?.sessionId === sessionId &&
+        state.sessionLifecycle === "owner"
+      );
+    });
+    const replacement = candidates.find((candidate) =>
+      (candidate.state as WsConnectionState | undefined)?.terminalOperationProtocol === 1)
+      ?? candidates[0];
+    if (!replacement) return;
+    this.activateSessionOwner(replacement, sessionId);
+    this.flushPendingTerminalDeliveries(sessionId);
   }
 
   private handleTerminalInputAck(
@@ -1012,14 +1246,17 @@ export class HubDO extends Server<Env> {
     sender: Connection,
     data: TerminalInputAckMessage | TerminalControlAckMessage,
   ): void {
-    // Only the session owner (the harness) may emit ACKs.
-    const senderState = sender.state as WsConnectionState | undefined;
-    if (
-      senderState?.sessionId !== data.sessionId ||
-      senderState.sessionLifecycle !== "owner"
-    ) {
+    // A handoff may demote the owner after it applied an operation but before
+    // its ACK arrives. Authorize that bounded in-flight route exactly once.
+    const ackKey = this.terminalAckKey(data);
+    const deliveredOwnerId = this.terminalAckOwnerRoutes.get(ackKey);
+    const authorized = deliveredOwnerId !== undefined
+      ? deliveredOwnerId === sender.id
+      : this.isActiveSessionOwnerConnection(sender, data.sessionId);
+    if (!authorized) {
       return;
     }
+    this.terminalAckOwnerRoutes.delete(ackKey);
 
     const routeKey = `${data.sessionId}:${data.clientId}`;
     for (const conn of this.getConnections()) {
@@ -1046,7 +1283,7 @@ export class HubDO extends Server<Env> {
     }
     const session = Q.getSession(this.db, sessionId);
     if (session) {
-      this.broadcastToAll({ type: "session-updated", session });
+      this.broadcastGlobal({ type: "session-updated", session });
     }
   }
 
@@ -1066,7 +1303,7 @@ export class HubDO extends Server<Env> {
     }
     const machine = Q.getMachine(this.db, machineId);
     if (machine) {
-      this.broadcastToAll({ type: "machine-updated", machine });
+      this.broadcastGlobal({ type: "machine-updated", machine });
     }
   }
 
@@ -1096,14 +1333,11 @@ export class HubDO extends Server<Env> {
     );
 
     if (sessionId && sessionLifecycle === "owner") {
-      // Stamp sessionOwnerSeenAt so the reconnected owner is immediately
-      // eligible for terminal fast-lane routing (not only after the next
-      // session-alive heartbeat).
       connection.setState({
         ...state,
         sessionId,
         sessionLifecycle,
-        sessionOwnerSeenAt: Date.now(),
+        terminalOwnerActive: ownerRebound ? false : state.terminalOwnerActive,
         terminalOperationProtocol: data.terminalOperationProtocol === 1 ? 1 : undefined,
         ...(ownerRebound
           ? {
@@ -1112,7 +1346,20 @@ export class HubDO extends Server<Env> {
             }
           : {}),
       } as WsConnectionState);
-      this.releaseControllersOnReplacedOwners(sessionId, connection.id);
+      if (data.terminalOperationProtocol === 1) {
+        // A capable explicit reconnect is the ownership election point.
+        this.activateSessionOwner(connection, sessionId);
+      } else {
+        this.claimSessionOwnerIfVacant(connection, sessionId);
+      }
+      if (
+        ownerRebound &&
+        state.terminalOwnerActive &&
+        state.sessionId &&
+        state.sessionId !== sessionId
+      ) {
+        this.promoteStandbyOwner(state.sessionId, connection.id);
+      }
     } else if (
       sessionId &&
       (state.sessionId !== sessionId || state.sessionLifecycle !== sessionLifecycle)
@@ -1121,17 +1368,21 @@ export class HubDO extends Server<Env> {
         ...state,
         sessionId,
         sessionLifecycle,
+        terminalOwnerActive: false,
         terminalOperationProtocol: undefined,
         terminalControllerConnectionId: undefined,
         terminalControllerClientId: undefined,
       } as WsConnectionState);
+      if (state.terminalOwnerActive && state.sessionId) {
+        this.promoteStandbyOwner(state.sessionId, connection.id);
+      }
     }
 
     if (sessionId && shouldRevive) {
       Q.reviveSession(this.db, sessionId);
       const session = Q.getSession(this.db, sessionId);
       if (session) {
-        this.broadcastToAll({ type: "session-updated", session });
+        this.broadcastGlobal({ type: "session-updated", session });
       }
       this.flushPendingTerminalDeliveries(sessionId);
     }
@@ -1146,6 +1397,15 @@ export class HubDO extends Server<Env> {
       const registrationId = typeof data.registrationId === "string" && data.registrationId.length <= 128
         ? data.registrationId
         : undefined;
+      if (!shouldRevive) {
+        this.send(connection, {
+          type: "replay",
+          events: [],
+          sessionId,
+          ...(registrationId ? { registrationId } : {}),
+        });
+        return;
+      }
       await this.serializeSessionAppend(sessionId, async () => {
         const baselineSeq = await this.getSessionCanonicalMaxSequence(sessionId);
         this.send(connection, {
@@ -1222,39 +1482,44 @@ export class HubDO extends Server<Env> {
     Q.setMachineActive(this.db, machineId, false);
     const updated = Q.getMachine(this.db, machineId);
     if (updated) {
-      this.broadcastToAll({ type: "machine-updated", machine: updated });
+      this.broadcastGlobal({ type: "machine-updated", machine: updated });
     }
   }
 
   // ── Connection cleanup ────────────────────────────────────────
 
   private cleanupConnection(connection: Connection): void {
+    const state = connection.state as WsConnectionState | undefined;
     this.clearPendingTerminalDeliveriesForConnection(connection.id);
     this.releaseTerminalController(connection.id);
+    if (state?.terminalOwnerActive && state.sessionId) {
+      connection.setState({ ...state, terminalOwnerActive: false } as WsConnectionState);
+      this.promoteStandbyOwner(state.sessionId, connection.id);
+    }
   }
 
   broadcastEnvUpsert(env: EnvMeta): void {
-    this.broadcastToAll({ type: "env-upsert", env });
+    this.broadcastGlobal({ type: "env-upsert", env });
   }
 
   broadcastEnvRemove(slug: string): void {
-    this.broadcastToAll({ type: "env-remove", slug });
+    this.broadcastGlobal({ type: "env-remove", slug });
   }
 
   broadcastRepoUpsert(repo: RepoMeta): void {
-    this.broadcastToAll({ type: "repo-upsert", repo });
+    this.broadcastGlobal({ type: "repo-upsert", repo });
   }
 
   broadcastRepoRemove(repoId: string): void {
-    this.broadcastToAll({ type: "repo-remove", repoId });
+    this.broadcastGlobal({ type: "repo-remove", repoId });
   }
 
   broadcastPlanArtifactUpdated(repoId: string, planArtifactId: string): void {
-    this.broadcastToAll({ type: "plan-artifact-updated", repoId, planArtifactId });
+    this.broadcastGlobal({ type: "plan-artifact-updated", repoId, planArtifactId });
   }
 
   broadcastPlanWriterState(repoId: string, planArtifactId: string): void {
-    this.broadcastToAll({ type: "plan-writer-state", repoId, planArtifactId });
+    this.broadcastGlobal({ type: "plan-writer-state", repoId, planArtifactId });
   }
 
   broadcastRepoMainChange(
@@ -1264,7 +1529,7 @@ export class HubDO extends Server<Env> {
     currentMainCommit: string | null,
     sourceEnvSlug?: string | null,
   ): void {
-    this.broadcastToAll({
+    this.broadcastGlobal({
       type: "repo-main-changed",
       repoId,
       repoUrl,
@@ -1283,8 +1548,35 @@ export class HubDO extends Server<Env> {
     metadata: unknown,
   ): StoredSession {
     const session = Q.createSession(this.db, id, tag, machineId, metadata);
-    this.broadcastToAll({ type: "session-updated", session });
+    this.broadcastGlobal({ type: "session-updated", session });
     return session;
+  }
+
+  ensurePlanWriterTerminal(
+    id: string,
+    tag: string,
+    machineId: string | null,
+    metadata: unknown,
+    repoId: string,
+    planArtifactId: string,
+    generation: number,
+  ):
+    | { status: "ready"; session: StoredSession; created: boolean }
+    | { status: "unavailable" } {
+    const result = Q.ensurePlanWriterTerminal(
+      this.db,
+      id,
+      tag,
+      machineId,
+      metadata,
+      repoId,
+      planArtifactId,
+      generation,
+    );
+    if (result.status === "ready" && result.created) {
+      this.broadcastGlobal({ type: "session-updated", session: result.session });
+    }
+    return result;
   }
 
   getSession(id: string): StoredSession | null {
@@ -1304,9 +1596,8 @@ export class HubDO extends Server<Env> {
     for (const conn of this.getConnections()) {
       const state = conn.state as WsConnectionState | undefined;
       if (
-        conn.readyState === WebSocket.OPEN &&
         state?.sessionId &&
-        state.sessionLifecycle === "owner"
+        this.isActiveSessionOwnerConnection(conn, state.sessionId)
       ) {
         const session = Q.getSession(this.db, state.sessionId);
         const scope = session ? readTerminalScopeFromStoredSession(session) : null;
@@ -1333,10 +1624,11 @@ export class HubDO extends Server<Env> {
   ): StoredSession | null {
     const session = Q.revokePlanWriterTerminal(this.db, id, repoId, planArtifactId, generation);
     if (!session) return null;
+    const activeOwner = this.getActiveSessionOwnerConnection(id);
     for (const conn of this.getConnections()) {
       const state = conn.state as WsConnectionState | undefined;
       if (state?.sessionId !== id) continue;
-      if (state.sessionLifecycle === "owner") {
+      if (activeOwner?.id === conn.id) {
         // Revocation is already durable, so this direct best-effort interrupt
         // cannot re-enable input or race a replacement generation.
         this.send(conn, {
@@ -1354,7 +1646,8 @@ export class HubDO extends Server<Env> {
       } as WsConnectionState);
     }
     this.flushPendingTerminalDeliveries(id);
-    this.broadcastToAll({ type: "session-updated", session });
+    this.broadcastGlobal({ type: "session-updated", session });
+    this.closeScopedSessionConnections(id, "Session revoked");
     return session;
   }
 
@@ -1368,14 +1661,15 @@ export class HubDO extends Server<Env> {
 
   deleteSession(id: string): void {
     Q.deleteSession(this.db, id);
-    this.broadcastToAll({ type: "session-deleted", sessionId: id });
+    this.broadcastGlobal({ type: "session-deleted", sessionId: id });
+    this.closeScopedSessionConnections(id, "Session deleted");
   }
 
   setSessionActive(id: string, active: boolean): void {
     Q.setSessionActive(this.db, id, active);
     const session = Q.getSession(this.db, id);
     if (session) {
-      this.broadcastToAll({ type: "session-updated", session });
+      this.broadcastGlobal({ type: "session-updated", session });
     }
   }
 
@@ -1453,6 +1747,7 @@ export class HubDO extends Server<Env> {
         // identifies the registration but never proves live compatibility.
         runnerCommandProtocol: live.runnerCommandProtocol,
         codexRuntimeAuthProtocol: live.codexRuntimeAuthProtocol,
+        reviewerIsolationProtocol: live.reviewerIsolationProtocol,
       };
     } catch {
       return null;
@@ -1549,7 +1844,7 @@ export class HubDO extends Server<Env> {
       excludePrefixes: string[];
     },
   ): Promise<{ sent: boolean; error?: string }> {
-    const owner = this.getLatestSessionOwnerConnection(sessionId);
+    const owner = this.getActiveSessionOwnerConnection(sessionId);
     if (!owner) {
       return { sent: false, error: "No active harness session is connected for review snapshot." };
     }
@@ -1574,6 +1869,11 @@ export class HubDO extends Server<Env> {
     localId: string | null,
     excludeConnectionId?: string,
   ): Promise<{ message: StoredMessage; sessionSeq: number }> {
+    const terminalOutput = Boolean(
+      content &&
+      typeof content === "object" &&
+      (content as { type?: unknown }).type === "terminal-output",
+    );
     return this.serializeSessionAppend(sessionId, async () => {
       if (!Q.getSession(this.db, sessionId)) {
         console.error("[HubDO] session append rejected", {
@@ -1593,6 +1893,10 @@ export class HubDO extends Server<Env> {
       }
 
       let appended;
+      const contentBytes = terminalOutput && this.terminalMetricsEnabled
+        ? new TextEncoder().encode(JSON.stringify(content)).byteLength
+        : 0;
+      const commitStartedAt = performance.now();
       try {
         appended = await thread.appendSessionMessage({
           id,
@@ -1612,7 +1916,15 @@ export class HubDO extends Server<Env> {
           code,
         });
         throw new Error(code);
+      } finally {
+        if (terminalOutput && this.terminalMetricsEnabled) {
+          this.terminalCommitRoundTripMetrics.record(
+            performance.now() - commitStartedAt,
+            contentBytes,
+          );
+        }
       }
+      const commitCompletedAt = performance.now();
 
       const message = this.threadMessageToStoredMessage(sessionId, appended.message);
       const result = { message, sessionSeq: message.seq };
@@ -1628,21 +1940,32 @@ export class HubDO extends Server<Env> {
           seq: message.seq,
           localId: message.local_id ?? undefined,
         };
-        const broadcastStartedAt = performance.now();
-        this.broadcastToAll(event, excludeConnectionId);
-        this.terminalBroadcastMetrics.record(
-          performance.now() - broadcastStartedAt,
-          new TextEncoder().encode(JSON.stringify(event)).byteLength,
-        );
+        this.sendToSession(sessionId, event, excludeConnectionId);
+        if (terminalOutput && this.terminalMetricsEnabled) {
+          this.terminalBroadcastMetrics.record(
+            performance.now() - commitCompletedAt,
+            new TextEncoder().encode(JSON.stringify(event)).byteLength,
+          );
+        }
       }
 
       return result;
-    });
+    }, terminalOutput);
   }
 
-  private serializeSessionAppend<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+  private serializeSessionAppend<T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+    recordTerminalQueueWait = false,
+  ): Promise<T> {
+    const enqueuedAt = performance.now();
     const previous = this.sessionAppendTails.get(sessionId) ?? Promise.resolve();
-    const result = previous.catch(() => undefined).then(operation);
+    const result = previous.catch(() => undefined).then(() => {
+      if (recordTerminalQueueWait) {
+        this.terminalAppendQueueMetrics.record(performance.now() - enqueuedAt);
+      }
+      return operation();
+    });
     const tail = result.then(() => undefined, () => undefined);
     this.sessionAppendTails.set(sessionId, tail);
     void tail.then(() => {
@@ -1738,28 +2061,21 @@ export class HubDO extends Server<Env> {
     return thread ? await thread.getCanonicalMaxSequence() : 0;
   }
 
-  private getLatestSessionOwnerConnection(sessionId: string): Connection | null {
-    let selected: { connection: Connection; seenAt: number } | null = null;
-
+  private getActiveSessionOwnerConnection(sessionId: string): Connection | null {
     for (const conn of this.getConnections()) {
-      const state = conn.state as WsConnectionState | undefined;
-      if (
-        conn.readyState !== WebSocket.OPEN ||
-        state?.sessionId !== sessionId ||
-        state.sessionLifecycle !== "owner"
-      ) {
-        continue;
-      }
-
-      // Owners without a stamp (e.g. connected before this field existed)
-      // stay eligible at lowest priority.
-      const seenAt = typeof state.sessionOwnerSeenAt === "number" ? state.sessionOwnerSeenAt : 0;
-      if (!selected || seenAt >= selected.seenAt) {
-        selected = { connection: conn, seenAt };
-      }
+      if (this.isActiveSessionOwnerConnection(conn, sessionId)) return conn;
     }
+    return null;
+  }
 
-    return selected?.connection ?? null;
+  private isActiveSessionOwnerConnection(connection: Connection, sessionId: string): boolean {
+    const state = connection.state as WsConnectionState | undefined;
+    return (
+      connection.readyState === WebSocket.OPEN &&
+      state?.sessionId === sessionId &&
+      state.sessionLifecycle === "owner" &&
+      state.terminalOwnerActive === true
+    );
   }
 
   private resolveRunnerMachineId(
@@ -1806,7 +2122,7 @@ export class HubDO extends Server<Env> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRunnerRequests.delete(requestId);
-        reject(new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE, {
+        reject(Object.assign(new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE), {
           cause: new Error("Timed out waiting for the execution machine."),
         }));
       }, timeoutMs);
@@ -1883,7 +2199,7 @@ export class HubDO extends Server<Env> {
     toolInput: unknown,
   ): StoredPermission {
     const permission = Q.createPermission(this.db, id, sessionId, toolName, toolInput);
-    this.broadcastToAll({ type: "permission-created", permission });
+    this.broadcastGlobal({ type: "permission-created", permission });
     return permission;
   }
 
@@ -1910,7 +2226,7 @@ export class HubDO extends Server<Env> {
     }
 
     // Broadcast resolution to all WS clients
-    this.broadcastToAll({ type: "permission-resolved", permission });
+    this.broadcastGlobal({ type: "permission-resolved", permission });
 
     // Resolve any waiting long-poll request
     const poll = this.pendingPolls.get(permId);
@@ -2051,9 +2367,6 @@ export class HubDO extends Server<Env> {
       ]) {
         this.db.exec("DELETE FROM config WHERE key = ?", key);
       }
-      // Pending origin-bound attempts cannot safely survive the strict
-      // workers.dev ingress cutover.
-      this.db.exec("DELETE FROM repo_cloudflare_mcp_oauth_states");
       // Hostname-derived machine registrations belong to the retired format.
       this.db.exec("DELETE FROM machines");
       this.setConfig(EXECUTION_MIGRATION_KEY, "1");
@@ -2072,6 +2385,13 @@ export class HubDO extends Server<Env> {
       throw new Error("Persisted execution backend selection is invalid.");
     }
     return selection;
+  }
+
+  private readSelectedHostMachineId(): string | null {
+    const selection = parseExecutionSelection(
+      readOptionalConfigValue(this.db, EXECUTION_SELECTION_KEY),
+    );
+    return selection?.target === "host" ? selection.machineId : null;
   }
 
   private readExecutionStatusNow(): ExecutionStatus {
@@ -2259,11 +2579,11 @@ export class HubDO extends Server<Env> {
     const decrypted = await crypto.subtle.decrypt(
       {
         name: "AES-GCM",
-        iv: base64ToBytes(args.nonce),
+        iv: bytesToArrayBuffer(base64ToBytes(args.nonce)),
         additionalData: aad,
       },
       args.key,
-      base64ToBytes(args.encryptedValue),
+      bytesToArrayBuffer(base64ToBytes(args.encryptedValue)),
     );
     return new TextDecoder().decode(decrypted);
   }
@@ -2410,441 +2730,6 @@ export class HubDO extends Server<Env> {
     Q.deleteRepoMcpServers(this.db, repoId);
   }
 
-  // ── Repo Cloudflare API MCP RPC methods ───────────────────────
-
-  private async getOrCreateCloudflareMcpDataKey(): Promise<string> {
-    return this.ctx.storage.transaction(async (txn) => {
-      const existing = await txn.get<string>(REPO_CLOUDFLARE_MCP_DATA_KEY);
-      if (existing) return existing;
-
-      const created = createDataKey();
-      await txn.put(REPO_CLOUDFLARE_MCP_DATA_KEY, created);
-      return created;
-    });
-  }
-
-  private async getCloudflareMcpDataKey(): Promise<string | null> {
-    const value = await this.ctx.storage.get<string>(REPO_CLOUDFLARE_MCP_DATA_KEY);
-    return value ?? null;
-  }
-
-  private async encryptCloudflareMcpSecret(args: {
-    key: CryptoKey;
-    repoId: string;
-    field: string;
-    value: string;
-  }): Promise<{ encryptedValue: string; nonce: string }> {
-    const nonce = new Uint8Array(12);
-    crypto.getRandomValues(nonce);
-    const aad = new TextEncoder().encode(`${args.repoId}\0${args.field}`);
-    const encrypted = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: nonce, additionalData: aad },
-      args.key,
-      new TextEncoder().encode(args.value),
-    );
-    return {
-      encryptedValue: bytesToBase64(new Uint8Array(encrypted)),
-      nonce: bytesToBase64(nonce),
-    };
-  }
-
-  private async decryptCloudflareMcpSecret(args: {
-    key: CryptoKey;
-    repoId: string;
-    field: string;
-    encryptedValue: string;
-    nonce: string;
-  }): Promise<string> {
-    const aad = new TextEncoder().encode(`${args.repoId}\0${args.field}`);
-    const decrypted = await crypto.subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv: base64ToBytes(args.nonce),
-        additionalData: aad,
-      },
-      args.key,
-      base64ToBytes(args.encryptedValue),
-    );
-    return new TextDecoder().decode(decrypted);
-  }
-
-  private async decryptCloudflareMcpSecrets(repoId: string): Promise<CloudflareMcpStoredSecrets | null> {
-    const row = Q.getRepoCloudflareMcpCredentialRow(this.db, repoId);
-    if (!row) return null;
-    const rawKey = await this.getCloudflareMcpDataKey();
-    if (!rawKey) throw new Error("Cloudflare MCP data key is missing.");
-    const key = await importAesKey(rawKey);
-    return {
-      accessToken: await this.decryptCloudflareMcpSecret({
-        key,
-        repoId,
-        field: "access_token",
-        encryptedValue: row.encrypted_access_token,
-        nonce: row.access_token_nonce,
-      }),
-      refreshToken: await this.decryptCloudflareMcpSecret({
-        key,
-        repoId,
-        field: "refresh_token",
-        encryptedValue: row.encrypted_refresh_token,
-        nonce: row.refresh_token_nonce,
-      }),
-    };
-  }
-
-  private buildCloudflareMcpStatus(
-    row: ReturnType<typeof Q.getRepoCloudflareMcpCredentialRow>,
-  ): CloudflareMcpStatus {
-    if (!row) return createCloudflareMcpStatus(null);
-    return createCloudflareMcpStatus({
-      enabled: row.enabled === 1,
-      scopes: row.scopes,
-      expiresAt: row.expires_at,
-      accountId: row.account_id,
-      accountName: row.account_name,
-      lastAuthError: row.last_auth_error,
-      lastAuthErrorAt: row.last_auth_error_at,
-    });
-  }
-
-  getRepoCloudflareMcpStatus(repoId: string): CloudflareMcpStatus {
-    return this.buildCloudflareMcpStatus(
-      Q.getRepoCloudflareMcpCredentialRow(this.db, repoId),
-    );
-  }
-
-  async startRepoCloudflareMcpOAuth(repoId: string, input: {
-    redirectUri: string;
-    hubOrigin: string;
-    requestIdentity?: string | null;
-  }): Promise<{ authorizeUrl: string; expiresAt: number }> {
-    Q.deleteExpiredRepoCloudflareMcpPendingOAuth(this.db, Date.now());
-    const state = createCloudflareMcpOAuthState();
-    const pkce = await createCloudflareMcpPkcePair();
-    const configuredClient = resolveConfiguredCloudflareMcpOAuthClient(this.env);
-    const client = configuredClient ?? await registerCloudflareMcpOAuthClient({
-      redirectUri: input.redirectUri,
-      hubOrigin: input.hubOrigin,
-    });
-    const expiresAt = Date.now() + CLOUDFLARE_MCP_OAUTH_STATE_TTL_MS;
-    Q.upsertRepoCloudflareMcpPendingOAuthRow(this.db, {
-      state,
-      repo_id: repoId,
-      redirect_uri: input.redirectUri,
-      pkce_verifier: pkce.verifier,
-      client_id: client.clientId,
-      initiating_identity: input.requestIdentity ?? null,
-      expires_at: expiresAt,
-    });
-    return {
-      authorizeUrl: buildCloudflareMcpAuthorizeUrl({
-        clientId: client.clientId,
-        redirectUri: input.redirectUri,
-        state,
-        pkceChallenge: pkce.challenge,
-      }),
-      expiresAt,
-    };
-  }
-
-  async completeRepoCloudflareMcpOAuth(repoId: string, input: {
-    state: string;
-    code: string;
-    redirectUri: string;
-    requestIdentity?: string | null;
-  }): Promise<CloudflareMcpStatus> {
-    const pending = Q.getRepoCloudflareMcpPendingOAuthRow(this.db, input.state);
-    if (!pending || pending.repo_id !== repoId) {
-      throw new CloudflareMcpUserError(400, "cloudflare_oauth_state_invalid", "Cloudflare MCP OAuth state is invalid.");
-    }
-    if (pending.expires_at <= Date.now()) {
-      Q.deleteRepoCloudflareMcpPendingOAuthState(this.db, input.state);
-      throw new CloudflareMcpUserError(400, "cloudflare_oauth_state_expired", "Cloudflare MCP OAuth state expired.");
-    }
-    if (pending.redirect_uri !== input.redirectUri) {
-      throw new CloudflareMcpUserError(400, "cloudflare_oauth_redirect_invalid", "Cloudflare MCP OAuth redirect URI did not match.");
-    }
-    if (pending.initiating_identity && pending.initiating_identity !== (input.requestIdentity ?? null)) {
-      throw new CloudflareMcpUserError(403, "cloudflare_oauth_identity_invalid", "Cloudflare MCP OAuth callback identity did not match.");
-    }
-
-    const configuredClient = resolveConfiguredCloudflareMcpOAuthClient(this.env);
-    const client: CloudflareMcpOAuthClient = {
-      clientId: pending.client_id,
-      clientSecret: configuredClient?.clientId === pending.client_id ? configuredClient.clientSecret : null,
-    };
-    const tokens = await exchangeCloudflareMcpOAuthCode({
-      client,
-      code: input.code,
-      redirectUri: input.redirectUri,
-      pkceVerifier: pending.pkce_verifier,
-    });
-    const storedTokens = buildStoredCloudflareMcpTokenFields({ tokens });
-    const account = await fetchCloudflareMcpAccountMetadata(storedTokens.accessToken);
-    const credentialKey = await importAesKey(await this.getOrCreateCloudflareMcpDataKey());
-    const encryptedAccessToken = await this.encryptCloudflareMcpSecret({
-      key: credentialKey,
-      repoId,
-      field: "access_token",
-      value: storedTokens.accessToken,
-    });
-    const encryptedRefreshToken = await this.encryptCloudflareMcpSecret({
-      key: credentialKey,
-      repoId,
-      field: "refresh_token",
-      value: storedTokens.refreshToken,
-    });
-    const existing = Q.getRepoCloudflareMcpCredentialRow(this.db, repoId);
-    this.ctx.storage.transactionSync(() => {
-      Q.upsertRepoCloudflareMcpCredentialRow(this.db, {
-        repo_id: repoId,
-        client_id: client.clientId,
-        encrypted_access_token: encryptedAccessToken.encryptedValue,
-        access_token_nonce: encryptedAccessToken.nonce,
-        encrypted_refresh_token: encryptedRefreshToken.encryptedValue,
-        refresh_token_nonce: encryptedRefreshToken.nonce,
-        token_type: storedTokens.tokenType,
-        scopes: JSON.stringify(storedTokens.scopes),
-        expires_at: storedTokens.expiresAt,
-        account_id: account?.id ?? existing?.account_id ?? null,
-        account_name: account?.name ?? existing?.account_name ?? null,
-        enabled: existing?.enabled === 1 ? 1 : 0,
-        last_auth_error: null,
-        last_auth_error_at: null,
-      });
-      Q.deleteRepoCloudflareMcpPendingOAuthState(this.db, pending.state);
-    });
-    return this.getRepoCloudflareMcpStatus(repoId);
-  }
-
-  enableRepoCloudflareMcp(repoId: string): CloudflareMcpStatus {
-    const row = Q.getRepoCloudflareMcpCredentialRow(this.db, repoId);
-    if (!row) {
-      throw new CloudflareMcpUserError(409, "cloudflare_not_connected", "Connect Cloudflare API MCP before enabling it.");
-    }
-    if (row.last_auth_error) {
-      throw new CloudflareMcpUserError(409, "cloudflare_reauth_required", "Reconnect Cloudflare API MCP before enabling it.");
-    }
-    Q.setRepoCloudflareMcpEnabled(this.db, repoId, true);
-    return this.getRepoCloudflareMcpStatus(repoId);
-  }
-
-  disableRepoCloudflareMcp(repoId: string): CloudflareMcpStatus {
-    Q.setRepoCloudflareMcpEnabled(this.db, repoId, false);
-    this.revokeCloudflareMcpProxyTokensForRepo(repoId);
-    return this.getRepoCloudflareMcpStatus(repoId);
-  }
-
-  disconnectRepoCloudflareMcp(repoId: string): CloudflareMcpStatus {
-    this.ctx.storage.transactionSync(() => {
-      Q.deleteRepoCloudflareMcpCredentials(this.db, repoId);
-      Q.deleteRepoCloudflareMcpPendingOAuth(this.db, repoId);
-      Q.deleteRepoCloudflareMcpProxyTokens(this.db, repoId);
-    });
-    return this.getRepoCloudflareMcpStatus(repoId);
-  }
-
-  deleteRepoCloudflareMcpIntegration(repoId: string): void {
-    this.ctx.storage.transactionSync(() => {
-      Q.deleteRepoCloudflareMcpCredentials(this.db, repoId);
-      Q.deleteRepoCloudflareMcpPendingOAuth(this.db, repoId);
-      Q.deleteRepoCloudflareMcpAuditEvents(this.db, repoId);
-      Q.deleteRepoCloudflareMcpProxyTokens(this.db, repoId);
-    });
-  }
-
-  async mintCloudflareMcpProxyToken(repoId: string, envSlug: string): Promise<string | null> {
-    const row = Q.getRepoCloudflareMcpCredentialRow(this.db, repoId);
-    if (!row || row.enabled !== 1 || row.last_auth_error) return null;
-    try {
-      await this.getValidCloudflareMcpAccessToken(repoId);
-    } catch {
-      return null;
-    }
-    const token = createCloudflareMcpProxyToken();
-    const tokenHash = await hashCloudflareMcpProxyToken(token);
-    Q.revokeRepoCloudflareMcpProxyTokensForEnv(this.db, envSlug);
-    Q.insertRepoCloudflareMcpProxyToken(this.db, {
-      token_hash: tokenHash,
-      repo_id: repoId,
-      env_slug: envSlug,
-      server_id: CLOUDFLARE_API_MCP_SERVER_ID,
-      incarnation_id: null,
-      start_op_id: null,
-      expires_at: Date.now() + CLOUDFLARE_MCP_PROXY_TOKEN_TTL_MS,
-    });
-    return token;
-  }
-
-  async mintCloudflareMcpProxyTokenForStart(
-    repoId: string,
-    envSlug: string,
-    scope: { incarnationId: string; startOpId: string },
-  ): Promise<{ token: string; credentialId: string } | null> {
-    const row = Q.getRepoCloudflareMcpCredentialRow(this.db, repoId);
-    if (!row || row.enabled !== 1 || row.last_auth_error) return null;
-    try {
-      await this.getValidCloudflareMcpAccessToken(repoId);
-    } catch {
-      return null;
-    }
-    const token = createCloudflareMcpProxyToken();
-    const tokenHash = await hashCloudflareMcpProxyToken(token);
-    Q.insertRepoCloudflareMcpProxyToken(this.db, {
-      token_hash: tokenHash,
-      repo_id: repoId,
-      env_slug: envSlug,
-      server_id: CLOUDFLARE_API_MCP_SERVER_ID,
-      incarnation_id: scope.incarnationId,
-      start_op_id: scope.startOpId,
-      expires_at: Date.now() + CLOUDFLARE_MCP_PROXY_TOKEN_TTL_MS,
-    });
-    return { token, credentialId: tokenHash };
-  }
-
-  async validateCloudflareMcpProxyToken(token: string): Promise<CloudflareMcpLaunchTokenValidation> {
-    const tokenHash = await hashCloudflareMcpProxyToken(token);
-    const row = Q.getRepoCloudflareMcpProxyTokenRow(this.db, tokenHash);
-    if (!row || row.revoked_at || row.expires_at <= Date.now() || row.server_id !== cloudflareApiConnector.serverId) {
-      return { ok: false, code: "cloudflare_proxy_auth_failed" };
-    }
-    return {
-      ok: true,
-      repoId: row.repo_id,
-      envSlug: row.env_slug,
-      serverId: row.server_id,
-    };
-  }
-
-  revokeCloudflareMcpProxyTokensForEnv(envSlug: string): void {
-    Q.revokeRepoCloudflareMcpProxyTokensForEnv(this.db, envSlug);
-  }
-
-  revokeCloudflareMcpProxyTokenForStart(input: {
-    credentialId: string;
-    envSlug: string;
-    incarnationId: string;
-    startOpId: string;
-  }): boolean {
-    return Q.revokeRepoCloudflareMcpProxyTokenForStart(this.db, {
-      tokenHash: input.credentialId,
-      envSlug: input.envSlug,
-      incarnationId: input.incarnationId,
-      startOpId: input.startOpId,
-    });
-  }
-
-  revokeCloudflareMcpProxyTokensForStart(input: {
-    envSlug: string;
-    incarnationId: string;
-    startOpId: string;
-  }): void {
-    Q.revokeRepoCloudflareMcpProxyTokensForStart(this.db, input);
-  }
-
-  revokeCloudflareMcpProxyTokensForRepo(repoId: string): void {
-    Q.revokeRepoCloudflareMcpProxyTokensForRepo(this.db, repoId);
-  }
-
-  recordCloudflareMcpAuditEvent(event: CloudflareMcpProxyAuditEvent): void {
-    Q.insertRepoCloudflareMcpAuditEvent(this.db, {
-      id: crypto.randomUUID(),
-      repo_id: event.repoId,
-      env_slug: event.envSlug,
-      server_id: event.serverId,
-      http_method: event.httpMethod,
-      json_rpc_method: event.jsonRpcMethod,
-      response_status: event.responseStatus,
-      error_code: event.errorCode,
-    });
-  }
-
-  async getValidCloudflareMcpAccessToken(
-    repoId: string,
-    options: { forceRefresh?: boolean } = {},
-  ): Promise<CloudflareMcpAccessTokenResult> {
-    const queueKey = repoId;
-    const task = async (): Promise<CloudflareMcpAccessTokenResult> => {
-      const row = Q.getRepoCloudflareMcpCredentialRow(this.db, repoId);
-      if (!row || row.last_auth_error) {
-        throw new CloudflareMcpUserError(401, "cloudflare_reauth_required", "Cloudflare API MCP requires reconnect.");
-      }
-      const secrets = await this.decryptCloudflareMcpSecrets(repoId);
-      if (!secrets) {
-        throw new CloudflareMcpUserError(401, "cloudflare_reauth_required", "Cloudflare API MCP requires reconnect.");
-      }
-      const shouldRefresh = options.forceRefresh || row.expires_at <= Date.now() + CLOUDFLARE_MCP_REFRESH_BUFFER_MS;
-      if (!shouldRefresh) {
-        return { accessToken: secrets.accessToken };
-      }
-
-      try {
-        const configuredClient = resolveConfiguredCloudflareMcpOAuthClient(this.env);
-        const tokens = await refreshCloudflareMcpOAuthToken({
-          client: {
-            clientId: row.client_id,
-            clientSecret: configuredClient?.clientId === row.client_id ? configuredClient.clientSecret : null,
-          },
-          refreshToken: secrets.refreshToken,
-        });
-        const storedTokens = buildStoredCloudflareMcpTokenFields({
-          tokens,
-          previousRefreshToken: secrets.refreshToken,
-        });
-        const key = await importAesKey(await this.getOrCreateCloudflareMcpDataKey());
-        const encryptedAccessToken = await this.encryptCloudflareMcpSecret({
-          key,
-          repoId,
-          field: "access_token",
-          value: storedTokens.accessToken,
-        });
-        const encryptedRefreshToken = await this.encryptCloudflareMcpSecret({
-          key,
-          repoId,
-          field: "refresh_token",
-          value: storedTokens.refreshToken,
-        });
-        Q.upsertRepoCloudflareMcpCredentialRow(this.db, {
-          repo_id: repoId,
-          client_id: row.client_id,
-          encrypted_access_token: encryptedAccessToken.encryptedValue,
-          access_token_nonce: encryptedAccessToken.nonce,
-          encrypted_refresh_token: encryptedRefreshToken.encryptedValue,
-          refresh_token_nonce: encryptedRefreshToken.nonce,
-          token_type: storedTokens.tokenType,
-          scopes: JSON.stringify(storedTokens.scopes),
-          expires_at: storedTokens.expiresAt,
-          account_id: row.account_id,
-          account_name: row.account_name,
-          enabled: row.enabled,
-          last_auth_error: null,
-          last_auth_error_at: null,
-        });
-        return { accessToken: storedTokens.accessToken };
-      } catch (error) {
-        if (isCloudflareMcpReauthRequired(error)) {
-          Q.setRepoCloudflareMcpAuthError(
-            this.db,
-            repoId,
-            "Cloudflare API MCP token refresh failed. Reconnect Cloudflare API MCP.",
-          );
-        }
-        throw error;
-      }
-    };
-
-    const previous = this.cloudflareMcpRefreshQueues.get(queueKey) ?? Promise.resolve({ accessToken: "" });
-    const run = previous.catch(() => ({ accessToken: "" })).then(task);
-    this.cloudflareMcpRefreshQueues.set(queueKey, run);
-    try {
-      return await run;
-    } finally {
-      if (this.cloudflareMcpRefreshQueues.get(queueKey) === run) {
-        this.cloudflareMcpRefreshQueues.delete(queueKey);
-      }
-    }
-  }
-
   // ── Alarm (stale session/machine cleanup) ─────────────────────
 
   async onAlarm(): Promise<void> {
@@ -2874,7 +2759,8 @@ export class HubDO extends Server<Env> {
     for (const { id } of inactiveSessions) {
       if (!live.sessionIds.has(id)) {
         Q.markSessionEnded(this.db, id);
-        this.broadcastToAll({ type: "session-deleted", sessionId: id });
+        this.broadcastGlobal({ type: "session-deleted", sessionId: id });
+        this.closeScopedSessionConnections(id, "Session expired");
       }
     }
 
@@ -2900,11 +2786,36 @@ export class HubDO extends Server<Env> {
     connection.send(JSON.stringify(message));
   }
 
-  private broadcastToAll(message: WsServerMessage, excludeId?: string): void {
+  private broadcastGlobal(message: WsServerMessage, excludeId?: string): void {
     const payload = JSON.stringify(message);
     for (const conn of this.getConnections()) {
       if (excludeId && conn.id === excludeId) continue;
+      const authorization = (conn.state as WsConnectionState | undefined)?.authorization;
+      if (authorization?.kind !== "global") continue;
       try { conn.send(payload); } catch { /* connection closing */ }
+    }
+  }
+
+  private sendToSession(sessionId: string, message: WsServerMessage, excludeId?: string): void {
+    const payload = JSON.stringify(message);
+    for (const conn of this.getConnections()) {
+      if (excludeId && conn.id === excludeId) continue;
+      const state = conn.state as WsConnectionState | undefined;
+      if (state?.sessionId !== sessionId) continue;
+      try { conn.send(payload); } catch { /* connection closing */ }
+    }
+  }
+
+  private closeScopedSessionConnections(sessionId: string, reason: string): void {
+    for (const conn of this.getConnections()) {
+      const state = conn.state as WsConnectionState | undefined;
+      const authorization = state?.authorization;
+      if (
+        state?.sessionId === sessionId
+        && (authorization?.kind === "environment" || authorization?.kind === "planWriter")
+      ) {
+        try { conn.close(4003, reason); } catch { /* connection already closing */ }
+      }
     }
   }
 }

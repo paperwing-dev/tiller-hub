@@ -2,18 +2,22 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import type {
   KeyboardEvent,
   MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
   ReactNode,
 } from "react";
 
 const DIVIDER_HEIGHT = 4;
-const MIN_ARTIFACT_HEIGHT = 180;
-const MIN_REVIEWERS_HEIGHT = 220;
+const MIN_ARTIFACT_HEIGHT = 128;
+const MIN_REVIEWERS_HEIGHT = 160;
 const KEYBOARD_RESIZE_STEP = 24;
 const REVIEWERS_HEIGHT_STORAGE_KEY = "tiller:plan-reviewers-height";
 
 interface ResizablePlanPanesProps {
   artifact: ReactNode;
   reviewers: ReactNode;
+  conversationFirst?: boolean;
+  documentFirst?: boolean;
+  dividerVisible?: boolean;
 }
 
 interface DragState {
@@ -54,8 +58,13 @@ function storeReviewersHeight(height: number): void {
 export default function ResizablePlanPanes({
   artifact,
   reviewers,
+  conversationFirst = false,
+  documentFirst = false,
+  dividerVisible = true,
 }: ResizablePlanPanesProps) {
-  const [initialReviewersHeight] = useState(readStoredReviewersHeight);
+  const [initialReviewersHeight] = useState(() => (
+    conversationFirst ? null : readStoredReviewersHeight()
+  ));
   const [reviewersHeight, setReviewersHeight] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const reviewersRef = useRef<HTMLDivElement | null>(null);
@@ -128,10 +137,12 @@ export default function ResizablePlanPanes({
       const reviewersPane = reviewersRef.current;
       if (!container || !reviewersPane) return;
       event.preventDefault();
+      const containerHeight = container.getBoundingClientRect().height;
+      const currentHeight = reviewersPane.getBoundingClientRect().height;
       dragStateRef.current = {
         startY: event.clientY,
-        startReviewersHeight: reviewersPane.getBoundingClientRect().height,
-        containerHeight: container.getBoundingClientRect().height,
+        startReviewersHeight: currentHeight,
+        containerHeight,
       };
       preferredHeightRef.current = dragStateRef.current.startReviewersHeight;
       renderedHeightRef.current = dragStateRef.current.startReviewersHeight;
@@ -141,6 +152,30 @@ export default function ResizablePlanPanes({
     [handleDrag, stopDrag],
   );
 
+  const handlePointerDrag = useCallback((event: PointerEvent) => {
+    handleDrag(event as unknown as MouseEvent);
+  }, [handleDrag]);
+
+  const stopPointerDrag = useCallback(() => {
+    stopDrag();
+    window.removeEventListener("pointermove", handlePointerDrag);
+    window.removeEventListener("pointerup", stopPointerDrag);
+    window.removeEventListener("pointercancel", stopPointerDrag);
+  }, [handlePointerDrag, stopDrag]);
+
+  const startPointerDrag = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    startDrag(event as unknown as ReactMouseEvent<HTMLDivElement>);
+    window.addEventListener("pointermove", handlePointerDrag);
+    window.addEventListener("pointerup", stopPointerDrag);
+    window.addEventListener("pointercancel", stopPointerDrag);
+  }, [handlePointerDrag, startDrag, stopPointerDrag]);
+
+  useEffect(() => () => {
+    window.removeEventListener("pointermove", handlePointerDrag);
+    window.removeEventListener("pointerup", stopPointerDrag);
+    window.removeEventListener("pointercancel", stopPointerDrag);
+  }, [handlePointerDrag, stopPointerDrag]);
+
   const resizeWithKeyboard = useCallback(
     (event: KeyboardEvent<HTMLDivElement>) => {
       if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
@@ -148,12 +183,13 @@ export default function ResizablePlanPanes({
       const reviewersPane = reviewersRef.current;
       if (!container || !reviewersPane) return;
       event.preventDefault();
+      const containerHeight = container.getBoundingClientRect().height;
       const direction = event.key === "ArrowUp" ? 1 : -1;
       const currentHeight =
         reviewersHeight ?? reviewersPane.getBoundingClientRect().height;
       const nextHeight = clampReviewersHeight(
         currentHeight + direction * KEYBOARD_RESIZE_STEP,
-        container.getBoundingClientRect().height,
+        containerHeight,
       );
       preferredHeightRef.current = nextHeight;
       updateReviewersHeight(nextHeight);
@@ -170,7 +206,11 @@ export default function ResizablePlanPanes({
       style={{
         gridTemplateRows:
           reviewersHeight === null
-            ? "minmax(0, 1fr) 4px minmax(220px, 0.9fr)"
+            ? documentFirst
+              ? "minmax(240px, 1.08fr) 4px minmax(200px, 0.92fr)"
+              : conversationFirst
+              ? "minmax(180px, 0.55fr) 4px minmax(260px, 1.45fr)"
+              : "minmax(0, 1fr) 4px minmax(160px, 0.9fr)"
             : `minmax(0, 1fr) 4px ${reviewersHeight}px`,
       }}
     >
@@ -180,19 +220,28 @@ export default function ResizablePlanPanes({
       >
         {artifact}
       </div>
+      {dividerVisible ? (
+        <div className="relative z-10">
+          <div
+            role="separator"
+            aria-label="Resize Plan and Plan Collaborators"
+            aria-orientation="horizontal"
+            aria-valuenow={reviewersHeight ?? undefined}
+            tabIndex={0}
+            className="group absolute inset-0 cursor-row-resize bg-transparent outline-none"
+            onMouseDown={startDrag}
+            onPointerDown={startPointerDrag}
+            onKeyDown={resizeWithKeyboard}
+          >
+            <span className="tiller-plan-resize-rule pointer-events-none absolute inset-x-0 top-1/2 -translate-y-1/2" aria-hidden="true" />
+            <span className="absolute inset-x-0 -inset-y-1" aria-hidden="true" />
+          </div>
+        </div>
+      ) : (
+        <div aria-hidden="true" />
+      )}
       <div
-        role="separator"
-        aria-label="Resize Plan and Plan Collaborators"
-        aria-orientation="horizontal"
-        aria-valuenow={reviewersHeight ?? undefined}
-        tabIndex={0}
-        className="group relative z-10 cursor-row-resize bg-kumo-line/60 outline-none transition-colors hover:bg-kumo-focus focus-visible:bg-kumo-focus"
-        onMouseDown={startDrag}
-        onKeyDown={resizeWithKeyboard}
-      >
-        <span className="absolute inset-x-0 -inset-y-1" aria-hidden="true" />
-      </div>
-      <div
+        id="plan-agent-terminal-pane"
         ref={reviewersRef}
         data-testid="plan-reviewers-pane"
         className="min-h-0 overflow-hidden"

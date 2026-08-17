@@ -1,30 +1,33 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { Badge } from "@cloudflare/kumo/components/badge";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Checkbox } from "@cloudflare/kumo/components/checkbox";
 import { Input } from "@cloudflare/kumo/components/input";
 import type { RepoMeta } from "../api/types";
-import type { RepoCloudflareMcpStatus, RepoMcpServer, RepoMcpServerInput } from "./api";
+import type { RepoMcpServer, RepoMcpServerInput } from "./api";
 import {
-  connectRepoCloudflareMcp,
-  disconnectRepoCloudflareMcp,
-  fetchRepoCloudflareMcpStatus,
   fetchRepoMcpServers,
   putRepoMcpServers,
-  setRepoCloudflareMcpEnabled,
 } from "./api";
 import { useToast } from "./Toast";
 import RepoSessionEnvSettings from "./RepoSessionEnvSettings";
 
 const HUB_URL = window.location.origin;
-const CLOUDFLARE_MCP_PRESETS = [
-  { label: "Cloudflare Docs", url: "https://docs.mcp.cloudflare.com/mcp" },
-];
+const CLOUDFLARE_DOCS_MCP = {
+  label: "Cloudflare Docs",
+  url: "https://docs.mcp.cloudflare.com/mcp",
+};
+
+// Keep the designed Cloudflare shortcuts available for a future managed MCP
+// connection, but do not expose non-functional controls in the live settings UI.
+const SHOW_CLOUDFLARE_MCP_UI = false;
 
 interface RepoSettingsPageProps {
   repo: RepoMeta;
   onDone: () => void;
+  embedded?: boolean;
+  implementationCount?: number;
+  onRemoveProject?: () => Promise<void>;
 }
 
 interface McpServerDraft {
@@ -45,10 +48,12 @@ function Section({
   children: ReactNode;
 }) {
   return (
-    <section className="rounded-2xl border border-kumo-line bg-kumo-elevated p-5">
-      <h3 className="text-base font-semibold text-kumo-strong">{title}</h3>
-      <p className="mt-1 text-sm text-kumo-subtle">{description}</p>
-      <div className="mt-4">{children}</div>
+    <section className="tiller-settings-section grid gap-5 border-b border-kumo-line px-6 py-6 lg:grid-cols-[12rem_minmax(0,1fr)] lg:gap-8">
+      <div>
+        <h3 className="text-sm font-semibold text-kumo-strong">{title}</h3>
+        <p className="mt-1 text-xs leading-5 text-kumo-subtle">{description}</p>
+      </div>
+      <div className="min-w-0">{children}</div>
     </section>
   );
 }
@@ -86,143 +91,6 @@ function toServerInput(row: McpServerDraft): RepoMcpServerInput {
   };
 }
 
-function canonicalUrlForComparison(url: string): string {
-  try {
-    return new URL(url.trim()).href;
-  } catch {
-    return url.trim();
-  }
-}
-
-function statusLabel(status: RepoCloudflareMcpStatus | null): string {
-  if (!status) return "Loading";
-  if (status.status === "not_connected") return "Not connected";
-  if (status.status === "reauth_required") return "Reauth required";
-  return status.enabled ? "Enabled" : "Connected";
-}
-
-function RepoCloudflareMcpSettings({ repo }: { repo: RepoMeta }) {
-  const [status, setStatus] = useState<RepoCloudflareMcpStatus | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const addToast = useToast();
-
-  async function refresh() {
-    setLoading(true);
-    setError(null);
-    try {
-      setStatus(await fetchRepoCloudflareMcpStatus(HUB_URL, repo.repoId));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    void refresh();
-  }, [repo.repoId]);
-
-  async function connect() {
-    setBusy("connect");
-    setError(null);
-    try {
-      const started = await connectRepoCloudflareMcp(HUB_URL, repo.repoId);
-      window.location.assign(started.authorizeUrl);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setBusy(null);
-    }
-  }
-
-  async function setEnabled(enabled: boolean) {
-    setBusy(enabled ? "enable" : "disable");
-    setError(null);
-    try {
-      const next = await setRepoCloudflareMcpEnabled(HUB_URL, repo.repoId, enabled);
-      setStatus(next);
-      addToast({ title: enabled ? "Cloudflare API MCP enabled" : "Cloudflare API MCP disabled", variant: "success" });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function disconnect() {
-    setBusy("disconnect");
-    setError(null);
-    try {
-      const next = await disconnectRepoCloudflareMcp(HUB_URL, repo.repoId);
-      setStatus(next);
-      addToast({ title: "Cloudflare API MCP disconnected", variant: "success" });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  const connected = status?.connected ?? false;
-  const needsReauth = status?.status === "reauth_required";
-  const disabled = loading || Boolean(busy);
-
-  return (
-    <div className="grid gap-3 rounded-xl border border-kumo-line bg-kumo-recessed p-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <h4 className="text-sm font-semibold text-kumo-default">Cloudflare API</h4>
-            <Badge variant={status?.enabled ? "success" : needsReauth ? "error" : "secondary"}>
-              {statusLabel(status)}
-            </Badge>
-          </div>
-          <p className="mt-1 text-xs leading-5 text-kumo-subtle">
-            Enabled sessions launch <span className="font-mono text-kumo-default">tiller_cloudflare_api</span> through Tiller with this repository's connected Cloudflare account.
-          </p>
-          {status?.account && (
-            <p className="mt-1 text-xs text-kumo-subtle">
-              Account: {status.account.name || status.account.id || "Connected account"}
-            </p>
-          )}
-          {status?.lastAuthError && <p className="mt-1 text-xs text-kumo-danger">{status.lastAuthError}</p>}
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void connect()}
-            disabled={disabled}
-            loading={busy === "connect"}
-          >
-            {connected ? "Reconnect" : "Connect"}
-          </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => void setEnabled(!status?.enabled)}
-            disabled={disabled || !connected || needsReauth}
-            loading={busy === "enable" || busy === "disable"}
-          >
-            {status?.enabled ? "Disable" : "Enable"}
-          </Button>
-          <Button
-            variant="secondary-destructive"
-            size="sm"
-            onClick={() => void disconnect()}
-            disabled={disabled || !connected}
-            loading={busy === "disconnect"}
-          >
-            Disconnect
-          </Button>
-        </div>
-      </div>
-      {error && <p className="text-xs text-kumo-danger">{error}</p>}
-    </div>
-  );
-}
-
 function RepoMcpServersSettings({ repo }: { repo: RepoMeta }) {
   const [rows, setRows] = useState<McpServerDraft[]>([]);
   const [loading, setLoading] = useState(false);
@@ -256,26 +124,17 @@ function RepoMcpServersSettings({ repo }: { repo: RepoMeta }) {
     );
   }
 
-  function addCloudflareMcpPreset() {
+  function addCloudflareDocs() {
     setRows((current) => {
-      const presetByUrl = new Map(CLOUDFLARE_MCP_PRESETS.map((preset) => [preset.url, preset]));
-      const claimedPresetUrls = new Set<string>();
-      const updatedRows = current.map((row) => {
-        const url = canonicalUrlForComparison(row.url);
-        const preset = presetByUrl.get(url);
-        if (!preset || claimedPresetUrls.has(url)) return row;
-        claimedPresetUrls.add(url);
-        return { ...row, label: row.label.trim() || preset.label, enabled: true };
-      });
-      const presentUrls = new Set(updatedRows.map((row) => canonicalUrlForComparison(row.url)));
-      return [
-        ...updatedRows,
-        ...CLOUDFLARE_MCP_PRESETS.filter((preset) => !presentUrls.has(preset.url)).map((preset) => newDraft({
-          label: preset.label,
-          url: preset.url,
-          enabled: true,
-        })),
-      ];
+      const existing = current.find(
+        (row) => row.url.trim().replace(/\/+$/, "") === CLOUDFLARE_DOCS_MCP.url,
+      );
+      if (existing) {
+        return current.map((row) => row.clientKey === existing.clientKey
+          ? { ...row, label: row.label.trim() || CLOUDFLARE_DOCS_MCP.label, enabled: true }
+          : row);
+      }
+      return [...current, newDraft({ ...CLOUDFLARE_DOCS_MCP })];
     });
   }
 
@@ -297,18 +156,19 @@ function RepoMcpServersSettings({ repo }: { repo: RepoMeta }) {
     <div className="grid gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs leading-5 text-kumo-subtle">
-          Enabled servers are materialized when sessions start. Existing running sessions are unchanged until restarted.
+          For now, Tiller supports only public HTTPS MCP servers that don't require authentication.
         </p>
         <div className="flex flex-wrap gap-2">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={addCloudflareMcpPreset}
-            disabled={loading || saving}
-            title="Adds the Cloudflare Docs MCP server used by this repo."
-          >
-            Cloudflare Docs
-          </Button>
+          {SHOW_CLOUDFLARE_MCP_UI && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={addCloudflareDocs}
+              disabled={loading || saving}
+            >
+              Cloudflare Docs
+            </Button>
+          )}
           <Button
             variant="secondary"
             size="sm"
@@ -352,13 +212,14 @@ function RepoMcpServersSettings({ repo }: { repo: RepoMeta }) {
                 onCheckedChange={(checked) => updateRow(row.clientKey, { enabled: checked === true })}
                 aria-label="Enabled"
                 label={<span className="md:hidden">Enabled</span>}
+                className="tiller-mcp-enabled-checkbox"
               />
               <Input
                 value={row.label}
                 onValueChange={(value) => updateRow(row.clientKey, { label: value })}
                 disabled={saving}
                 aria-label="MCP server label"
-                placeholder="Cloudflare Docs"
+                placeholder="Documentation"
                 className="min-w-0"
               />
               <Input
@@ -388,10 +249,36 @@ function RepoMcpServersSettings({ repo }: { repo: RepoMeta }) {
   );
 }
 
-export default function RepoSettingsPage({ repo, onDone }: RepoSettingsPageProps) {
+export default function RepoSettingsPage({
+  repo,
+  onDone,
+  embedded = false,
+  implementationCount = 0,
+  onRemoveProject,
+}: RepoSettingsPageProps) {
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+
+  const removeProject = async () => {
+    if (!onRemoveProject || removing) return;
+    const implementationWarning = implementationCount > 0
+      ? `\n\nThis will also delete ${implementationCount} ${implementationCount === 1 ? "implementation" : "implementations"} and their saved workspaces.`
+      : "";
+    if (!confirm(`Remove project "${repoLabel(repo)}" from Tiller?${implementationWarning}`)) return;
+
+    setRemoving(true);
+    setRemoveError(null);
+    try {
+      await onRemoveProject();
+    } catch (error) {
+      setRemoveError(error instanceof Error ? error.message : "Failed to remove project.");
+      setRemoving(false);
+    }
+  };
+
   return (
     <div className="flex-1 overflow-y-auto bg-kumo-recessed">
-      <div className="border-b border-kumo-line bg-kumo-base px-6 py-4">
+      {!embedded && <div className="border-b border-kumo-line bg-kumo-base px-6 py-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold text-kumo-strong">Repository Settings</h2>
@@ -401,29 +288,69 @@ export default function RepoSettingsPage({ repo, onDone }: RepoSettingsPageProps
             Done
           </Button>
         </div>
-      </div>
+      </div>}
 
-      <div className="mx-auto grid max-w-5xl gap-5 px-6 py-6">
+      <div className="mx-auto grid max-w-5xl">
         <Section
-          title="Session Env"
-          description="Manage launch environment variables for this repository."
+          title="Task variables"
+          description="Manage environment variables injected when this project's coding tasks start."
         >
           <RepoSessionEnvSettings repo={repo} />
         </Section>
 
-        <Section
-          title="Cloudflare MCP"
-          description="Connect the managed Cloudflare API integration for restarted sessions."
-        >
-          <RepoCloudflareMcpSettings repo={repo} />
-        </Section>
+        {SHOW_CLOUDFLARE_MCP_UI && (
+          <Section
+            title="Cloudflare MCP"
+            description="Managed Cloudflare account access for new and restarted tasks."
+          >
+            <div className="tiller-settings-panel grid gap-3 px-3 py-3" aria-disabled="true">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h4 className="text-sm font-semibold text-kumo-default">Cloudflare API</h4>
+                    <span className="border border-kumo-line px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-kumo-subtle">
+                      Unavailable
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-kumo-subtle">
+                    This design requires a managed Cloudflare account connection that the live app does not provide yet.
+                  </p>
+                </div>
+                <Button variant="secondary" size="sm" disabled>
+                  Connect
+                </Button>
+              </div>
+            </div>
+          </Section>
+        )}
 
         <Section
-          title="MCP Servers"
-          description="Manage public no-auth HTTPS MCP servers for restarted sessions."
+          title="MCP servers"
+          description="Manage public no-auth HTTPS MCP servers for newly started or resumed tasks."
         >
           <RepoMcpServersSettings repo={repo} />
         </Section>
+
+        {onRemoveProject && (
+          <Section
+            title="Remove project"
+            description="Remove this repository and its Tiller workspaces. The GitHub repository is not deleted."
+          >
+            <div>
+              <Button
+                type="button"
+                variant="secondary-destructive"
+                size="sm"
+                loading={removing}
+                disabled={removing}
+                onClick={() => void removeProject()}
+              >
+                {removing ? "Removing…" : "Remove project"}
+              </Button>
+              {removeError && <p className="mt-2 text-xs text-kumo-danger">{removeError}</p>}
+            </div>
+          </Section>
+        )}
       </div>
     </div>
   );

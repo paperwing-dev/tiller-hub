@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "shared/**/*.ts", "api/globals.d.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "build",
+    "src/**/__tests__/**",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/test-setup.ts",
+    "test/**",
+    "test-support/**"
+  ]
+}

@@ -20,8 +20,6 @@ import {
 } from "./access";
 import { refreshGitHubDefaultBranchHead } from "./refresh";
 import { getArtifactStoreStub, getEnvLifecycleStub, getEnvReviewStub } from "../helpers";
-import { cleanupPlanWriterRuntime } from "../planner/dispatch";
-import { planWriterTerminalId } from "../planner/plan-writer-contract";
 import { projectRepoSummary } from "../sync/projectors";
 import { isGitHubAppAllowedForRequest } from "../github/app";
 import {
@@ -30,14 +28,8 @@ import {
   type RepoSessionEnvMetadata,
 } from "../session-env";
 import type { RepoMcpServer } from "../mcp-servers";
-import {
-  CloudflareMcpUserError,
-  buildCloudflareMcpRedirectUri,
-  getCloudflareMcpRequestIdentity,
-  type CloudflareMcpStatus,
-} from "../cloudflare-mcp";
-import { resolveCanonicalRequestOrigin } from "../canonical-origin";
 import { getDurableObjectStub } from "../durable-object";
+import { broadcastPlanArtifactUpdatedHint } from "../plan-artifact-hints";
 
 const repoRoutes = new Hono<HonoEnv>();
 type RepoWorkspaceHandle = RepoWorkspace;
@@ -57,14 +49,6 @@ type RepoHub = Pick<
   | "listRepoMcpServers"
   | "putRepoMcpServers"
   | "deleteRepoMcpServers"
-  | "getRepoCloudflareMcpStatus"
-  | "startRepoCloudflareMcpOAuth"
-  | "completeRepoCloudflareMcpOAuth"
-  | "enableRepoCloudflareMcp"
-  | "disableRepoCloudflareMcp"
-  | "disconnectRepoCloudflareMcp"
-  | "deleteRepoCloudflareMcpIntegration"
-  | "revokeCloudflareMcpProxyTokensForEnv"
 >;
 
 async function broadcastRepoSummary(
@@ -102,21 +86,20 @@ function isPlanStatus(value: unknown): value is PlanStatus {
 async function getRepoArtifactState(
   env: Env,
   repo: RepoWorkspaceHandle,
-): Promise<{
-  artifactStore: ReturnType<typeof getArtifactStoreStub>;
-  artifacts: Awaited<ReturnType<typeof loadRepoArtifacts>>["artifacts"];
-  refs: Awaited<ReturnType<typeof loadRepoArtifacts>>["refs"];
-}> {
+) {
   const artifactStore = getArtifactStoreStub(
     env,
     repo.meta.repoId,
     repo.meta.artifactStoreGeneration,
   );
-  const { artifacts, refs } = await loadRepoArtifacts(artifactStore);
+  const { artifacts, refs, attention } = await artifactStore.getRepoArtifactState(
+    repo.meta.repoId,
+  );
   return {
     artifactStore,
     artifacts,
     refs,
+    attention,
   };
 }
 
@@ -185,15 +168,60 @@ repoRoutes.get("/api/repos/:repoId/artifacts", async (c) => {
   const loadedRepo = await readTrackedRepoRouteContext(c);
   if (!loadedRepo.ok) return loadedRepo.response;
   const repo = loadedRepo.repo;
-  const { artifacts, refs } = await getRepoArtifactState(c.env, repo);
-  return c.json({ artifacts, refs });
+  const { artifacts, refs, attention } = await getRepoArtifactState(c.env, repo);
+  return c.json({ artifacts, refs, attention });
+});
+
+repoRoutes.post("/api/repos/:repoId/plans/:planArtifactId/attention/acknowledge", async (c) => {
+  const loadedRepo = await readTrackedRepoRouteContext(c);
+  if (!loadedRepo.ok) return loadedRepo.response;
+  const body: {
+    sourceKind?: unknown;
+    sourceId?: unknown;
+    token?: unknown;
+  } = await c.req.json<{
+    sourceKind?: unknown;
+    sourceId?: unknown;
+    token?: unknown;
+  }>().catch((): { sourceKind?: unknown; sourceId?: unknown; token?: unknown } => ({}));
+  const sourceKind = body.sourceKind;
+  const sourceId = typeof body.sourceId === "string" ? body.sourceId.trim() : "";
+  const token = typeof body.token === "string" ? body.token.trim() : "";
+  if ((sourceKind !== "scribe" && sourceKind !== "reviewer") || !sourceId || !token) {
+    return c.json({ error: "sourceKind, sourceId, and token are required" }, 400);
+  }
+  const repo = loadedRepo.repo;
+  const artifactStore = getArtifactStoreStub(
+    c.env,
+    repo.meta.repoId,
+    repo.meta.artifactStoreGeneration,
+  );
+  const result = await artifactStore.acknowledgePlanAttention({
+    repoId: repo.meta.repoId,
+    planArtifactId: c.req.param("planArtifactId"),
+    sourceKind,
+    sourceId,
+    token,
+  });
+  if (result === "conflict") {
+    return c.json({ error: "The attention source has a newer token." }, 409);
+  }
+  if (result === "acknowledged") {
+    await broadcastPlanArtifactUpdatedHint(c.env, repo.meta.repoId, c.req.param("planArtifactId"));
+  }
+  return c.body(null, 204);
 });
 
 repoRoutes.get("/api/repos/:repoId/artifacts/:id", async (c) => {
   const loadedRepo = await readTrackedRepoRouteContext(c);
   if (!loadedRepo.ok) return loadedRepo.response;
   const repo = loadedRepo.repo;
-  const { artifacts, refs } = await getRepoArtifactState(c.env, repo);
+  const artifactStore = getArtifactStoreStub(
+    c.env,
+    repo.meta.repoId,
+    repo.meta.artifactStoreGeneration,
+  );
+  const { artifacts, refs } = await loadRepoArtifacts(artifactStore);
   const artifact = artifacts.find((candidate) => candidate.id === c.req.param("id")) ?? null;
   if (!artifact) {
     return c.json({ error: "Artifact not found" }, 404);
@@ -251,55 +279,33 @@ repoRoutes.patch("/api/repos/:repoId/artifacts/:id/status", async (c) => {
     repo.meta.artifactStoreGeneration,
   );
   try {
-    const artifact = await artifactStore.updateArtifactStatus({
+    const transition = await artifactStore.updateArtifactStatus({
       repoId: repo.meta.repoId,
       id: c.req.param("id"),
       status: body.status,
       expectedVersion: typeof body.expectedVersion === "number" ? body.expectedVersion : null,
     });
+    const artifact = transition.artifact;
+    await broadcastPlanArtifactUpdatedHint(c.env, repo.meta.repoId, artifact.id);
     if (body.status === "completed" || body.status === "archived") {
-      const writer = await artifactStore.getPlanWriter(repo.meta.repoId, artifact.id);
-      if (writer?.generation) {
-        const fenced = await artifactStore.fencePlanWriterStop({
-          repoId: repo.meta.repoId,
-          planArtifactId: artifact.id,
-          expectedGeneration: writer.generation,
-          reason: body.status,
-        });
-        const stopped = fenced.writer;
-        if (stopped) {
-          const terminalId = planWriterTerminalId(repo.meta.repoId, artifact.id, writer.generation);
-          const hub = getHub(c.env) as unknown as RepoHub & {
-            revokePlanWriterTerminal(
-              sessionId: string,
-              repoId: string,
-              planArtifactId: string,
-              generation: number,
-            ): void | Promise<void>;
-            broadcastPlanWriterState(repoId: string, planArtifactId: string): void | Promise<void>;
-          };
-          await Promise.resolve(
-            hub.revokePlanWriterTerminal(terminalId, repo.meta.repoId, artifact.id, writer.generation),
-          ).catch(() => undefined);
-          if (stopped.runtime || stopped.jobSlug) {
-            try {
-              await cleanupPlanWriterRuntime(c.env, artifactStore, stopped);
-            } catch (cleanupError) {
-              const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-              await artifactStore.setPlanWriterError({
-                repoId: repo.meta.repoId,
-                planArtifactId: artifact.id,
-                generation: writer.generation,
-                kind: "cleanup",
-                error: message,
-              });
-              await Promise.resolve(hub.broadcastPlanWriterState(repo.meta.repoId, artifact.id)).catch(() => undefined);
-              return c.json({ error: `Plan status changed, but the writer cleanup failed: ${message}`, artifact }, 502);
-            }
-          }
-          await Promise.resolve(hub.broadcastPlanWriterState(repo.meta.repoId, artifact.id)).catch(() => undefined);
-        }
-      }
+      const cleanupPending = transition.cleanupTargets.length > 0;
+      const cleanupWarning = transition.cleanupTargets.some((target) => (
+        target.kind === "writer" &&
+        (target.schemaVersion === 2
+          ? target.placement
+          : target.launchProvenance)?.backend === "host"
+      ))
+        ? "Plan moved. Scribe cleanup will finish when Your machine reconnects."
+        : "Plan moved. Runtime cleanup will continue in the background.";
+      return c.json({
+        ok: true,
+        artifact,
+        ...(cleanupPending ? {
+          cleanupPending,
+          cleanupCode: "runtime_cleanup_deferred",
+          cleanupWarning,
+        } : {}),
+      });
     }
     return c.json({ ok: true, artifact });
   } catch (error) {
@@ -324,17 +330,32 @@ repoRoutes.delete("/api/repos/:repoId/plans/:artifactId", async (c) => {
     expectedVersion: typeof body.expectedVersion === "number" ? body.expectedVersion : null,
   });
   try {
-    const artifact = await discard();
-    return c.json({ ok: true, artifact });
+    const discarded = await discard();
+    const artifact = discarded.artifact;
+    await broadcastPlanArtifactUpdatedHint(c.env, repo.meta.repoId, artifact.id);
+    const cleanupPending = discarded.cleanupTargets.length > 0;
+    return c.json({
+      ok: true,
+      artifact,
+      ...(cleanupPending ? {
+        cleanupPending,
+        cleanupCode: "runtime_cleanup_deferred",
+        cleanupWarning: discarded.cleanupTargets.some((target) => (
+          target.kind === "writer" &&
+          (target.schemaVersion === 2
+            ? target.placement
+            : target.launchProvenance)?.backend === "host"
+        ))
+          ? "Plan deleted. Scribe cleanup will finish when Your machine reconnects."
+          : "Plan deleted. Runtime cleanup will continue in the background.",
+      } : {}),
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to discard plan";
-    const status = /version mismatch|only draft|active planner run|runtime provenance|stop the plan writer/i.test(message)
+    const status = /version mismatch|only draft/i.test(message)
       ? 409
       : 404;
-    const publicMessage = /runtime provenance/i.test(message)
-      ? "This plan still retains a Plan Writer runtime. Stop the Plan Writer and retry cleanup before deleting the plan."
-      : message;
-    return c.json({ error: publicMessage }, status);
+    return c.json({ error: message }, status);
   }
 });
 
@@ -384,50 +405,6 @@ function sortMcpServers(servers: RepoMcpServer[]): RepoMcpServer[] {
   return [...servers].sort((a, b) => a.label.localeCompare(b.label) || a.id.localeCompare(b.id));
 }
 
-function cloudflareMcpJson(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-    },
-  });
-}
-
-function cloudflareMcpFinishPage(title: string, message: string): string {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${title}</title>
-  <style>
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #24292f; background: #f6f8fa; }
-    main { width: min(420px, calc(100vw - 32px)); border: 1px solid #d0d7de; border-radius: 12px; background: #fff; padding: 24px; box-shadow: 0 16px 40px rgba(31, 35, 40, 0.08); }
-    h1 { margin: 0; font-size: 20px; line-height: 1.3; }
-    p { margin: 10px 0 0; color: #57606a; font-size: 14px; line-height: 1.5; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>${title}</h1>
-    <p>${message}</p>
-  </main>
-</body>
-</html>`;
-}
-
-function cloudflareMcpErrorResponse(error: unknown): Response {
-  if (error instanceof CloudflareMcpUserError) {
-    return cloudflareMcpJson({ error: error.message, code: error.code }, error.status);
-  }
-  throw error;
-}
-
-function repoCloudflareMcpStatusBody(status: CloudflareMcpStatus): { integration: CloudflareMcpStatus } {
-  return { integration: status };
-}
-
 async function sessionEnvAccessFailure(response: Response): Promise<Response> {
   const body = await response.clone().json().catch(() => ({ error: "Repository access failed" }));
   return sessionEnvJson(body, response.status);
@@ -474,90 +451,6 @@ repoRoutes.put("/api/repos/:repoId/mcp-servers", async (c) => {
   return sessionEnvJson({ ok: true, servers: sortMcpServers(result.servers) });
 });
 
-repoRoutes.get("/api/repos/:repoId/cloudflare-mcp", async (c) => {
-  const loadedRepo = await readValidatedRepoRouteContext(c);
-  if (!loadedRepo.ok) return sessionEnvAccessFailure(loadedRepo.response);
-  const status = await getHub(c.env).getRepoCloudflareMcpStatus(loadedRepo.repo.meta.repoId);
-  return cloudflareMcpJson(repoCloudflareMcpStatusBody(status));
-});
-
-repoRoutes.post("/api/repos/:repoId/cloudflare-mcp/connect", async (c) => {
-  const loadedRepo = await readValidatedRepoRouteContext(c);
-  if (!loadedRepo.ok) return sessionEnvAccessFailure(loadedRepo.response);
-  try {
-    const hubOrigin = await resolveCanonicalRequestOrigin(c.env, c.req.raw);
-    const redirectUri = buildCloudflareMcpRedirectUri(hubOrigin, loadedRepo.repo.meta.repoId);
-    const started = await getHub(c.env).startRepoCloudflareMcpOAuth(loadedRepo.repo.meta.repoId, {
-      redirectUri,
-      hubOrigin,
-      requestIdentity: getCloudflareMcpRequestIdentity(c.req.raw),
-    });
-    return cloudflareMcpJson({ ok: true, ...started });
-  } catch (error) {
-    return cloudflareMcpErrorResponse(error);
-  }
-});
-
-repoRoutes.get("/api/repos/:repoId/cloudflare-mcp/callback", async (c) => {
-  const loadedRepo = await readValidatedRepoRouteContext(c);
-  if (!loadedRepo.ok) return sessionEnvAccessFailure(loadedRepo.response);
-  const code = c.req.query("code")?.trim() ?? "";
-  const state = c.req.query("state")?.trim() ?? "";
-  if (!code || !state) {
-    return cloudflareMcpJson({
-      error: "Cloudflare MCP OAuth callback is missing code or state.",
-      code: "cloudflare_oauth_callback_invalid",
-    }, 400);
-  }
-  try {
-    const hubOrigin = await resolveCanonicalRequestOrigin(c.env, c.req.raw);
-    const redirectUri = buildCloudflareMcpRedirectUri(hubOrigin, loadedRepo.repo.meta.repoId);
-    const status = await getHub(c.env).completeRepoCloudflareMcpOAuth(loadedRepo.repo.meta.repoId, {
-      state,
-      code,
-      redirectUri,
-      requestIdentity: getCloudflareMcpRequestIdentity(c.req.raw),
-    });
-    if (c.req.header("Accept")?.includes("application/json")) {
-      return cloudflareMcpJson({ ok: true, ...repoCloudflareMcpStatusBody(status) });
-    }
-    return c.html(cloudflareMcpFinishPage("Cloudflare API connected", "Return to Tiller to enable Cloudflare API MCP for this repository."));
-  } catch (error) {
-    if (c.req.header("Accept")?.includes("application/json")) {
-      return cloudflareMcpErrorResponse(error);
-    }
-    if (error instanceof CloudflareMcpUserError) {
-      return c.html(cloudflareMcpFinishPage("Cloudflare API connection failed", error.message), error.status as any);
-    }
-    throw error;
-  }
-});
-
-repoRoutes.post("/api/repos/:repoId/cloudflare-mcp/enable", async (c) => {
-  const loadedRepo = await readValidatedRepoRouteContext(c);
-  if (!loadedRepo.ok) return sessionEnvAccessFailure(loadedRepo.response);
-  try {
-    const status = await getHub(c.env).enableRepoCloudflareMcp(loadedRepo.repo.meta.repoId);
-    return cloudflareMcpJson({ ok: true, ...repoCloudflareMcpStatusBody(status) });
-  } catch (error) {
-    return cloudflareMcpErrorResponse(error);
-  }
-});
-
-repoRoutes.post("/api/repos/:repoId/cloudflare-mcp/disable", async (c) => {
-  const loadedRepo = await readValidatedRepoRouteContext(c);
-  if (!loadedRepo.ok) return sessionEnvAccessFailure(loadedRepo.response);
-  const status = await getHub(c.env).disableRepoCloudflareMcp(loadedRepo.repo.meta.repoId);
-  return cloudflareMcpJson({ ok: true, ...repoCloudflareMcpStatusBody(status) });
-});
-
-repoRoutes.post("/api/repos/:repoId/cloudflare-mcp/disconnect", async (c) => {
-  const loadedRepo = await readValidatedRepoRouteContext(c);
-  if (!loadedRepo.ok) return sessionEnvAccessFailure(loadedRepo.response);
-  const status = await getHub(c.env).disconnectRepoCloudflareMcp(loadedRepo.repo.meta.repoId);
-  return cloudflareMcpJson({ ok: true, ...repoCloudflareMcpStatusBody(status) });
-});
-
 repoRoutes.delete("/api/repos/:repoId", async (c) => {
   const repoId = c.req.param("repoId");
   const loaded = await loadTrackedRepoForRequest(c.env, c.req.raw, repoId);
@@ -594,9 +487,10 @@ repoRoutes.delete("/api/repos/:repoId", async (c) => {
     repoId,
     repo.meta.artifactStoreGeneration,
   );
-  const [plannerRuns, planWriters] = await Promise.all([
+  const [plannerRuns, planWriters, runtimeCleanupTargets] = await Promise.all([
     artifactStore.listPlannerWorkloadStateForPredeploy(repoId),
     artifactStore.listPlanWritersForRepo(repoId),
+    artifactStore.listPlanRuntimeCleanupTargetsForRepo(repoId),
   ]);
   for (const run of plannerRuns) {
     if (
@@ -625,6 +519,13 @@ repoRoutes.delete("/api/repos/:repoId", async (c) => {
       blockers.push({ kind: "plan_writer_cleanup", id: writer.threadId, label: `Plan Writer cleanup ${writer.threadId}` });
     }
   }
+  for (const target of runtimeCleanupTargets) {
+    blockers.push({
+      kind: "plan_runtime_cleanup",
+      id: target.cleanupId,
+      label: `Pending ${target.kind} cleanup ${target.ownerId}`,
+    });
+  }
   if (blockers.length > 0) {
     return c.json({
       error: "Repository still owns environments or active work. Resolve every blocker before deleting it.",
@@ -640,9 +541,6 @@ repoRoutes.delete("/api/repos/:repoId", async (c) => {
   await hub.deleteRepoSessionEnv(repoId);
   if (typeof hub.deleteRepoMcpServers === "function") {
     await hub.deleteRepoMcpServers(repoId);
-  }
-  if (typeof hub.deleteRepoCloudflareMcpIntegration === "function") {
-    await hub.deleteRepoCloudflareMcpIntegration(repoId);
   }
   await hub.broadcastRepoRemove(repoId);
 

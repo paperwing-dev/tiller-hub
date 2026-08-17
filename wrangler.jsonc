@@ -23,7 +23,7 @@
 		{
 			"class_name": "SandboxDO",
 			"image": "docker.io/jamieatlason/tiller-sandbox:stable",
-			"max_instances": 2,
+			"max_instances": 30,
 			"instance_type": "standard-1"
 		},
 		{

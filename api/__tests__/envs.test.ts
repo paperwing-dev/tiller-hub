@@ -16,8 +16,8 @@ const mocks = vi.hoisted(() => ({
   revokeGitHubBridgesForInteractiveEnv: vi.fn(),
   revokeGitHubBridgesForEnvironmentStart: vi.fn(),
   refreshGitHubDefaultBranchHeadForRequest: vi.fn(),
-  verifyImplementorCodexRuntimeCapability: vi.fn(),
   exchangeCodexRuntimeAuth: vi.fn(),
+  cleanupEnvReviewRunRuntime: vi.fn(),
 }));
 
 vi.mock("../setup/config", async (importOriginal) => {
@@ -58,19 +58,19 @@ vi.mock("../repo/refresh", () => ({
   refreshGitHubDefaultBranchHeadForRequest: mocks.refreshGitHubDefaultBranchHeadForRequest,
 }));
 
-vi.mock("../env/codex-runtime-capability", async () => {
-  const actual = await vi.importActual<typeof import("../env/codex-runtime-capability")>("../env/codex-runtime-capability");
-  return {
-    ...actual,
-    verifyImplementorCodexRuntimeCapability: mocks.verifyImplementorCodexRuntimeCapability,
-  };
-});
-
 vi.mock("../codex-runtime-auth", async () => {
   const actual = await vi.importActual<typeof import("../codex-runtime-auth")>("../codex-runtime-auth");
   return {
     ...actual,
     exchangeCodexRuntimeAuth: mocks.exchangeCodexRuntimeAuth,
+  };
+});
+
+vi.mock("../env-review/dispatch", async () => {
+  const actual = await vi.importActual<typeof import("../env-review/dispatch")>("../env-review/dispatch");
+  return {
+    ...actual,
+    cleanupEnvReviewRunRuntime: mocks.cleanupEnvReviewRunRuntime,
   };
 });
 
@@ -86,7 +86,17 @@ import { resolveContainerHubUrl, resolveHubPublicUrl, rewriteLoopbackHubUrlForDo
 
 function createTestApp() {
   const app = new Hono<HonoEnv>();
-  app.use("*", async (_c, next) => {
+  app.use("*", async (c, next) => {
+    if (c.req.path.endsWith("/codex/runtime-auth")) {
+      c.set("authorization", {
+        kind: "environment",
+        envSlug: "my-env",
+        incarnationId: "incarnation-1",
+        startOperationId: "start-op-1",
+      });
+    } else {
+      c.set("authorization", { kind: "global", source: "local-dev" });
+    }
     await next();
   });
   app.route("/", envRoutes);
@@ -332,8 +342,6 @@ function createHubBinding(
       broadcastRepoUpsert: vi.fn(),
       broadcastRepoMainChange: vi.fn(),
       addMessage: vi.fn(),
-      revokeCloudflareMcpProxyTokensForEnv: vi.fn(),
-      revokeCloudflareMcpProxyTokensForStart: vi.fn(),
       getOpenAIAuthStatus: vi.fn().mockResolvedValue({
         status: "connected",
         authenticated: true,
@@ -431,6 +439,7 @@ function createLifecycleStub() {
     workspaceDirty: null as boolean | null,
     workspaceNeedsAttention: null as boolean | null,
     workspaceLastSyncedAt: null as string | null,
+    implementorAttentionToken: null as string | null,
     baseMainCommit: null as string | null,
     lastKnownMainCommit: null as string | null,
     scmOperationType: null as string | null,
@@ -488,6 +497,8 @@ function createLifecycleStub() {
     requestScheduledRunOutcome: vi.fn().mockResolvedValue({ status: "accepted", outcome: "completed" }),
     persistOwnedProjection: vi.fn().mockImplementation(async () => current),
     getOwnedEnvView: vi.fn().mockImplementation(async () => current),
+    reportImplementorCompletion: vi.fn().mockResolvedValue({ accepted: true, changed: true }),
+    acknowledgeImplementorAttention: vi.fn().mockResolvedValue("acknowledged"),
     recordScheduledRunCredentialsCleaned: vi.fn().mockResolvedValue(false),
     recordScheduledRunCredentialCleanupPending: vi.fn().mockResolvedValue(false),
     recordScheduledRunnerUncertainty: vi.fn().mockResolvedValue(false),
@@ -502,6 +513,7 @@ function createLifecycleStub() {
       operationId,
       desiredState,
     })),
+    getRunnerCommandClaim: vi.fn().mockResolvedValue(null),
     rebaseRejectedRunnerCommand: vi.fn().mockImplementation(async ({
       rejectedCommand,
       currentCommandGeneration,
@@ -530,6 +542,7 @@ function createLifecycleStub() {
     getGitHubPublishOperation: vi.fn().mockResolvedValue(null),
     clearState: vi.fn().mockResolvedValue(null),
     getState: vi.fn().mockResolvedValue(null),
+    getEnvironmentRuntimeSubject: vi.fn().mockResolvedValue(null),
     getMutableState: vi.fn().mockImplementation(async () => current),
     peekMutableState: vi.fn().mockImplementation(async () => current),
     peekVisibleMutableState: vi.fn().mockImplementation(async (incarnationId: string) => (
@@ -614,6 +627,8 @@ function createLifecycleStub() {
     }),
     beginStart: vi.fn().mockImplementation(async (settings: Record<string, unknown>) => claimStart(settings)),
     requestStop: vi.fn().mockResolvedValue(null),
+    ensureStopDispatchScheduled: vi.fn().mockResolvedValue(true),
+    resumeStopRetry: vi.fn().mockResolvedValue(null),
     reconcile: vi.fn().mockResolvedValue(null),
     clearLeadHarnessState: vi.fn().mockResolvedValue(current),
     beginStartupDiagnostics: vi.fn().mockResolvedValue(current),
@@ -679,6 +694,11 @@ function createLifecycleStub() {
     noteFencedRunnerAbsentBeforeScheduledStart: vi.fn().mockResolvedValue(false),
     noteFencedScheduledStartRejectedBeforeMutation: vi.fn().mockResolvedValue(false),
     noteStopWorkspaceSynced: vi.fn().mockResolvedValue(null),
+    acceptStopWorkspaceSynced: vi.fn().mockResolvedValue({
+      accepted: true,
+      opId: "callback-op-1",
+      state: null,
+    }),
     noteWorkspaceSyncFailed: vi.fn().mockResolvedValue(null),
     noteStopDispatchFailed: vi.fn().mockResolvedValue(null),
     clearStopWorkspaceSyncedMeta: vi.fn().mockResolvedValue(undefined),
@@ -698,13 +718,13 @@ beforeEach(() => {
   mocks.destroyEnv.mockResolvedValue(undefined);
   mocks.revokeGitHubBridgesForInteractiveEnv.mockResolvedValue(undefined);
   mocks.revokeGitHubBridgesForEnvironmentStart.mockResolvedValue(undefined);
-  mocks.verifyImplementorCodexRuntimeCapability.mockResolvedValue(true);
   mocks.exchangeCodexRuntimeAuth.mockResolvedValue({
     ok: true,
     access_token: "runtime-access-token",
     account_id: "chatgpt-account",
     expires_at: "2026-07-13T20:00:00.000Z",
   });
+  mocks.cleanupEnvReviewRunRuntime.mockResolvedValue(null);
   mocks.refreshGitHubDefaultBranchHeadForRequest.mockImplementation(async (env: unknown, _request: Request, repoId?: string | null) => {
     const resolvedRepoId = repoId?.trim() || "repo-1";
     return {
@@ -764,6 +784,267 @@ beforeEach(() => {
   }));
 });
 
+describe("Cloudflare Stop durability", () => {
+  function createCloudflareStopFixture() {
+    const stopOpId = "stop-op-cf";
+    const runningMeta = buildStoredEnvRecord({
+      slug: "my-env",
+      backend: "cf",
+      executionPlacement: { backend: "cf", machineId: null },
+      status: "running",
+      lifecyclePhase: "running",
+      lifecycleOpId: "start-op-1",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
+      lifecycleInfraState: "ready",
+      lifecycleRuntimeReady: true,
+    });
+    const savingMeta = buildStoredEnvRecord({
+      ...runningMeta,
+      status: "saving",
+      lifecyclePhase: "saving",
+      lifecycleOpId: stopOpId,
+      lifecycleOperation: "stop",
+      lifecycleDesiredState: "stopped",
+      lifecycleRuntimeReady: false,
+    });
+    const lifecycleStub = createLifecycleStub();
+    lifecycleStub.requestStop.mockResolvedValue({
+      phase: "saving",
+      activeOpId: stopOpId,
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastRunnerState: "running",
+      lastWorkspaceSyncedAckOpId: null,
+      infraState: "ready",
+      runtimeReady: false,
+      lastError: null,
+      lastErrorAt: null,
+      updatedAt: "2026-08-13T00:00:00.000Z",
+    });
+    lifecycleStub.persistOwnedProjection.mockResolvedValue(savingMeta);
+    const stopScope = {
+      envSlug: "my-env",
+      incarnationId: runningMeta.incarnationId,
+      startOperationId: "start-op-1",
+      stopOperationId: stopOpId,
+    };
+    lifecycleStub.getEnvironmentRuntimeSubject = vi.fn().mockResolvedValue({
+      envSlug: stopScope.envSlug,
+      incarnationId: stopScope.incarnationId,
+      startOperationId: stopScope.startOperationId,
+      lifecycle: {
+        phase: "saving",
+        activeOpId: stopOpId,
+        activeOperation: "stop",
+        desiredState: "stopped",
+        lastRunnerState: "running",
+        lastWorkspaceSyncedAckOpId: null,
+        infraState: "ready",
+        runtimeReady: false,
+        lastError: null,
+        lastErrorAt: null,
+        updatedAt: "2026-08-13T00:00:00.000Z",
+      },
+      failedStopFinalizationAuthorized: false,
+    });
+    lifecycleStub.getState.mockResolvedValue({
+      phase: "saving",
+      activeOpId: stopOpId,
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastRunnerState: "running",
+      lastWorkspaceSyncedAckOpId: null,
+      infraState: "ready",
+      runtimeReady: false,
+      lastError: null,
+      lastErrorAt: null,
+      updatedAt: "2026-08-13T00:00:00.000Z",
+    });
+    lifecycleStub.acceptStopWorkspaceSynced.mockResolvedValue({
+      accepted: true,
+      opId: stopOpId,
+      state: null,
+    });
+    const sandbox = {
+      getStatus: vi.fn().mockResolvedValue("running"),
+      prepareWorkspaceStop: vi.fn().mockResolvedValue({
+        status: "prepared",
+        receipt: {
+          ...stopScope,
+          workspaceLastSyncedAt: "2026-08-13T00:00:05.000Z",
+        },
+      }),
+      schedulePreparedTermination: vi.fn().mockResolvedValue({ status: "scheduled" }),
+    };
+    const env = {
+      ENVS_KV: {
+        get: vi.fn(async (key: string) => key === "repo:repo-1"
+          ? JSON.stringify({ repoId: "repo-1", updatedAt: "2026-08-13T00:00:00.000Z" })
+          : null),
+      },
+      SANDBOX: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => sandbox),
+      },
+      HUB: createHubBinding(),
+    } as any;
+    return { env, lifecycleStub, runningMeta, sandbox, stopOpId, stopScope };
+  }
+
+  it("queues interactive Stop in the lifecycle alarm instead of post-response waitUntil", async () => {
+    const fixture = createCloudflareStopFixture();
+    const executionCtx = createExecutionCtx();
+
+    const result = await stopEnvAction({
+      env: fixture.env,
+      executionCtx: executionCtx as any,
+      slug: "my-env",
+      lifecycleStub: fixture.lifecycleStub as any,
+      cachedMeta: fixture.runningMeta as any,
+    });
+
+    expect(result).toMatchObject({ status: 200, operationId: fixture.stopOpId });
+    expect(fixture.lifecycleStub.ensureStopDispatchScheduled).toHaveBeenCalledWith(fixture.stopOpId);
+    expect(executionCtx.waitUntil).not.toHaveBeenCalled();
+    expect(fixture.sandbox.prepareWorkspaceStop).not.toHaveBeenCalled();
+  });
+
+  it("awaits the full Cloudflare Stop handshake in an alarm-owned dispatch", async () => {
+    const fixture = createCloudflareStopFixture();
+    const executionCtx = createExecutionCtx();
+    let resolveStop!: () => void;
+    fixture.sandbox.prepareWorkspaceStop.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveStop = () => resolve({
+        status: "prepared",
+        receipt: {
+          ...fixture.stopScope,
+          workspaceLastSyncedAt: "2026-08-13T00:00:05.000Z",
+        },
+      });
+    }));
+    let settled = false;
+
+    const resultPromise = stopEnvAction({
+      env: fixture.env,
+      executionCtx: executionCtx as any,
+      slug: "my-env",
+      lifecycleStub: fixture.lifecycleStub as any,
+      cachedMeta: fixture.runningMeta as any,
+      awaitRunnerDispatch: true,
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+
+    await vi.waitFor(() => expect(fixture.sandbox.prepareWorkspaceStop).toHaveBeenCalledWith(
+      fixture.stopScope,
+      null,
+    ));
+    expect(settled).toBe(false);
+    resolveStop();
+    const result = await resultPromise;
+
+    expect(result).toMatchObject({ status: 200, operationId: fixture.stopOpId });
+    expect(fixture.lifecycleStub.ensureStopDispatchScheduled).not.toHaveBeenCalled();
+    expect(fixture.lifecycleStub.acceptStopWorkspaceSynced).toHaveBeenCalledWith(
+      fixture.stopOpId,
+      expect.objectContaining({
+        workspaceLastSyncedAt: "2026-08-13T00:00:05.000Z",
+      }),
+    );
+    expect(fixture.sandbox.schedulePreparedTermination).toHaveBeenCalledWith(fixture.stopScope);
+    expect(
+      fixture.lifecycleStub.acceptStopWorkspaceSynced.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      fixture.sandbox.schedulePreparedTermination.mock.invocationCallOrder[0]!,
+    );
+    expect(executionCtx.waitUntil).not.toHaveBeenCalled();
+  });
+
+  it("resumes an acknowledged Cloudflare Stop by scheduling only the termination phase", async () => {
+    const fixture = createCloudflareStopFixture();
+    const acknowledgedLifecycle = {
+      phase: "stopping",
+      activeOpId: fixture.stopOpId,
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastRunnerState: "running",
+      lastWorkspaceSyncedAckOpId: fixture.stopOpId,
+      infraState: "ready",
+      runtimeReady: false,
+      lastError: null,
+      lastErrorAt: null,
+      updatedAt: "2026-08-13T00:00:05.000Z",
+    };
+    fixture.lifecycleStub.getState.mockResolvedValue(acknowledgedLifecycle);
+    fixture.lifecycleStub.resumeStopRetry.mockResolvedValue(acknowledgedLifecycle);
+
+    const result = await stopEnvAction({
+      env: fixture.env,
+      executionCtx: createExecutionCtx() as any,
+      slug: "my-env",
+      lifecycleStub: fixture.lifecycleStub as any,
+      cachedMeta: fixture.runningMeta as any,
+      expectedStopOpId: fixture.stopOpId,
+      awaitRunnerDispatch: true,
+    });
+
+    expect(result).toMatchObject({ status: 200, operationId: fixture.stopOpId });
+    expect(fixture.sandbox.prepareWorkspaceStop).not.toHaveBeenCalled();
+    expect(fixture.lifecycleStub.acceptStopWorkspaceSynced).not.toHaveBeenCalled();
+    expect(fixture.sandbox.schedulePreparedTermination).toHaveBeenCalledWith(fixture.stopScope);
+  });
+
+  it("does not schedule termination when LifecycleDO rejects the workspace receipt", async () => {
+    const fixture = createCloudflareStopFixture();
+    fixture.lifecycleStub.acceptStopWorkspaceSynced.mockResolvedValue({
+      accepted: false,
+      opId: fixture.stopOpId,
+      state: null,
+    });
+
+    const result = await stopEnvAction({
+      env: fixture.env,
+      executionCtx: createExecutionCtx() as any,
+      slug: "my-env",
+      lifecycleStub: fixture.lifecycleStub as any,
+      cachedMeta: fixture.runningMeta as any,
+      awaitRunnerDispatch: true,
+    });
+
+    expect(result).toMatchObject({ status: 200, operationId: fixture.stopOpId });
+    expect(fixture.sandbox.prepareWorkspaceStop).toHaveBeenCalledTimes(1);
+    expect(fixture.sandbox.schedulePreparedTermination).not.toHaveBeenCalled();
+    expect(fixture.lifecycleStub.noteStopDispatchFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not turn a post-schedule projection failure into a Stop failure", async () => {
+    const fixture = createCloudflareStopFixture();
+    fixture.lifecycleStub.persistOwnedProjection
+      .mockResolvedValueOnce(fixture.runningMeta)
+      .mockRejectedValueOnce(new Error("projection unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      const result = await stopEnvAction({
+        env: fixture.env,
+        executionCtx: createExecutionCtx() as any,
+        slug: "my-env",
+        lifecycleStub: fixture.lifecycleStub as any,
+        cachedMeta: fixture.runningMeta as any,
+        awaitRunnerDispatch: true,
+      });
+
+      expect(result).toMatchObject({ status: 200, operationId: fixture.stopOpId });
+      expect(fixture.sandbox.schedulePreparedTermination).toHaveBeenCalledTimes(1);
+      expect(fixture.lifecycleStub.noteStopDispatchFailed).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe("POST /api/envs/:slug/codex/runtime-auth", () => {
   const subscriptionProfile = {
     kind: "subscription-app-server" as const,
@@ -790,7 +1071,7 @@ describe("POST /api/envs/:slug/codex/runtime-auth", () => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Tiller-Codex-Runtime-Capability": "start-capability",
+          "X-Tiller-Capability": "start-capability",
         },
         body: JSON.stringify({ rejected_access_token_sha256: "d".repeat(64) }),
       },
@@ -804,11 +1085,6 @@ describe("POST /api/envs/:slug/codex/runtime-auth", () => {
       account_id: "chatgpt-account",
       expires_at: "2026-07-13T20:00:00.000Z",
     });
-    expect(mocks.verifyImplementorCodexRuntimeCapability).toHaveBeenCalledWith(
-      expect.anything(),
-      subject,
-      "start-capability",
-    );
     expect(mocks.exchangeCodexRuntimeAuth).toHaveBeenCalledWith(
       expect.anything(),
       "d".repeat(64),
@@ -830,7 +1106,7 @@ describe("POST /api/envs/:slug/codex/runtime-auth", () => {
 
     const cancelled = await createTestApp().request(
       "/api/envs/my-env/codex/runtime-auth",
-      { method: "POST", headers: { "X-Tiller-Codex-Runtime-Capability": "capability" } },
+      { method: "POST", headers: { "X-Tiller-Capability": "capability" } },
       {} as any,
       createExecutionCtx() as any,
     );
@@ -840,7 +1116,7 @@ describe("POST /api/envs/:slug/codex/runtime-auth", () => {
     acceptImplementorCodexRuntimeAuth.mockResolvedValue("account_changed");
     const changed = await createTestApp().request(
       "/api/envs/my-env/codex/runtime-auth",
-      { method: "POST", headers: { "X-Tiller-Codex-Runtime-Capability": "capability" } },
+      { method: "POST", headers: { "X-Tiller-Capability": "capability" } },
       {} as any,
       createExecutionCtx() as any,
     );
@@ -851,20 +1127,6 @@ describe("POST /api/envs/:slug/codex/runtime-auth", () => {
   it("rejects invalid, inactive, and API-key starts before broker access", async () => {
     const getActiveImplementorCodexRuntimeSubject = vi.fn(async () => subject as any);
     mocks.getEnvLifecycleStub.mockReturnValue({ getActiveImplementorCodexRuntimeSubject });
-    mocks.verifyImplementorCodexRuntimeCapability.mockResolvedValue(false);
-
-    const invalid = await createTestApp().request(
-      "/api/envs/my-env/codex/runtime-auth",
-      {
-        method: "POST",
-        headers: { "X-Tiller-Codex-Runtime-Capability": "wrong" },
-      },
-      {} as any,
-      createExecutionCtx() as any,
-    );
-    expect(invalid.status).toBe(401);
-
-    mocks.verifyImplementorCodexRuntimeCapability.mockResolvedValue(true);
     getActiveImplementorCodexRuntimeSubject.mockResolvedValue(null);
     const inactive = await createTestApp().request(
       "/api/envs/my-env/codex/runtime-auth",
@@ -885,7 +1147,7 @@ describe("POST /api/envs/:slug/codex/runtime-auth", () => {
     } as any);
     const apiKey = await createTestApp().request(
       "/api/envs/my-env/codex/runtime-auth",
-      { method: "POST", headers: { "X-Tiller-Codex-Runtime-Capability": "capability" } },
+      { method: "POST", headers: { "X-Tiller-Capability": "capability" } },
       {} as any,
       createExecutionCtx() as any,
     );
@@ -906,28 +1168,40 @@ describe("create env startup plan selection", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({ code: "plan_id_removed" });
   });
+
+  it("rejects client-supplied environment display names", async () => {
+    const response = await createTestApp().request("/api/envs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repoId: "repo-1",
+        harness: "codex",
+        displayName: "Client name",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "display_name_server_generated",
+    });
+  });
 });
 
 describe("Scheduled Run credential cleanup", () => {
   it("revokes only the exact incarnation and Start operation", async () => {
-    const hubBinding = createHubBinding();
-    const hub = hubBinding.get("hub-id") as any;
-    const env = { HUB: hubBinding } as any;
+    const env = { HUB: createHubBinding() } as any;
     const scope = { incarnationId: "incarnation-a", startOpId: "start-a" };
 
-    await expect(cleanupLaunchCredentialsBestEffort(env, "my-env", hub, {
+    await expect(cleanupLaunchCredentialsBestEffort(env, "my-env", {
       scope,
       ids: {
         githubBridgeId: "bridge-a",
-        cloudflareMcpProxyTokenId: "cloudflare-a",
       },
     })).resolves.toEqual({ complete: true });
 
     const exact = { envSlug: "my-env", ...scope };
     expect(mocks.revokeGitHubBridgesForEnvironmentStart).toHaveBeenCalledWith(env, exact);
-    expect(hub.revokeCloudflareMcpProxyTokensForStart).toHaveBeenCalledWith(exact);
     expect(mocks.revokeGitHubBridgesForInteractiveEnv).not.toHaveBeenCalled();
-    expect(hub.revokeCloudflareMcpProxyTokensForEnv).not.toHaveBeenCalled();
   });
 });
 
@@ -979,6 +1253,7 @@ describe("Scheduled Run lifecycle callbacks", () => {
       outcome: "completed",
     });
     expect(lifecycleStub.requestStop).not.toHaveBeenCalled();
+    expect(mocks.getEnvReviewStub).not.toHaveBeenCalled();
   });
 
 });
@@ -1009,6 +1284,123 @@ describe("start env startup plan selection", () => {
       code: "startup_plan_selection_removed",
     });
   });
+
+  it("allows Retry Start for an exact host failure proven to precede harness launch", async () => {
+    const runtimeSourceId = "d".repeat(40);
+    (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__ = {
+      schemaVersion: 1,
+      channel: "development",
+      hubVersion: "0.4.1",
+    };
+    (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__ = {
+      imageSourceId: runtimeSourceId,
+      sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${runtimeSourceId}`,
+    };
+    try {
+      const failedStartOpId = "start-op-failed";
+      const lifecycleStub = createLifecycleStub();
+      const failedMeta = buildStoredEnvRecord({
+        slug: "my-env",
+        incarnationId: "incarnation-1",
+        repoId: "repo-1",
+        backend: "host",
+        executionPlacement: { backend: "host", machineId: "machine-1" },
+        harness: "codex",
+        harnessSettings: { model: "gpt-5.5", effort: "high" },
+        status: "failed",
+        lifecyclePhase: "failed",
+        lifecycleOpId: failedStartOpId,
+        lifecycleOperation: "start",
+        lifecycleDesiredState: "running",
+        lifecycleInfraState: "stopped",
+        lifecycleRuntimeReady: false,
+      });
+      await lifecycleStub.initializeMutableStateFromMeta(failedMeta);
+      lifecycleStub.getState.mockResolvedValue({
+        phase: "failed",
+        activeOpId: failedStartOpId,
+        activeOperation: "start",
+        desiredState: "running",
+        lastRunnerState: "stopped",
+        lastWorkspaceSyncedAckOpId: null,
+        infraState: "stopped",
+        runtimeReady: false,
+        lastError: "projected startup failure",
+        lastErrorAt: "2026-08-08T00:00:00.000Z",
+        updatedAt: "2026-08-08T00:00:00.000Z",
+      });
+      lifecycleStub.getRunnerCommandClaim.mockResolvedValue({
+        commandGeneration: 7,
+        operationId: failedStartOpId,
+        desiredState: "running",
+      });
+      lifecycleStub.beginStartupDiagnostics.mockRejectedValue(new Error("diagnostic checkpoint"));
+      mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+      const hostService = {
+        machineId: "machine-1",
+        displayName: "Build machine",
+        connectedAt: "2026-08-08T00:00:00.000Z",
+        runnerCommandProtocol: 1,
+        codexRuntimeAuthProtocol: 1,
+        dockerAvailable: true,
+        runnerAvailable: true,
+        claudeSubscription: false,
+        localRunnerImage: `docker.io/jamieatlason/tiller-sandbox:${runtimeSourceId}`,
+        localRunnerImageSourceId: runtimeSourceId,
+        transport: "session",
+      } as const;
+      const requestLocalRunner = vi.fn().mockResolvedValue({
+        machineId: "machine-1",
+        result: {
+          status: "stopped",
+          failedStartBeforeHarness: true,
+          commandGeneration: 7,
+          operationId: failedStartOpId,
+        },
+      });
+      const env = {
+        OPENAI_API_KEY: "test-openai-key",
+        HUB: createHubBinding({
+          activeHostService: hostService,
+          hostServicesByMachineId: { "machine-1": hostService },
+          isHostRoutable: true,
+          requestLocalRunner,
+        }),
+      } as any;
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      let result;
+      try {
+        result = await startEnvAction({
+          env,
+          executionCtx: createExecutionCtx() as any,
+          request: new Request("https://demo.preview.workers.dev/api/envs/my-env/start"),
+          requestUrl: "https://demo.preview.workers.dev/api/envs/my-env/start",
+          slug: "my-env",
+          lifecycleStub: lifecycleStub as any,
+          cachedMeta: failedMeta as any,
+        });
+      } finally {
+        consoleError.mockRestore();
+      }
+
+      expect(result).toMatchObject({
+        status: 502,
+        body: {
+          code: "workspace_hydration_failed",
+          error: expect.stringMatching(/^Tiller couldn’t restore the workspace\. Retry Start\. Reference ID: TLR-/),
+        },
+      });
+      expect(lifecycleStub.beginStart).toHaveBeenCalledTimes(1);
+      expect(lifecycleStub.beginStartupDiagnostics).toHaveBeenCalledWith(expect.objectContaining({
+        implementationMode: "fresh",
+      }));
+      expect(lifecycleStub.noteRunnerStopped).not.toHaveBeenCalled();
+    } finally {
+      delete (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__;
+      delete (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__;
+    }
+  });
 });
 
 describe("scheduled start execution placement", () => {
@@ -1034,19 +1426,14 @@ describe("scheduled start execution placement", () => {
     expectedHostMachineId,
   }) => {
     const runtimeSourceId = "c".repeat(40);
-    (globalThis as typeof globalThis & { __TILLER_CURRENT_UPDATE__?: unknown }).__TILLER_CURRENT_UPDATE__ = {
+    (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__ = {
       schemaVersion: 1,
-      channel: "deploy-button",
-      updateMode: "full-source",
-      sourceRepo: "paperwing-dev/tiller-hub",
-      sourceId: "hub-source",
-      version: "test",
-      label: "test",
-      managedFiles: ["package.json"],
-      selfHostRuntime: {
-        imageSourceId: runtimeSourceId,
-        sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${runtimeSourceId}`,
-      },
+      channel: "development",
+      hubVersion: "0.2.54",
+    };
+    (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__ = {
+      imageSourceId: runtimeSourceId,
+      sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${runtimeSourceId}`,
     };
     try {
       const lifecycleStub = createLifecycleStub();
@@ -1063,6 +1450,19 @@ describe("scheduled start execution placement", () => {
         startupPlanId: "plan-1",
         status: "stopped",
       }));
+      lifecycleStub.getState.mockResolvedValue({
+        phase: "stopped",
+        activeOpId: "prior-stop-op",
+        activeOperation: "stop",
+        desiredState: "stopped",
+        lastRunnerState: "stopped",
+        lastWorkspaceSyncedAckOpId: "prior-stop-op",
+        infraState: "stopped",
+        runtimeReady: false,
+        lastError: null,
+        lastErrorAt: null,
+        updatedAt: "2026-07-17T00:00:00.000Z",
+      });
       const scheduledLifecycle = lifecycleStub as any;
       scheduledLifecycle.beginScheduledRunAttempt = vi.fn().mockResolvedValue({
         attemptId: "attempt-1",
@@ -1113,6 +1513,10 @@ describe("scheduled start execution placement", () => {
         : null;
       const env = {
         OPENAI_API_KEY: "test-openai-key",
+        SANDBOX: {
+          idFromName: vi.fn().mockReturnValue("sandbox-id"),
+          get: vi.fn().mockReturnValue({ getStatus: vi.fn().mockResolvedValue("stopped") }),
+        },
         HUB: createHubBinding({
           executionPlacement: currentSelection,
           ...(hostService
@@ -1122,6 +1526,10 @@ describe("scheduled start execution placement", () => {
                 isHostRoutable: true,
               }
             : {}),
+          requestLocalRunner: vi.fn().mockRejectedValue(Object.assign(
+            new Error("Runner not found"),
+            { code: "runner_not_found" },
+          )),
         }),
       } as any;
       const result = await startEnvAction({
@@ -1150,7 +1558,11 @@ describe("scheduled start execution placement", () => {
 
       expect(result).toMatchObject({
         status: 502,
-        body: { error: expect.stringContaining("diagnostic checkpoint") },
+        body: {
+          error: expect.stringMatching(/^Tiller couldn’t restore the workspace\. Retry Start\. Reference ID: TLR-/),
+          code: "workspace_hydration_failed",
+          referenceId: expect.stringMatching(/^TLR-/),
+        },
         scheduledRunTransitionApplied: true,
       });
       expect(scheduledLifecycle.claimScheduledRunStart).toHaveBeenCalledWith({
@@ -1162,8 +1574,12 @@ describe("scheduled start execution placement", () => {
           codexAuthPreference: "api-key",
         },
       });
+      expect(lifecycleStub.beginStartupDiagnostics).toHaveBeenCalledWith(expect.objectContaining({
+        implementationMode: "plan",
+      }));
     } finally {
-      delete (globalThis as typeof globalThis & { __TILLER_CURRENT_UPDATE__?: unknown }).__TILLER_CURRENT_UPDATE__;
+      delete (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__;
+      delete (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__;
     }
   });
 });
@@ -1356,6 +1772,83 @@ describe("startup diagnostics routes", () => {
     });
   });
 
+  it("projects stored runtime failures without exposing raw diagnostics", async () => {
+    const lifecycleStub = createLifecycleStub();
+    lifecycleStub.getStartupDiagnostics.mockResolvedValue({
+      active: {
+        opId: "start-op-raw",
+        backend: "host",
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:05.000Z",
+        currentStepId: "harness-launch",
+        currentStepMessage: "secret runtime output",
+        events: [
+          {
+            at: "2024-01-01T00:00:05.000Z",
+            opId: "start-op-raw",
+            stepId: "harness-launch",
+            severity: "error",
+            message: "secret runtime output",
+            detail: "private detail",
+          },
+          {
+            at: "2024-01-01T00:00:04.000Z",
+            opId: "start-op-raw",
+            stepId: "hub-connect",
+            severity: "warn",
+            message: "tiller-harness last output: private warning output",
+            detail: null,
+          },
+        ],
+        failure: {
+          message: "secret runtime output",
+          exitCode: 17,
+          signal: "SIGTERM",
+          lastStepId: "harness-launch",
+        },
+        logTails: {
+          harness: "private harness log",
+          stopControl: "private stop log",
+          bootstrap: "private bootstrap log",
+        },
+      },
+      lastFailed: null,
+    });
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const env = {
+      ENVS_KV: createKvStore({ "my-env": ENV_META }),
+      HUB: createHubBinding(),
+    };
+
+    const res = await createTestApp().request(
+      "/api/envs/my-env/startup-diagnostics",
+      {},
+      env as any,
+    );
+    const body = await res.json() as any;
+    const serialized = JSON.stringify(body);
+
+    expect(res.status).toBe(200);
+    expect(body.active.failure).toMatchObject({
+      message: expect.stringMatching(/^Tiller couldn’t start the environment runtime\. Retry Start\. Reference ID: TLR-/),
+      exitCode: null,
+      signal: null,
+    });
+    expect(body.active.events[0]).toMatchObject({
+      message: body.active.failure.message,
+      detail: null,
+    });
+    expect(body.active.logTails).toEqual({
+      harness: null,
+      stopControl: null,
+      bootstrap: null,
+    });
+    expect(serialized).not.toContain("secret runtime output");
+    expect(serialized).not.toContain("private detail");
+    expect(serialized).not.toContain("private harness log");
+    expect(serialized).not.toContain("private warning output");
+  });
+
   it("accepts structured startup events", async () => {
     const lifecycleStub = createLifecycleStub();
     mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
@@ -1465,12 +1958,14 @@ describe("startup diagnostics routes", () => {
       ok: true,
       slug: "my-env",
       status: "failed",
-      error: "Harness exited before connecting",
+      error: expect.stringMatching(/^Tiller couldn’t start the environment runtime\. Retry Start\. Reference ID: TLR-/),
+      code: "runtime_start_failed",
+      referenceId: expect.stringMatching(/^TLR-/),
     });
     expect(lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
       opId: "start-op-1",
       stepId: "harness-launch",
-      message: "Harness exited before connecting",
+      message: expect.stringMatching(/^Tiller couldn’t start the environment runtime\. Retry Start\. Reference ID: TLR-/),
       detail: "exit code 1",
       at: null,
       exitCode: 1,
@@ -1481,7 +1976,7 @@ describe("startup diagnostics routes", () => {
     await expect(lifecycleStub.getOwnedEnvView()).resolves.toMatchObject({
       slug: "my-env",
       status: "failed",
-      error: "Harness exited before connecting",
+      error: expect.stringMatching(/^Tiller couldn’t start the environment runtime\. Retry Start\. Reference ID: TLR-/),
     });
   });
 
@@ -1498,12 +1993,100 @@ describe("startup diagnostics routes", () => {
 });
 
 describe("runner lifecycle callbacks", () => {
+  it("accepts or idempotently replays fenced implementor completion reports", async () => {
+    const lifecycleStub = createLifecycleStub();
+    lifecycleStub.reportImplementorCompletion
+      .mockResolvedValueOnce({ accepted: true, changed: true })
+      .mockResolvedValueOnce({ accepted: true, changed: false });
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const env = { ENVS_KV: createKvStore({}), HUB: createHubBinding() };
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const res = await createTestApp().request(
+        "/api/envs/my-env/implementor-attention/completions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Tiller-Lifecycle-Op-Id": "start-op-1",
+          },
+          body: JSON.stringify({ sequence: 4 }),
+        },
+        env as any,
+      );
+      expect(res.status).toBe(204);
+    }
+
+    expect(lifecycleStub.reportImplementorCompletion).toHaveBeenNthCalledWith(
+      1,
+      "start-op-1",
+      4,
+    );
+    expect(lifecycleStub.reportImplementorCompletion).toHaveBeenNthCalledWith(
+      2,
+      "start-op-1",
+      4,
+    );
+    expect(lifecycleStub.persistOwnedProjection).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects completions from an older Start without publishing", async () => {
+    const lifecycleStub = createLifecycleStub();
+    lifecycleStub.reportImplementorCompletion.mockResolvedValue({
+      accepted: false,
+      changed: false,
+    });
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+
+    const res = await createTestApp().request(
+      "/api/envs/my-env/implementor-attention/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Tiller-Lifecycle-Op-Id": "old-start",
+        },
+        body: JSON.stringify({ sequence: 1 }),
+      },
+      { ENVS_KV: createKvStore({}), HUB: createHubBinding() } as any,
+    );
+
+    expect(res.status).toBe(409);
+    expect(lifecycleStub.persistOwnedProjection).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges the exact implementor token and reports newer-token conflicts", async () => {
+    const lifecycleStub = createLifecycleStub();
+    lifecycleStub.acknowledgeImplementorAttention
+      .mockResolvedValueOnce("acknowledged")
+      .mockResolvedValueOnce("conflict");
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const env = { ENVS_KV: createKvStore({}), HUB: createHubBinding() };
+
+    const acknowledge = () => createTestApp().request(
+      "/api/envs/my-env/implementor-attention/acknowledge",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: "attention-token" }),
+      },
+      env as any,
+    );
+    expect((await acknowledge()).status).toBe(204);
+    expect((await acknowledge()).status).toBe(409);
+    expect(lifecycleStub.acknowledgeImplementorAttention).toHaveBeenCalledTimes(2);
+    expect(lifecycleStub.persistOwnedProjection).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ["infra-ready", "noteInfraReady", "", ["callback-op-1"]],
     ["runner-ready", "noteRunnerStarted", "", ["callback-op-1"]],
-    ["runner-stopped", "noteRunnerStopped", "container exited", ["callback-op-1", "container exited"]],
-    ["workspace-synced", "noteStopWorkspaceSynced", "", ["callback-op-1", {}]],
-    ["stop-failed", "recordWorkspaceSyncFailed", "workspace upload failed", ["callback-op-1", "workspace upload failed"]],
+    ["runner-stopped", "noteRunnerStopped", "container exited", ["callback-op-1", null]],
+    ["workspace-synced", "acceptStopWorkspaceSynced", "", ["callback-op-1", {}]],
+    ["stop-failed", "recordWorkspaceSyncFailed", "workspace upload failed", [
+      "callback-op-1",
+      expect.stringMatching(/^Tiller couldn’t confirm the workspace save yet\. Saving will retry automatically\. Reference ID: TLR-/),
+    ]],
   ] as const)(
     "persists %s in the lifecycle owner when the KV projection is missing",
     async (path, method, body, expectedArgs) => {
@@ -1528,6 +2111,42 @@ describe("runner lifecycle callbacks", () => {
       expect((lifecycleStub as any)[method]).toHaveBeenCalledWith(...expectedArgs);
     },
   );
+
+  it("returns the exact accepted Stop operation and rejects stale workspace acknowledgements", async () => {
+    const lifecycleStub = createLifecycleStub();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const env = {
+      ENVS_KV: createKvStore({}),
+      HUB: createHubBinding(),
+    };
+    const app = createTestApp();
+
+    const accepted = await app.request(
+      "/api/envs/my-env/workspace-synced",
+      {
+        method: "POST",
+        headers: { "X-Tiller-Lifecycle-Op-Id": "callback-op-1" },
+      },
+      env as any,
+    );
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toEqual({ accepted: true, opId: "callback-op-1" });
+
+    lifecycleStub.acceptStopWorkspaceSynced.mockResolvedValueOnce({
+      accepted: false,
+      opId: null,
+      state: null,
+    });
+    const stale = await app.request(
+      "/api/envs/my-env/workspace-synced",
+      {
+        method: "POST",
+        headers: { "X-Tiller-Lifecycle-Op-Id": "stale-stop-op" },
+      },
+      env as any,
+    );
+    expect(stale.status).toBe(409);
+  });
 
   it("marks a starting env infra-ready without completing startup", async () => {
     const lifecycleStub = createLifecycleStub();
@@ -1716,14 +2335,45 @@ describe("runner lifecycle callbacks", () => {
 
   it("fails a starting env immediately when runner-stopped arrives", async () => {
     const lifecycleStub = createLifecycleStub();
-    const noteRunnerStopped = vi.fn().mockImplementation(async () => {
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      repoId: "repo-1",
+      backend: "host",
+      executionPlacement: { backend: "host", machineId: "my-env" },
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "starting",
+      lifecyclePhase: "starting",
+      lifecycleOpId: "start-op-1",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
+    }));
+    lifecycleStub.getState.mockResolvedValue({
+      phase: "starting",
+      activeOpId: "start-op-1",
+      activeOperation: "start",
+      desiredState: "running",
+      lastRunnerState: null,
+      lastWorkspaceSyncedAckOpId: null,
+      infraState: "ready",
+      runtimeReady: false,
+      lastError: null,
+      lastErrorAt: null,
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+    const noteRunnerStopped = vi.fn().mockImplementation(async (
+      _opId: string,
+      failureMessage: string,
+    ) => {
       await lifecycleStub.initializeMutableStateFromMeta({
         status: "failed",
         lifecyclePhase: "failed",
         lifecycleDesiredState: "running",
         lifecycleInfraState: "stopped",
         lifecycleRuntimeReady: false,
-        error: "Container exited before the environment finished starting (container exited with code 1).",
+        error: failureMessage,
         errorAt: "2026-04-12T00:00:00.000Z",
         updatedAt: "2026-04-12T00:00:00.000Z",
         lifecycleUpdatedAt: "2026-04-12T00:00:00.000Z",
@@ -1737,7 +2387,7 @@ describe("runner lifecycle callbacks", () => {
         lastWorkspaceSyncedAckOpId: null,
         infraState: "stopped",
         runtimeReady: false,
-        lastError: "Container exited before the environment finished starting (container exited with code 1).",
+        lastError: failureMessage,
         lastErrorAt: "2026-04-12T00:00:00.000Z",
         updatedAt: "2026-04-12T00:00:00.000Z",
       };
@@ -1783,11 +2433,14 @@ describe("runner lifecycle callbacks", () => {
       slug: "my-env",
       status: "failed",
     });
-    expect(noteRunnerStopped).toHaveBeenCalledWith("start-op-1", "container exited with code 1");
+    expect(noteRunnerStopped).toHaveBeenCalledWith(
+      "start-op-1",
+      expect.stringMatching(/^The environment runtime stopped unexpectedly\. Reference ID: TLR-/),
+    );
     expect(lifecycleStub.persistOwnedProjection).toHaveBeenCalledWith({ broadcast: true });
     await expect(lifecycleStub.getOwnedEnvView()).resolves.toMatchObject({
       status: "failed",
-      error: expect.stringContaining("container exited with code 1"),
+      error: expect.stringMatching(/^The environment runtime stopped unexpectedly\. Reference ID: TLR-/),
     });
   });
 
@@ -1886,9 +2539,9 @@ describe("runner lifecycle callbacks", () => {
       ok: true,
       slug: "my-env",
       status: "stopped",
-      error: "exit",
+      error: null,
     });
-    expect(noteRunnerStopped).toHaveBeenCalledWith("stop-op-1", "exit");
+    expect(noteRunnerStopped).toHaveBeenCalledWith("stop-op-1", null);
     expect(mocks.revokeGitHubBridgesForInteractiveEnv).toHaveBeenCalledWith(env, "my-env");
     expect(lifecycleStub.clearStopWorkspaceSyncedMeta).toHaveBeenCalledTimes(1);
     expect(lifecycleStub.persistOwnedProjection).toHaveBeenCalledWith({ broadcast: true });
@@ -2059,7 +2712,6 @@ describe("env authoritative reads", () => {
         updatedAt: "2024-01-01T00:00:00.000Z",
       })],
     ]);
-
     const app = createTestApp();
     const res = await app.request(
       "/api/envs",
@@ -2590,17 +3242,117 @@ describe("DELETE /api/envs/:slug", () => {
     });
   });
 
-  it("refuses deletion before mutation while an environment review is active", async () => {
+  it("cancels and cleans an active environment review before deletion", async () => {
     const lifecycleStub = createLifecycleStub();
     await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({ slug: "my-env", status: "stopped" }));
     mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const runtime = { jobSlug: "env-review-review-1" };
+    const running = {
+      runId: "review-1",
+      envSlug: "my-env",
+      status: "running",
+      runtime,
+      skillInvocationId: "review-round-1",
+    };
+    const cancelled = { ...running, status: "cancelled" };
+    const listWorkloads = vi.fn()
+      .mockResolvedValueOnce([{
+        runId: running.runId,
+        status: running.status,
+        hasRuntime: true,
+      }])
+      .mockResolvedValueOnce([]);
+    const review = {
+      listWorkloadStateForPredeploy: listWorkloads,
+      getRun: vi.fn()
+        .mockResolvedValueOnce(running)
+        .mockResolvedValueOnce(cancelled),
+      cancelSkillInvocation: vi.fn().mockResolvedValue({
+        invocationId: running.skillInvocationId,
+        status: "cancelled",
+      }),
+    };
+    mocks.getEnvReviewStub.mockReturnValue(review);
+    const env = {
+      ENVS_KV: createKvStore({
+        "my-env": JSON.stringify(buildStoredEnvRecord({ slug: "my-env", status: "stopped" })),
+      }),
+      HUB: createHubBinding(),
+      ARTIFACT_STORE: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => ({
+          releaseEnvironmentSidebarSlot: vi.fn().mockResolvedValue(undefined),
+        })),
+      },
+    };
+    const executionCtx = createExecutionCtx();
+    const res = await createTestApp().request("/api/envs/my-env", { method: "DELETE" }, env as any, executionCtx as any);
+    expect(res.status).toBe(200);
+    expect(review.cancelSkillInvocation).toHaveBeenCalledWith(running.skillInvocationId);
+    expect(mocks.cleanupEnvReviewRunRuntime).toHaveBeenCalledWith(env, review, cancelled);
+    expect(listWorkloads).toHaveBeenCalledTimes(2);
+    expect(executionCtx.waitUntil).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleans retained terminal review runtimes before deletion", async () => {
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({ slug: "my-env", status: "stopped" }));
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const run = {
+      runId: "review-1",
+      envSlug: "my-env",
+      status: "ready",
+      runtime: { jobSlug: "env-review-review-1" },
+    };
+    const listWorkloads = vi.fn()
+      .mockResolvedValueOnce([{ runId: run.runId, status: run.status, hasRuntime: true }])
+      .mockResolvedValueOnce([{ runId: run.runId, status: run.status, hasRuntime: false }]);
+    const review = {
+      listWorkloadStateForPredeploy: listWorkloads,
+      getRun: vi.fn().mockResolvedValue(run),
+    };
+    mocks.getEnvReviewStub.mockReturnValue(review);
+    const env = {
+      ENVS_KV: createKvStore({
+        "my-env": JSON.stringify(buildStoredEnvRecord({ slug: "my-env", status: "stopped" })),
+      }),
+      HUB: createHubBinding(),
+      ARTIFACT_STORE: {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => ({
+          releaseEnvironmentSidebarSlot: vi.fn().mockResolvedValue(undefined),
+        })),
+      },
+    };
+    const executionCtx = createExecutionCtx();
+
+    const res = await createTestApp().request("/api/envs/my-env", { method: "DELETE" }, env as any, executionCtx as any);
+
+    expect(res.status).toBe(200);
+    expect(mocks.cleanupEnvReviewRunRuntime).toHaveBeenCalledWith(env, review, run);
+    expect(listWorkloads).toHaveBeenCalledTimes(2);
+    expect(executionCtx.waitUntil).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps deletion blocked when retained terminal review cleanup fails", async () => {
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(buildStoredEnvRecord({ slug: "my-env", status: "stopped" }));
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const run = {
+      runId: "review-1",
+      envSlug: "my-env",
+      status: "ready",
+      runtime: { jobSlug: "env-review-review-1" },
+    };
     mocks.getEnvReviewStub.mockReturnValue({
       listWorkloadStateForPredeploy: vi.fn().mockResolvedValue([{
-        runId: "review-1",
-        status: "running",
+        runId: run.runId,
+        status: run.status,
         hasRuntime: true,
       }]),
+      getRun: vi.fn().mockResolvedValue(run),
     });
+    mocks.cleanupEnvReviewRunRuntime.mockRejectedValueOnce(new Error("runner unavailable"));
     const env = {
       ENVS_KV: createKvStore({
         "my-env": JSON.stringify(buildStoredEnvRecord({ slug: "my-env", status: "stopped" })),
@@ -2608,10 +3360,11 @@ describe("DELETE /api/envs/:slug", () => {
       HUB: createHubBinding(),
     };
     const executionCtx = createExecutionCtx();
+
     const res = await createTestApp().request("/api/envs/my-env", { method: "DELETE" }, env as any, executionCtx as any);
+
     expect(res.status).toBe(409);
     await expect(res.json()).resolves.toMatchObject({ code: "environment_delete_blocked" });
-    expect(mocks.getScheduledRunCapacityStub).not.toHaveBeenCalled();
     expect(mocks.destroyEnv).not.toHaveBeenCalled();
     expect(executionCtx.waitUntil).not.toHaveBeenCalled();
   });
@@ -2752,6 +3505,125 @@ describe("POST /api/envs/:slug/reset-to-repo", () => {
 });
 
 describe("Your machine Stop ambiguity", () => {
+  it("cancels and cleans active reviewers before stopping the implementor", async () => {
+    const stopOpId = "stop-op-1";
+    const runningMeta = buildStoredEnvRecord({
+      slug: "my-env",
+      backend: "host",
+      executionPlacement: { backend: "host", machineId: "host-1" },
+      status: "running",
+      lifecyclePhase: "running",
+      lifecycleOpId: "start-op-1",
+      lifecycleOperation: "start",
+      lifecycleDesiredState: "running",
+      lifecycleInfraState: "ready",
+      lifecycleRuntimeReady: true,
+    });
+    const savingMeta = buildStoredEnvRecord({
+      ...runningMeta,
+      status: "saving",
+      lifecyclePhase: "saving",
+      lifecycleOpId: stopOpId,
+      lifecycleOperation: "stop",
+      lifecycleDesiredState: "stopped",
+      lifecycleRuntimeReady: false,
+    });
+    const lifecycleStub = createLifecycleStub();
+    await lifecycleStub.initializeMutableStateFromMeta(runningMeta);
+    lifecycleStub.requestStop.mockResolvedValue({
+      phase: "saving",
+      activeOpId: stopOpId,
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastRunnerState: "running",
+      lastWorkspaceSyncedAckOpId: null,
+      infraState: "ready",
+      runtimeReady: false,
+      lastError: null,
+      lastErrorAt: null,
+      updatedAt: "2026-08-12T00:00:00.000Z",
+    });
+    lifecycleStub.persistOwnedProjection.mockResolvedValue(savingMeta);
+    const runningReview = {
+      runId: "review-1",
+      envSlug: "my-env",
+      status: "running",
+      runtime: { jobSlug: "env-review-review-1" },
+    };
+    const cancelledReview = { ...runningReview, status: "cancelled" };
+    const review = {
+      listWorkloadStateForPredeploy: vi.fn()
+        .mockResolvedValueOnce([{
+          runId: runningReview.runId,
+          status: runningReview.status,
+          hasRuntime: true,
+        }])
+        .mockResolvedValueOnce([]),
+      getRun: vi.fn()
+        .mockResolvedValueOnce(runningReview)
+        .mockResolvedValueOnce(cancelledReview),
+      cancelRun: vi.fn().mockResolvedValue(cancelledReview),
+    };
+    mocks.getEnvReviewStub.mockReturnValue(review);
+    const requestLocalRunner = vi.fn().mockImplementation(async (
+      _machineId: string | null,
+      action: string,
+      _slug: string,
+      options?: Record<string, unknown>,
+    ) => ({
+      machineId: "host-1",
+      result: action === "status"
+        ? { status: "running" }
+        : {
+            status: "stopping",
+            callbackExpected: true,
+            commandGeneration: options?.commandGeneration,
+            operationId: options?.operationId,
+            desiredState: options?.desiredState,
+          },
+    }));
+    const hostService = {
+      machineId: "host-1",
+      displayName: "host-1",
+      connectedAt: "2026-08-12T00:00:00.000Z",
+      runnerCommandProtocol: 1,
+      codexRuntimeAuthProtocol: 1,
+      dockerAvailable: true,
+      runnerAvailable: true,
+      claudeSubscription: true,
+      transport: "session",
+    };
+    const env = {
+      HUB: createHubBinding({
+        activeHostService: hostService,
+        hostServicesByMachineId: { "host-1": hostService },
+        isHostRoutable: true,
+        executionPlacement: { backend: "host", machineId: "host-1" },
+        requestLocalRunner,
+      }),
+    } as any;
+
+    const result = await stopEnvAction({
+      env,
+      executionCtx: createExecutionCtx() as any,
+      slug: "my-env",
+      lifecycleStub: lifecycleStub as any,
+      cachedMeta: runningMeta as any,
+    });
+
+    expect(result).toMatchObject({ status: 200, operationId: stopOpId });
+    expect(review.cancelRun).toHaveBeenCalledWith(
+      runningReview.runId,
+      "Reviewer run cancelled because the environment was stopped.",
+    );
+    expect(mocks.cleanupEnvReviewRunRuntime).toHaveBeenCalledWith(
+      env,
+      review,
+      cancelledReview,
+    );
+    expect(lifecycleStub.requestStop).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     { label: "ordinary", intent: undefined },
     { label: "Scheduled Run", intent: "scheduled" as const },
@@ -3086,7 +3958,10 @@ describe("Your machine Stop ambiguity", () => {
           desiredState: "stopped",
         },
       );
-      expect(lifecycleStub.noteStopDispatchFailed).not.toHaveBeenCalled();
+      expect(lifecycleStub.noteStopDispatchFailed).toHaveBeenCalledWith(
+        stopOpId,
+        expect.stringMatching(/^Tiller couldn’t complete the runtime operation\. Reference ID: TLR-/),
+      );
     } finally {
       consoleError.mockRestore();
     }
@@ -3227,19 +4102,14 @@ describe("host backend offline handling", () => {
     ["custom", "registry.example.com/custom/tiller-sandbox:latest", undefined],
   ])("rejects %s runtimes before lifecycle mutation on Create and Start", async (_runtimeStatus, runtimeImage, runtimeSource) => {
     const expectedSource = "b".repeat(40);
-    (globalThis as typeof globalThis & { __TILLER_CURRENT_UPDATE__?: unknown }).__TILLER_CURRENT_UPDATE__ = {
+    (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__ = {
       schemaVersion: 1,
-      channel: "deploy-button",
-      updateMode: "full-source",
-      sourceRepo: "paperwing-dev/tiller-hub",
-      sourceId: "hub-source",
-      version: "test",
-      label: "test",
-      managedFiles: ["package.json"],
-      selfHostRuntime: {
-        imageSourceId: expectedSource,
-        sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${expectedSource}`,
-      },
+      channel: "development",
+      hubVersion: "0.2.54",
+    };
+    (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__ = {
+      imageSourceId: expectedSource,
+      sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${expectedSource}`,
     };
     try {
       const lifecycleStub = createLifecycleStub();
@@ -3318,7 +4188,8 @@ describe("host backend offline handling", () => {
       expect(lifecycleStub.initializeAndBeginStart).not.toHaveBeenCalled();
       expect(lifecycleStub.beginStart).not.toHaveBeenCalled();
     } finally {
-      delete (globalThis as typeof globalThis & { __TILLER_CURRENT_UPDATE__?: unknown }).__TILLER_CURRENT_UPDATE__;
+      delete (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__;
+      delete (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__;
     }
   });
 
@@ -3535,7 +4406,33 @@ describe("host backend offline handling", () => {
     });
   });
 
-  it("rejects stopping a host env when the host session is disconnected", async () => {
+  it("keeps an exact retrying Stop when the assigned host session is disconnected", async () => {
+    const lifecycleStub = createLifecycleStub();
+    const runningMeta = buildStoredEnvRecord({
+      slug: "my-env",
+      repoUrl: "https://github.com/test/repo",
+      backend: "host",
+      executionPlacement: { backend: "host", machineId: "my-env" },
+      harness: "claude-code",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+      status: "running",
+    });
+    await lifecycleStub.initializeMutableStateFromMeta(runningMeta);
+    lifecycleStub.requestStop.mockResolvedValue({
+      phase: "saving",
+      activeOpId: "stop-op-offline",
+      activeOperation: "stop",
+      desiredState: "stopped",
+      lastRunnerState: "running",
+      lastWorkspaceSyncedAckOpId: null,
+      infraState: "ready",
+      runtimeReady: false,
+      lastError: null,
+      lastErrorAt: null,
+      updatedAt: "2024-01-01T00:00:01.000Z",
+    });
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
     const app = createTestApp();
     const res = await app.request(
       "/api/envs/my-env/stop",
@@ -3557,10 +4454,17 @@ describe("host backend offline handling", () => {
       } as any,
     );
 
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(200);
     await expect(res.json()).resolves.toMatchObject({
-      error: "This workload’s execution backend is unavailable. Delete and recreate it to use your current Settings choice.",
+      ok: true,
+      slug: "my-env",
+      status: "saving",
     });
+    expect(lifecycleStub.requestStop).toHaveBeenCalledTimes(1);
+    expect(lifecycleStub.noteStopDispatchFailed).toHaveBeenCalledWith(
+      "stop-op-offline",
+      expect.stringMatching(/^Tiller couldn’t complete the runtime operation\. Reference ID: TLR-/),
+    );
   });
 
   it("rejects deleting a host env when the host session is disconnected", async () => {
@@ -3653,7 +4557,7 @@ describe("POST /api/envs/:slug/harness-failed", () => {
     });
     expect(reportStartupFailure).toHaveBeenCalledWith({
       opId: "start-op-1",
-      message: "tiller-harness exited with code 1",
+      message: expect.stringMatching(/^Tiller couldn’t start the environment runtime\. Retry Start\. Reference ID: TLR-/),
       runnerMayExist: true,
       leadHarnessFailure: true,
     });
@@ -3733,7 +4637,7 @@ describe("POST /api/envs/:slug/harness-failed", () => {
     });
     expect(reportStartupFailure).toHaveBeenCalledWith({
       opId: "start-op-1",
-      message: "tiller-harness exited with code 1",
+      message: expect.stringMatching(/^Tiller couldn’t start the environment runtime\. Retry Start\. Reference ID: TLR-/),
       runnerMayExist: true,
       leadHarnessFailure: true,
     });

@@ -5,11 +5,16 @@ import type {
   WorkersDevAccessRuntimeCredential,
   WorkersDevAccessRuntimeTrust,
 } from "../workers-dev-access/types";
-import { installedAccessBindings, TEST_WORKERS_DEV_HOSTNAME } from "./access-binding-fixture";
+import {
+  installedAccessBindings,
+  TEST_WORKERS_DEV_HOSTNAME,
+} from "./access-binding-fixture";
 
 const { partyMiddleware, partyserverMiddleware } = vi.hoisted(() => ({
   partyMiddleware: vi.fn(async () => new Response("party ok")),
-  partyserverMiddleware: vi.fn(() => vi.fn(async () => new Response("party ok"))),
+  partyserverMiddleware: vi.fn(() =>
+    vi.fn(async () => new Response("party ok")),
+  ),
 }));
 
 vi.mock("agents", () => ({
@@ -67,6 +72,7 @@ const canonicalCredential: WorkersDevAccessRuntimeCredential = {
   currentSecret: "service-secret",
   tokenExpiresAt: "2027-07-16T00:00:00.000Z",
 };
+const CONTROL_SECRET = "entrypoint-control-secret";
 
 let accessPrivateKey: CryptoKey;
 let accessPublicJwk: Record<string, unknown>;
@@ -106,15 +112,17 @@ function mockEnv(
 ): Env {
   return {
     ...config,
-    ...(trust ? installedAccessBindings({
-      hostname: trust.workersDevHostname,
-      issuer: trust.issuer,
-      audience: trust.audience,
-      serviceClientId: trust.serviceClientId,
-      serviceClientSecret: canonicalCredential.currentSecret,
-      ownerEmail: trust.ownerEmail,
-      tokenExpiresAt: canonicalCredential.tokenExpiresAt,
-    }) : {}),
+    ...(trust
+      ? installedAccessBindings({
+          hostname: trust.workersDevHostname,
+          issuer: trust.issuer,
+          audience: trust.audience,
+          serviceClientId: trust.serviceClientId,
+          serviceClientSecret: canonicalCredential.currentSecret,
+          ownerEmail: trust.ownerEmail,
+          tokenExpiresAt: canonicalCredential.tokenExpiresAt,
+        })
+      : {}),
     HUB: {
       idFromName: vi.fn(() => "hub"),
       get: vi.fn(() => ({
@@ -130,12 +138,15 @@ beforeAll(async () => {
   const keys = await generateKeyPair("RS256");
   accessPrivateKey = keys.privateKey;
   accessPublicJwk = {
-    ...await exportJWK(keys.publicKey),
+    ...(await exportJWK(keys.publicKey)),
     kid: "entrypoint-test-key",
     alg: "RS256",
     use: "sig",
   };
-  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ keys: [accessPublicJwk] })));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => Response.json({ keys: [accessPublicJwk] })),
+  );
 });
 
 describe("Worker dynamic entrypoints", () => {
@@ -189,29 +200,37 @@ describe("Worker dynamic entrypoints", () => {
     ["POST", "/api/settings/workers-dev-access/oauth/start"],
     ["POST", "/api/setup/workers-dev-access/broker/proof"],
     ["POST", "/api/setup/workers-dev-access/broker/complete"],
-  ] as const)("authenticates retired Access routes before returning 404 for %s %s", async (method, path) => {
-    const env = mockEnv({}, canonicalTrust);
-    const unauthenticated = await worker.fetch(
-      new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, { method }),
-      env,
-      {} as ExecutionContext,
-    );
-    expect(unauthenticated.status).toBe(401);
+  ] as const)(
+    "authenticates retired Access routes before returning 404 for %s %s",
+    async (method, path) => {
+      const env = mockEnv({}, canonicalTrust);
+      const unauthenticated = await worker.fetch(
+        new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, { method }),
+        env,
+        {} as ExecutionContext,
+      );
+      expect(unauthenticated.status).toBe(401);
 
-    const authenticated = await worker.fetch(
-      new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, {
-        method,
-        headers: { "Cf-Access-Jwt-Assertion": await ownerAssertion() },
-      }),
-      env,
-      {} as ExecutionContext,
-    );
-    expect(authenticated.status).toBe(404);
-  });
+      const authenticated = await worker.fetch(
+        new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, {
+          method,
+          headers: {
+            "Cf-Access-Jwt-Assertion": await ownerAssertion(),
+            Origin: `https://${TEST_WORKERS_DEV_HOSTNAME}`,
+          },
+        }),
+        env,
+        {} as ExecutionContext,
+      );
+      expect(authenticated.status).toBe(404);
+    },
+  );
 
   it("fails closed on /agents before canonical trust exists", async () => {
     const response = await worker.fetch(
-      new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default"),
+      new Request(
+        "https://tiller.preview.workers.dev/agents/reviewer-chat/default",
+      ),
       mockEnv({ HUB_PUBLIC_URL: "https://tiller.preview.workers.dev" }),
       {} as ExecutionContext,
     );
@@ -223,39 +242,53 @@ describe("Worker dynamic entrypoints", () => {
   });
 
   it("authenticates retired /agents routes before returning gone", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
-    }, canonicalTrust);
+    const env = mockEnv(
+      {
+        HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+        TILLER_CONTROL_SECRET: CONTROL_SECRET,
+      },
+      canonicalTrust,
+    );
 
     const missing = await worker.fetch(
-      new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default"),
+      new Request(
+        "https://tiller.preview.workers.dev/agents/reviewer-chat/default",
+      ),
       env,
       {} as ExecutionContext,
     );
     expect(missing.status).toBe(401);
 
     const authed = await worker.fetch(
-      new Request("https://tiller.preview.workers.dev/agents/reviewer-chat/default", {
-        headers: {
-          "CF-Access-Client-Id": canonicalTrust.serviceClientId,
-          "CF-Access-Client-Secret": canonicalCredential.currentSecret,
-          "Cf-Access-Jwt-Assertion": await serviceAssertion(),
+      new Request(
+        "https://tiller.preview.workers.dev/agents/reviewer-chat/default",
+        {
+          headers: {
+            "CF-Access-Client-Id": canonicalTrust.serviceClientId,
+            "CF-Access-Client-Secret": canonicalCredential.currentSecret,
+            "Cf-Access-Jwt-Assertion": await serviceAssertion(),
+            "X-Tiller-Capability": CONTROL_SECRET,
+          },
         },
-      }),
+      ),
       env,
       {} as ExecutionContext,
     );
     expect(authed.status).toBe(410);
     expect(authed.headers.get("Cache-Control")).toBe("no-store");
     await expect(authed.json()).resolves.toEqual({
-      error: "Hosted agent routes have been retired. Use planner reviewer threads instead.",
+      error:
+        "Hosted agent routes have been retired. Use planner reviewer threads instead.",
     });
   });
 
   it("authenticates retired hosted-agent metadata before returning gone", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
-    }, canonicalTrust);
+    const env = mockEnv(
+      {
+        HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+      },
+      canonicalTrust,
+    );
     const missing = await worker.fetch(
       new Request("https://tiller.preview.workers.dev/api/agents"),
       env,
@@ -273,11 +306,12 @@ describe("Worker dynamic entrypoints", () => {
     expect(response.status).toBe(410);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     await expect(response.json()).resolves.toEqual({
-      error: "Hosted agent routes have been retired. Use planner reviewer threads instead.",
+      error:
+        "Hosted agent routes have been retired. Use planner reviewer threads instead.",
     });
   });
 
-  it("exposes the installer probe only to the exact Access service principal", async () => {
+  it("exposes the installer probe to global owners and the exact bootstrap service principal", async () => {
     const env = mockEnv({}, canonicalTrust);
     const url = `https://${TEST_WORKERS_DEV_HOSTNAME}/api/installer/probe`;
 
@@ -295,8 +329,7 @@ describe("Worker dynamic entrypoints", () => {
       env,
       {} as ExecutionContext,
     );
-    expect(owner.status).toBe(403);
-    await expect(owner.json()).resolves.toEqual({ error: "Service principal required" });
+    expect(owner.status).toBe(200);
 
     const service = await worker.fetch(
       new Request(url, {
@@ -312,25 +345,43 @@ describe("Worker dynamic entrypoints", () => {
     });
   });
 
-  it("does not treat local development as the installer service principal", async () => {
+  it("allows local development through global authority while preserving probe availability checks", async () => {
     const response = await worker.fetch(
       new Request("http://localhost/api/installer/probe"),
       mockEnv({ LOCAL_DEV_ONLY_BACKEND: "true" }),
       {} as ExecutionContext,
     );
 
-    expect(response.status).toBe(403);
-    await expect(response.json()).resolves.toEqual({ error: "Service principal required" });
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Release marker unavailable",
+    });
   });
 
-  it("lets the installation service verify its exact live machine advertisement", async () => {
+  it.each(["GET", "POST", "DELETE"])(
+    "returns 404 for the removed Cloudflare MCP proxy on %s",
+    async (method) => {
+      const response = await worker.fetch(
+        new Request("http://localhost/api/mcp/cloudflare", { method }),
+        mockEnv({ LOCAL_DEV_ONLY_BACKEND: "true" }),
+        {} as ExecutionContext,
+      );
+
+      expect(response.status).toBe(404);
+    },
+  );
+
+  it("requires installation control authority to verify a live machine advertisement", async () => {
     const getMachineExecutionStatus = vi.fn(() => ({
       state: "ready",
       machineId: "machine-1",
       displayName: "Build Mac",
     }));
     const env = mockEnv(
-      { HUB_PUBLIC_URL: "https://tiller.preview.workers.dev" },
+      {
+        HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+        TILLER_CONTROL_SECRET: CONTROL_SECRET,
+      },
       canonicalTrust,
       { getMachineExecutionStatus },
     );
@@ -343,6 +394,7 @@ describe("Worker dynamic entrypoints", () => {
             "CF-Access-Client-Id": canonicalTrust.serviceClientId,
             "CF-Access-Client-Secret": canonicalCredential.currentSecret,
             "Cf-Access-Jwt-Assertion": await serviceAssertion(),
+            "X-Tiller-Capability": CONTROL_SECRET,
           },
         },
       ),
@@ -365,20 +417,48 @@ describe("Worker dynamic entrypoints", () => {
     ["DELETE", "/api/repos/repo-1"],
     ["PATCH", "/api/repos/repo-1/session-env"],
     ["PUT", "/api/repos/repo-1/mcp-servers"],
-    ["POST", "/api/repos/repo-1/cloudflare-mcp/connect"],
     ["PUT", "/api/repos/repo-1/plan-writer-settings"],
-  ])("rejects the service principal from repository administration for %s %s", async (method, path) => {
+  ])(
+    "rejects the service principal from repository administration for %s %s",
+    async (method, path) => {
+      const response = await worker.fetch(
+        new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, {
+          method,
+          headers: { "Cf-Access-Jwt-Assertion": await serviceAssertion() },
+        }),
+        mockEnv({}, canonicalTrust),
+        {} as ExecutionContext,
+      );
+
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({
+        error: "A control or environment capability is required",
+      });
+    },
+  );
+
+  it("does not let a forged specialized header reopen broad runtime session creation", async () => {
     const response = await worker.fetch(
-      new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}${path}`, {
-        method,
-        headers: { "Cf-Access-Jwt-Assertion": await serviceAssertion() },
+      new Request(`https://${TEST_WORKERS_DEV_HOSTNAME}/api/sessions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Cf-Access-Jwt-Assertion": await serviceAssertion(),
+          "X-Tiller-Plan-Writer-Token": "forged",
+        },
+        body: JSON.stringify({
+          tag: "forged",
+          metadata: { envSlug: "other-env", role: "lead" },
+        }),
       }),
       mockEnv({}, canonicalTrust),
       {} as ExecutionContext,
     );
 
-    expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toEqual({ error: "Unauthorized" });
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "Plan writer authority required",
+    });
   });
 
   it("fails closed on /parties before canonical trust exists", async () => {
@@ -398,10 +478,14 @@ describe("Worker dynamic entrypoints", () => {
     expect(partyMiddleware).not.toHaveBeenCalled();
   });
 
-  it("requires Access auth on /parties after workers.dev Access is configured", async () => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
-    }, canonicalTrust);
+  it("delegates Hub WebSocket authorization to HubDO", async () => {
+    const env = mockEnv(
+      {
+        HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+        TILLER_CONTROL_SECRET: CONTROL_SECRET,
+      },
+      canonicalTrust,
+    );
 
     const missing = await worker.fetch(
       new Request("https://tiller.preview.workers.dev/parties/hub/hub", {
@@ -410,9 +494,9 @@ describe("Worker dynamic entrypoints", () => {
       env,
       {} as ExecutionContext,
     );
-    expect(missing.status).toBe(401);
-    expect(partyserverMiddleware).not.toHaveBeenCalled();
-    expect(partyMiddleware).not.toHaveBeenCalled();
+    expect(missing.status).toBe(200);
+    expect(partyserverMiddleware).toHaveBeenCalledTimes(1);
+    expect(partyMiddleware).toHaveBeenCalledTimes(1);
 
     const authed = await worker.fetch(
       new Request("https://tiller.preview.workers.dev/parties/hub/hub", {
@@ -420,6 +504,7 @@ describe("Worker dynamic entrypoints", () => {
           "CF-Access-Client-Id": canonicalTrust.serviceClientId,
           "CF-Access-Client-Secret": canonicalCredential.currentSecret,
           "Cf-Access-Jwt-Assertion": await serviceAssertion(),
+          "X-Tiller-Capability": CONTROL_SECRET,
           Upgrade: "websocket",
         },
       }),
@@ -428,44 +513,53 @@ describe("Worker dynamic entrypoints", () => {
     );
     expect(authed.status).toBe(200);
     await expect(authed.text()).resolves.toBe("party ok");
-    expect(partyserverMiddleware).toHaveBeenCalledTimes(1);
-    expect(partyMiddleware).toHaveBeenCalledTimes(1);
+    expect(partyserverMiddleware).toHaveBeenCalledTimes(2);
+    expect(partyMiddleware).toHaveBeenCalledTimes(2);
   });
 
   it.each([
     "/parties/reviewer-chat/default",
     "/parties//reviewer-chat/default",
-  ])("authenticates the retired reviewer PartyServer namespace before returning gone for %s", async (path) => {
-    const env = mockEnv({
-      HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
-    }, canonicalTrust);
-    const url = `https://tiller.preview.workers.dev${path}`;
-
-    const missing = await worker.fetch(
-      new Request(url, { headers: { Upgrade: "websocket" } }),
-      env,
-      {} as ExecutionContext,
-    );
-    expect(missing.status).toBe(401);
-
-    const authed = await worker.fetch(
-      new Request(url, {
-        headers: {
-          "CF-Access-Client-Id": canonicalTrust.serviceClientId,
-          "CF-Access-Client-Secret": canonicalCredential.currentSecret,
-          "Cf-Access-Jwt-Assertion": await serviceAssertion(),
-          Upgrade: "websocket",
+  ])(
+    "authenticates the retired reviewer PartyServer namespace before returning gone for %s",
+    async (path) => {
+      const env = mockEnv(
+        {
+          HUB_PUBLIC_URL: "https://tiller.preview.workers.dev",
+          TILLER_CONTROL_SECRET: CONTROL_SECRET,
         },
-      }),
-      env,
-      {} as ExecutionContext,
-    );
-    expect(authed.status).toBe(410);
-    expect(authed.headers.get("Cache-Control")).toBe("no-store");
-    await expect(authed.json()).resolves.toEqual({
-      error: "Hosted agent routes have been retired. Use planner reviewer threads instead.",
-    });
-    expect(partyserverMiddleware).not.toHaveBeenCalled();
-    expect(partyMiddleware).not.toHaveBeenCalled();
-  });
+        canonicalTrust,
+      );
+      const url = `https://tiller.preview.workers.dev${path}`;
+
+      const missing = await worker.fetch(
+        new Request(url, { headers: { Upgrade: "websocket" } }),
+        env,
+        {} as ExecutionContext,
+      );
+      expect(missing.status).toBe(401);
+
+      const authed = await worker.fetch(
+        new Request(url, {
+          headers: {
+            "CF-Access-Client-Id": canonicalTrust.serviceClientId,
+            "CF-Access-Client-Secret": canonicalCredential.currentSecret,
+            "Cf-Access-Jwt-Assertion": await serviceAssertion(),
+            "X-Tiller-Capability": CONTROL_SECRET,
+            Upgrade: "websocket",
+          },
+        }),
+        env,
+        {} as ExecutionContext,
+      );
+      expect(authed.status).toBe(410);
+      expect(authed.headers.get("Cache-Control")).toBe("no-store");
+      await expect(authed.json()).resolves.toEqual({
+        error:
+          "Hosted agent routes have been retired. Use planner reviewer threads instead.",
+      });
+      expect(partyserverMiddleware).not.toHaveBeenCalled();
+      expect(partyMiddleware).not.toHaveBeenCalled();
+    },
+  );
 });

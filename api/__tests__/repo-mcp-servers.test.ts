@@ -19,7 +19,6 @@ import {
   REPO_MCP_MAX_SERVERS,
   normalizeRepoMcpServersRequest,
 } from "../mcp-servers";
-import { CLOUDFLARE_API_MCP_SERVER_ID } from "../cloudflare-mcp";
 
 type SqlResultRow = Record<string, unknown>;
 
@@ -114,8 +113,8 @@ describe("repo MCP server storage", () => {
     const servers = unwrapPutResult(subject.putRepoMcpServers("repo-1", {
       servers: [
         {
-          label: "  Cloudflare Docs  ",
-          url: "https://DOCS.MCP.CLOUDFLARE.COM:443/mcp",
+          label: "  Documentation  ",
+          url: "https://DOCS.EXAMPLE.COM:443/mcp",
           enabled: true,
         },
         {
@@ -129,18 +128,18 @@ describe("repo MCP server storage", () => {
     expect(servers).toEqual([
       {
         id: expect.stringMatching(/^tiller_[a-z2-7]+$/),
-        label: "Cloudflare Docs",
-        url: "https://docs.mcp.cloudflare.com/mcp",
-        enabled: true,
-      },
-      {
-        id: expect.stringMatching(/^tiller_[a-z2-7]+$/),
         label: "Disabled",
         url: "https://example.com/mcp",
         enabled: false,
       },
+      {
+        id: expect.stringMatching(/^tiller_[a-z2-7]+$/),
+        label: "Documentation",
+        url: "https://docs.example.com/mcp",
+        enabled: true,
+      },
     ]);
-    expect(subject.listEnabledRepoMcpServers("repo-1")).toEqual([servers[0]]);
+    expect(subject.listEnabledRepoMcpServers("repo-1")).toEqual([servers[1]]);
 
     storage.close();
   });
@@ -198,30 +197,40 @@ describe("repo MCP server storage", () => {
     })).toHaveLength(2);
   });
 
-  it("rejects the managed Cloudflare API MCP id in generic MCP settings", () => {
-    expect(() => normalizeRepoMcpServersRequest({
+  it("does not reserve provider-specific MCP server IDs", () => {
+    expect(normalizeRepoMcpServersRequest({
       servers: [
         {
           id: "tiller_cloudflare_api",
-          label: "Cloudflare API",
-          url: "https://mcp.cloudflare.com/mcp",
+          label: "Provider API",
+          url: "https://api.example.com/mcp",
           enabled: true,
         },
       ],
-    }, { existingIds: ["tiller_cloudflare_api"] })).toThrow("MCP server id is reserved by Tiller.");
+    }, { existingIds: ["tiller_cloudflare_api"] })).toEqual([{
+      id: "tiller_cloudflare_api",
+      label: "Provider API",
+      url: "https://api.example.com/mcp",
+      enabled: true,
+    }]);
 
-    expect(() => normalizeRepoMcpServersRequest({
+    expect(normalizeRepoMcpServersRequest({
       servers: [
         {
-          label: "Cloudflare API",
-          url: "https://mcp.cloudflare.com/mcp",
+          label: "Provider API",
+          url: "https://api.example.com/mcp",
           enabled: true,
         },
       ],
     }, {
       existingIds: [],
       generateId: () => "tiller_cloudflare_api",
-    })).toThrow("MCP server id is reserved by Tiller.");
+    })).toEqual([{
+      id: "tiller_cloudflare_api",
+      label: "Provider API",
+      url: "https://api.example.com/mcp",
+      enabled: true,
+    }]);
   });
 
   it("rejects invalid public HTTPS URLs and limits", () => {
@@ -274,168 +283,4 @@ describe("repo MCP server storage", () => {
     storage.close();
   });
 
-  it("sanitizes dynamic Cloudflare MCP OAuth client registration network failures", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network secret")));
-    const { subject, storage } = createSubject();
-
-    await expect(subject.startRepoCloudflareMcpOAuth("repo-1", {
-      redirectUri: "https://hub.example.com/api/repos/repo-1/cloudflare-mcp/callback",
-      hubOrigin: "https://hub.example.com",
-    })).rejects.toMatchObject({
-      status: 502,
-      code: "cloudflare_oauth_registration_failed",
-      message: "Cloudflare OAuth client registration failed.",
-    });
-
-    storage.close();
-  });
-
-  it("stores Cloudflare MCP OAuth credentials encrypted and revokes launch tokens", async () => {
-    const fetchMock = vi.fn(async (url: string | URL | Request) => {
-      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
-      if (href === "https://mcp.cloudflare.com/token") {
-        return new Response(JSON.stringify({
-          access_token: "access-secret",
-          refresh_token: "refresh-secret",
-          expires_in: 3600,
-          scope: "accounts:read",
-        }), { status: 200, headers: { "Content-Type": "application/json" } });
-      }
-      if (href.startsWith("https://api.cloudflare.com/client/v4/accounts")) {
-        return new Response(JSON.stringify({
-          result: [{ id: "account-1", name: "Paperwing" }],
-        }), { status: 200, headers: { "Content-Type": "application/json" } });
-      }
-      return new Response("not found", { status: 404 });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const { subject, storage } = createSubject({
-      CLOUDFLARE_MCP_OAUTH_CLIENT_ID: "client-1",
-      CLOUDFLARE_MCP_OAUTH_CLIENT_SECRET: "client-secret",
-    });
-    const redirectUri = "https://hub.example.com/api/repos/repo-1/cloudflare-mcp/callback";
-
-    const started = await subject.startRepoCloudflareMcpOAuth("repo-1", {
-      redirectUri,
-      hubOrigin: "https://hub.example.com",
-      requestIdentity: "cf-access-email:user@example.com",
-    });
-    const state = new URL(started.authorizeUrl).searchParams.get("state")!;
-    const connected = await subject.completeRepoCloudflareMcpOAuth("repo-1", {
-      state,
-      code: "oauth-code",
-      redirectUri,
-      requestIdentity: "cf-access-email:user@example.com",
-    });
-
-    expect(connected).toMatchObject({
-      status: "connected",
-      connected: true,
-      enabled: false,
-      account: { id: "account-1", name: "Paperwing" },
-    });
-    const credentialRow = storage.sql.exec(
-      `SELECT encrypted_access_token, encrypted_refresh_token, client_id FROM repo_cloudflare_mcp_credentials WHERE repo_id = ?`,
-      "repo-1",
-    ).toArray()[0];
-    expect(JSON.stringify(credentialRow)).not.toContain("access-secret");
-    expect(JSON.stringify(credentialRow)).not.toContain("refresh-secret");
-    expect(JSON.stringify(credentialRow)).not.toContain("client-secret");
-    await expect(subject.getValidCloudflareMcpAccessToken("repo-1")).resolves.toEqual({
-      accessToken: "access-secret",
-    });
-
-    expect(subject.enableRepoCloudflareMcp("repo-1")).toMatchObject({ enabled: true });
-    const token = await subject.mintCloudflareMcpProxyToken("repo-1", "env-1");
-    expect(token).toMatch(/^tcmpt_/);
-    await expect(subject.validateCloudflareMcpProxyToken(token!)).resolves.toEqual({
-      ok: true,
-      repoId: "repo-1",
-      envSlug: "env-1",
-      serverId: CLOUDFLARE_API_MCP_SERVER_ID,
-    });
-    subject.revokeCloudflareMcpProxyTokensForEnv("env-1");
-    await expect(subject.validateCloudflareMcpProxyToken(token!)).resolves.toEqual({
-      ok: false,
-      code: "cloudflare_proxy_auth_failed",
-    });
-
-    storage.close();
-  });
-
-  it("keeps Cloudflare MCP audit events when disconnecting", async () => {
-    const { subject, storage } = createSubject();
-
-    subject.recordCloudflareMcpAuditEvent({
-      repoId: "repo-1",
-      envSlug: "env-1",
-      serverId: CLOUDFLARE_API_MCP_SERVER_ID,
-      httpMethod: "POST",
-      jsonRpcMethod: "tools/list",
-      responseStatus: 200,
-      errorCode: null,
-    });
-    subject.disconnectRepoCloudflareMcp("repo-1");
-
-    expect(storage.sql.exec(
-      `SELECT COUNT(*) AS count FROM repo_cloudflare_mcp_audit_events WHERE repo_id = ?`,
-      "repo-1",
-    ).toArray()[0]).toEqual({ count: 1 });
-
-    storage.close();
-  });
-
-  it("does not mark reauth required for transient Cloudflare token refresh failures", async () => {
-    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
-      const body = typeof init?.body === "string" ? init.body : "";
-      if (href === "https://mcp.cloudflare.com/token" && body.includes("grant_type=authorization_code")) {
-        return new Response(JSON.stringify({
-          access_token: "access-secret",
-          refresh_token: "refresh-secret",
-          expires_in: 1,
-          scope: "accounts:read",
-        }), { status: 200, headers: { "Content-Type": "application/json" } });
-      }
-      if (href === "https://mcp.cloudflare.com/token" && body.includes("grant_type=refresh_token")) {
-        return new Response(JSON.stringify({ error: "temporarily_unavailable" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response("not found", { status: 404 });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const { subject, storage } = createSubject({
-      CLOUDFLARE_MCP_OAUTH_CLIENT_ID: "client-1",
-    });
-    const redirectUri = "https://hub.example.com/api/repos/repo-1/cloudflare-mcp/callback";
-    const started = await subject.startRepoCloudflareMcpOAuth("repo-1", {
-      redirectUri,
-      hubOrigin: "https://hub.example.com",
-    });
-    const state = new URL(started.authorizeUrl).searchParams.get("state")!;
-    await subject.completeRepoCloudflareMcpOAuth("repo-1", {
-      state,
-      code: "oauth-code",
-      redirectUri,
-    });
-    subject.enableRepoCloudflareMcp("repo-1");
-    storage.sql.exec(
-      `UPDATE repo_cloudflare_mcp_credentials SET expires_at = ? WHERE repo_id = ?`,
-      Date.now() - 1000,
-      "repo-1",
-    );
-
-    await expect(subject.getValidCloudflareMcpAccessToken("repo-1")).rejects.toMatchObject({
-      code: "cloudflare_upstream_error",
-    });
-    expect(subject.getRepoCloudflareMcpStatus("repo-1")).toMatchObject({
-      status: "connected",
-      enabled: true,
-      lastAuthError: null,
-    });
-
-    storage.close();
-  });
 });

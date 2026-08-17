@@ -37,11 +37,12 @@ function createSubject() {
   const ctx = {
     storage: {
       get: transaction.get,
+      put: transaction.put,
       transaction: async <T>(callback: (value: typeof transaction) => Promise<T>) => callback(transaction),
     },
     container: { destroy },
   };
-  return { runtime: new PlannerRunDO(ctx as any, {} as any), destroy };
+  return { runtime: new PlannerRunDO(ctx as any, {} as any), destroy, ctx };
 }
 
 describe("PlannerRunDO Plan Writer fencing", () => {
@@ -78,6 +79,42 @@ describe("PlannerRunDO Plan Writer fencing", () => {
     mocks.start.mockRejectedValueOnce(new Error("create failed"));
     await expect(runtime.ensurePlanWriterRuntime("writer-1", {})).rejects.toThrow("create failed");
     expect(await runtime.inspectPlanWriterRuntime("writer-1")).toEqual({ registered: false, live: false, jobSlug: null });
+  });
+
+  it("permanently rejects a Plan Writer start when cleanup arrives first", async () => {
+    const { runtime, destroy, ctx } = createSubject();
+
+    await runtime.destroyPlanWriterRuntime("writer-1");
+
+    const restarted = new PlannerRunDO(ctx as any, {} as any);
+    await expect(restarted.ensurePlanWriterRuntime("writer-1", {})).rejects.toThrow(/already destroyed/i);
+    expect(mocks.start).not.toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("permanently rejects a one-shot planner start when cleanup arrives first", async () => {
+    const { runtime, destroy, ctx } = createSubject();
+
+    await runtime.destroyPlannerJob();
+    await runtime.destroyPlannerJob();
+
+    const restarted = new PlannerRunDO(ctx as any, {} as any);
+    await expect(restarted.startPlannerJob({})).rejects.toThrow(/already destroyed/i);
+    expect(mocks.start).not.toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires the protected reviewer protocol for one-shot planner starts", async () => {
+    const { runtime } = createSubject();
+
+    await expect(runtime.startPlannerJob({})).rejects.toThrow(/protected reviewer isolation/i);
+    expect(mocks.start).not.toHaveBeenCalled();
+
+    await runtime.startPlannerJob({ TILLER_REVIEWER_ISOLATION_PROTOCOL: "1" });
+    expect(mocks.start).toHaveBeenCalledWith({
+      envVars: { TILLER_REVIEWER_ISOLATION_PROTOCOL: "1" },
+      enableInternet: true,
+    });
   });
 
   it("distinguishes a retained reservation from a live container", async () => {

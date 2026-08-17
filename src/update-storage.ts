@@ -8,6 +8,6 @@ export function isUpdateDismissed(sourceId: string): boolean {
   return window.localStorage.getItem(getDismissKey(sourceId)) === 'true';
 }
 
-export function dismissUpdate(sourceId: string): void {
+export function ignoreUpdateUntilNext(sourceId: string): void {
   window.localStorage.setItem(getDismissKey(sourceId), 'true');
 }

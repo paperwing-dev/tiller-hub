@@ -1,6 +1,7 @@
 import React from "react";
 import type { AgentRoute, PlannerEffort, PlannerProviderMetadata } from "./api";
 import ModelEffortPicker, { type ModelEffortOption } from "./ModelEffortPicker";
+import { PLAN_AGENT_LABEL } from "./plan-agent-copy";
 
 export interface PlanWriterModelSelection {
   routeKey: string;
@@ -63,12 +64,9 @@ export default function PlanWriterModelPicker({
       <ModelEffortPicker
         options={buildPlanWriterModelOptions(routes, providers)}
         value={{ model: value.routeKey, effort: value.effort }}
-        onChange={(selection) => onChange({
-          routeKey: selection.model,
-          effort: selection.effort,
-        })}
+        onChange={(selection) => onChange({ routeKey: selection.model, effort: selection.effort })}
         disabled={disabled}
-        modelLabel="Scribe model"
+        modelLabel={`${PLAN_AGENT_LABEL} model`}
         effortLabel="Reasoning effort"
       />
       {settingsHref && (

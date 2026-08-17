@@ -25,6 +25,7 @@ export type PredeployBlockerKind =
   | "active_plan_writer"
   | "retained_plan_writer_runtime"
   | "pending_plan_writer_cleanup"
+  | "pending_plan_runtime_cleanup"
   | "hub_session_record"
   | "active_hub_session"
   | "routable_hub_session";
@@ -126,9 +127,10 @@ export async function inspectPredeployCleanSlate(
       repoId,
       loaded.repo.meta.artifactStoreGeneration,
     );
-    const [runs, writers] = await Promise.all([
+    const [runs, writers, runtimeCleanupTargets] = await Promise.all([
       artifactStore.listPlannerWorkloadStateForPredeploy(repoId),
       artifactStore.listPlanWritersForRepo(repoId),
+      artifactStore.listPlanRuntimeCleanupTargetsForRepo(repoId),
     ]);
     for (const run of runs) {
       if (!run?.runId || typeof run.status !== "string" || typeof run.hasRuntime !== "boolean") {
@@ -162,6 +164,15 @@ export async function inspectPredeployCleanSlate(
           resourceId: writer.threadId,
         });
       }
+    }
+    for (const target of runtimeCleanupTargets) {
+      if (!target?.cleanupId || target.repoId !== repoId) {
+        throw new Error(`Repository ${repoId} has malformed plan runtime cleanup state.`);
+      }
+      blockers.push({
+        kind: "pending_plan_runtime_cleanup",
+        resourceId: target.cleanupId,
+      });
     }
   }
 

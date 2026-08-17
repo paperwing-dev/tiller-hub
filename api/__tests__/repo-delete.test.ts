@@ -52,7 +52,6 @@ function createEnv() {
   const hub = {
     deleteRepoSessionEnv: vi.fn(async () => undefined),
     deleteRepoMcpServers: vi.fn(async () => undefined),
-    deleteRepoCloudflareMcpIntegration: vi.fn(async () => undefined),
     broadcastRepoRemove: vi.fn(async () => undefined),
   };
   return {
@@ -87,6 +86,7 @@ describe("repository deletion safety", () => {
     mocks.getArtifactStoreStub.mockReturnValue({
       listPlannerWorkloadStateForPredeploy: vi.fn(async () => []),
       listPlanWritersForRepo: vi.fn(async () => []),
+      listPlanRuntimeCleanupTargetsForRepo: vi.fn(async () => []),
       finalizeRepositoryDeletion: vi.fn(async () => undefined),
     });
     mocks.getEnvLifecycleStub.mockReturnValue({ getGitHubPublishOperation: vi.fn(async () => null) });
@@ -124,6 +124,11 @@ describe("repository deletion safety", () => {
         planArtifactId: "plan-1",
         jobSlug: "job-1",
       }]),
+      listPlanRuntimeCleanupTargetsForRepo: vi.fn(async () => [{
+        cleanupId: "cleanup-1",
+        ownerId: "writer-1",
+        kind: "writer",
+      }]),
       finalizeRepositoryDeletion: vi.fn(async () => undefined),
     });
     const { HUB, hub } = createEnv();
@@ -136,6 +141,7 @@ describe("repository deletion safety", () => {
         expect.objectContaining({ kind: "planner_run", id: "run-1" }),
         expect.objectContaining({ kind: "plan_writer", id: "writer-1" }),
         expect.objectContaining({ kind: "plan_writer_runtime", id: "writer-1" }),
+        expect.objectContaining({ kind: "plan_runtime_cleanup", id: "cleanup-1" }),
       ]),
     });
     expect(mocks.deleteRepoIndex).not.toHaveBeenCalled();

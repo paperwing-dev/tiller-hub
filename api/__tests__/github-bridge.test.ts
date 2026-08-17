@@ -203,12 +203,13 @@ describe("GitHub bridge validation", () => {
         envSlug: "dev",
         repoId: "repo-id",
         operationId: "op-1",
+        tokenAccess: "publish",
       },
       githubFullName: "example/repo",
     });
 
     const publish = await validateGitHubBridgeRequest(env, bridgeRequest(publishCreds), "example/repo");
     expect(publish.ok).toBe(true);
-    if (publish.ok) expect(githubBridgeTokenAccess(publish.record)).toBe("write");
+    if (publish.ok) expect(githubBridgeTokenAccess(publish.record)).toBe("publish");
   });
 });

@@ -42,14 +42,30 @@ export interface ThreadMessage {
   createdAt: string;
 }
 
+/** Chat body used by Plan and Environment Review threads. */
+export interface ReviewThreadMessageBody {
+  role: "user" | "assistant";
+  text: string;
+  /** Optional only so historical messages created before run correlation remain readable. */
+  runId?: string;
+  planVersion?: number;
+}
+
 export type ArtifactType = "plan" | "review" | "decision" | "checkpoint" | "completion";
 export type PlanStatus = "draft" | "evaluating" | "todo" | "completed" | "archived";
 export type PlannerRunRole = "reviewer";
 export type PlannerRunStatus = "queued" | "running" | "saving" | "completed" | "failed" | "cancelled";
 export type PlanContributionStatus = "pending" | "incorporated" | "dismissed";
-export type PlanContributionSourceKind = "manual" | "reviewer_message" | "reviewer_run" | "skill_guidance";
-export type PlanWriterProvider = "claude-code" | "codex";
+export type PlanContributionSourceKind =
+  | "manual"
+  | "reviewer_message"
+  | "reviewer_run"
+  | "skill_guidance"
+  | "skill_overview"
+  | "curated_reviewer_handoff";
+export type PlanWriterProvider = "claude-code" | "codex" | "opencode";
 export type PlanWriterLifecycle = "not_running" | "starting" | "running";
+export type PlanWriterStartupStage = "reserving" | "launching";
 export type PlanWriterStopReason =
   | "user"
   | "idle"
@@ -59,11 +75,49 @@ export type PlanWriterStopReason =
   | "mode_invalidated"
   | "watchdog";
 export type PlanWriterSynchronizationState = "up_to_date" | "saving" | "sync_failed";
+export type PlanAttentionSourceKind = "scribe" | "reviewer";
 export type SkillSurface = "plan" | "review";
 export type SkillAutomationMode = "auto" | "manual";
 export type SkillOrigin = "builtin" | "custom";
-export type SkillRunRole = "child_initial" | "child_followup" | "overview";
+export type SkillRunRole =
+  | "root_initial"
+  | "root_followup"
+  | "report_initial"
+  | "report_followup"
+  | "overview";
 export type SkillInvocationStatus = "setting_up" | "active" | "completed" | "failed" | "cancelled";
+export type ReviewNodeKind = "generic" | "skill_root" | "report";
+export type PlanRiskLevel = "low" | "medium" | "high";
+export type PlanChangeSize = "small" | "medium" | "large";
+
+export interface PlanHealthValues {
+  risk: {
+    level: PlanRiskLevel;
+    summary: string;
+  };
+  changeSize: {
+    size: PlanChangeSize;
+    summary: string;
+  };
+}
+
+export interface PlanHealthAssessment {
+  schemaVersion: 1;
+  assessments: PlanHealthValues;
+  assessedAt: string;
+  skillInvocationId: string;
+  basisVersion: number;
+  staleAt?: string;
+}
+
+export interface PlanHealthSkillResult {
+  kind: "plan-health";
+  schemaVersion: 1;
+  assessments: PlanHealthValues;
+  assessedAt: string;
+  basisVersion: number;
+  application: "applied" | "plan_changed";
+}
 
 export interface AgentRoute {
   key: string;
@@ -109,6 +163,7 @@ export interface PlannerRunBasis {
   artifactId: string;
   title: string;
   markdown: string;
+  normalizationVersion?: 1;
   version: number;
   gitBaseCommitSha: string | null;
 }
@@ -134,6 +189,12 @@ export interface FrozenOverviewPayload {
   frozenAt: string;
 }
 
+export interface FrozenReviewRoute {
+  provider: string;
+  model: string;
+  effort: PlannerEffort;
+}
+
 export interface RepoPlanWriterSettings {
   repoId: string;
   routeKey: string;
@@ -150,10 +211,15 @@ export interface PlanSkillInvocation {
   definitionSnapshot: SkillDefinitionSnapshot;
   basis: PlannerRunBasis;
   status: SkillInvocationStatus;
+  overviewMode: SkillAutomationMode;
+  includedMessageIds: string[];
+  overviewRunId: string | null;
+  overviewRoute: FrozenReviewRoute | null;
   error: string | null;
   cancelledAt: string | null;
   createdAt: string;
   updatedAt: string;
+  result: PlanHealthSkillResult | null;
 }
 
 export interface SkillInvocationSummary {
@@ -221,6 +287,8 @@ export interface Artifact<TBody = unknown> {
   createdAt: string;
   updatedAt?: string;
   version?: number;
+  /** Present only for plan artifacts with a valid persisted Health snapshot. */
+  planHealth?: PlanHealthAssessment;
 }
 
 export interface ArtifactRef {
@@ -229,6 +297,13 @@ export interface ArtifactRef {
   artifactId: string;
   version: number;
   updatedAt: string;
+}
+
+export interface PlanAttentionItem {
+  planArtifactId: string;
+  sourceKind: PlanAttentionSourceKind;
+  sourceId: string;
+  token: string;
 }
 
 export interface PlanArtifactBody {
@@ -305,6 +380,7 @@ export interface PlanContribution {
   sourceThreadId?: string;
   sourceMessageId?: string;
   sourcePlanVersion?: number;
+  sourceRefs: PlanContributionSourceRef[];
   provider: string;
   model: string;
   skill?: string;
@@ -314,6 +390,23 @@ export interface PlanContribution {
   updatedAt: string;
   incorporatedAt?: string;
   dismissedAt?: string;
+}
+
+export interface PlanContributionSourceRef {
+  threadId: string;
+  messageId: string;
+  runId: string;
+}
+
+export interface ReviewerRunAttribution {
+  status: PlannerRunStatus;
+  error?: string;
+  provider: string;
+  model: string;
+  effort?: PlannerEffort;
+  skillRunRole?: SkillRunRole;
+  command?: string;
+  agentLabel?: string;
 }
 
 export interface WriterPublicationCursor {
@@ -338,6 +431,7 @@ export interface ObservedPlanPublication {
 export type PublishObservedPlanResult =
   | {
       status: "updated" | "unchanged" | "replayed";
+      changed: boolean;
       artifactVersion: number;
       cursor: WriterPublicationCursor;
       artifact: Artifact<PlanArtifactBody>;
@@ -356,8 +450,8 @@ export type PublishObservedPlanResult =
     };
 
 export interface StartPlanWriterRequest {
-  provider?: PlanWriterProvider;
-  model?: string;
+  routeKey?: string;
+  effort?: PlannerEffort;
 }
 
 export interface StopPlanWriterRequest {
@@ -379,6 +473,7 @@ export interface CreatePlanContributionInput {
   sourceThreadId?: string;
   sourceMessageId?: string;
   sourcePlanVersion?: number;
+  sourceRefs?: PlanContributionSourceRef[];
   idempotencyKey?: string;
   provider: string;
   model: string;
@@ -386,6 +481,12 @@ export interface CreatePlanContributionInput {
   text: string;
   createdAt?: string;
 }
+
+export type CreateCuratedPlanContributionResult =
+  | { status: "created"; contribution: PlanContribution }
+  | { status: "existing"; contribution: PlanContribution }
+  | { status: "conflict"; contribution: PlanContribution; reason: "request_payload_changed" }
+  | { status: "source_used"; source: PlanContributionSourceRef };
 
 export type CreateOrGetPlanContributionResult =
   | { status: "created"; contribution: PlanContribution }
@@ -411,6 +512,12 @@ export interface PlannerRunInput {
   skillDefinitionSnapshot?: SkillDefinitionSnapshot;
   basis?: PlannerRunBasis;
   effort?: PlannerEffort;
+  frozenOverview?: FrozenOverviewPayload;
+}
+
+/** Internal storage input. Never serialize this shape through planner APIs. */
+export interface StoredPlannerRunInput extends PlannerRunInput {
+  initialResultHandler?: "plan-health@1";
 }
 
 export interface PlannerRunRuntimeProvenance {
@@ -423,11 +530,83 @@ export type PlannerRunLaunchProvenance = ExecutionPlacement & {
   claudeAuthMode?: ResolvedClaudeAuthMode;
 };
 
-export type PlanWriterLaunchProvenance = PlannerRunLaunchProvenance;
+export interface PlanWriterSkillProjectionEnvelope {
+  version: 1;
+  repositoryId: string;
+  planId: string;
+  generation: number;
+  skills: AgentSkillDefinition[];
+}
+
+export type PlanWriterLaunchProvenance = ExecutionPlacement & {
+  schemaVersion: 2;
+  codexExecution?: CodexExecutionProfile;
+  claudeAuthMode?: ResolvedClaudeAuthMode;
+  skillProjection: PlanWriterSkillProjectionEnvelope;
+};
 
 export interface PlanWriterRuntimeProvenance extends PlannerRunRuntimeProvenance {
   generation: number;
 }
+
+/**
+ * Immutable, versioned ownership snapshot for backend work that must be
+ * destroyed after the plan-facing mutation has committed.
+ */
+export type PlanRuntimeCleanupTargetV1 =
+  | {
+      schemaVersion: 1;
+      cleanupId: string;
+      kind: "writer";
+      repoId: string;
+      planArtifactId: string;
+      ownerId: string;
+      generation: number;
+      runtime: PlanWriterRuntimeProvenance | null;
+      launchProvenance:
+        PlanWriterLaunchProvenance | PlannerRunLaunchProvenance | null;
+    }
+  | {
+      schemaVersion: 1;
+      cleanupId: string;
+      kind: "reviewer";
+      repoId: string;
+      planArtifactId: string;
+      ownerId: string;
+      runtime: PlannerRunRuntimeProvenance;
+      launchProvenance: PlannerRunLaunchProvenance;
+    };
+
+/**
+ * Cleanup needs only an exact runtime identity and its execution placement.
+ * Keeping this envelope independent from launch configuration lets cleanup
+ * survive changes to skills, provider metadata, and other agent contracts.
+ */
+export type PlanRuntimeCleanupTargetV2 =
+  | {
+      schemaVersion: 2;
+      cleanupId: string;
+      kind: "writer";
+      repoId: string;
+      planArtifactId: string;
+      ownerId: string;
+      generation: number;
+      runtime: PlanWriterRuntimeProvenance | null;
+      placement: ExecutionPlacement | null;
+    }
+  | {
+      schemaVersion: 2;
+      cleanupId: string;
+      kind: "reviewer";
+      repoId: string;
+      planArtifactId: string;
+      ownerId: string;
+      runtime: PlannerRunRuntimeProvenance;
+      placement: ExecutionPlacement;
+    };
+
+export type PlanRuntimeCleanupTarget =
+  PlanRuntimeCleanupTargetV1 | PlanRuntimeCleanupTargetV2;
 
 export interface PlannerRun {
   runId: string;
@@ -464,10 +643,11 @@ export interface CreatePlannerRunInput {
   skill?: string;
   threadId?: string;
   startedAt?: string;
-  input?: PlannerRunInput;
+  input?: StoredPlannerRunInput;
   skillInvocationId?: string;
   skillAgentId?: string;
   skillRunRole?: SkillRunRole;
+  expectedPlanVersion?: number;
   launchProvenance: PlannerRunLaunchProvenance;
 }
 
@@ -506,17 +686,143 @@ export interface UpdateArtifactStatusInput {
   expectedVersion?: number | null;
 }
 
+export interface FinishActiveReviewerRunInput {
+  runId: string;
+  repoId: string;
+  planArtifactId: string;
+  status: "completed" | "failed";
+  completedAt: string;
+  error?: string | null;
+  /**
+   * Watchdog-only fence for abandoning a stale active run. The store rechecks
+   * every persisted liveness signal against this cutoff in the same
+   * transaction that finalizes the run.
+   */
+  staleActiveCutoff?: string;
+  /**
+   * Dispatch-only ownership fence. `null` means the caller may finalize only
+   * while no runtime has been claimed; a value requires that exact runtime.
+   * Omitted callers retain the existing completion/failure semantics.
+   */
+  expectedRuntime?: PlannerRunRuntimeProvenance | null;
+  events: Array<{
+    type: string;
+    message?: string;
+    data?: unknown;
+  }>;
+}
+
+export interface FinishActiveReviewerRunResult {
+  run: PlannerRun;
+  finalized: boolean;
+}
+
+export type ReviewerTerminalOutput =
+  | { status: "succeeded"; text: string }
+  | { status: "failed"; error: string };
+
+export type PlanHealthCompletionResult =
+  | { handled: false }
+  | {
+      handled: true;
+      run: PlannerRun;
+      finalized: boolean;
+      result?: PlanHealthSkillResult;
+      error?: string;
+    };
+
 export interface SavePlanInput {
   repoId: string;
   id: string;
   markdown: string;
 }
 
+export interface SavePlanResult {
+  artifact: Artifact<PlanArtifactBody>;
+  changed: boolean;
+}
+
+export type RepoPlanMutationErrorCode =
+  | "invalid_request"
+  | "source_inactive"
+  | "plan_not_found"
+  | "self_target"
+  | "plan_not_editable"
+  | "target_writer_active"
+  | "version_conflict"
+  | "idempotency_conflict";
+
+interface RepoPlanMutationSource {
+  repoId: string;
+  sourcePlanId: string;
+  sourceGeneration: number;
+}
+
+export type RepoPlanMutationInput =
+  | (RepoPlanMutationSource & {
+      kind: "create";
+      requestId: string;
+      markdown: string;
+    })
+  | (RepoPlanMutationSource & {
+      kind: "update";
+      targetPlanId: string;
+      expectedVersion: number;
+      markdown: string;
+    });
+
+export type RepoPlanMutationResult =
+  | {
+      ok: true;
+      outcome: "created" | "updated" | "unchanged" | "replayed";
+      artifact: Artifact<PlanArtifactBody>;
+    }
+  | {
+      ok: false;
+      code: RepoPlanMutationErrorCode;
+      currentVersion?: number;
+    };
+
 export interface DiscardPlanInput {
   repoId: string;
   id: string;
   expectedVersion?: number | null;
 }
+
+export interface ResetPlanAgentsInput {
+  repoId: string;
+  resetId: string;
+  requestHash: string;
+}
+
+export interface PlanAgentResetReport {
+  resetId: string;
+  resetAt: string;
+  plansPreserved: number;
+  scribesRemoved: number;
+  reviewersRemoved: number;
+  runsRetired: number;
+  cleanupQueued: number;
+}
+
+export interface UnsupportedPlanAgentCleanupOwner {
+  kind: "writer" | "reviewer" | "cleanup";
+  planArtifactId: string;
+  ownerId: string;
+  cleanupId?: string;
+}
+
+export type ResetPlanAgentsResult =
+  | {
+      status: "reset" | "replayed";
+      report: PlanAgentResetReport;
+    }
+  | { status: "idempotency_conflict" }
+  | {
+      status: "unsupported_cleanup_ownership";
+      blockerCount: number;
+      blockers: UnsupportedPlanAgentCleanupOwner[];
+    };
 
 export interface ReviewerRegistryEntry {
   threadId: string;
@@ -553,10 +859,14 @@ export interface ReviewerRegistryEntry {
   cleanupError?: string;
   skillInvocationId?: string;
   skillAgentId?: string;
+  nodeKind: ReviewNodeKind;
+  skillRootThreadId: string | null;
+  displayLabel?: string;
 }
 
 export interface PlanWriterState {
   lifecycle: PlanWriterLifecycle;
+  threadId?: string | null;
   generation: number | null;
   provider: PlanWriterProvider | null;
   model: string | null;
@@ -567,6 +877,10 @@ export interface PlanWriterState {
   stopReason?: PlanWriterStopReason;
   startupError?: string;
   cleanupError?: string;
+  startup?: {
+    stage: PlanWriterStartupStage;
+    updatedAt: string;
+  };
   synchronization: {
     state: PlanWriterSynchronizationState;
     error?: string;
@@ -585,6 +899,8 @@ export interface UpsertReviewerInput {
   threadId?: string;
   skillInvocationId?: string;
   skillAgentId?: string;
+  nodeKind?: ReviewNodeKind;
+  skillRootThreadId?: string | null;
 }
 
 export interface SetRefInput {

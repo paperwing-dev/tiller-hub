@@ -10,6 +10,7 @@ import { getHarnessModel } from "../../shared/harness-catalog";
 
 const KIMI_K2_7_MODEL = getHarnessModel("opencode", "kimi-k2.7-code")!;
 const OPENAI_OPENCODE_MODEL = getHarnessModel("opencode", "gpt-5.6-sol")!;
+const ANTHROPIC_OPENCODE_MODEL = getHarnessModel("opencode", "claude-opus-5")!;
 
 const { getOrCreateSecret, getSecret } = vi.hoisted(() => ({
   getOrCreateSecret: vi.fn(async (env: Record<string, unknown>, key: string, createValue: () => string) => {
@@ -166,6 +167,42 @@ describe("resolveOpenCodeContainerAuth", () => {
     });
   });
 
+  it("reads only the Anthropic key for an OpenCode Claude model", async () => {
+    await expect(resolveOpenCodeContainerAuth(
+      mockEnv({
+        ANTHROPIC_API_KEY: "anthropic-key",
+        OPENAI_API_KEY: "inactive-openai-key",
+        CLAUDE_CODE_OAUTH_TOKEN: "inactive-subscription-token",
+        [OPENCODE_PROXY_TOKEN_KEY]: "inactive-proxy-token",
+      }),
+      ANTHROPIC_OPENCODE_MODEL,
+    )).resolves.toEqual({
+      model: "claude-opus-5",
+      baseUrl: "https://api.anthropic.com/v1",
+      token: "anthropic-key",
+    });
+    expect(getSecret).toHaveBeenCalledTimes(1);
+    expect(getSecret).toHaveBeenCalledWith(expect.anything(), "ANTHROPIC_API_KEY", { fresh: true });
+    expect(getOrCreateSecret).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back when an OpenCode Claude model is missing its Anthropic key", async () => {
+    await expect(resolveOpenCodeContainerAuth(
+      mockEnv({
+        OPENAI_API_KEY: "inactive-openai-key",
+        CLAUDE_CODE_OAUTH_TOKEN: "inactive-subscription-token",
+        [OPENCODE_PROXY_TOKEN_KEY]: "inactive-proxy-token",
+      }),
+      ANTHROPIC_OPENCODE_MODEL,
+    )).rejects.toMatchObject({
+      reason: "credential-not-configured",
+      message: expect.stringContaining("requires ANTHROPIC_API_KEY"),
+    });
+    expect(getSecret).toHaveBeenCalledTimes(1);
+    expect(getSecret).toHaveBeenCalledWith(expect.anything(), "ANTHROPIC_API_KEY", { fresh: true });
+    expect(getOrCreateSecret).not.toHaveBeenCalled();
+  });
+
   it("returns a hub-managed proxy token when configured", async () => {
     await expect(
       resolveOpenCodeContainerAuth(
@@ -179,6 +216,7 @@ describe("resolveOpenCodeContainerAuth", () => {
       baseUrl: null,
       token: "proxy-token-123",
     });
+    expect(getSecret).not.toHaveBeenCalled();
   });
 
   it("creates a proxy token when one is missing", async () => {

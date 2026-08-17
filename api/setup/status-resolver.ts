@@ -25,12 +25,12 @@ import {
   isGitHubAppAllowedForRequest,
   isGitHubAppInstallationReady,
 } from "../github/app";
-import { getBuildDiagnostics } from "../update/metadata";
+import { getBuildDiagnostics } from "../update/release-info";
 import {
   classifyHostRuntimeCompatibilityForExpectedRuntime,
   resolveExpectedHostRuntime,
 } from "./runtime-compatibility";
-import type { HubUpdateRepoState, UpdateBuildDiagnostics } from "../update/types";
+import type { UpdateBuildDiagnostics } from "../update/types";
 import { resolveCodexBackendReadiness } from "../codex-execution";
 import { readWorkersDevAccessLifecycle } from "../workers-dev-access/records";
 import { readExecutionStatus } from "../execution";
@@ -74,7 +74,6 @@ export interface SetupStatusPayload {
   githubAppManageUrl: string;
   githubAppPublicHubDisabled: boolean;
   buildDiagnostics: UpdateBuildDiagnostics;
-  selfUpdateRepo: HubUpdateRepoState;
   dashboardOnboarding: {
     dismissed: boolean;
     executionReady: boolean;
@@ -264,9 +263,6 @@ export async function resolveSetupStatus(
     env,
   });
   const githubAppReady = githubAppReadiness === "ready";
-  // Kept in the response for one compatibility window. Generated deployment
-  // repositories are no longer part of setup or lifecycle updates.
-  const selfUpdateRepo: HubUpdateRepoState = { status: "not_checked", lastDetectedAt: null };
   const openaiPlanner = resolveOpenAIPlannerStatus({
     hasOpenAIKey: modelAuth.hasOpenAIKey,
     chatgptAuthStatus: modelAuth.chatgptAuthStatus,
@@ -279,11 +275,17 @@ export async function resolveSetupStatus(
       ? null
       : protection.hubUrl;
   const installerManaged = Boolean(env.TILLER_INSTALLER_SCHEMA?.trim());
-  const installationRegion = !isLocalDev
-    && installerManaged
-    && isPlacementRegion(env.DO_LOCATION_HINT)
+  const configuredRegion = isPlacementRegion(env.DO_LOCATION_HINT)
     ? env.DO_LOCATION_HINT
     : null;
+  if (!isLocalDev && installerManaged) {
+    if (configuredRegion === null) {
+      throw new Error("Installer-managed installation region configuration is invalid");
+    }
+  }
+  const installationRegion: PlacementRegion | null = isLocalDev
+    ? null
+    : configuredRegion;
   const githubAppRequired = !isLocalDev;
   // Model, execution, and machine configuration are dashboard onboarding. Only
   // a usable GitHub App installation blocks first entry to the dashboard.
@@ -329,7 +331,6 @@ export async function resolveSetupStatus(
     githubAppManageUrl: getGitHubAppManageUrl(),
     githubAppPublicHubDisabled: !githubAppAllowed,
     buildDiagnostics,
-    selfUpdateRepo,
     dashboardOnboarding: {
       dismissed: (await loadConfig(env))[DASHBOARD_ONBOARDING_DISMISSED_KEY] === "1",
       executionReady: execution.executionReady,

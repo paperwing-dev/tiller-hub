@@ -21,6 +21,7 @@ vi.mock("../setup/runtime-compatibility", () => ({
 
 import { HubDO } from "../hub";
 import * as Q from "../queries";
+import { EXECUTION_SELECTION_KEY } from "../execution";
 import type { HostServiceRegistration, WsConnectionState } from "../types";
 
 const DEFAULT_MACHINE_ID = "11111111-1111-4111-8111-111111111111";
@@ -99,7 +100,10 @@ function createConnection(id: string, initialState: WsConnectionState = {}): Fak
     id,
     readyState: WebSocket.OPEN,
     sent: [],
-    state: initialState,
+    state: {
+      authorization: { kind: "global", source: "local-dev" },
+      ...initialState,
+    },
     setState(next) {
       this.state = typeof next === "function" ? next(this.state) : next;
       return this.state;
@@ -161,6 +165,13 @@ function seedRegisteredHost(subject: HubDO, machineId = DEFAULT_MACHINE_ID, supp
   );
 }
 
+function selectHost(subject: HubDO, machineId: string): void {
+  subject.setConfig(
+    EXECUTION_SELECTION_KEY,
+    JSON.stringify({ target: "host", machineId }),
+  );
+}
+
 function advertiseHost(
   subject: HubDO,
   connection: FakeConnection,
@@ -197,6 +208,41 @@ describe("HubDO reconnect healing", () => {
       machineServiceKeys: [],
     });
     expect(subject.isHostRoutable(DEFAULT_MACHINE_ID)).toBe(false);
+
+    storage.close();
+  });
+
+  it("broadcasts machine changes for binding, reconnection, and reactivation but not routine heartbeats", () => {
+    const { subject, storage, connections } = createSubject();
+    seedRegisteredHost(subject);
+    const observer = createConnection("observer");
+    const initial = createConnection("initial");
+    connections.set(observer.id, observer);
+    connections.set(initial.id, initial);
+
+    const machineUpdates = () => observer.sent
+      .map((payload) => JSON.parse(payload))
+      .filter((message) => message.type === "machine-updated");
+
+    (subject as any).handleMachineAlive(initial, DEFAULT_MACHINE_ID);
+    expect(machineUpdates()).toHaveLength(1);
+
+    (subject as any).handleMachineAlive(initial, DEFAULT_MACHINE_ID);
+    (subject as any).handleMachineAlive(initial, DEFAULT_MACHINE_ID);
+    expect(machineUpdates()).toHaveLength(1);
+
+    const reconnected = createConnection("reconnected");
+    connections.set(reconnected.id, reconnected);
+    (subject as any).handleMachineAlive(reconnected, DEFAULT_MACHINE_ID);
+    expect(machineUpdates()).toHaveLength(2);
+
+    Q.setMachineActive((subject as any).db, DEFAULT_MACHINE_ID, false);
+    (subject as any).handleMachineAlive(reconnected, DEFAULT_MACHINE_ID);
+    expect(machineUpdates()).toHaveLength(3);
+    expect(machineUpdates().at(-1)).toMatchObject({
+      type: "machine-updated",
+      machine: { id: DEFAULT_MACHINE_ID, active: 1 },
+    });
 
     storage.close();
   });
@@ -273,12 +319,12 @@ describe("HubDO reconnect healing", () => {
     const owner = createConnection("owner", {
       sessionId: "session-1",
       sessionLifecycle: "owner",
-      sessionOwnerSeenAt: 2,
+      terminalOwnerActive: true,
     });
     const imposter = createConnection("imposter", {
       sessionId: "session-1",
       sessionLifecycle: "owner",
-      sessionOwnerSeenAt: 1,
+      terminalOwnerActive: false,
     });
     connections.set(owner.id, owner);
     connections.set(imposter.id, imposter);
@@ -316,9 +362,10 @@ describe("HubDO reconnect healing", () => {
     const reconnectedOwner = createConnection("owner-2", {
       sessionId: "session-1",
       sessionLifecycle: "owner",
-      sessionOwnerSeenAt: 3,
+      terminalOwnerActive: false,
     });
     connections.set(reconnectedOwner.id, reconnectedOwner);
+    (subject as any).activateSessionOwner(reconnectedOwner, "session-1");
 
     await expect(subject.sendEnvReviewSnapshotRequest("session-1", "op-2", "env-1", "token-2", {
       uploadUrl: "https://hub.example/api/envs/env-1/review/snapshots/op-2",
@@ -703,6 +750,66 @@ describe("HubDO reconnect healing", () => {
     expect(second.sent.map((payload) => JSON.parse(payload))).toContainEqual({
       type: "error",
       message: `Another execution machine is already connected (${MACHINE_ONE}).`,
+    });
+    storage.close();
+  });
+
+  it("lets the selected machine preempt a different machine that owns the slot", () => {
+    const { subject, storage, connections } = createSubject();
+    seedRegisteredHost(subject, MACHINE_ONE);
+    seedRegisteredHost(subject, MACHINE_TWO);
+    selectHost(subject, MACHINE_TWO);
+    const staleMachine = createConnection("stale-machine");
+    const selectedMachine = createConnection("selected-machine");
+    connections.set(staleMachine.id, staleMachine);
+    connections.set(selectedMachine.id, selectedMachine);
+
+    advertiseHost(
+      subject,
+      staleMachine,
+      MACHINE_ONE,
+      buildHostRegistration(MACHINE_ONE, true, "stale-image"),
+    );
+    advertiseHost(subject, selectedMachine, MACHINE_TWO);
+
+    expect(subject.isHostRoutable(MACHINE_ONE)).toBe(false);
+    expect(subject.isHostRoutable(MACHINE_TWO)).toBe(true);
+    expect(staleMachine.state).toMatchObject({
+      hostDemoted: true,
+      machineServiceKeys: [],
+    });
+    expect(staleMachine.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: "error",
+      message: `The selected execution machine connected (${MACHINE_TWO}); this machine is now on standby.`,
+    });
+    storage.close();
+  });
+
+  it("keeps the current machine active when a selected takeover fails its version fence", () => {
+    const { subject, storage, connections } = createSubject();
+    seedRegisteredHost(subject, MACHINE_ONE);
+    seedRegisteredHost(subject, MACHINE_TWO);
+    selectHost(subject, MACHINE_TWO);
+    const currentMachine = createConnection("current-machine");
+    const staleSelectedMachine = createConnection("stale-selected-machine");
+    connections.set(currentMachine.id, currentMachine);
+    connections.set(staleSelectedMachine.id, staleSelectedMachine);
+    advertiseHost(subject, currentMachine, MACHINE_ONE);
+    (subject as any).handleMachineAlive(staleSelectedMachine, MACHINE_TWO);
+
+    (subject as any).handleMachineUpdateRunnerState(staleSelectedMachine, {
+      type: "machine-update-runner-state",
+      machineId: MACHINE_TWO,
+      runnerState: { host: buildHostRegistration(MACHINE_TWO) },
+      expectedVersion: 1,
+    });
+
+    expect(subject.isHostRoutable(MACHINE_ONE)).toBe(true);
+    expect(subject.isHostRoutable(MACHINE_TWO)).toBe(false);
+    expect(currentMachine.state.machineServiceKeys).toContain("host");
+    expect(staleSelectedMachine.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: "error",
+      message: "Version conflict (current: 2)",
     });
     storage.close();
   });

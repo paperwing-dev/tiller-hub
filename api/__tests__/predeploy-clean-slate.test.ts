@@ -51,6 +51,7 @@ describe("predeploy clean-slate inspection", () => {
     mocks.getArtifactStoreStub.mockReturnValue({
       listPlannerWorkloadStateForPredeploy: vi.fn(async () => []),
       listPlanWritersForRepo: vi.fn(async () => []),
+      listPlanRuntimeCleanupTargetsForRepo: vi.fn(async () => []),
     });
   });
 
@@ -91,6 +92,11 @@ describe("predeploy clean-slate inspection", () => {
         runtime: { backend: "cf", machineId: null, jobSlug: "writer-job", generation: 1 },
         cleanupError: "retry",
       }]),
+      listPlanRuntimeCleanupTargetsForRepo: vi.fn(async () => [{
+        cleanupId: "cleanup-1",
+        repoId: "repo-1",
+        kind: "writer",
+      }]),
     });
 
     const status = await inspectPredeployCleanSlate({} as any, emptyHubState);
@@ -110,6 +116,7 @@ describe("predeploy clean-slate inspection", () => {
       "active_plan_writer",
       "retained_plan_writer_runtime",
       "pending_plan_writer_cleanup",
+      "pending_plan_runtime_cleanup",
     ]);
   });
 
@@ -138,6 +145,7 @@ describe("predeploy clean-slate inspection", () => {
         jobSlug: null,
         cleanupError: null,
       }]),
+      listPlanRuntimeCleanupTargetsForRepo: vi.fn(async () => []),
     });
 
     const status = await inspectPredeployCleanSlate({} as any, emptyHubState);

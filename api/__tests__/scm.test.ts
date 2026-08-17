@@ -10,9 +10,12 @@ import {
 } from "../scm/artifacts";
 import {
   buildScmContainerEnvVars,
+  buildGitHubEnvBranchName,
   createInitialEnvScmState,
   createInitialRepoScmState,
   deriveBranchBackedEnvStatus,
+  deriveGitHubEnvBranchStatus,
+  isRecoverableGitHubPublishFailure,
   isEnvTransitioning,
   parseScmBooleanFlag,
 } from "../scm/model";
@@ -88,6 +91,13 @@ describe("SCM model defaults", () => {
     });
   });
 
+  it("uses the environment incarnation to avoid reusing a stale GitHub PR branch", () => {
+    expect(buildGitHubEnvBranchName(
+      "auth cleanup",
+      "env-12345678-90ab-cdef-1234-567890abcdef",
+    )).toBe("tiller/env/auth-cleanup-1234567890ab");
+  });
+
   it("builds scm env vars for branch-backed containers", () => {
     expect(
       buildScmContainerEnvVars({
@@ -119,6 +129,63 @@ describe("SCM model defaults", () => {
 });
 
 describe("branch-backed env behavior", () => {
+  it("recovers legacy workflow permission failures from false git attention", () => {
+    const failure = {
+      githubPublishStatus: "failed" as const,
+      githubPublishError: "refusing to update workflow files without `workflows` permission",
+    };
+
+    expect(isRecoverableGitHubPublishFailure(failure)).toBe(true);
+    expect(
+      deriveGitHubEnvBranchStatus(
+        {
+          ...failure,
+          githubBaseCommitSha: "head-1",
+          githubPrState: null,
+          githubMergedAt: null,
+          workspaceDirty: true,
+          workspaceNeedsAttention: true,
+        },
+        { githubDefaultBranchHeadSha: "head-1" },
+      ),
+    ).toBe("ready-to-merge");
+  });
+
+  it("recovers credential-scoped repository failures from false git attention", () => {
+    const failure = {
+      githubPublishStatus: "failed" as const,
+      githubPublishError: "Failed to push tiller/env/demo: remote: Repository not found.",
+      githubBaseCommitSha: "base-sha",
+      githubPrState: null,
+      githubMergedAt: null,
+      workspaceDirty: true,
+      workspaceNeedsAttention: true,
+    };
+
+    expect(isRecoverableGitHubPublishFailure(failure)).toBe(true);
+    expect(deriveGitHubEnvBranchStatus(failure, {
+      githubDefaultBranchHeadSha: "base-sha",
+    })).toBe("ready-to-merge");
+  });
+
+  it("keeps retryable GitHub publish failures out of needs-attention", () => {
+    expect(
+      deriveGitHubEnvBranchStatus(
+        {
+          githubBaseCommitSha: "head-1",
+          githubPublishStatus: "failed",
+          githubPrState: null,
+          githubMergedAt: null,
+          workspaceDirty: true,
+          workspaceNeedsAttention: false,
+        },
+        {
+          githubDefaultBranchHeadSha: "head-2",
+        },
+      ),
+    ).toBe("behind-main");
+  });
+
   it("derives behind-main before ready-to-merge", () => {
     expect(
       deriveBranchBackedEnvStatus(

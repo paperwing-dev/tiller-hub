@@ -10,7 +10,7 @@ import {
   createGitHubBridgeRecord,
   revokeGitHubBridgesForEnvPublish,
 } from "./bridge";
-import { createGitHubPendingPublishProjection } from "../scm/model";
+import { buildGitHubEnvBranchName, createGitHubPendingPublishProjection } from "../scm/model";
 import {
   computeGitHubDraftChangeSetHash,
 } from "./draft-overlay";
@@ -30,7 +30,7 @@ import { projectEnvSummary } from "../sync/projectors";
 import { adoptionPayload, hmacHex } from "./adoption";
 import { assertSupportedGitHubBaseMetadata } from "./metadata-validation";
 import { TREE_HASH_EXCLUDES } from "../env/launch-config";
-import { mintGitHubInstallationToken, resolveGitHubAppBotCommitIdentity } from "./app";
+import { GitHubAppError, mintGitHubInstallationToken, resolveGitHubAppBotCommitIdentity } from "./app";
 import { canonicalizeGitHubRepo } from "./repo";
 import { asPlanArtifact, renderArtifactBodyMarkdown } from "../coordination";
 import {
@@ -50,6 +50,7 @@ import {
   buildGitHubPublishJobMeta,
   cleanupGitHubPublishRuntime,
 } from "./publish-runtime";
+import { broadcastPlanArtifactUpdatedHint } from "../plan-artifact-hints";
 
 type RouteResult = { status: number; body: Record<string, unknown> };
 
@@ -73,12 +74,29 @@ function createOperationId(): string {
   return `ghpub-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
-function publishFailureNeedsAttention(code: string | null): boolean {
-  return code === "branch_changed_on_github" || code === "unsupported_metadata" || code === "unsafe_path";
+function publishFailureNeedsAttention(code: string | null, message: string): boolean {
+  if (code === "unsupported_metadata" || code === "unsafe_path") return true;
+  return code === "branch_changed_on_github"
+    && /(?:moved from .+ to .+|already exists|no longer exists)/i.test(message);
 }
 
 function retryableBranchStatus(meta: EnvMeta): EnvMeta["branchStatus"] {
   return meta.branchStatus === "needs-attention" ? "ready-to-merge" : meta.branchStatus;
+}
+
+function withIncarnationPublishBranch(meta: EnvMeta): EnvMeta {
+  const legacyBranch = buildGitHubEnvBranchName(meta.slug);
+  if (
+    meta.githubBranch !== legacyBranch
+    || meta.githubHeadCommitSha
+    || meta.githubPrNumber
+  ) {
+    return meta;
+  }
+  return {
+    ...meta,
+    githubBranch: buildGitHubEnvBranchName(meta.slug, meta.incarnationId),
+  };
 }
 
 async function ensureDraftPullRequest(args: {
@@ -150,6 +168,7 @@ async function buildPublishEnvVars(args: {
   commitAuthorEmail: string;
   jobSlug: string;
   placement: ExecutionPlacement;
+  githubTokenAccess: "write" | "publish";
 }): Promise<Record<string, string>> {
   const hubPublicUrl = await resolveContainerHubUrl(
     args.env,
@@ -164,6 +183,7 @@ async function buildPublishEnvVars(args: {
       envSlug: args.meta.slug,
       repoId: args.repo.meta.repoId,
       operationId: args.operationId,
+      tokenAccess: args.githubTokenAccess,
     },
     githubFullName: args.repo.meta.githubFullName,
   });
@@ -267,6 +287,10 @@ async function readGitHubDraftChangeSet(args: {
   };
 }
 
+function changesGitHubWorkflows(changedFiles: readonly DraftPrChangedFile[]): boolean {
+  return changedFiles.some((file) => file.path.replace(/^\/+/, "").startsWith(".github/workflows/"));
+}
+
 async function readStartupPlanContext(
   env: Env,
   meta: Pick<EnvMeta, "repoId" | "startupPlanId">,
@@ -295,6 +319,34 @@ async function readStartupPlanContext(
   }
 }
 
+async function completeStartupPlan(
+  env: Env,
+  meta: Pick<EnvMeta, "repoId" | "startupPlanId">,
+  repo: Pick<RepoMeta, "repoId" | "artifactStoreGeneration">,
+): Promise<void> {
+  if (!meta.startupPlanId || repo.repoId !== meta.repoId) return;
+  const artifactStore = getArtifactStoreStub(
+    env,
+    meta.repoId,
+    repo.artifactStoreGeneration,
+  );
+  const plan = asPlanArtifact(await artifactStore.getArtifact(meta.startupPlanId));
+  if (!plan || plan.repoId !== meta.repoId) return;
+  const alreadyTerminal = plan.status === "completed" || plan.status === "archived";
+  if (alreadyTerminal) {
+    await artifactStore.getRetainedTerminalPlanCleanupWork(meta.repoId, meta.startupPlanId);
+  } else {
+    await artifactStore.updateArtifactStatus({
+      repoId: meta.repoId,
+      id: meta.startupPlanId,
+      status: "completed",
+    });
+  }
+  if (!alreadyTerminal) {
+    await broadcastPlanArtifactUpdatedHint(env, meta.repoId, meta.startupPlanId);
+  }
+}
+
 export async function startGitHubDraftPrPublish(args: {
   env: Env;
   requestUrl: string;
@@ -316,7 +368,8 @@ export async function startGitHubDraftPrPublish(args: {
   }
 
   const backend = await getRunnerBackend(args.env, storedMeta.backend);
-  const { meta } = await projectEnvMetaForAction(args.env, storedMeta, backend);
+  const projected = await projectEnvMetaForAction(args.env, storedMeta, backend);
+  const meta = withIncarnationPublishBranch(projected.meta);
   if (meta.status !== "stopped") {
     return { status: 409, body: { error: "Environment must be stopped before publishing a draft PR.", code: "env_not_stopped" } };
   }
@@ -351,6 +404,21 @@ export async function startGitHubDraftPrPublish(args: {
     meta,
     baseTree,
   });
+  const githubTokenAccess = changesGitHubWorkflows(draftChangeSet.changedFiles) ? "publish" : "write";
+  if (githubTokenAccess === "publish") {
+    try {
+      const githubRepo = canonicalizeGitHubRepo(repo.meta.githubFullName, { allowOwnerRepo: true });
+      installationToken = (await mintGitHubInstallationToken(args.env, githubRepo, { access: "publish" })).token;
+    } catch (error) {
+      return {
+        status: error instanceof GitHubAppError ? error.status : 502,
+        body: {
+          error: error instanceof Error ? error.message : "GitHub workflow publishing permission is unavailable.",
+          code: error instanceof GitHubAppError ? error.code : "github_app_token_create_failed",
+        },
+      };
+    }
+  }
   const workspaceHash = draftChangeSet.workspaceHash;
   const recoveredPriorHead = await readExistingEnvBranchHead({
     env: args.env,
@@ -480,7 +548,10 @@ export async function startGitHubDraftPrPublish(args: {
       env: args.env,
       requestUrl: args.requestUrl,
       repo,
-      meta: publishingMeta ?? meta,
+      meta: {
+        ...(publishingMeta ?? meta),
+        githubBranch: meta.githubBranch,
+      },
       operationId,
       workspaceHash,
       expectedPriorHead,
@@ -491,6 +562,7 @@ export async function startGitHubDraftPrPublish(args: {
       commitAuthorEmail: commitIdentity.email,
       jobSlug,
       placement,
+      githubTokenAccess,
     });
     if (placement.backend === "host") {
       const jobBackend = await getRunnerBackend(args.env, "host");
@@ -564,17 +636,17 @@ export async function handleGitHubDraftPrPublishResult(args: {
     workspaceHash: typeof args.body.workspaceHash === "string" ? args.body.workspaceHash : "",
     claimId: resultClaimId,
   });
-  if (resultClaim.status === "invalid") {
-    return { status: 403, body: { error: "Publish callback did not match the active operation.", code: "github_publish_callback_invalid" } };
-  }
-  if (resultClaim.status === "cleanup_pending") {
-    return { status: 409, body: { error: "Publish runtime cleanup is already pending.", code: "github_publish_cleanup_pending" } };
-  }
-  if (resultClaim.status === "in_progress") {
-    return { status: 409, body: { error: "This publish result is already being processed.", code: "github_publish_result_in_progress" } };
-  }
-  if (resultClaim.status === "inactive") {
-    return { status: 409, body: { error: "Publish operation is no longer active.", code: "github_publish_not_active" } };
+  switch (resultClaim.status) {
+    case "invalid":
+      return { status: 403, body: { error: "Publish callback did not match the active operation.", code: "github_publish_callback_invalid" } };
+    case "cleanup_pending":
+      return { status: 409, body: { error: "Publish runtime cleanup is already pending.", code: "github_publish_cleanup_pending" } };
+    case "in_progress":
+      return { status: 409, body: { error: "This publish result is already being processed.", code: "github_publish_result_in_progress" } };
+    case "inactive":
+      return { status: 409, body: { error: "Publish operation is no longer active.", code: "github_publish_not_active" } };
+    case "claimed":
+      break;
   }
   const operation = resultClaim.operation;
   const meta = await projectAndPersistEnvSummary(args.env, getHub(args.env), args.slug, { broadcast: false });
@@ -611,7 +683,7 @@ export async function handleGitHubDraftPrPublishResult(args: {
     const code = typeof args.body.code === "string" && args.body.code.trim()
       ? args.body.code.trim()
       : null;
-    const needsAttention = publishFailureNeedsAttention(code);
+    const needsAttention = publishFailureNeedsAttention(code, message);
     const finish = await lifecycle.finishGitHubPublishOperation({
       operationId: args.operationId,
       resultClaimId,
@@ -665,6 +737,14 @@ export async function handleGitHubDraftPrPublishResult(args: {
       workspaceHash: operation.workspaceHash,
       content: operation.pullRequestContent,
     });
+    try {
+      await completeStartupPlan(args.env, meta, repoMeta);
+    } catch (error) {
+      console.warn(
+        `[github-publish] Failed to complete startup plan ${meta.startupPlanId ?? "(none)"}:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   const publishedAt = nowIso();

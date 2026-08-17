@@ -12,12 +12,13 @@ const runtime = (imageSourceId: string) => ({
   imageSourceId,
   sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${imageSourceId}`,
 });
-const deployRecord = (imageSourceId: string) => ({
+const deployRecord = (imageSourceId: string, reviewerIsolationProtocol?: 1) => ({
   schemaVersion: 2,
   hubCommitSha: imageSourceId,
   imageCommitSha: imageSourceId,
   sandboxImage: runtime(imageSourceId).sandboxImage,
   scmImage: `docker.io/jamieatlason/tiller-scm:${imageSourceId}`,
+  ...(reviewerIsolationProtocol === 1 ? { reviewerIsolationProtocol } : {}),
   recordedAt: "2026-07-09T00:00:00.000Z",
 });
 
@@ -75,6 +76,7 @@ describe("machine runtime build metadata", () => {
 
   it("accepts only complete validation deploy records with a matching runtime", () => {
     expect(parseDevelopmentSelfHostDeployRecord(deployRecord(SOURCE_A))).toEqual(runtime(SOURCE_A));
+    expect(parseDevelopmentSelfHostDeployRecord(deployRecord(SOURCE_A, 1))).toEqual(runtime(SOURCE_A));
     expect(parseDevelopmentSelfHostDeployRecord({
       imageCommitSha: SOURCE_A,
       sandboxImage: runtime(SOURCE_A).sandboxImage,

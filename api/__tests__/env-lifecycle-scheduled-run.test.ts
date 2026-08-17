@@ -126,6 +126,7 @@ function createEnvMeta(overrides: Partial<EnvMeta> = {}): EnvMeta {
     createdAt: "2026-07-10T00:00:00.000Z",
     updatedAt: "2026-07-10T00:00:00.000Z",
     status: "stopped",
+    implementorAttentionToken: null,
     ...overrides,
   };
 }
@@ -399,6 +400,47 @@ describe("EnvLifecycleDO Scheduled Run ownership", () => {
     await subject.finalizeDeletion();
     await expect(storage.get("runner-command-generation")).resolves.toBe(generation);
     await expect(storage.get("env-scheduled-run-attempt-sequence")).resolves.toBe(attemptSequence);
+  });
+
+  it("keeps a completed scheduled implementor turn unread after the environment stops", async () => {
+    const { env } = createKvEnv();
+    const { subject } = createSubject(env);
+    await publishScheduled(subject);
+    const active = await claimScheduledStart(subject);
+    await subject.noteRunnerStarted(active.startOpId);
+
+    await expect(subject.reportImplementorCompletion(active.startOpId, 1)).resolves.toEqual({
+      accepted: true,
+      changed: true,
+    });
+    const unreadToken = (await subject.peekMutableState())!
+      .implementorAttentionState.unreadToken;
+    expect(unreadToken).toEqual(expect.any(String));
+
+    const requested = await subject.requestScheduledRunOutcome({
+      opId: active.startOpId,
+      outcome: "completed",
+    });
+    if (requested.status === "rejected" || !requested.lifecycle?.activeOpId) {
+      throw new Error("Expected completion to claim Scheduled Run Stop");
+    }
+    await subject.finishScheduledRunPreparation({
+      opId: active.startOpId,
+      claimedAtMs: active.preparation!.claimedAtMs,
+    });
+    await subject.noteStopWorkspaceSynced(requested.lifecycle.activeOpId);
+    await subject.noteRunnerStopped(requested.lifecycle.activeOpId, "exit");
+    await subject.confirmScheduledRunLeaseReleased(active.attemptId);
+
+    await expect(subject.peekMutableState()).resolves.toMatchObject({
+      status: "stopped",
+      implementorAttentionState: {
+        runtimeStartOpId: active.startOpId,
+        lastCompletionSequence: 1,
+        unreadToken,
+      },
+      scheduledRun: { state: "completed" },
+    });
   });
 
   it("keeps Scheduled Run Start and Stop generation pins aligned when rebasing", async () => {

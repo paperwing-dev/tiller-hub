@@ -39,6 +39,16 @@ function createSessionsGroup(sql: SqlStorage): void {
   sql.exec(`
     CREATE INDEX IF NOT EXISTS idx_permissions_session_status ON permissions(session_id, status)
   `);
+
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS plan_writer_terminal_tombstones (
+      id TEXT PRIMARY KEY,
+      repo_id TEXT NOT NULL,
+      plan_artifact_id TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
 }
 
 export function ensureSchema(sql: SqlStorage): void {
@@ -128,104 +138,14 @@ export function ensureSchema(sql: SqlStorage): void {
     CREATE INDEX IF NOT EXISTS idx_repo_mcp_servers_repo ON repo_mcp_servers(repo_id)
   `);
 
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS repo_cloudflare_mcp_credentials (
-      repo_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      encrypted_access_token TEXT NOT NULL,
-      access_token_nonce TEXT NOT NULL,
-      encrypted_refresh_token TEXT NOT NULL,
-      refresh_token_nonce TEXT NOT NULL,
-      token_type TEXT NOT NULL DEFAULT 'Bearer',
-      scopes TEXT NOT NULL DEFAULT '[]',
-      expires_at INTEGER NOT NULL,
-      account_id TEXT,
-      account_name TEXT,
-      enabled INTEGER NOT NULL DEFAULT 0,
-      last_auth_error TEXT,
-      last_auth_error_at TEXT,
-      connected_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (repo_id)
-    )
-  `);
-
-  sql.exec(`
-    CREATE INDEX IF NOT EXISTS idx_repo_cloudflare_mcp_credentials_repo
-    ON repo_cloudflare_mcp_credentials(repo_id)
-  `);
-
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS repo_cloudflare_mcp_oauth_states (
-      state TEXT NOT NULL PRIMARY KEY,
-      repo_id TEXT NOT NULL,
-      redirect_uri TEXT NOT NULL,
-      pkce_verifier TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      initiating_identity TEXT,
-      expires_at INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
-
-  sql.exec(`
-    CREATE INDEX IF NOT EXISTS idx_repo_cloudflare_mcp_oauth_states_repo
-    ON repo_cloudflare_mcp_oauth_states(repo_id)
-  `);
-
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS repo_cloudflare_mcp_proxy_tokens (
-      token_hash TEXT NOT NULL PRIMARY KEY,
-      repo_id TEXT NOT NULL,
-      env_slug TEXT NOT NULL,
-      server_id TEXT NOT NULL,
-      incarnation_id TEXT,
-      start_op_id TEXT,
-      expires_at INTEGER NOT NULL,
-      revoked_at TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
-
-  sql.exec(`
-    CREATE INDEX IF NOT EXISTS idx_repo_cloudflare_mcp_proxy_tokens_repo
-    ON repo_cloudflare_mcp_proxy_tokens(repo_id)
-  `);
-
-  sql.exec(`
-    CREATE INDEX IF NOT EXISTS idx_repo_cloudflare_mcp_proxy_tokens_env
-    ON repo_cloudflare_mcp_proxy_tokens(env_slug)
-  `);
-
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS repo_cloudflare_mcp_audit_events (
-      id TEXT NOT NULL PRIMARY KEY,
-      repo_id TEXT NOT NULL,
-      env_slug TEXT NOT NULL,
-      server_id TEXT NOT NULL,
-      http_method TEXT NOT NULL,
-      json_rpc_method TEXT,
-      response_status INTEGER NOT NULL,
-      error_code TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
-
-  sql.exec(`
-    CREATE INDEX IF NOT EXISTS idx_repo_cloudflare_mcp_audit_events_repo
-    ON repo_cloudflare_mcp_audit_events(repo_id)
-  `);
+  // One-way cleanup for the retired authenticated Cloudflare MCP integration.
+  sql.exec("DROP TABLE IF EXISTS repo_cloudflare_mcp_audit_events");
+  sql.exec("DROP TABLE IF EXISTS repo_cloudflare_mcp_proxy_tokens");
+  sql.exec("DROP TABLE IF EXISTS repo_cloudflare_mcp_oauth_states");
+  sql.exec("DROP TABLE IF EXISTS repo_cloudflare_mcp_credentials");
 
   // ── Additive column migrations (safe for existing DOs) ───────────────────────
   const sessionCols = sql.exec("PRAGMA table_info(sessions)").toArray() as { name: string }[];
-  const proxyTokenCols = sql.exec("PRAGMA table_info(repo_cloudflare_mcp_proxy_tokens)").toArray() as { name: string }[];
-
-  if (!proxyTokenCols.some((c) => c.name === "incarnation_id")) {
-    sql.exec("ALTER TABLE repo_cloudflare_mcp_proxy_tokens ADD COLUMN incarnation_id TEXT");
-  }
-  if (!proxyTokenCols.some((c) => c.name === "start_op_id")) {
-    sql.exec("ALTER TABLE repo_cloudflare_mcp_proxy_tokens ADD COLUMN start_op_id TEXT");
-  }
 
   if (!sessionCols.some((c) => c.name === "allowed_tools")) {
     sql.exec("ALTER TABLE sessions ADD COLUMN allowed_tools TEXT NOT NULL DEFAULT '[]'");

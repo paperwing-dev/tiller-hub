@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-mode="light">
+<html lang="en" data-mode="light" data-theme="paperwing">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -11,10 +11,9 @@
         try {
           pref = localStorage.getItem("tiller-theme");
         } catch (e) {}
-        if (pref !== "light" && pref !== "dark") {
-          pref = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-        }
-        document.documentElement.dataset.mode = pref;
+        document.documentElement.dataset.mode = "light";
+        document.documentElement.dataset.theme =
+          pref === "classic-light" ? "classic-light" : "paperwing";
       })();
     </script>
   </head>

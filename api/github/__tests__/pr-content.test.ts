@@ -6,21 +6,22 @@ import {
 } from "../pr-content";
 
 describe("draft PR content", () => {
-  it("uses startup plan feature context for the title and plain-text summary", () => {
+  it("uses the complete startup plan as the PR content", () => {
+    const planMarkdown = [
+      "# Improve draft PR descriptions",
+      "",
+      "## Summary",
+      "",
+      "Generate **useful** pull request titles and explain the user-facing change.",
+      "",
+      "## Implementation",
+      "",
+      "Preserve these internal details in the PR plan.",
+    ].join("\n");
     const content = buildDraftPrContent({
       envSlug: "tiller",
       planTitle: "Implementation Plan: Improve draft PR descriptions",
-      planMarkdown: [
-        "# Improve draft PR descriptions",
-        "",
-        "## Summary",
-        "",
-        "Generate **useful** pull request titles and explain the user-facing change.",
-        "",
-        "## Implementation",
-        "",
-        "Internal details that should not become the PR summary.",
-      ].join("\n"),
+      planMarkdown,
       changedFiles: [
         {
           path: "/packages/hub/api/github/env-publish-service.ts",
@@ -31,12 +32,8 @@ describe("draft PR content", () => {
     });
 
     expect(content.title).toBe("Improve draft PR descriptions");
-    expect(content.featureMarkdown).toContain(
-      "## Summary\n\nGenerate useful pull request titles and explain the user-facing change.",
-    );
-    expect(content.featureMarkdown).toContain(
-      "2 files changed (1 added, 1 modified).",
-    );
+    expect(content.featureMarkdown).toBe(planMarkdown);
+    expect(content.featureMarkdown).not.toContain("2 files changed");
   });
 
   it("uses a meaningful plan heading when the artifact title is generic", () => {
@@ -67,11 +64,10 @@ describe("draft PR content", () => {
     expect(content.title).toBe("Add packages/hub/api/github/publish.ts");
   });
 
-  it("renders accurate file statuses and keeps metadata secondary", () => {
+  it("falls back to the generated summary when there is no plan", () => {
     const content = buildDraftPrContent({
       envSlug: "tiller",
       planTitle: "Improve draft PR descriptions",
-      planMarkdown: "## Goal\n\nDescribe the feature and changed files.",
       changedFiles: [
         { path: "packages/hub/api/github/new-content.ts", status: "added" },
         { path: "packages/hub/api/github/pr-content.ts", status: "modified" },
@@ -91,6 +87,7 @@ describe("draft PR content", () => {
     expect(section).toContain(
       "3 files changed (1 added, 1 modified, 1 deleted).",
     );
+    expect(section).toContain("## Summary\n\nImprove draft PR descriptions.");
     expect(section).toContain(
       "- Added `packages/hub/api/github/new-content.ts`",
     );
@@ -106,60 +103,53 @@ describe("draft PR content", () => {
     );
   });
 
-  it("turns fenced plan content into safe plain text", () => {
+  it("preserves fenced content in a plan", () => {
+    const planMarkdown = [
+      "## Summary",
+      "",
+      "Explain this example:",
+      "```ts",
+      "# heading-looking content",
+      "```",
+    ].join("\n");
     const content = buildDraftPrContent({
       envSlug: "tiller",
       planTitle: "Render safe summaries",
-      planMarkdown: [
-        "## Summary",
-        "",
-        "Explain this example:",
-        "```ts",
-        "# heading-looking content",
-        "```",
-      ].join("\n"),
+      planMarkdown,
       changedFiles: [{ path: "src/summary.ts", status: "modified" }],
     });
 
-    expect(content.featureMarkdown).not.toContain("```");
-    expect(content.featureMarkdown).toContain("## Changes");
+    expect(content.featureMarkdown).toBe(planMarkdown);
+    expect(content.featureMarkdown).toContain("```ts");
+    expect(content.featureMarkdown).not.toContain("## Changes");
   });
 
-  it("ignores heading-looking lines inside fences when selecting the summary", () => {
+  it("does not reduce a plan to its Summary section", () => {
+    const planMarkdown = [
+      "```md",
+      "## Summary",
+      "This is example content.",
+      "```",
+      "",
+      "## Summary",
+      "",
+      "This is the feature summary.",
+      "",
+      "## Implementation",
+      "",
+      "These implementation details are part of the plan.",
+    ].join("\n");
     const content = buildDraftPrContent({
       envSlug: "tiller",
       planTitle: "Describe the actual feature",
-      planMarkdown: [
-        "```md",
-        "## Summary",
-        "This is example content, not the feature summary.",
-        "```",
-        "",
-        "## Summary",
-        "",
-        "This is the actual feature summary.",
-        "",
-        "```md",
-        "## Example heading",
-        "```",
-        "",
-        "This is still part of the feature summary.",
-        "",
-        "## Implementation",
-        "",
-        "Internal details.",
-      ].join("\n"),
+      planMarkdown,
       changedFiles: [{ path: "src/summary.ts", status: "modified" }],
     });
 
+    expect(content.featureMarkdown).toBe(planMarkdown);
+    expect(content.featureMarkdown).toContain("## Implementation");
     expect(content.featureMarkdown).toContain(
-      "This is the actual feature summary.",
-    );
-    expect(content.featureMarkdown).toContain(
-      "This is still part of the feature summary.",
-    );
-    expect(content.featureMarkdown).not.toContain(
-      "This is example content, not the feature summary.",
+      "These implementation details are part of the plan.",
     );
   });
 
@@ -182,5 +172,19 @@ describe("draft PR content", () => {
     expect(updated).toContain("Footer written on GitHub.");
     expect(updated).toContain("New details.");
     expect(updated).not.toContain("Old generated content.");
+  });
+
+  it("updates a managed plan that mentions the section marker", () => {
+    const existing = [
+      "<!-- tiller:env-draft:v2:start -->",
+      "# Plan",
+      "",
+      "Keep `<!-- tiller:env-draft:v2:end -->` safe in examples.",
+      "<!-- tiller:env-draft:v2:end -->",
+    ].join("\n");
+    const nextSection =
+      "<!-- tiller:env-draft:v2:start -->\n# Updated plan\n<!-- tiller:env-draft:v2:end -->";
+
+    expect(upsertManagedPrSection(existing, nextSection)).toBe(nextSection);
   });
 });

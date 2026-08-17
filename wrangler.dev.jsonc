@@ -19,7 +19,9 @@
 		}
 	],
 	"vars": {
-		"LOCAL_DEV_ONLY_BACKEND": "true"
+		"LOCAL_DEV_ONLY_BACKEND": "true",
+		"TILLER_LOCAL_DEV_ORIGIN": "http://localhost:5173",
+		"TILLER_TERMINAL_METRICS": "1"
 	},
 	"containers": [
 		{

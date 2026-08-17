@@ -36,6 +36,12 @@ const TEST_LAUNCH_PROVENANCE = {
   machineId: null,
 };
 
+const TEST_OVERVIEW_ROUTE = {
+  provider: "fake",
+  model: "fake-fast",
+  effort: "medium" as const,
+};
+
 type SqlResultRow = Record<string, unknown>;
 const encoder = new TextEncoder();
 
@@ -141,6 +147,160 @@ function createTab(review: EnvReviewDO) {
 }
 
 describe("EnvReviewDO", () => {
+  it("creates state on first access without touching updated_at on later reads", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-12T10:00:00.000Z"));
+      const { storage, review } = createSubject();
+      const input = {
+        envSlug: "env-1",
+        repoId: "repo-1",
+        mainSessionId: "session-1",
+      };
+
+      const first = review.getState(input);
+      vi.setSystemTime(new Date("2026-08-12T11:00:00.000Z"));
+      const second = review.getState(input);
+
+      expect(second.session.createdAt).toBe(first.session.createdAt);
+      expect(second.session.updatedAt).toBe(first.session.updatedAt);
+      vi.setSystemTime(new Date("2026-08-12T12:00:00.000Z"));
+      const mismatchedRead = review.getState({ ...input, repoId: "repo-2" });
+      expect(mismatchedRead.session.repoId).toBe("repo-1");
+      expect(mismatchedRead.session.updatedAt).toBe(first.session.updatedAt);
+
+      vi.setSystemTime(new Date("2026-08-12T13:00:00.000Z"));
+      expect(review.getOrCreateSession({ ...input, repoId: "repo-2" })).toMatchObject({
+        repoId: "repo-2",
+        updatedAt: "2026-08-12T13:00:00.000Z",
+      });
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("creates one primary reviewer and keeps its original implementor selection", () => {
+    const { storage, review } = createSubject();
+    const first = review.ensurePrimaryReviewerTab({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "xhigh",
+    });
+    const second = review.ensurePrimaryReviewerTab({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      provider: "claude-code",
+      model: "claude-opus-4-8",
+      effort: "max",
+    });
+
+    expect(first.status).toBe("created");
+    expect(second.status).toBe("existing");
+    expect(second.tab).toMatchObject({
+      threadId: first.tab.threadId,
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "xhigh",
+    });
+    expect(review.getState({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+    }).tabs).toHaveLength(1);
+    storage.close();
+  });
+
+  it("inherits reviewer configurations once when an environment opens a new lead session", () => {
+    const { storage, review } = createSubject();
+    const first = review.addReviewerTab({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      threadId: "thread-1",
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "xhigh",
+      roleLabel: "Correctness Reviewer",
+      taskKind: "correctness",
+    });
+    review.addReviewerTab({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      threadId: "thread-2",
+      provider: "claude-code",
+      model: "claude-opus-4.8",
+      effort: "max",
+      roleLabel: "Architecture Reviewer",
+      taskKind: "architecture",
+    });
+
+    const inherited = review.inheritReviewerTabsFromLatestSession({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-2",
+    });
+    expect(inherited.status).toBe("inherited");
+    expect(inherited.tabs).toHaveLength(2);
+    expect(inherited.tabs[0]).toMatchObject({
+      provider: first.provider,
+      model: first.model,
+      effort: first.effort,
+      roleLabel: first.roleLabel,
+      mainSessionId: "session-2",
+      status: "idle",
+      latestRunId: null,
+    });
+    expect(inherited.tabs[0]?.threadId).toBe(first.threadId);
+    expect(review.getState({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+    }).tabs).toHaveLength(0);
+
+    const repeated = review.inheritReviewerTabsFromLatestSession({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-2",
+    });
+    expect(repeated.status).toBe("existing");
+    expect(repeated.tabs.map((tab) => tab.threadId)).toEqual(inherited.tabs.map((tab) => tab.threadId));
+    expect(review.getState({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-2",
+    }).tabs).toHaveLength(2);
+    storage.close();
+  });
+
+  it("reuses an explicitly added reviewer as the primary conversation", () => {
+    const { storage, review } = createSubject();
+    const explicit = createTab(review);
+
+    const ensured = review.ensurePrimaryReviewerTab({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "xhigh",
+    });
+
+    expect(ensured.status).toBe("existing");
+    expect(ensured.tab.threadId).toBe(explicit.threadId);
+    expect(ensured.tab).toMatchObject({
+      provider: "fake",
+      model: "fake-fast",
+      effort: "medium",
+    });
+    storage.close();
+  });
+
   it("bounds stored event history for a reviewer run", () => {
     const { storage, review } = createSubject();
     for (let index = 1; index <= 205; index += 1) {
@@ -741,16 +901,17 @@ describe("EnvReviewDO", () => {
       envSlug: "env-1",
       repoId: "repo-1",
       mainSessionId: "session-1",
-      parentThreadId: parent.threadId,
+      parentThreadId: "skill-root:review-invoke-1",
       definitionSnapshot: definition,
       overviewMode: "manual" as const,
       preparationOpId: "op-skill-1",
       requestUrl: "https://hub.example/api/envs/env-1/review",
-      agents: definition.agents.map((agent) => ({
+      overviewRoute: TEST_OVERVIEW_ROUTE,
+      agents: definition.agents.map((agent, index) => ({
         id: agent.id,
-        provider: "fake",
-        model: "fake-fast",
-        effort: "medium" as const,
+        provider: index === 0 ? "fake" : "other-provider",
+        model: index === 0 ? "fake-fast" : "other-model",
+        effort: index === 0 ? "medium" as const : "high" as const,
         launchProvenance: TEST_LAUNCH_PROVENANCE,
       })),
     };
@@ -781,7 +942,8 @@ describe("EnvReviewDO", () => {
       skillInvocationId: input.invocationId,
       skillAgentId: definition.agents[0]!.id,
     });
-    expect(review.getState({ envSlug: "env-1", repoId: "repo-1", mainSessionId: "session-1" }).tabs).toEqual([parent]);
+    expect(review.getState({ envSlug: "env-1", repoId: "repo-1", mainSessionId: "session-1" }).tabs.map((tab) => tab.nodeKind))
+      .toEqual(["generic", "skill_root", "report", "report"]);
     review.activateSkillInvocation(input.invocationId);
 
     const preparation = {
@@ -915,7 +1077,22 @@ describe("EnvReviewDO", () => {
     expect(overviewCompletion).toMatchObject({
       status: "completed",
       run: { status: "ready" },
-      feedback: { feedbackId: "skill-overview:overview-1", text: "Frozen Overview" },
+      feedback: {
+        feedbackId: "skill-overview:overview-1",
+        text: "Frozen Overview",
+        metadata: {
+          reviewHandoff: {
+            schemaVersion: 1,
+            kind: "fanout_overview",
+            skillLabel: definition.label,
+            reviewerCount: 2,
+            models: [
+              { provider: "fake", model: "fake-fast" },
+              { provider: "other-provider", model: "other-model" },
+            ],
+          },
+        },
+      },
     });
     expect(review.completeRunSuccessfully({
       runId: "overview-1",
@@ -926,13 +1103,378 @@ describe("EnvReviewDO", () => {
       feedback: { feedbackId: "skill-overview:overview-1" },
     });
     expect(review.getSkillInvocation(input.invocationId)?.status).toBe("completed");
-    expect(review.getActiveSkillInvocationForParent(parent.threadId, "session-1")).toBeNull();
+    expect(review.getActiveSkillInvocationForParent(input.parentThreadId, "session-1")).toBeNull();
+    review.completePreparationOperation({ opId: first.invocation.preparationOpId, result: preparation });
+    const restarted = review.restartSkillInvocation({
+      invocationId: input.invocationId,
+      requestId: "rerun-request-1",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      requestUrl: "https://hub.example/api/envs/env-1/review/skill-invocations/review-invoke-1/rerun",
+      overviewRoute: { provider: "codex", model: "gpt-5.5", effort: "xhigh" },
+      agents: definition.agents.map((agent) => ({
+        id: agent.id,
+        launchProvenance: TEST_LAUNCH_PROVENANCE,
+      })),
+    });
+    expect(restarted.status).toBe("created");
+    if (restarted.status === "conflict" || restarted.status === "not_found" || restarted.status === "parent_locked") {
+      throw new Error("unexpected restart result");
+    }
+    expect(restarted.invocation).toMatchObject({
+      invocationId: "rerun-request-1",
+      preparationOpId: "rerun-request-1",
+      status: "setting_up",
+      includedMessageIds: [],
+      overviewRunId: null,
+    });
+    expect(restarted.tabs.map((tab) => tab.threadId)).toEqual(first.tabs.map((tab) => tab.threadId));
+    expect(review.getTab(input.parentThreadId)).toMatchObject({
+      skillInvocationId: "rerun-request-1",
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "xhigh",
+    });
+    expect(restarted.tabs.every((tab) => tab.skillInvocationId === "rerun-request-1")).toBe(true);
+    expect(restarted.runs).toHaveLength(definition.agents.length);
+    expect(restarted.runs.every((run) => (
+      run.preparationOpId === "rerun-request-1"
+      && run.skillRunRole === "report_initial"
+      && run.customTask === "Continue this review against the latest workspace snapshot. Use the existing conversation and your earlier findings as context. Verify what was fixed, discard findings that no longer apply, and report remaining or newly introduced issues."
+    ))).toBe(true);
+    review.activateSkillInvocation("rerun-request-1");
+    review.recordSkillReport(first.runs[0]!.runId, "old-round-message");
+    expect(review.getSkillInvocation("rerun-request-1")?.includedMessageIds).toEqual([]);
+    const replayed = review.restartSkillInvocation({
+      invocationId: input.invocationId,
+      requestId: "rerun-request-1",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      requestUrl: "https://hub.example/retry",
+      agents: definition.agents.map((agent) => ({ id: agent.id })),
+    });
+    expect(replayed.status).toBe("existing");
+    if (replayed.status === "conflict" || replayed.status === "not_found" || replayed.status === "parent_locked") {
+      throw new Error("unexpected replay result");
+    }
+    expect(replayed.runs.map((run) => run.runId)).toEqual(restarted.runs.map((run) => run.runId));
     const tables = storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%skill_invocations'").toArray();
     expect(tables).toEqual([{ name: "env_review_skill_invocations" }]);
     storage.close();
   });
 
-  it("atomically excludes fanouts, ordinary parent turns, and parent removal", () => {
+  it("runs a single-agent skill through its root with direct feedback and no Overview", () => {
+    const { storage, review } = createSubject();
+    const parent = review.addReviewerTab({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      threadId: "direct-parent",
+      provider: "fake",
+      model: "fake-fast",
+      effort: "medium",
+      roleLabel: "Origin Reviewer",
+    });
+    const definition = {
+      ...DEFAULT_CODE_REVIEW_SKILL,
+      id: "focused-review",
+      command: "focused-review",
+      label: "Focused Review",
+      sharedInstructions: "",
+      agents: [{
+        ...DEFAULT_CODE_REVIEW_SKILL.agents[0]!,
+        label: "Focused Agent",
+        instructions: "Inspect the focused risk and report directly.",
+      }],
+    };
+    const input = {
+      invocationId: "direct-invocation",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      parentThreadId: "skill-root:direct-invocation",
+      definitionSnapshot: definition,
+      overviewMode: "auto" as const,
+      preparationOpId: "direct-op",
+      requestUrl: "https://hub.example/review",
+      agents: [{
+        id: definition.agents[0]!.id,
+        provider: "claude-code",
+        model: "sonnet",
+        effort: "high" as const,
+        launchProvenance: TEST_LAUNCH_PROVENANCE,
+      }],
+    };
+    const reserved = review.reserveSkillInvocation(input);
+    if (reserved.status === "conflict" || reserved.status === "parent_locked") {
+      throw new Error("unexpected reservation result");
+    }
+    expect(reserved.tabs).toHaveLength(1);
+    expect(reserved.runs).toHaveLength(1);
+    expect(reserved.runs[0]).toMatchObject({
+      provider: "claude-code",
+      model: "sonnet",
+      effort: "high",
+      roleLabel: "Focused Agent",
+      recipeInstructions: "Inspect the focused risk and report directly.",
+    });
+    review.activateSkillInvocation(input.invocationId);
+    expect(review.assignSkillOverview({
+      invocationId: input.invocationId,
+      overviewRunId: "forbidden-overview",
+      expectedOverviewMode: "auto",
+      expectedIncludedMessageIds: [],
+      payload: {
+        invocationId: input.invocationId,
+        skillId: definition.id,
+        skillLabel: definition.label,
+        mode: "auto",
+        reports: [],
+        failureNotices: [],
+        guidance: null,
+        overviewInstructions: definition.overviewInstructions,
+        frozenAt: "2026-07-10T00:00:00.000Z",
+      },
+      provider: parent.provider,
+      model: parent.model,
+      effort: parent.effort,
+      roleLabel: "Overview",
+      preparation: null,
+      changeContext: null,
+      planBasis: null,
+      prompt: "must not run",
+      launchProvenance: TEST_LAUNCH_PROVENANCE,
+    })).toMatchObject({ status: "not_active", run: null });
+    expect(review.getRun("forbidden-overview")).toBeNull();
+
+    const completed = review.completeRunSuccessfully({
+      runId: reserved.runs[0]!.runId,
+      messageId: "direct-message",
+      text: "Direct attributed finding.",
+    });
+    expect(completed).toMatchObject({
+      status: "completed",
+      feedback: {
+        feedbackId: `env-review:${reserved.runs[0]!.runId}`,
+        status: "ready",
+        text: "Direct attributed finding.",
+        roleLabel: "Focused Agent",
+        provider: "claude-code",
+        model: "sonnet",
+        metadata: {
+          skillInvocationId: input.invocationId,
+          role: "Focused Agent",
+          provider: "claude-code",
+          model: "sonnet",
+        },
+      },
+    });
+    expect(review.getSkillInvocation(input.invocationId)).toMatchObject({
+      status: "completed",
+      overviewRunId: null,
+    });
+    expect(review.getActiveSkillInvocationForParent(input.parentThreadId, "session-1")).toBeNull();
+
+    const restarted = review.restartSkillInvocation({
+      invocationId: input.invocationId,
+      requestId: "direct-rerun",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      requestUrl: "https://hub.example/review/rerun",
+      agents: [{ id: definition.agents[0]!.id, launchProvenance: TEST_LAUNCH_PROVENANCE }],
+    });
+    expect(restarted).toMatchObject({
+      status: "created",
+      invocation: { invocationId: "direct-rerun", status: "setting_up" },
+      runs: [{ skillRunRole: "root_initial" }],
+    });
+    if (restarted.status === "conflict" || restarted.status === "not_found" || restarted.status === "parent_locked") {
+      throw new Error("unexpected restart result");
+    }
+    review.activateSkillInvocation("direct-rerun");
+    review.updateRun({
+      runId: restarted.runs[0]!.runId,
+      status: "failed",
+      completedAt: "2026-07-10T00:04:00.000Z",
+      error: "Configured child failed.",
+    });
+    expect(review.getSkillInvocation("direct-rerun")).toMatchObject({
+      status: "failed",
+      error: "Configured child failed.",
+    });
+    storage.close();
+  });
+
+  it("cancels a single-agent root invocation", () => {
+    const { storage, review } = createSubject();
+    const parent = createTab(review);
+    const definition = {
+      ...DEFAULT_CODE_REVIEW_SKILL,
+      sharedInstructions: "",
+      agents: [{ ...DEFAULT_CODE_REVIEW_SKILL.agents[0]! }],
+    };
+    const input = {
+      invocationId: "direct-cancel",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      parentThreadId: "skill-root:direct-cancel",
+      definitionSnapshot: definition,
+      overviewMode: "manual" as const,
+      preparationOpId: "direct-cancel-op",
+      requestUrl: "https://hub.example/review",
+      agents: [{
+        id: definition.agents[0]!.id,
+        provider: "fake",
+        model: "fake-fast",
+        effort: "medium" as const,
+        launchProvenance: TEST_LAUNCH_PROVENANCE,
+      }],
+    };
+    const reserved = review.reserveSkillInvocation(input);
+    if (reserved.status === "conflict" || reserved.status === "parent_locked") throw new Error("unexpected reservation result");
+    review.activateSkillInvocation(input.invocationId);
+    expect(review.cancelSkillInvocation(input.invocationId)).toMatchObject({ status: "cancelled" });
+    expect(review.getRun(reserved.runs[0]!.runId)).toMatchObject({ status: "cancelled" });
+    expect(review.getActiveSkillInvocationForParent(input.parentThreadId, "session-1")).toBeNull();
+    storage.close();
+  });
+
+  it("removes a stopped skill round and its children while preserving the parent reviewer", () => {
+    const { storage, review } = createSubject();
+    const parent = review.addReviewerTab({
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      threadId: "remove-parent",
+      provider: "fake",
+      model: "fake-fast",
+      effort: "medium",
+      roleLabel: "Parent",
+    });
+    const ordinaryParentRun = review.createRun({
+      runId: "ordinary-parent-run",
+      threadId: parent.threadId,
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      provider: parent.provider,
+      model: parent.model,
+      effort: parent.effort,
+      roleLabel: parent.roleLabel,
+      taskKind: "correctness",
+      preparationOpId: "ordinary-parent-op",
+      initialStatus: "ready",
+      launchProvenance: TEST_LAUNCH_PROVENANCE,
+    });
+    const definition = {
+      ...DEFAULT_CODE_REVIEW_SKILL,
+      agents: DEFAULT_CODE_REVIEW_SKILL.agents.slice(0, 2),
+    };
+    const fanout = review.reserveSkillInvocation({
+      invocationId: "remove-fanout",
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      parentThreadId: "skill-root:remove-fanout",
+      definitionSnapshot: definition,
+      overviewMode: "manual",
+      overviewRoute: TEST_OVERVIEW_ROUTE,
+      preparationOpId: "remove-fanout-op",
+      requestUrl: "https://hub.example/review",
+      agents: definition.agents.map((agent) => ({
+        id: agent.id,
+        provider: "fake",
+        model: "fake-fast",
+        effort: "medium" as const,
+        launchProvenance: TEST_LAUNCH_PROVENANCE,
+      })),
+    });
+    expect(fanout.status).toBe("created");
+    if (fanout.status === "conflict" || fanout.status === "parent_locked") {
+      throw new Error("unexpected reservation result");
+    }
+    review.activateSkillInvocation("remove-fanout");
+    const overview = review.createRun({
+      runId: "remove-overview",
+      threadId: fanout.invocation.parentThreadId,
+      envSlug: "env-1",
+      repoId: "repo-1",
+      mainSessionId: "session-1",
+      provider: parent.provider,
+      model: parent.model,
+      effort: parent.effort,
+      roleLabel: "Overview",
+      taskKind: "custom",
+      preparationOpId: fanout.invocation.preparationOpId,
+      skillInvocationId: fanout.invocation.invocationId,
+      skillRunRole: "overview",
+      skillDefinitionSnapshot: definition,
+      initialStatus: "queued",
+      launchProvenance: TEST_LAUNCH_PROVENANCE,
+    });
+    const childRun = fanout.runs[0]!;
+    const runtime = { jobSlug: "remove-child-runtime" };
+    review.updateRun({ runId: childRun.runId, runtime });
+    review.appendRunEvent({ runId: childRun.runId, type: "test", message: "Stored event" });
+    const feedback = review.createFeedback({
+      envSlug: childRun.envSlug,
+      repoId: childRun.repoId,
+      mainSessionId: childRun.mainSessionId,
+      threadId: childRun.threadId,
+      runId: childRun.runId,
+      messageId: "remove-child-message",
+      provider: childRun.provider,
+      model: childRun.model,
+      roleLabel: childRun.roleLabel,
+      text: "Stored feedback",
+    });
+
+    expect(review.removeSkillInvocation({
+      invocationId: "remove-fanout",
+      envSlug: "env-1",
+      mainSessionId: "session-1",
+    })).toEqual({ status: "active" });
+    review.cancelSkillInvocation("remove-fanout");
+    expect(review.removeSkillInvocation({
+      invocationId: "remove-fanout",
+      envSlug: "env-1",
+      mainSessionId: "session-1",
+    })).toEqual({ status: "runtime_retained" });
+    expect(review.clearRunRuntimeIfCurrent(childRun.runId, runtime)).toMatchObject({ runtime: null });
+
+    expect(review.removeSkillInvocation({
+      invocationId: "remove-fanout",
+      envSlug: "env-1",
+      mainSessionId: "session-1",
+    })).toMatchObject({
+      status: "removed",
+      parentThreadId: fanout.invocation.parentThreadId,
+      childThreadIds: expect.arrayContaining([
+        fanout.invocation.parentThreadId,
+        ...fanout.tabs.map((tab) => tab.threadId),
+      ]),
+    });
+    expect(review.getSkillInvocation("remove-fanout")).toMatchObject({ status: "cancelled" });
+    expect(review.listSkillInvocationTabs("remove-fanout")).toHaveLength(fanout.tabs.length);
+    expect(review.listSkillInvocationRuns("remove-fanout")).not.toEqual([]);
+    expect(review.getRun(overview.runId)).toBeTruthy();
+    expect(review.getTab(fanout.tabs[0]!.threadId)).toMatchObject({ removedAt: expect.any(String) });
+    expect(review.getFeedback(feedback.feedbackId)).toBeTruthy();
+    expect(review.listRunEvents(childRun.runId)).toHaveLength(1);
+    expect(review.getTab(parent.threadId)).toMatchObject({
+      threadId: parent.threadId,
+      latestRunId: ordinaryParentRun.runId,
+      status: "ready",
+      removedAt: null,
+    });
+    storage.close();
+  });
+
+  it("atomically excludes ordinary top-level turns and direct removal from a skill root", () => {
     const { storage, review } = createSubject();
     const parent = review.addReviewerTab({
       envSlug: "env-1",
@@ -953,9 +1495,10 @@ describe("EnvReviewDO", () => {
       envSlug: "env-1",
       repoId: "repo-1",
       mainSessionId: "session-1",
-      parentThreadId: parent.threadId,
+      parentThreadId: "skill-root:atomic-fanout",
       definitionSnapshot: definition,
       overviewMode: "manual",
+      overviewRoute: TEST_OVERVIEW_ROUTE,
       preparationOpId: "atomic-fanout-op",
       requestUrl: "https://hub.example/review",
       agents: definition.agents.map((agent) => ({
@@ -970,7 +1513,7 @@ describe("EnvReviewDO", () => {
     review.activateSkillInvocation("atomic-fanout");
     expect(review.reserveTopLevelRun({
       runId: "blocked-parent-run",
-      threadId: parent.threadId,
+      threadId: fanout.invocation.parentThreadId,
       envSlug: "env-1",
       repoId: "repo-1",
       mainSessionId: "session-1",
@@ -982,42 +1525,10 @@ describe("EnvReviewDO", () => {
       preparationOpId: "blocked-parent-op",
       launchProvenance: TEST_LAUNCH_PROVENANCE,
     }).status).toBe("parent_locked");
-    expect(review.removeReviewerTabIfUnlocked(parent.threadId, "env-1", "session-1").status).toBe("parent_locked");
+    expect(review.removeReviewerTabIfUnlocked(fanout.invocation.parentThreadId, "env-1", "session-1").status).toBe("skill_child");
 
     review.cancelSkillInvocation("atomic-fanout");
-    const ordinary = review.reserveTopLevelRun({
-      runId: "ordinary-parent-run",
-      threadId: parent.threadId,
-      envSlug: "env-1",
-      repoId: "repo-1",
-      mainSessionId: "session-1",
-      provider: "fake",
-      model: "fake-fast",
-      effort: "medium",
-      roleLabel: "Parent",
-      taskKind: "correctness",
-      preparationOpId: "ordinary-parent-op",
-      launchProvenance: TEST_LAUNCH_PROVENANCE,
-    });
-    expect(ordinary.status).toBe("created");
-    expect(review.reserveSkillInvocation({
-      invocationId: "blocked-by-ordinary",
-      envSlug: "env-1",
-      repoId: "repo-1",
-      mainSessionId: "session-1",
-      parentThreadId: parent.threadId,
-      definitionSnapshot: definition,
-      overviewMode: "manual",
-      preparationOpId: "blocked-by-ordinary-op",
-      requestUrl: "https://hub.example/review",
-      agents: definition.agents.map((agent) => ({
-        id: agent.id,
-        provider: "fake",
-        model: "fake-fast",
-        effort: "medium" as const,
-        launchProvenance: TEST_LAUNCH_PROVENANCE,
-      })),
-    }).status).toBe("parent_locked");
+    expect(review.getActiveSkillInvocationForParent(fanout.invocation.parentThreadId)).toBeNull();
     storage.close();
   });
 
@@ -1042,9 +1553,10 @@ describe("EnvReviewDO", () => {
       envSlug: "env-1",
       repoId: "repo-1",
       mainSessionId: "session-1",
-      parentThreadId: parent.threadId,
+      parentThreadId: "skill-root:cancel-race",
       definitionSnapshot: definition,
       overviewMode: "auto",
+      overviewRoute: TEST_OVERVIEW_ROUTE,
       preparationOpId: "cancel-race-op",
       requestUrl: "https://hub.example/review",
       agents: definition.agents.map((agent) => ({
@@ -1091,9 +1603,10 @@ describe("EnvReviewDO", () => {
       envSlug: "env-1",
       repoId: "repo-1",
       mainSessionId: "session-1",
-      parentThreadId: parent.threadId,
+      parentThreadId: "skill-root:manual-followup",
       definitionSnapshot: definition,
       overviewMode: "manual",
+      overviewRoute: TEST_OVERVIEW_ROUTE,
       preparationOpId: "op-manual-followup",
       requestUrl: "https://hub.example/api/envs/env-1/review",
       agents: definition.agents.map((agent) => ({
@@ -1127,7 +1640,7 @@ describe("EnvReviewDO", () => {
       preparationOpId: reserved.invocation.preparationOpId,
       skillInvocationId: reserved.invocation.invocationId,
       skillAgentId: reserved.runs[0]!.skillAgentId,
-      skillRunRole: "child_followup",
+      skillRunRole: "report_followup",
       skillDefinitionSnapshot: definition,
       launchProvenance: TEST_LAUNCH_PROVENANCE,
     });

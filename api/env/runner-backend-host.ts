@@ -2,6 +2,7 @@ import {
   getRunnerCurrentCommandGeneration,
   getRunnerControlErrorCode,
   RunnerBackendControlError,
+  classifyRunnerInspection,
   type RunnerBackend,
   type RunnerDestroyOptions,
   type RunnerStartOptions,
@@ -22,6 +23,7 @@ interface HostRunnerStatus {
   status?: string;
   callbackExpected?: boolean;
   startRejectedBeforeWorkspace?: boolean;
+  failedStartBeforeHarness?: boolean;
   commandGeneration?: number;
   operationId?: string;
   desiredState?: RunnerCommandDesiredState;
@@ -54,6 +56,7 @@ function parseHostRunnerStatus(value: unknown): HostRunnerStatus {
     ...(typeof result.status === "string" ? { status: result.status } : {}),
     ...(typeof result.callbackExpected === "boolean" ? { callbackExpected: result.callbackExpected } : {}),
     ...(result.startRejectedBeforeWorkspace === true ? { startRejectedBeforeWorkspace: true } : {}),
+    ...(result.failedStartBeforeHarness === true ? { failedStartBeforeHarness: true } : {}),
     ...(Number.isSafeInteger(result.commandGeneration) ? { commandGeneration: result.commandGeneration as number } : {}),
     ...(typeof result.operationId === "string" ? { operationId: result.operationId.trim() } : {}),
     ...(result.desiredState === "running" || result.desiredState === "stopped" || result.desiredState === "absent"
@@ -139,7 +142,9 @@ function wrapHostRunnerError(prefix: string, error: unknown): Error {
     );
   }
   if (message === EXISTING_EXECUTION_UNAVAILABLE_MESSAGE) {
-    return new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE, { cause: error });
+    const unavailable = new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE);
+    Object.defineProperty(unavailable, "cause", { value: error, configurable: true });
+    return unavailable;
   }
   const wrapped = new Error(`${prefix}: ${message}`);
   Object.defineProperty(wrapped, "cause", { value: error, configurable: true });
@@ -163,6 +168,36 @@ async function requestHostRunner(
 }
 
 export async function createHostRunnerBackend(env: Env): Promise<RunnerBackend> {
+  const inspect = async (meta: EnvMeta) => {
+    try {
+      const response = await requestHostRunner(env, "status", meta);
+      const result = parseHostRunnerStatus(response.result);
+      const inspection = classifyRunnerInspection(result.status);
+      if (
+        inspection.state === "stopped"
+        && result.failedStartBeforeHarness
+        && Number.isSafeInteger(result.commandGeneration)
+        && (result.commandGeneration ?? 0) > 0
+        && result.operationId
+      ) {
+        return {
+          ...inspection,
+          safeReplacement: {
+            reason: "failed_before_harness" as const,
+            operationId: result.operationId,
+            commandGeneration: result.commandGeneration!,
+          },
+        };
+      }
+      return inspection;
+    } catch (error) {
+      if (isConfirmedRunnerNotFound(error)) {
+        return { state: "absent" as const, status: "absent" };
+      }
+      return { state: "unknown" as const, status: "unknown" };
+    }
+  };
+
   return {
     kind: "host",
 
@@ -194,18 +229,10 @@ export async function createHostRunnerBackend(env: Env): Promise<RunnerBackend> 
     },
 
     async getStatus(meta: EnvMeta): Promise<string> {
-      try {
-        const response = await requestHostRunner(env, "status", meta);
-        const result = parseHostRunnerStatus(response.result);
-        return result.status ?? "unknown";
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (/404/.test(message) || /not found/i.test(message)) {
-          return "stopped";
-        }
-        throw new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE, { cause: error });
-      }
+      return (await inspect(meta)).status;
     },
+
+    inspect,
 
     async start(
       meta: EnvMeta,

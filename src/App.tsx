@@ -1,3 +1,4 @@
+import { lazy, Suspense, type ReactNode } from 'react';
 import { Navigate } from 'react-router';
 import type { RouteObject } from 'react-router';
 import DashboardDataProvider from './DashboardDataProvider';
@@ -6,16 +7,28 @@ import { WorkspaceLayout } from './DashboardLayout';
 import {
   EnvWaitingRoute,
   LegacyChangesRoute,
-  PlanRoute,
-  ProjectWorkspaceHomeRoute,
-  ProjectsHomeRoute,
-  RepoSettingsRoute,
-  SessionRoute,
-  ShipRoute,
-  SettingsRoute,
+  WorkspaceRootRoute,
   UpdateRoute,
-  WorkspaceSettingsRoute,
 } from './dashboard-route-views';
+import { RouteLoading } from './dashboard-route-state';
+
+const PlanRoute = lazy(() => import('./dashboard-plan-route'));
+const ProjectImplementationsRoute = lazy(() => import('./dashboard-implementations-route'));
+const ShipRoute = lazy(() => import('./dashboard-ship-route'));
+const SessionRoute = lazy(() => import('./dashboard-session-route'));
+const SettingsRoute = lazy(() => import('./dashboard-settings-routes').then((module) => ({
+  default: module.SettingsRoute,
+})));
+const RepoSettingsRoute = lazy(() => import('./dashboard-settings-routes').then((module) => ({
+  default: module.RepoSettingsRoute,
+})));
+const WorkspaceSettingsRoute = lazy(() => import('./dashboard-settings-routes').then((module) => ({
+  default: module.WorkspaceSettingsRoute,
+})));
+
+function lazyRoute(element: ReactNode, label: string) {
+  return <Suspense fallback={<RouteLoading label={label} />}>{element}</Suspense>;
+}
 
 export {
   getTopLevelUpdateIssue,
@@ -29,8 +42,8 @@ export const dashboardRoutes: RouteObject[] = [
   {
     element: <DashboardDataProvider />,
     children: [
-      { index: true, element: <ProjectsHomeRoute /> },
-      { path: 'settings', element: <SettingsRoute /> },
+      { index: true, element: <WorkspaceRootRoute /> },
+      { path: 'settings', element: lazyRoute(<SettingsRoute />, 'Loading settings') },
       { path: 'update', element: <UpdateRoute /> },
       {
         path: 'projects/:repoId',
@@ -40,11 +53,12 @@ export const dashboardRoutes: RouteObject[] = [
           </ProjectGuard>
         ),
         children: [
-          { index: true, element: <ProjectWorkspaceHomeRoute /> },
-          { path: 'plan', element: <PlanRoute /> },
-          { path: 'plan/:planArtifactId', element: <PlanRoute /> },
-          { path: 'global-settings', element: <WorkspaceSettingsRoute /> },
-          { path: 'settings', element: <RepoSettingsRoute /> },
+          { index: true, element: lazyRoute(<PlanRoute />, 'Loading Plan') },
+          { path: 'plan', element: lazyRoute(<PlanRoute />, 'Loading Plan') },
+          { path: 'plan/:planArtifactId', element: lazyRoute(<PlanRoute />, 'Loading Plan') },
+          { path: 'implementations', element: lazyRoute(<ProjectImplementationsRoute />, 'Loading implementations') },
+          { path: 'global-settings', element: lazyRoute(<WorkspaceSettingsRoute />, 'Loading settings') },
+          { path: 'settings', element: lazyRoute(<RepoSettingsRoute />, 'Loading repository settings') },
         ],
       },
       {
@@ -60,7 +74,7 @@ export const dashboardRoutes: RouteObject[] = [
         ),
         children: [
           { index: true, element: <EnvWaitingRoute /> },
-          { path: 'ship', element: <ShipRoute /> },
+          { path: 'ship', element: lazyRoute(<ShipRoute />, 'Loading Ship') },
         ],
       },
       {
@@ -70,7 +84,7 @@ export const dashboardRoutes: RouteObject[] = [
             <WorkspaceLayout />
           </SessionGuard>
         ),
-        children: [{ index: true, element: <SessionRoute /> }],
+        children: [{ index: true, element: lazyRoute(<SessionRoute />, 'Loading session') }],
       },
       { path: '*', element: <Navigate to="/" replace /> },
     ],

@@ -51,7 +51,10 @@ const skills: AgentSkillDefinition[] = [{
   updatedAt: null,
 }];
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  window.sessionStorage.clear();
+});
 
 describe("PlanChatInput skill commands", () => {
   it("opens and filters the prototype-style slash popup", () => {
@@ -120,5 +123,61 @@ describe("PlanChatInput skill commands", () => {
     fireEvent.change(composer, { target: { value: "/security-review" } });
     fireEvent.keyDown(composer, { key: "Enter" });
     await waitFor(() => expect(onInvokeSkill).toHaveBeenCalledWith(skills[1]));
+  });
+
+  it("restores a scoped draft after remount and clears it after a successful send", async () => {
+    const draftStorageKey = "tiller:test:reviewer-draft";
+    const onSend = vi.fn().mockResolvedValue(true);
+    const first = render(
+      <PlanChatInput
+        placeholder="Message"
+        draftStorageKey={draftStorageKey}
+        onSend={onSend}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Recovered after reload" } });
+    expect(window.sessionStorage.getItem(draftStorageKey)).toBe("Recovered after reload");
+    first.unmount();
+
+    render(
+      <PlanChatInput
+        placeholder="Message"
+        draftStorageKey={draftStorageKey}
+        onSend={onSend}
+      />,
+    );
+    const restored = screen.getByLabelText("Message");
+    expect(restored).toHaveValue("Recovered after reload");
+
+    fireEvent.keyDown(restored, { key: "Enter" });
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Recovered after reload"));
+    expect(restored).toHaveValue("");
+    expect(window.sessionStorage.getItem(draftStorageKey)).toBeNull();
+  });
+
+  it("keeps the durable draft while an optimistic send is unresolved", async () => {
+    let resolveSend!: (result: boolean) => void;
+    const onSend = vi.fn(() => new Promise<boolean>((resolve) => {
+      resolveSend = resolve;
+    }));
+    const draftStorageKey = "tiller:test:pending-reviewer-draft";
+    render(
+      <PlanChatInput
+        placeholder="Message"
+        draftStorageKey={draftStorageKey}
+        optimisticClear
+        onSend={onSend}
+      />,
+    );
+    const composer = screen.getByLabelText("Message");
+    fireEvent.change(composer, { target: { value: "Do not lose this" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    expect(composer).toHaveValue("");
+    expect(window.sessionStorage.getItem(draftStorageKey)).toBe("Do not lose this");
+
+    resolveSend(true);
+    await waitFor(() => expect(window.sessionStorage.getItem(draftStorageKey)).toBeNull());
   });
 });

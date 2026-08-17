@@ -12,7 +12,14 @@ const GITHUB_ENV_PUBLISH_TTL_SECONDS = 2 * 60 * 60;
 export type GitHubBridgeSubject =
   | { type: "interactive-env"; envSlug: string; incarnationId?: string; startOpId?: string }
   | { type: "github-planner"; jobSlug: string; repoId: string }
-  | { type: "github-env-publish"; jobSlug: string; envSlug: string; repoId: string; operationId: string };
+  | {
+      type: "github-env-publish";
+      jobSlug: string;
+      envSlug: string;
+      repoId: string;
+      operationId: string;
+      tokenAccess?: "write" | "publish";
+    };
 
 export interface GitHubBridgeRecord {
   id: string;
@@ -31,7 +38,7 @@ export interface GitHubBridgeCredentials {
   expiresAt: string;
 }
 
-export type GitHubBridgeTokenAccess = "read" | "write";
+export type GitHubBridgeTokenAccess = "read" | "write" | "publish";
 
 export interface GitHubBridgeValidationFailure {
   ok: false;
@@ -237,7 +244,8 @@ export function bridgeCredentialsToEnvVars(credentials: GitHubBridgeCredentials)
 }
 
 export function githubBridgeTokenAccess(record: GitHubBridgeRecord): GitHubBridgeTokenAccess {
-  return record.subject.type === "github-env-publish" ? "write" : "read";
+  if (record.subject.type !== "github-env-publish") return "read";
+  return record.subject.tokenAccess === "publish" ? "publish" : "write";
 }
 
 export async function validateGitHubBridgeRequest(

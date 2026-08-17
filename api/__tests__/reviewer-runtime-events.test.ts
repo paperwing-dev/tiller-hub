@@ -15,11 +15,12 @@ describe("reviewer runtime event contract", () => {
     })).toEqual({ ok: false, error: "Unsupported event type: progress" });
   });
 
-  it("normalizes startup and bounded model activity without provider data", () => {
+  it("normalizes startup, bounded model activity, and user-facing commentary", () => {
     const parsed = parseReviewerRuntimeEventBatch({
       events: [
         { type: "runtime_startup", message: "provider text", data: { secret: true } },
         { type: "model_activity", message: `  ${"x".repeat(MAX_REVIEWER_RUNTIME_EVENT_MESSAGE_CHARS + 10)}  ` },
+        { type: "model_commentary", message: "  I’m checking the event boundary.  " },
       ],
     });
 
@@ -31,6 +32,7 @@ describe("reviewer runtime event contract", () => {
           type: "model_activity",
           message: `${"x".repeat(MAX_REVIEWER_RUNTIME_EVENT_MESSAGE_CHARS)}…`,
         },
+        { type: "model_commentary", message: "I’m checking the event boundary." },
       ],
     });
   });

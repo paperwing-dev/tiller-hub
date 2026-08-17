@@ -3,6 +3,7 @@
  */
 import React from "react";
 import { renderToString } from "react-dom/server";
+import { fireEvent, waitFor } from "@testing-library/react";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -59,6 +60,7 @@ function makeEnv(overrides: Partial<EnvMeta> = {}): EnvMeta {
     workspaceDirty: true,
     workspaceNeedsAttention: false,
     workspaceLastSyncedAt: "2026-05-01T00:00:00.000Z",
+    implementorAttentionToken: null,
     baseMainCommit: "main-a",
     lastKnownMainCommit: "main-a",
     scmOperationType: null,
@@ -110,6 +112,7 @@ describe("SessionList implementor cards", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     Object.defineProperty(globalThis, "React", {
       configurable: true,
       value: originalReact,
@@ -122,6 +125,29 @@ describe("SessionList implementor cards", () => {
     expect(html).toContain('class="contents">Ship</span>');
     expect(html).not.toContain("Draft PR Diff");
     expect(html).not.toContain("Draft changed");
+  });
+
+  it("gives unread implementor attention blue precedence over stopped gray", () => {
+    const document = new DOMParser().parseFromString(
+      render(makeEnv({
+        status: "stopped",
+        implementorAttentionToken: "attention-token",
+      })),
+      "text/html",
+    );
+    const status = document.querySelector('[aria-label="Status: Needs attention"]');
+
+    expect(status).not.toBeNull();
+    expect(status?.getAttribute("aria-label")).toBe("Status: Needs attention");
+    expect(status?.classList.contains("bg-kumo-info")).toBe(true);
+    expect(status?.classList.contains("bg-kumo-line")).toBe(false);
+  });
+
+  it("hides Ship while a changed env is running", () => {
+    const html = render(makeEnv({ status: "running" }));
+
+    expect(html).toContain('class="contents">Stop</span>');
+    expect(html).not.toContain('class="contents">Ship</span>');
   });
 
   it("shows each workload's read-only execution backend badge on the card", () => {
@@ -246,11 +272,11 @@ describe("SessionList implementor cards", () => {
     const document = new DOMParser().parseFromString(html, "text/html");
     const indicator = document.querySelector('[data-testid="repo-main-pending-indicator"]');
 
-    expect(document.body.textContent?.match(/Reading GitHub default branch/g)).toHaveLength(1);
+    expect(document.body.textContent?.match(/Pulling updates from GitHub/g)).toHaveLength(1);
     expect(indicator?.getAttribute("role")).toBe("status");
     expect(indicator?.getAttribute("aria-live")).toBe("polite");
     expect(indicator?.querySelector(".animate-spin")).not.toBeNull();
-    expect(indicator?.textContent).toBe("Reading GitHub default branch…");
+    expect(indicator?.textContent).toBe("Pulling updates from GitHub…");
   });
 
   it("uses a plain environment name header with a separate linked plan", () => {
@@ -274,12 +300,169 @@ describe("SessionList implementor cards", () => {
     expect(html).not.toContain("test/repo</p>");
   });
 
+  it("loads startup-plan labels from repository artifacts", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      artifacts: [{
+        id: "plan-1",
+        repoId: "repo-1",
+        type: "plan",
+        basis: { repoId: "repo-1", mainCommit: "main-a" },
+        title: "Catalog plan label",
+        body: { markdown: "# Catalog plan" },
+        status: "todo",
+        createdAt: "2026-05-01T00:00:00.000Z",
+        updatedAt: "2026-05-02T00:00:00.000Z",
+        version: 2,
+      }],
+      refs: [],
+      attention: [],
+    }), { status: 200 }));
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <SessionList
+          repos={[makeRepo()]}
+          sessions={[]}
+          envs={[makeEnv({ startupPlanId: "plan-1" })]}
+          hubUrl="https://hub.test"
+        />,
+      );
+    });
+
+    await waitFor(() => expect(container.textContent).toContain("Catalog plan label"));
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://hub.test/api/repos/repo-1/artifacts",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    act(() => root.unmount());
+    container.remove();
+    fetchSpy.mockRestore();
+  });
+
   it("shows No plan beneath the plain environment name", () => {
     const html = render(makeEnv({ startupPlanId: null }));
 
     expect(html).toContain('title="demo-env"');
     expect(html).toContain("Plan:");
     expect(html).toContain("No plan");
+  });
+
+  it("prefers display names and disambiguates duplicate names with slugs", () => {
+    const html = renderToString(
+      <SessionList
+        repos={[makeRepo()]}
+        sessions={[]}
+        envs={[
+          makeEnv({ slug: "first-env", displayName: "Shared plan", sidebarSlot: 1 }),
+          makeEnv({ slug: "second-env", displayName: "Shared plan", sidebarSlot: 2 }),
+        ]}
+      />,
+    );
+
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const first = document.querySelector('[data-testid="env-card-first-env"]')?.textContent;
+    const second = document.querySelector('[data-testid="env-card-second-env"]')?.textContent;
+    expect(first).toContain("Shared plan");
+    expect(first).toContain("Slug: first-env");
+    expect(second).toContain("Shared plan");
+    expect(second).toContain("Slug: second-env");
+  });
+
+  it("falls back to the slug when a legacy environment has no display name", () => {
+    const html = render(makeEnv({ displayName: undefined }));
+
+    expect(html).toContain('title="demo-env"');
+    expect(html).not.toContain("Slug: demo-env");
+  });
+
+  it("confirms environment deletion in an app modal", async () => {
+    const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    const onRecoverEnv = vi.fn();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <SessionList
+          repos={[makeRepo()]}
+          sessions={[]}
+          envs={[makeEnv({ displayName: "Implement settings" })]}
+          hubUrl="https://hub.test"
+          onRecoverEnv={onRecoverEnv}
+        />,
+      );
+    });
+
+    const deleteButton = container.querySelector(
+      '[aria-label="Delete Implement settings (slug: demo-env)"]',
+    );
+    expect(deleteButton).toBeInstanceOf(HTMLButtonElement);
+    fireEvent.click(deleteButton!);
+
+    const dialog = await waitFor(() => {
+      const current = document.body.querySelector('[role="dialog"]');
+      expect(current).not.toBeNull();
+      return current;
+    });
+    expect(dialog?.textContent).toContain("Delete environment?");
+    expect(dialog?.textContent).toContain(
+      '"Implement settings" (slug: demo-env) and its container and R2 storage will be permanently deleted.',
+    );
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    const cancelButton = Array.from(dialog!.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Cancel");
+    fireEvent.click(cancelButton!);
+    await waitFor(() => expect(document.body.querySelector('[role="dialog"]')).toBeNull());
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(deleteButton!);
+    const reopenedDialog = await waitFor(() => {
+      const current = document.body.querySelector('[role="dialog"]');
+      expect(current).not.toBeNull();
+      return current;
+    });
+    const confirmButton = Array.from(reopenedDialog!.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Delete environment");
+    fireEvent.click(confirmButton!);
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledWith(
+      "https://hub.test/api/envs/demo-env",
+      { method: "DELETE", credentials: "include" },
+    ));
+    expect(onRecoverEnv).toHaveBeenCalledWith("demo-env", "deleting");
+    await waitFor(() => expect(document.body.querySelector('[role="dialog"]')).toBeNull());
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("shows explicit slug and current sidebar slot rows in collapsed previews", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <SessionList
+          repos={[makeRepo()]}
+          sessions={[]}
+          envs={[makeEnv({ displayName: "Implement settings", sidebarSlot: 7 })]}
+          sidebarCollapsed
+        />,
+      );
+    });
+
+    fireEvent.mouseEnter(container.querySelector('[data-testid="env-card-demo-env"]')!);
+
+    await waitFor(() => expect(document.body.textContent).toContain("Sidebar slot"));
+    expect(document.body.textContent).toContain("demo-env");
+    expect(document.body.textContent).toContain("#7");
+    act(() => root.unmount());
+    container.remove();
   });
 
   it("sorts the unified workload list by the persistent repo slot", () => {

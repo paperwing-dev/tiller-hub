@@ -60,7 +60,6 @@ export interface ScheduledRunCredentialScope {
 
 export interface ScheduledRunCredentialIds {
   githubBridgeId?: string;
-  cloudflareMcpProxyTokenId?: string;
 }
 
 export interface ActiveScheduledRunReceipt extends ScheduledRunIdentity {

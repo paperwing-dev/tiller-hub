@@ -52,6 +52,37 @@ describe("POST /api/envs/:slug/start request body", () => {
     expect(actionMocks.startEnvAction).not.toHaveBeenCalled();
   });
 
+  it.each(["fresh", "plan"] as const)("passes the %s implementation mode to Start", async (implementationMode) => {
+    const response = await createApp().request(
+      "https://hub.example.com/api/envs/demo/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ implementationMode }),
+      },
+      {} as HonoEnv["Bindings"],
+    );
+
+    expect(response.status).toBe(200);
+    expect(actionMocks.startEnvAction).toHaveBeenCalledWith(expect.objectContaining({ implementationMode }));
+  });
+
+  it("rejects an unknown implementation mode", async () => {
+    const response = await createApp().request(
+      "https://hub.example.com/api/envs/demo/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ implementationMode: "surprise" }),
+      },
+      {} as HonoEnv["Bindings"],
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: "invalid_implementation_mode" });
+    expect(actionMocks.startEnvAction).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["without a content type", {}],
     ["with an explicitly empty JSON body", {

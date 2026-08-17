@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import React from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   EnvMeta,
@@ -13,22 +13,13 @@ import { createInitialEnvScmState } from "../../api/scm/model";
 
 const mocks = vi.hoisted(() => ({
   fetchDiagnostics: vi.fn(),
+  startEnv: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
   fetchEnvStartupDiagnostics: mocks.fetchDiagnostics,
+  startEnv: mocks.startEnv,
 }));
-
-vi.mock("../SailingScene", async () => {
-  const ReactModule = await import("react");
-  return {
-    default: ({ motionVariant }: { motionVariant: string }) => ReactModule.createElement("div", {
-      "aria-hidden": "true",
-      "data-motion-variant": motionVariant,
-      "data-testid": "sailing-scene",
-    }),
-  };
-});
 
 import EnvWaitingView from "../EnvWaitingView";
 
@@ -91,15 +82,6 @@ function diagnostics(
   return { active, lastFailed };
 }
 
-function technicalDetails(): HTMLDetailsElement {
-  const summary = screen.getByText("Technical details");
-  const details = summary.closest("details");
-  if (!(details instanceof HTMLDetailsElement)) {
-    throw new Error("Technical details disclosure was not rendered");
-  }
-  return details;
-}
-
 async function flushDiagnosticsFetch() {
   await act(async () => {
     await Promise.resolve();
@@ -111,6 +93,8 @@ describe("EnvWaitingView", () => {
   beforeEach(() => {
     mocks.fetchDiagnostics.mockReset();
     mocks.fetchDiagnostics.mockResolvedValue(diagnostics());
+    mocks.startEnv.mockReset();
+    mocks.startEnv.mockResolvedValue({ ok: true, slug: "demo-env", status: "starting" });
   });
 
   afterEach(() => {
@@ -119,7 +103,7 @@ describe("EnvWaitingView", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the animation-led hero and keeps technical details collapsed normally", async () => {
+  it("renders the animation-led hero without a technical-details disclosure", async () => {
     const active = makeSnapshot();
     mocks.fetchDiagnostics.mockResolvedValue(diagnostics(active));
 
@@ -129,19 +113,50 @@ describe("EnvWaitingView", () => {
     expect(screen.getByRole("heading", { name: "Preparing your environment" })).toBeInTheDocument();
     const liveAction = screen.getByText("Syncing your workspace…");
     expect(liveAction).toHaveAttribute("aria-live", "polite");
-    expect(screen.getByTestId("sailing-scene")).toHaveAttribute("data-motion-variant", "preparing");
-    expect(technicalDetails()).not.toHaveAttribute("open");
-    expect(technicalDetails()).toContainElement(screen.getByText("Cloning internal workspace data"));
+    expect(screen.getByRole("img", { name: "Animated ASCII ocean waves" })).toBeInTheDocument();
+    expect(screen.getByText("Current: Cloning internal workspace data")).toBeInTheDocument();
+    expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
 
   it.each([
-    ["saving", "Saving your work", "Syncing your latest changes before shutdown…", "saving"],
-    ["stopping", "Stopping your environment", "Your work is saved. Finishing shutdown…", "stopping"],
-    ["deleting", "Removing your environment", "Deleting the environment and its stored workspace…", "deleting"],
+    ["fresh", "No plan", "Fixed plan"],
+    ["plan", "Fixed plan", "No plan"],
+  ] as const)(
+    "labels a %s start from the active launch mode, not the saved plan",
+    async (implementationMode, expected, unexpected) => {
+      mocks.fetchDiagnostics.mockResolvedValue(diagnostics(makeSnapshot({ implementationMode })));
+
+      render(
+        <EnvWaitingView
+          env={makeEnv({ startupPlanId: "plan-1" })}
+          hubUrl="https://hub.test"
+        />,
+      );
+      await flushDiagnosticsFetch();
+
+      const metadata = screen.getByLabelText(new RegExp(`${expected}$`));
+      expect(metadata).toBeInTheDocument();
+      expect(metadata.getAttribute("aria-label")).not.toContain(unexpected);
+    },
+  );
+
+  it("uses a static wave illustration when stopped", async () => {
+    render(<EnvWaitingView env={makeEnv({ status: "stopped" })} hubUrl="https://hub.test" />);
+    await flushDiagnosticsFetch();
+
+    expect(screen.getByRole("heading", { name: "Your environment is stopped" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "ASCII ocean waves" })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "Animated ASCII ocean waves" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["saving", "Saving your work", "Saving workspace…", true, "Workspace Sync"],
+    ["stopping", "Stopping your environment", "Your work is saved. Finishing shutdown…", true, "Stopping"],
+    ["deleting", "Removing your environment", "Deleting the environment and its stored workspace…", false, null],
   ] as const)(
     "uses the friendly %s lifecycle presentation even when diagnostics fetching fails",
-    async (status, heading, action, motionVariant) => {
+    async (status, heading, action, animated, detail) => {
       vi.spyOn(console, "warn").mockImplementation(() => undefined);
       mocks.fetchDiagnostics.mockRejectedValue(new Error("diagnostics unavailable"));
 
@@ -150,171 +165,58 @@ describe("EnvWaitingView", () => {
 
       expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument();
       expect(screen.getByText(action)).toBeInTheDocument();
-      expect(screen.getByTestId("sailing-scene")).toHaveAttribute(
-        "data-motion-variant",
-        motionVariant,
-      );
-      expect(technicalDetails()).not.toHaveAttribute("open");
+      if (animated) {
+        expect(screen.getByRole("img", { name: "Animated ASCII ocean waves" })).toBeInTheDocument();
+        expect(screen.getByText(detail)).toBeInTheDocument();
+      } else {
+        expect(screen.getByRole("img", { name: "ASCII ocean waves" })).toBeInTheDocument();
+      }
+      expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
     },
   );
 
-  it("auto-opens once for a correlated failure and does not reopen after a temporary missing response", async () => {
-    const failure = makeSnapshot({
-      failure: { message: "Harness exited", lastStepId: "harness-launch" },
-    });
-    mocks.fetchDiagnostics
-      .mockResolvedValueOnce(diagnostics(failure))
-      .mockResolvedValueOnce(diagnostics())
-      .mockResolvedValueOnce(diagnostics(failure));
-
-    const { rerender } = render(
-      <EnvWaitingView
-        env={makeEnv({ status: "failed" })}
-        hubUrl="https://hub.test"
-      />,
-    );
-
-    await waitFor(() => expect(technicalDetails()).toHaveAttribute("open"));
-    expect(screen.getByRole("heading", {
-      name: "We couldn’t prepare your environment",
-    })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByText("Technical details"));
-    await waitFor(() => expect(technicalDetails()).not.toHaveAttribute("open"));
-
-    rerender(
-      <EnvWaitingView
-        env={makeEnv({ status: "failed", updatedAt: "2026-07-16T12:00:06.000Z" })}
-        hubUrl="https://hub.test"
-      />,
-    );
-    await waitFor(() => expect(screen.getByRole("heading", {
-      name: "This environment needs attention",
-    })).toBeInTheDocument());
-    expect(technicalDetails()).not.toHaveAttribute("open");
-
-    rerender(
-      <EnvWaitingView
-        env={makeEnv({ status: "failed", updatedAt: "2026-07-16T12:00:07.000Z" })}
-        hubUrl="https://hub.test"
-      />,
-    );
-    await waitFor(() => expect(screen.getByRole("heading", {
-      name: "We couldn’t prepare your environment",
-    })).toBeInTheDocument());
-    expect(technicalDetails()).not.toHaveAttribute("open");
-  });
-
-  it("opens a new correlated startup operation after the previous operation was closed", async () => {
-    const firstFailure = makeSnapshot({ failure: { message: "First failure" } });
-    const secondFailure = makeSnapshot({
-      opId: "start-2",
-      failure: { message: "Second failure" },
-      events: [],
-    });
-    mocks.fetchDiagnostics
-      .mockResolvedValueOnce(diagnostics(firstFailure))
-      .mockResolvedValueOnce(diagnostics(secondFailure));
-
-    const { rerender } = render(
-      <EnvWaitingView env={makeEnv({ status: "failed" })} hubUrl="https://hub.test" />,
-    );
-    await waitFor(() => expect(technicalDetails()).toHaveAttribute("open"));
-    fireEvent.click(screen.getByText("Technical details"));
-    await waitFor(() => expect(technicalDetails()).not.toHaveAttribute("open"));
-
-    rerender(
+  it("shows the safe reason when saving is waiting for an active agent turn", async () => {
+    render(
       <EnvWaitingView
         env={makeEnv({
-          status: "failed",
-          lifecycleOpId: "start-2",
-          updatedAt: "2026-07-16T12:01:00.000Z",
+          status: "saving",
+          bootStepId: "workspace-sync",
+          bootMessage: "Waiting for the active agent turn to finish safely…",
         })}
         hubUrl="https://hub.test"
       />,
     );
-
-    await waitFor(() => expect(technicalDetails()).toHaveAttribute("open"));
-    expect(screen.getByText("Second failure")).toBeInTheDocument();
-  });
-
-  it("does not auto-open stale or previous failure diagnostics", async () => {
-    const staleActive = makeSnapshot({
-      opId: "old-start",
-      failure: { message: "Stale active failure" },
-    });
-    const previousFailure = makeSnapshot({
-      opId: "previous-start",
-      failure: { message: "Previous failure" },
-    });
-    mocks.fetchDiagnostics.mockResolvedValue(diagnostics(staleActive, previousFailure));
-
-    render(
-      <EnvWaitingView env={makeEnv({ status: "failed" })} hubUrl="https://hub.test" />,
-    );
     await flushDiagnosticsFetch();
 
-    expect(screen.getByRole("heading", {
-      name: "This environment needs attention",
-    })).toBeInTheDocument();
-    expect(technicalDetails()).not.toHaveAttribute("open");
-    const previousSummary = screen.getByText("Previous startup failure");
-    expect(previousSummary.closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByText("Current: Waiting for the active agent turn to finish safely…"))
+      .toBeInTheDocument();
   });
 
-  it("keeps metadata, timeline, logs, raw messages, and copy inside technical details", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
+  it("uses correlated failure diagnostics without exposing a technical-details panel", async () => {
     const failure = makeSnapshot({
-      failure: {
-        message: "Harness exited",
-        exitCode: 17,
-        signal: "SIGTERM",
-        lastStepId: "harness-launch",
-      },
+      failure: { message: "Harness exited", lastStepId: "harness-launch" },
     });
     mocks.fetchDiagnostics.mockResolvedValue(diagnostics(failure));
 
     render(
       <EnvWaitingView
-        env={makeEnv({
-          status: "failed",
-          bootMessage: "Raw environment boot message",
-        })}
+        env={makeEnv({ status: "failed" })}
         hubUrl="https://hub.test"
       />,
     );
-    await waitFor(() => expect(technicalDetails()).toHaveAttribute("open"));
-
-    const details = technicalDetails();
-    for (const text of [
-      "Environment metadata",
-      "Operation start-1",
-      "Raw environment boot message",
-      "Raw timeline event",
-      "Timeline detail",
-      "harness log output",
-      "stop-control log output",
-      "bootstrap log output",
-      "Harness exited",
-    ]) {
-      expect(details).toContainElement(screen.getByText(text, { exact: false }));
-    }
-
-    fireEvent.click(within(details).getByRole("button", { name: "Copy Diagnostics" }));
-    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
-    expect(writeText.mock.calls[0][0]).toContain('"opId": "start-1"');
-    expect(within(details).getByRole("button", { name: "Copied" })).toBeInTheDocument();
+    await flushDiagnosticsFetch();
+    expect(screen.getByRole("heading", {
+      name: "We couldn’t prepare your environment",
+    })).toBeInTheDocument();
+    expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
+    expect(screen.queryByText("Harness exited")).not.toBeInTheDocument();
   });
 
   it.each([
-    ["stopped", "Start environment"],
-    ["failed", "Try again"],
-  ] as const)("uses the %s primary action label", async (status, label) => {
-    const onStartRequest = vi.fn();
+    "stopped",
+    "failed",
+  ] as const)("starts a %s environment fresh without another confirmation", async (status) => {
+    const onRecoverEnv = vi.fn();
     if (status === "failed") {
       mocks.fetchDiagnostics.mockResolvedValue(diagnostics(makeSnapshot({
         failure: { message: "Startup failed" },
@@ -325,13 +227,98 @@ describe("EnvWaitingView", () => {
       <EnvWaitingView
         env={makeEnv({ status })}
         hubUrl="https://hub.test"
-        onStartRequest={onStartRequest}
+        onRecoverEnv={onRecoverEnv}
       />,
     );
     await flushDiagnosticsFetch();
 
-    fireEvent.click(screen.getByRole("button", { name: label }));
-    expect(onStartRequest).toHaveBeenCalledWith("demo-env");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Start fresh" }));
+    });
+    expect(mocks.startEnv).toHaveBeenCalledWith(
+      "https://hub.test",
+      "demo-env",
+      { implementationMode: "fresh" },
+    );
+    expect(onRecoverEnv).toHaveBeenCalledWith("demo-env", "starting");
+  });
+
+  it("offers a restart when a previously running environment failed without startup diagnostics", async () => {
+    render(
+      <EnvWaitingView
+        env={makeEnv({ status: "failed" })}
+        hubUrl="https://hub.test"
+      />,
+    );
+    await flushDiagnosticsFetch();
+
+    expect(screen.getByText("Start it again to restore the latest saved workspace.")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "ASCII ocean waves" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start fresh" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start with plan" })).toBeDisabled();
+  });
+
+  it("offers an explicit last-saved recovery after Stop persistence times out", async () => {
+    const onRecoverEnv = vi.fn();
+    render(
+      <EnvWaitingView
+        env={makeEnv({
+          status: "failed",
+          lifecycleOpId: "stop-1",
+          lifecycleOperation: "stop",
+          lifecycleDesiredState: "stopped",
+          lifecycleInfraState: "stopped",
+        })}
+        hubUrl="https://hub.test"
+        onRecoverEnv={onRecoverEnv}
+      />,
+    );
+    await flushDiagnosticsFetch();
+
+    expect(screen.getByRole("heading", { name: "Workspace saving wasn’t confirmed" }))
+      .toBeInTheDocument();
+    expect(screen.getByText(
+      "Start again to restore the latest saved workspace. Recent changes may be missing.",
+    )).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Start fresh" }));
+    });
+    expect(mocks.startEnv).toHaveBeenCalledWith(
+      "https://hub.test",
+      "demo-env",
+      { implementationMode: "fresh" },
+    );
+    expect(onRecoverEnv).toHaveBeenCalledWith("demo-env", "starting");
+  });
+
+  it("uses the static wave illustration while a ready environment opens", async () => {
+    render(<EnvWaitingView env={makeEnv({ status: "running" })} hubUrl="https://hub.test" />);
+    await flushDiagnosticsFetch();
+
+    expect(screen.getByRole("heading", { name: "Your environment is ready" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "ASCII ocean waves" })).toBeInTheDocument();
+  });
+
+  it("starts directly with the environment's saved plan", async () => {
+    const onRecoverEnv = vi.fn();
+    render(
+      <EnvWaitingView
+        env={makeEnv({ status: "stopped", startupPlanId: "plan-1" })}
+        hubUrl="https://hub.test"
+        onRecoverEnv={onRecoverEnv}
+      />,
+    );
+    await flushDiagnosticsFetch();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Start with plan" }));
+    });
+    expect(mocks.startEnv).toHaveBeenCalledWith(
+      "https://hub.test",
+      "demo-env",
+      { implementationMode: "plan" },
+    );
+    expect(onRecoverEnv).toHaveBeenCalledWith("demo-env", "starting");
   });
 });
 
@@ -418,7 +405,7 @@ describe("EnvWaitingView elapsed time", () => {
     );
     await flushDiagnosticsFetch();
     expect(screen.getByTestId("startup-elapsed")).toHaveTextContent("Elapsed 1s");
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
 
     unmount();
     expect(vi.getTimerCount()).toBe(0);

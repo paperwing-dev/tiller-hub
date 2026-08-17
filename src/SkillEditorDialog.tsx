@@ -7,6 +7,7 @@ import { Input, Textarea } from "@cloudflare/kumo/components/input";
 import { InputGroup } from "@cloudflare/kumo/components/input-group";
 import { LayerCard } from "@cloudflare/kumo/components/layer-card";
 import { Select } from "@cloudflare/kumo/components/select";
+import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import {
   createAgentSkill,
   deleteAgentSkill,
@@ -60,13 +61,17 @@ function newAgent(routes: AgentRoute[], index = 0): AgentDefinition {
   };
 }
 
+function combineInstructions(common: string, agent: string): string {
+  return [common.trim(), agent.trim()].filter(Boolean).join("\n\n");
+}
+
 function emptyDraft(surface: "plan" | "review", routes: AgentRoute[]): Draft {
   return {
     surface,
     command: "",
     label: "",
     description: "",
-    sharedInstructions: "Describe the shared goal and immutable basis every agent should use.",
+    sharedInstructions: "",
     overviewInstructions: "Deduplicate findings and preserve attribution.",
     overviewMode: surface === "review" ? "auto" : "manual",
     agents: [newAgent(routes)],
@@ -108,6 +113,7 @@ export default function SkillEditorDialog({
     ? skills.find((skill) => skill.id === selectedId) ?? null
     : null;
   const fanout = draft.agents.length > 1;
+  const fixedSingleAgent = selected?.id === "plan-health";
   const routesByKey = useMemo(() => new Map(routes.map((route) => [route.key, route])), [routes]);
 
   useEffect(() => {
@@ -188,38 +194,49 @@ export default function SkillEditorDialog({
 
   return (
     <Dialog.Root open onOpenChange={(nextOpen) => { if (!nextOpen) onOpenChange(false); }}>
-      <Dialog size="xl" className="flex max-h-[92vh] w-[calc(100vw-2rem)] max-w-[1200px] flex-col overflow-hidden p-0 sm:w-[calc(100vw-2rem)]">
-        <div className="flex items-center justify-between gap-3 border-b border-kumo-line px-4 py-3">
+      <Dialog size="xl" className="tiller-dialog-shell tiller-workflow-dialog flex max-h-[88vh] w-[calc(100vw-2rem)] max-w-[1080px] flex-col overflow-hidden p-0 sm:w-[calc(100vw-2rem)]">
+        <div className="tiller-dialog-header flex items-center justify-between gap-3 border-b border-kumo-line px-5 py-4">
           <div>
-            <Dialog.Title className="text-sm font-semibold text-kumo-strong">
+            <div className="tiller-workflow-eyebrow">
+              {surface === "plan" ? "Planning settings" : "Implementation settings"}
+            </div>
+            <Dialog.Title className="tiller-dialog-title mt-1 text-sm font-semibold text-kumo-strong">
               {surface === "plan" ? "Plan Skills" : "Review Skills"}
             </Dialog.Title>
-            <Dialog.Description className="mt-0.5 text-xs text-kumo-subtle">
+            <Dialog.Description className="tiller-dialog-description mt-0.5 text-xs text-kumo-subtle">
               One slash command configures the agent experience used when invoked.
             </Dialog.Description>
           </div>
-          <Button type="button" size="sm" variant="secondary" onClick={() => onOpenChange(false)}>Close</Button>
+          <Button className="tiller-dialog-button tiller-dialog-button--secondary" type="button" size="sm" variant="secondary" onClick={() => onOpenChange(false)}>Close</Button>
         </div>
 
         <div className="grid min-h-0 flex-1 grid-cols-[260px_minmax(0,1fr)]">
-          <aside className="min-h-0 overflow-y-auto border-r border-kumo-line bg-kumo-recessed">
-            <div className="sticky top-0 z-10 flex items-center justify-between border-b border-kumo-line bg-kumo-recessed px-3 py-2">
-              <span className="text-[10px] font-semibold uppercase tracking-wide text-kumo-subtle">Commands</span>
-              <Button type="button" size="xs" variant="secondary" disabled={saving} onClick={add}>Add</Button>
+          <aside className="tiller-workflow-sidebar min-h-0 overflow-y-auto border-r border-kumo-line bg-kumo-recessed">
+            <div className="tiller-workflow-sidebar-header sticky top-0 z-10 flex items-center justify-between border-b border-kumo-line bg-kumo-recessed px-3 py-2">
+              <span className="tiller-workflow-sidebar-title">Skills</span>
+              <Button className="tiller-workflow-add" type="button" size="xs" variant="secondary" disabled={saving} onClick={add}>New skill</Button>
             </div>
             {visibleSkills.map((skill) => (
               <Button
                 key={skill.id}
                 type="button"
                 variant="ghost"
+                data-selected={selectedId === skill.id ? "true" : "false"}
                 onClick={() => { if (skill.id !== "new") choose(skill as AgentSkillDefinition); }}
-                className={`block h-auto w-full rounded-none border-b border-kumo-line px-3 py-3 text-left ${selectedId === skill.id ? "bg-kumo-info/10" : ""}`}
+                className={`tiller-workflow-list-item block h-auto w-full rounded-none border-b border-kumo-line px-3 py-3 text-left ${selectedId === skill.id ? "bg-kumo-info/10" : ""}`}
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-mono text-xs font-semibold text-kumo-info">/{skill.command || "new-skill"}</span>
-                  <Badge variant="outline" className="text-[9px] uppercase">
-                    {skill.agents.length} agent{skill.agents.length === 1 ? "" : "s"}
-                  </Badge>
+                  <span className="flex items-center gap-1">
+                    {"origin" in skill && skill.origin === "builtin" && (
+                      <Badge variant="outline" className="text-[9px] uppercase text-kumo-subtle">
+                        Built-in
+                      </Badge>
+                    )}
+                    <Badge variant="outline" className="text-[9px] uppercase">
+                      {skill.agents.length} agent{skill.agents.length === 1 ? "" : "s"}
+                    </Badge>
+                  </span>
                 </div>
                 <div className="mt-1 truncate text-xs font-medium text-kumo-default">{skill.label || "Untitled skill"}</div>
                 <div className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-kumo-subtle">{skill.description}</div>
@@ -227,12 +244,12 @@ export default function SkillEditorDialog({
             ))}
           </aside>
 
-          <div className="min-h-0 overflow-y-auto p-4">
+          <div className="tiller-dialog-body min-h-0 overflow-y-auto p-5">
             <div className="w-full space-y-5">
-              <LayerCard className="bg-kumo-recessed p-4">
+              <LayerCard className="tiller-card-surface tiller-workflow-section bg-kumo-recessed p-4">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Field label="Command">
-                    <InputGroup size="sm" disabled={selected?.origin === "builtin" || saving} className="w-full">
+                    <InputGroup size="sm" disabled={selected?.origin === "builtin" || saving} className="tiller-workflow-command tiller-workflow-input-group w-full">
                       <InputGroup.Addon>/</InputGroup.Addon>
                       <InputGroup.Input
                         aria-label="Command"
@@ -245,6 +262,7 @@ export default function SkillEditorDialog({
                   <Input
                     size="sm"
                     label="Skill name"
+                    className="tiller-workflow-editable"
                     value={draft.label}
                     disabled={saving}
                     onChange={(event) => setDraft((current) => ({ ...current, label: event.target.value }))}
@@ -254,58 +272,67 @@ export default function SkillEditorDialog({
                   <Input
                     size="sm"
                     label="Description"
+                    className="tiller-workflow-editable"
                     value={draft.description}
                     disabled={saving}
                     onChange={(event) => setDraft((current) => ({ ...current, description: event.target.value }))}
                   />
                 </div>
                 {fanout && (
-                  <>
-                    <div className="mt-3">
-                      <Textarea
-                        size="sm"
-                        label="Shared goal"
-                        description="Sent to every child agent."
-                        value={draft.sharedInstructions}
+                  <div className="mt-3 space-y-3">
+                    <Textarea
+                      size="sm"
+                      label="Common instructions"
+                      description="Editable. Added to every child review; Tiller supplies the workspace context separately."
+                      value={draft.sharedInstructions}
+                      disabled={saving}
+                      onChange={(event) => setDraft((current) => ({ ...current, sharedInstructions: event.target.value }))}
+                      rows={3}
+                      className="tiller-workflow-editable w-full resize-y text-xs leading-5"
+                    />
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-xs font-medium text-kumo-default">Default Overview mode</span>
+                      <SkillAutomationToggle
+                        value={draft.overviewMode}
+                        onChange={(overviewMode) => setDraft((current) => ({ ...current, overviewMode }))}
+                        ariaLabel="Default Overview mode"
+                        manualTooltip="Let you choose the exact successful responses before creating Overview."
+                        autoTooltip="Create Overview after every initial Report becomes terminal."
                         disabled={saving}
-                        onChange={(event) => setDraft((current) => ({ ...current, sharedInstructions: event.target.value }))}
-                        rows={3}
-                        className="w-full resize-y text-xs leading-5"
                       />
                     </div>
-                    {surface === "review" && (
-                      <div className="mt-3">
-                        <Textarea
-                          size="sm"
-                          label="Reviewer instructions"
-                          description="Included when agent reports are sent together."
-                          value={draft.overviewInstructions}
-                          disabled={saving}
-                          onChange={(event) => setDraft((current) => ({ ...current, overviewInstructions: event.target.value }))}
-                          rows={3}
-                          className="w-full resize-y text-xs leading-5"
-                        />
-                      </div>
-                    )}
-                  </>
+                    <Textarea
+                      size="sm"
+                      label="Overview instructions"
+                      description="Editable. Used only to synthesize the child reports."
+                      value={draft.overviewInstructions}
+                      disabled={saving}
+                      onChange={(event) => setDraft((current) => ({ ...current, overviewInstructions: event.target.value }))}
+                      rows={3}
+                      className="tiller-workflow-editable w-full resize-y text-xs leading-5"
+                    />
+                  </div>
                 )}
               </LayerCard>
 
               <section>
                 <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <h3 className="text-sm font-semibold text-kumo-strong">{draft.agents.length === 1 ? "Agent" : "Agents"}</h3>
+                    <h3 className="tiller-workflow-section-title text-sm font-semibold text-kumo-strong">{draft.agents.length === 1 ? "Reviewer" : "Reviewers"}</h3>
                     <p className="text-xs text-kumo-subtle">
                       {draft.agents.length === 1
-                        ? "This agent runs directly in the current tab."
-                        : "Each agent becomes a nested, fully interactive tab."}
+                        ? surface === "plan"
+                          ? "Runs in the selected reviewer using this agent's route and reasoning effort. The reviewer resumes its own settings afterward."
+                          : "Runs in the selected Implementation Review tab using the parent reviewer's route and reasoning effort."
+                        : "Each agent uses its configured route in a nested, reusable conversation."}
                     </p>
                   </div>
                   <Button
                     type="button"
                     size="sm"
                     variant="primary"
-                    disabled={draft.agents.length >= 4 || saving}
+                    className="tiller-workflow-add-reviewer"
+                    disabled={fixedSingleAgent || draft.agents.length >= 4 || saving}
                     onClick={() => setDraft((current) => ({ ...current, agents: [...current.agents, newAgent(routes, current.agents.length)] }))}
                   >
                     Add agent
@@ -316,14 +343,14 @@ export default function SkillEditorDialog({
                   {draft.agents.map((agent, index) => {
                     const route = routesByKey.get(agent.routeKey) ?? null;
                     return (
-                      <LayerCard key={agent.id} className="bg-kumo-recessed p-4">
+                      <LayerCard key={agent.id} className="tiller-card-surface tiller-workflow-reviewer bg-kumo-recessed p-4">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                           <div className="flex min-w-0 items-center gap-2">
                             <span className="flex h-6 w-6 items-center justify-center rounded-full bg-kumo-info/15 text-[10px] font-bold text-kumo-info">{index + 1}</span>
                             <span className="truncate text-xs font-semibold text-kumo-strong">{agent.label || "Untitled agent"}</span>
                           </div>
                           <div className="flex items-center gap-1">
-                            {surface === "review" && fanout && (
+                            {fanout && (
                               <SkillAutomationToggle
                                 value={agent.reportMode}
                                 onChange={(reportMode) => updateAgent(agent.id, { reportMode })}
@@ -339,8 +366,22 @@ export default function SkillEditorDialog({
                               variant="secondary-destructive"
                               aria-label={`Remove agent ${index + 1}`}
                               title="Remove agent"
-                              disabled={draft.agents.length === 1 || saving}
-                              onClick={() => setDraft((current) => ({ ...current, agents: current.agents.filter((entry) => entry.id !== agent.id) }))}
+                              disabled={fixedSingleAgent || draft.agents.length === 1 || saving}
+                              onClick={() => setDraft((current) => {
+                                const agents = current.agents.filter((entry) => entry.id !== agent.id);
+                                if (agents.length !== 1) return { ...current, agents };
+                                return {
+                                  ...current,
+                                  sharedInstructions: "",
+                                  agents: [{
+                                    ...agents[0]!,
+                                    instructions: combineInstructions(
+                                      current.sharedInstructions,
+                                      agents[0]!.instructions,
+                                    ),
+                                  }],
+                                };
+                              })}
                               className="ml-2 cursor-pointer disabled:cursor-not-allowed"
                             >
                               Remove
@@ -356,10 +397,10 @@ export default function SkillEditorDialog({
                             value={agent.label}
                             disabled={saving}
                             onChange={(event) => updateAgent(agent.id, { label: event.target.value })}
-                            className="w-full min-w-0"
+                            className="tiller-workflow-editable tiller-workflow-tab-label w-full min-w-0"
                           />
                           <Field label="Model & reasoning">
-                            <div className="grid min-w-0 grid-cols-[270px_150px] overflow-hidden rounded-md ring ring-kumo-line focus-within:ring-kumo-focus/50">
+                            <div className="tiller-workflow-model-controls grid min-w-0 grid-cols-[270px_150px] gap-2">
                               <Select<string>
                                 aria-label={`${agent.label} model`}
                                 size="sm"
@@ -367,7 +408,7 @@ export default function SkillEditorDialog({
                                 disabled={saving}
                                 onValueChange={(value) => { if (value) chooseRoute(agent, value); }}
                                 renderValue={(value) => routesByKey.get(value)?.label ?? value}
-                                className="w-full min-w-0 rounded-none bg-transparent ring-0 focus:ring-0"
+                                className="tiller-workflow-select w-full min-w-0 rounded-none bg-transparent ring-0 focus:ring-0"
                               >
                                 {routes.map((option) => (
                                   <Select.Option key={option.key} value={option.key} disabled={!option.available}>{option.label}</Select.Option>
@@ -380,7 +421,7 @@ export default function SkillEditorDialog({
                                 disabled={saving}
                                 onValueChange={(effort) => { if (effort) updateAgent(agent.id, { effort }); }}
                                 renderValue={(effort) => EFFORT_LABELS[effort]}
-                                className="w-full rounded-none border-l border-kumo-line bg-transparent ring-0 focus:ring-0"
+                                className="tiller-workflow-select w-full min-w-0 rounded-none bg-transparent ring-0 focus:ring-0"
                               >
                                 {(route?.supportedEfforts ?? []).map((effort) => (
                                   <Select.Option key={effort} value={effort}>{EFFORT_LABELS[effort]}</Select.Option>
@@ -393,13 +434,13 @@ export default function SkillEditorDialog({
                         <div className="mt-3">
                           <Textarea
                             size="sm"
-                            label="Role instructions"
+                            label="Agent instructions"
                             aria-label={`Agent ${index + 1} instructions`}
                             value={agent.instructions}
                             disabled={saving}
                             onChange={(event) => updateAgent(agent.id, { instructions: event.target.value })}
                             rows={3}
-                            className="w-full resize-y text-xs leading-5"
+                            className="tiller-workflow-editable w-full resize-y text-xs leading-5"
                           />
                         </div>
                       </LayerCard>
@@ -413,17 +454,36 @@ export default function SkillEditorDialog({
           </div>
         </div>
 
-        <div className="flex items-center justify-between gap-3 border-t border-kumo-line px-4 py-3">
+        <div className="tiller-dialog-footer flex items-center justify-between gap-3 border-t border-kumo-line px-5 py-3">
           <div>
-            {selected && (
-              <Button type="button" size="sm" variant="secondary-destructive" disabled={saving} onClick={() => void removeOrReset()}>
-                {selected.origin === "builtin" ? "Reset" : "Delete"}
+            {selected?.origin === "builtin" && (
+              <Tooltip
+                content="Restore the built-in version of this skill and discard your custom changes."
+                side="top"
+                delay={250}
+                render={(
+                  <Button
+                    className="tiller-workflow-remove"
+                    type="button"
+                    size="sm"
+                    variant="secondary-destructive"
+                    disabled={saving}
+                    onClick={() => void removeOrReset()}
+                  />
+                )}
+              >
+                Reset
+              </Tooltip>
+            )}
+            {selected && selected.origin !== "builtin" && (
+              <Button className="tiller-workflow-remove" type="button" size="sm" variant="secondary-destructive" disabled={saving} onClick={() => void removeOrReset()}>
+                Delete
               </Button>
             )}
           </div>
           <div className="flex gap-2">
-            <Button type="button" size="sm" variant="secondary" disabled={saving} onClick={() => onOpenChange(false)}>Cancel</Button>
-            <Button type="button" size="sm" variant="primary" disabled={saving} onClick={() => void save()}>
+            <Button className="tiller-dialog-button tiller-dialog-button--secondary" type="button" size="sm" variant="secondary" disabled={saving} onClick={() => onOpenChange(false)}>Cancel</Button>
+            <Button className="tiller-dialog-button tiller-dialog-button--primary" type="button" size="sm" variant="primary" disabled={saving} onClick={() => void save()}>
               {saving ? "Saving…" : "Save skill"}
             </Button>
           </div>

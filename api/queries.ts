@@ -3,10 +3,6 @@ import { mergeMachineServiceState, parseMachineServiceState } from "./machine-se
 import { isManagedSessionMetadataUpdateValid } from "./session-attachment";
 import type {
   MachineServiceState,
-  RepoCloudflareMcpAuditEventRow,
-  RepoCloudflareMcpCredentialRow,
-  RepoCloudflareMcpPendingOAuthRow,
-  RepoCloudflareMcpProxyTokenRow,
   RepoMcpServerRow,
   RepoSessionEnvRow,
   StoredSession,
@@ -14,7 +10,11 @@ import type {
   StoredPermission,
   VersionedUpdateResult,
 } from "./types";
-import { readTerminalScopeFromStoredSession } from "./session-attachment";
+import {
+  readTerminalScopeFromMetadata,
+  readTerminalScopeFromStoredSession,
+} from "./session-attachment";
+import { planWriterTerminalId } from "./planner/runtime-identity";
 
 // ── Sessions ────────────────────────────────────────────────────────
 
@@ -53,6 +53,61 @@ export function getAllSessions(sql: SqlStorage): StoredSession[] {
     .toArray() as unknown as StoredSession[];
 }
 
+export function ensurePlanWriterTerminal(
+  sql: SqlStorage,
+  id: string,
+  tag: string,
+  machineId: string | null,
+  metadata: unknown,
+  repoId: string,
+  planArtifactId: string,
+  generation: number,
+):
+  | { status: "ready"; session: StoredSession; created: boolean }
+  | { status: "unavailable" } {
+  const requestedScope = readTerminalScopeFromMetadata(metadata);
+  if (
+    id !== planWriterTerminalId(repoId, planArtifactId, generation)
+    || requestedScope?.kind !== "plan-writer"
+    || requestedScope.repoId !== repoId
+    || requestedScope.planArtifactId !== planArtifactId
+    || requestedScope.generation !== generation
+    || requestedScope.revokedAt
+  ) {
+    throw new Error("Plan writer terminal scope is invalid.");
+  }
+  const tombstone = sql.exec(
+    "SELECT repo_id, plan_artifact_id, generation FROM plan_writer_terminal_tombstones WHERE id = ?",
+    id,
+  ).toArray()[0] as unknown as {
+    repo_id: string;
+    plan_artifact_id: string;
+    generation: number;
+  } | undefined;
+  if (tombstone) {
+    return { status: "unavailable" };
+  }
+  const existing = getSession(sql, id);
+  if (existing) {
+    const existingScope = readTerminalScopeFromStoredSession(existing);
+    if (
+      existingScope?.kind !== "plan-writer"
+      || existingScope.repoId !== repoId
+      || existingScope.planArtifactId !== planArtifactId
+      || existingScope.generation !== generation
+      || existingScope.revokedAt
+    ) {
+      return { status: "unavailable" };
+    }
+    return { status: "ready", session: existing, created: false };
+  }
+  return {
+    status: "ready",
+    session: createSession(sql, id, tag, machineId, metadata),
+    created: true,
+  };
+}
+
 export function revokePlanWriterTerminal(
   sql: SqlStorage,
   id: string,
@@ -60,16 +115,51 @@ export function revokePlanWriterTerminal(
   planArtifactId: string,
   generation: number,
 ): StoredSession | null {
+  if (id !== planWriterTerminalId(repoId, planArtifactId, generation)) {
+    throw new Error("Plan writer terminal identity does not match the cleanup fence.");
+  }
   const session = getSession(sql, id);
+  if (session) {
+    const scope = readTerminalScopeFromStoredSession(session);
+    if (
+      scope?.kind !== "plan-writer"
+      || scope.repoId !== repoId
+      || scope.planArtifactId !== planArtifactId
+      || scope.generation !== generation
+    ) {
+      throw new Error("Plan writer terminal identity does not match the cleanup fence.");
+    }
+  }
+  const tombstone = sql.exec(
+    "SELECT repo_id, plan_artifact_id, generation FROM plan_writer_terminal_tombstones WHERE id = ?",
+    id,
+  ).toArray()[0] as unknown as {
+    repo_id: string;
+    plan_artifact_id: string;
+    generation: number;
+  } | undefined;
+  if (
+    tombstone
+    && (
+      tombstone.repo_id !== repoId
+      || tombstone.plan_artifact_id !== planArtifactId
+      || tombstone.generation !== generation
+    )
+  ) {
+    throw new Error("Plan writer terminal tombstone does not match the cleanup fence.");
+  }
+  sql.exec(
+    `INSERT INTO plan_writer_terminal_tombstones (id, repo_id, plan_artifact_id, generation)
+     VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+    id,
+    repoId,
+    planArtifactId,
+    generation,
+  );
   if (!session) return null;
   const scope = readTerminalScopeFromStoredSession(session);
-  if (
-    scope?.kind !== "plan-writer"
-    || scope.repoId !== repoId
-    || scope.planArtifactId !== planArtifactId
-    || scope.generation !== generation
-  ) {
-    return null;
+  if (scope?.kind !== "plan-writer") {
+    throw new Error("Plan writer terminal identity does not match the cleanup fence.");
   }
   if (scope.revokedAt) return session;
   const metadata = JSON.parse(session.metadata) as Record<string, unknown>;
@@ -427,276 +517,4 @@ export function replaceRepoMcpServerRows(
 
 export function deleteRepoMcpServers(sql: SqlStorage, repoId: string): void {
   sql.exec("DELETE FROM repo_mcp_servers WHERE repo_id = ?", repoId);
-}
-
-// ── Repo Cloudflare MCP integration ────────────────────────────────
-
-export function getRepoCloudflareMcpCredentialRow(
-  sql: SqlStorage,
-  repoId: string,
-): RepoCloudflareMcpCredentialRow | null {
-  const row = sql
-    .exec(
-      `SELECT repo_id, client_id,
-              encrypted_access_token, access_token_nonce, encrypted_refresh_token, refresh_token_nonce,
-              token_type, scopes, expires_at, account_id, account_name, enabled,
-              last_auth_error, last_auth_error_at, connected_at, updated_at
-       FROM repo_cloudflare_mcp_credentials
-       WHERE repo_id = ?`,
-      repoId,
-    )
-    .toArray()[0] as unknown as RepoCloudflareMcpCredentialRow | undefined;
-  return row ?? null;
-}
-
-export function upsertRepoCloudflareMcpCredentialRow(
-  sql: SqlStorage,
-  row: Omit<RepoCloudflareMcpCredentialRow, "connected_at" | "updated_at">,
-): void {
-  sql.exec(
-    `INSERT INTO repo_cloudflare_mcp_credentials (
-       repo_id, client_id,
-       encrypted_access_token, access_token_nonce, encrypted_refresh_token, refresh_token_nonce,
-       token_type, scopes, expires_at, account_id, account_name, enabled,
-       last_auth_error, last_auth_error_at, connected_at, updated_at
-     )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-     ON CONFLICT(repo_id) DO UPDATE SET
-       client_id = excluded.client_id,
-       encrypted_access_token = excluded.encrypted_access_token,
-       access_token_nonce = excluded.access_token_nonce,
-       encrypted_refresh_token = excluded.encrypted_refresh_token,
-       refresh_token_nonce = excluded.refresh_token_nonce,
-       token_type = excluded.token_type,
-       scopes = excluded.scopes,
-       expires_at = excluded.expires_at,
-       account_id = excluded.account_id,
-       account_name = excluded.account_name,
-       enabled = excluded.enabled,
-       last_auth_error = excluded.last_auth_error,
-       last_auth_error_at = excluded.last_auth_error_at,
-       updated_at = excluded.updated_at`,
-    row.repo_id,
-    row.client_id,
-    row.encrypted_access_token,
-    row.access_token_nonce,
-    row.encrypted_refresh_token,
-    row.refresh_token_nonce,
-    row.token_type,
-    row.scopes,
-    row.expires_at,
-    row.account_id,
-    row.account_name,
-    row.enabled,
-    row.last_auth_error,
-    row.last_auth_error_at,
-  );
-}
-
-export function setRepoCloudflareMcpEnabled(
-  sql: SqlStorage,
-  repoId: string,
-  enabled: boolean,
-): void {
-  sql.exec(
-    `UPDATE repo_cloudflare_mcp_credentials
-     SET enabled = ?, updated_at = datetime('now')
-     WHERE repo_id = ?`,
-    enabled ? 1 : 0,
-    repoId,
-  );
-}
-
-export function setRepoCloudflareMcpAuthError(
-  sql: SqlStorage,
-  repoId: string,
-  error: string | null,
-): void {
-  sql.exec(
-    `UPDATE repo_cloudflare_mcp_credentials
-     SET last_auth_error = ?, last_auth_error_at = CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END,
-         enabled = CASE WHEN ? IS NULL THEN enabled ELSE 0 END,
-         updated_at = datetime('now')
-     WHERE repo_id = ?`,
-    error,
-    error,
-    error,
-    repoId,
-  );
-}
-
-export function deleteRepoCloudflareMcpCredentials(sql: SqlStorage, repoId: string): void {
-  sql.exec("DELETE FROM repo_cloudflare_mcp_credentials WHERE repo_id = ?", repoId);
-}
-
-export function upsertRepoCloudflareMcpPendingOAuthRow(
-  sql: SqlStorage,
-  row: Omit<RepoCloudflareMcpPendingOAuthRow, "created_at">,
-): void {
-  sql.exec(
-    `INSERT INTO repo_cloudflare_mcp_oauth_states (
-       state, repo_id, redirect_uri, pkce_verifier, client_id,
-       initiating_identity, expires_at, created_at
-     )
-     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-     ON CONFLICT(state) DO UPDATE SET
-       repo_id = excluded.repo_id,
-       redirect_uri = excluded.redirect_uri,
-       pkce_verifier = excluded.pkce_verifier,
-       client_id = excluded.client_id,
-       initiating_identity = excluded.initiating_identity,
-       expires_at = excluded.expires_at`,
-    row.state,
-    row.repo_id,
-    row.redirect_uri,
-    row.pkce_verifier,
-    row.client_id,
-    row.initiating_identity,
-    row.expires_at,
-  );
-}
-
-export function getRepoCloudflareMcpPendingOAuthRow(
-  sql: SqlStorage,
-  state: string,
-): RepoCloudflareMcpPendingOAuthRow | null {
-  const row = sql
-    .exec(
-      `SELECT state, repo_id, redirect_uri, pkce_verifier, client_id,
-              initiating_identity, expires_at, created_at
-       FROM repo_cloudflare_mcp_oauth_states
-       WHERE state = ?`,
-      state,
-    )
-    .toArray()[0] as unknown as RepoCloudflareMcpPendingOAuthRow | undefined;
-  return row ?? null;
-}
-
-export function deleteRepoCloudflareMcpPendingOAuthState(sql: SqlStorage, state: string): void {
-  sql.exec("DELETE FROM repo_cloudflare_mcp_oauth_states WHERE state = ?", state);
-}
-
-export function deleteRepoCloudflareMcpPendingOAuth(sql: SqlStorage, repoId: string): void {
-  sql.exec("DELETE FROM repo_cloudflare_mcp_oauth_states WHERE repo_id = ?", repoId);
-}
-
-export function deleteExpiredRepoCloudflareMcpPendingOAuth(sql: SqlStorage, nowMs: number): void {
-  sql.exec("DELETE FROM repo_cloudflare_mcp_oauth_states WHERE expires_at <= ?", nowMs);
-}
-
-export function insertRepoCloudflareMcpProxyToken(
-  sql: SqlStorage,
-  row: Omit<RepoCloudflareMcpProxyTokenRow, "created_at" | "revoked_at">,
-): void {
-  sql.exec(
-    `INSERT INTO repo_cloudflare_mcp_proxy_tokens (
-       token_hash, repo_id, env_slug, server_id, incarnation_id, start_op_id,
-       expires_at, revoked_at, created_at
-     )
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))`,
-    row.token_hash,
-    row.repo_id,
-    row.env_slug,
-    row.server_id,
-    row.incarnation_id,
-    row.start_op_id,
-    row.expires_at,
-  );
-}
-
-export function getRepoCloudflareMcpProxyTokenRow(
-  sql: SqlStorage,
-  tokenHash: string,
-): RepoCloudflareMcpProxyTokenRow | null {
-  const row = sql
-    .exec(
-      `SELECT token_hash, repo_id, env_slug, server_id, incarnation_id, start_op_id,
-              expires_at, revoked_at, created_at
-       FROM repo_cloudflare_mcp_proxy_tokens
-       WHERE token_hash = ?`,
-      tokenHash,
-    )
-    .toArray()[0] as unknown as RepoCloudflareMcpProxyTokenRow | undefined;
-  return row ?? null;
-}
-
-export function revokeRepoCloudflareMcpProxyTokenForStart(
-  sql: SqlStorage,
-  input: { tokenHash: string; envSlug: string; incarnationId: string; startOpId: string },
-): boolean {
-  const row = getRepoCloudflareMcpProxyTokenRow(sql, input.tokenHash);
-  if (!row) return true;
-  if (
-    row.env_slug !== input.envSlug
-    || row.incarnation_id !== input.incarnationId
-    || row.start_op_id !== input.startOpId
-  ) return false;
-  sql.exec(
-    `UPDATE repo_cloudflare_mcp_proxy_tokens
-     SET revoked_at = datetime('now')
-     WHERE token_hash = ? AND revoked_at IS NULL`,
-    input.tokenHash,
-  );
-  return true;
-}
-
-export function revokeRepoCloudflareMcpProxyTokensForStart(
-  sql: SqlStorage,
-  input: { envSlug: string; incarnationId: string; startOpId: string },
-): void {
-  sql.exec(
-    `UPDATE repo_cloudflare_mcp_proxy_tokens
-     SET revoked_at = datetime('now')
-     WHERE env_slug = ? AND incarnation_id = ? AND start_op_id = ? AND revoked_at IS NULL`,
-    input.envSlug,
-    input.incarnationId,
-    input.startOpId,
-  );
-}
-
-export function revokeRepoCloudflareMcpProxyTokensForEnv(sql: SqlStorage, envSlug: string): void {
-  sql.exec(
-    `UPDATE repo_cloudflare_mcp_proxy_tokens
-     SET revoked_at = datetime('now')
-     WHERE env_slug = ? AND revoked_at IS NULL`,
-    envSlug,
-  );
-}
-
-export function revokeRepoCloudflareMcpProxyTokensForRepo(sql: SqlStorage, repoId: string): void {
-  sql.exec(
-    `UPDATE repo_cloudflare_mcp_proxy_tokens
-     SET revoked_at = datetime('now')
-     WHERE repo_id = ? AND revoked_at IS NULL`,
-    repoId,
-  );
-}
-
-export function deleteRepoCloudflareMcpProxyTokens(sql: SqlStorage, repoId: string): void {
-  sql.exec("DELETE FROM repo_cloudflare_mcp_proxy_tokens WHERE repo_id = ?", repoId);
-}
-
-export function insertRepoCloudflareMcpAuditEvent(
-  sql: SqlStorage,
-  row: Omit<RepoCloudflareMcpAuditEventRow, "created_at">,
-): void {
-  sql.exec(
-    `INSERT INTO repo_cloudflare_mcp_audit_events (
-       id, repo_id, env_slug, server_id, http_method, json_rpc_method,
-       response_status, error_code, created_at
-     )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
-    row.id,
-    row.repo_id,
-    row.env_slug,
-    row.server_id,
-    row.http_method,
-    row.json_rpc_method,
-    row.response_status,
-    row.error_code,
-  );
-}
-
-export function deleteRepoCloudflareMcpAuditEvents(sql: SqlStorage, repoId: string): void {
-  sql.exec("DELETE FROM repo_cloudflare_mcp_audit_events WHERE repo_id = ?", repoId);
 }

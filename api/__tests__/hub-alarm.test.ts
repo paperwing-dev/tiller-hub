@@ -96,7 +96,10 @@ function createConnection(id: string, initialState: WsConnectionState = {}): Fak
     id,
     readyState: 1,
     sent: [],
-    state: initialState,
+    state: {
+      authorization: { kind: "global", source: "local-dev" },
+      ...initialState,
+    },
     setState(next) {
       this.state = typeof next === "function" ? next(this.state) : next;
       return this.state;

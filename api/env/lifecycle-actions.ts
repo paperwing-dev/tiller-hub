@@ -51,20 +51,25 @@ import {
   buildContainerLaunchConfig,
   materializeResolvedStartupPlan,
   materializeStartupPlan,
+  materializeStartupPlanDocument,
   renderResolvedStartupPlanDocument,
-  resolveSpecificStartupPlanArtifact,
+  resolveSelectedPlanArtifact,
   resolveStartupPlanDocument,
   resolveSelectedPlanId,
   TREE_HASH_EXCLUDES,
   withStartCausePreamble,
   type EnvStartCause,
 } from "./launch-config";
+import { deriveEnvDisplayName } from "../../shared/env-display-name";
 import {
   getRunnerControlErrorCode,
+  inspectRunnerBackend,
   runRunnerMutationWithGenerationReconciliation,
+  type EnvironmentStopScope,
   type RunnerBackend,
   type RunnerBackendKind,
 } from "./runner-backend";
+import { buildWorkspaceSyncedPatch } from "./workspace-synced";
 import { getRunnerBackend } from "./runner-backends";
 import { normalizeRunnerStatus } from "./status";
 import {
@@ -78,8 +83,6 @@ import {
   projectAndPersistEnvSummary,
   projectEnvMetaForAction,
   readLifecycleState,
-  revokeCloudflareMcpProxyTokensForEnvBestEffort,
-  revokeCloudflareMcpProxyTokensForStartBestEffort,
 } from "./service";
 import type {
   ScheduledRunCredentialIds,
@@ -93,41 +96,23 @@ import {
   resolveNewExecutionPlacement,
 } from "../execution";
 import { isLocalDevRequest } from "../protection";
+import { cleanupEnvReviewRunRuntime } from "../env-review/dispatch";
+import {
+  isProjectedRuntimeFailure,
+  projectRuntimeFailure,
+  type RuntimeFailureCode,
+} from "./runtime-failure";
 
-function base64Utf8(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}
+type WaitUntilExecutionContext = Pick<ExecutionContext, "waitUntil">;
 
 function actionErrorMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
 }
 
-function isAmbiguousHostRunnerResponse(error: unknown): boolean {
-  let current: unknown = error;
-  const seen = new Set<unknown>();
-  while (current && typeof current === "object" && !seen.has(current)) {
-    seen.add(current);
-    const message = current instanceof Error ? current.message : "";
-    if (/timed out waiting for the execution machine/i.test(message)) return true;
-    current = (current as { cause?: unknown }).cause;
-  }
-  return false;
-}
-
-function withStartupPlanDocumentEnvVar(
-  envVars: Record<string, string>,
-  document: string | null,
-): Record<string, string> {
-  if (!document) return envVars;
-  return {
-    ...envVars,
-    TILLER_STARTUP_PLAN_DOCUMENT_B64: base64Utf8(document),
-  };
+function isCloudflareContainerAllocationTimeout(value: unknown): boolean {
+  return actionErrorMessage(value).includes(
+    "there is no container instance that can be provided to this durable object",
+  );
 }
 
 export type RouteResult = {
@@ -140,6 +125,26 @@ export type RouteResult = {
   scheduledRunTransitionApplied?: boolean;
   runnerUncertain?: boolean;
 };
+
+function projectedRuntimeFailureResult(
+  code: RuntimeFailureCode,
+  detail: unknown,
+  context: Record<string, unknown>,
+  status = 502,
+): { failure: ReturnType<typeof projectRuntimeFailure>; result: RouteResult } {
+  const failure = projectRuntimeFailure(code, detail, context);
+  return {
+    failure,
+    result: {
+      status,
+      body: {
+        error: failure.message,
+        code: failure.code,
+        referenceId: failure.referenceId,
+      },
+    },
+  };
+}
 
 type ClaimedStartContext = Readonly<{
   opId: string;
@@ -189,7 +194,6 @@ const SCHEDULED_RUN_PREPARATION_HEARTBEAT_MS = 20_000;
 export async function cleanupLaunchCredentialsBestEffort(
   env: Env,
   slug: string,
-  hub = getHub(env),
   scheduled?: { scope: ScheduledRunCredentialScope; ids: ScheduledRunCredentialIds },
 ): Promise<{ complete: boolean }> {
   if (scheduled) {
@@ -198,20 +202,18 @@ export async function cleanupLaunchCredentialsBestEffort(
       incarnationId: scheduled.scope.incarnationId,
       startOpId: scheduled.scope.startOpId,
     };
-    const results = await Promise.all([
-      revokeGitHubBridgesForEnvironmentStart(env, exact).then(() => true).catch(() => false),
-      revokeCloudflareMcpProxyTokensForStartBestEffort(hub, exact),
-    ]);
-    return { complete: results.every(Boolean) };
+    const complete = await revokeGitHubBridgesForEnvironmentStart(env, exact)
+      .then(() => true)
+      .catch(() => false);
+    return { complete };
   }
-  const results = await Promise.all([
-    revokeGitHubBridgesForInteractiveEnv(env, slug).then(() => true).catch((error) => {
+  const complete = await revokeGitHubBridgesForInteractiveEnv(env, slug)
+    .then(() => true)
+    .catch((error) => {
       console.error(`[envs] Failed to revoke GitHub launch credentials for ${slug}:`, error);
       return false;
-    }),
-    revokeCloudflareMcpProxyTokensForEnvBestEffort(hub, slug),
-  ]);
-  return { complete: results.every(Boolean) };
+    });
+  return { complete };
 }
 
 function isDispatchableMutableStart(
@@ -378,10 +380,59 @@ async function dispatchStopAndFinalizeIfNoCallback(args: {
   meta: EnvMeta;
   hub: ReturnType<typeof getHub>;
   stopOpId: string;
+  idleClaimId?: string | null;
   lifecycleStub?: ReturnType<typeof getEnvLifecycleStub>;
   projectSummary?: () => Promise<EnvMeta | null>;
 }): Promise<void> {
   const lifecycleStub = args.lifecycleStub ?? getEnvLifecycleStub(args.env, args.slug);
+  let stopScope: EnvironmentStopScope | null = null;
+  if (args.backend.kind === "cf") {
+    const runtimeSubject = await lifecycleStub.getEnvironmentRuntimeSubject();
+    if (
+      !runtimeSubject
+      || runtimeSubject.envSlug !== args.slug
+      || runtimeSubject.incarnationId !== args.meta.incarnationId
+    ) {
+      throw new Error("Cloudflare Stop no longer matches the active environment runtime.");
+    }
+    stopScope = {
+      envSlug: runtimeSubject.envSlug,
+      incarnationId: runtimeSubject.incarnationId,
+      startOperationId: runtimeSubject.startOperationId,
+      stopOperationId: args.stopOpId,
+    };
+  }
+
+  const scheduleCloudflareTermination = async (scope: EnvironmentStopScope) => {
+    if (!args.backend.schedulePreparedStop) {
+      throw new Error("Cloudflare runner backend cannot schedule prepared termination.");
+    }
+    const termination = await args.backend.schedulePreparedStop(args.meta, scope);
+    if (termination.status === "already-stopped") {
+      await lifecycleStub.noteRunnerStopped(args.stopOpId, null);
+    }
+    await (args.projectSummary?.() ?? projectAndPersistEnvSummary(args.env, args.hub, args.slug))
+      .catch((error) => {
+        console.warn(
+          `[envs] Failed to project prepared Stop for ${args.slug}; lifecycle remains authoritative:`,
+          error,
+        );
+      });
+  };
+
+  if (stopScope) {
+    const lifecycle = await lifecycleStub.getState();
+    if (
+      lifecycle?.activeOpId === args.stopOpId
+      && lifecycle.activeOperation === "stop"
+      && lifecycle.desiredState === "stopped"
+      && lifecycle.lastWorkspaceSyncedAckOpId === args.stopOpId
+    ) {
+      await scheduleCloudflareTermination(stopScope);
+      return;
+    }
+  }
+
   const runnerCommand = args.meta.backend === "host"
     ? await lifecycleStub.claimRunnerCommand(args.stopOpId, "stopped")
     : undefined;
@@ -389,6 +440,8 @@ async function dispatchStopAndFinalizeIfNoCallback(args: {
   try {
     const dispatch = (command = runnerCommand) => args.backend.stop(args.meta, {
       stopOpId: args.stopOpId,
+      ...(stopScope ? { stopScope } : {}),
+      ...(args.idleClaimId ? { idleClaimId: args.idleClaimId } : {}),
       ...(command ? { runnerCommand: command } : {}),
     });
     stopDispatch = runnerCommand
@@ -409,6 +462,59 @@ async function dispatchStopAndFinalizeIfNoCallback(args: {
     ) return;
     throw error;
   }
+  if (stopScope) {
+    if (stopDispatch.workspacePreparationUnavailable) {
+      await lifecycleStub.noteRunnerStopped(args.stopOpId, null);
+      throw new Error(
+        "Cloudflare runner stopped before producing a durable workspace receipt.",
+      );
+    }
+    const receipt = stopDispatch.workspaceStopReceipt;
+    if (
+      !receipt
+      || receipt.envSlug !== stopScope.envSlug
+      || receipt.incarnationId !== stopScope.incarnationId
+      || receipt.startOperationId !== stopScope.startOperationId
+      || receipt.stopOperationId !== stopScope.stopOperationId
+      || Number.isNaN(new Date(receipt.workspaceLastSyncedAt).getTime())
+    ) {
+      throw new Error("Cloudflare runner returned a malformed or mismatched workspace receipt.");
+    }
+    // This is a lifecycle-owned continuation of a previously authorized Stop,
+    // so classify against Tiller's tracked repository snapshot. Rechecking the
+    // live GitHub App selection here would turn a transient GitHub outage into
+    // a workspace-save failure after the sandbox has already produced proof.
+    const loadedRepo = await loadTrackedRepo(args.env, args.meta.repoId);
+    if (!loadedRepo.ok) {
+      throw new Error(
+        typeof loadedRepo.body.error === "string"
+          ? loadedRepo.body.error
+          : "Repository metadata is unavailable for workspace finalization.",
+      );
+    }
+    const classified = await buildWorkspaceSyncedPatch(
+      args.env,
+      args.meta,
+      { workspaceLastSyncedAt: receipt.workspaceLastSyncedAt },
+      async () => loadedRepo,
+    );
+    if (!classified.ok) {
+      throw new Error(
+        typeof classified.body.error === "string"
+          ? classified.body.error
+          : "Workspace finalization metadata is unavailable.",
+      );
+    }
+    const acknowledgement = await lifecycleStub.acceptStopWorkspaceSynced(
+      args.stopOpId,
+      buildEnvScmMetaPatch(args.meta, classified.patch),
+    );
+    if (!acknowledgement.accepted) {
+      throw new Error("Workspace receipt no longer matches the active Stop operation.");
+    }
+    await scheduleCloudflareTermination(stopScope);
+    return;
+  }
   if (!stopDispatch.callbackExpected) {
     // The owner can also prove no workspace effect when lifecycle Start never
     // reached runner dispatch. Post-dispatch absence remains unsafe unless
@@ -428,16 +534,103 @@ async function dispatchStopAndFinalizeIfNoCallback(args: {
   }
 }
 
+const ACTIVE_ENV_REVIEW_STATUSES = new Set([
+  "syncing",
+  "preparing",
+  "queued",
+  "running",
+  "saving",
+]);
+
+async function stopEnvReviewWorkloads(
+  env: Env,
+  slug: string,
+  message: string,
+): Promise<void> {
+  const review = getEnvReviewStub(env, slug);
+
+  // A workload can become terminal between the summary read and getRun, and
+  // cancellation can race a runtime callback. Re-read once so either owner can
+  // finish exact-runtime cleanup without leaving Stop/Delete permanently
+  // blocked on retained provenance.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const workloads = await review.listWorkloadStateForPredeploy();
+    const blocking = workloads.filter(
+      (workload) =>
+        workload.hasRuntime || ACTIVE_ENV_REVIEW_STATUSES.has(workload.status),
+    );
+    if (blocking.length === 0) return;
+
+    const runs = await Promise.all(
+      blocking.map(async (workload) => {
+        const run = await review.getRun(workload.runId);
+        if (!run || run.envSlug !== slug) {
+          throw new Error(
+            `Environment review ${workload.runId} could not be stopped.`,
+          );
+        }
+        return run;
+      }),
+    );
+    const activeRuns = runs.filter((run) =>
+      ACTIVE_ENV_REVIEW_STATUSES.has(run.status),
+    );
+    const skillInvocationIds = new Set(
+      activeRuns
+        .map((run) => run.skillInvocationId)
+        .filter((invocationId): invocationId is string => Boolean(invocationId)),
+    );
+    await Promise.all([
+      ...[...skillInvocationIds].map((invocationId) =>
+        review.cancelSkillInvocation(invocationId),
+      ),
+      ...activeRuns
+        .filter((run) => !run.skillInvocationId)
+        .map((run) => review.cancelRun(run.runId, message)),
+    ]);
+
+    const currentRuns = await Promise.all(
+      runs.map(async (run) => {
+        if (!ACTIVE_ENV_REVIEW_STATUSES.has(run.status)) return run;
+        const cancelled = await review.getRun(run.runId);
+        if (!cancelled || cancelled.envSlug !== slug) {
+          throw new Error(
+            `Environment review ${run.runId} could not be cancelled.`,
+          );
+        }
+        return cancelled;
+      }),
+    );
+    await Promise.all(
+      currentRuns.map((run) => run.runtime
+        ? cleanupEnvReviewRunRuntime(env, review, run)
+        : Promise.resolve()),
+    );
+  }
+
+  const retained = (await review.listWorkloadStateForPredeploy()).find(
+    (workload) =>
+      workload.hasRuntime || ACTIVE_ENV_REVIEW_STATUSES.has(workload.status),
+  );
+  if (retained) {
+    throw new Error(`Environment review ${retained.runId} is still stopping.`);
+  }
+}
+
 export async function stopEnvAction(args: {
   env: Env;
-  executionCtx: ExecutionContext;
+  executionCtx: WaitUntilExecutionContext;
   slug: string;
   intent?: "ordinary" | "scheduled";
   requestedOutcome?: "completed" | "interrupted";
   expectedStartOpId?: string;
+  expectedStopOpId?: string;
+  idleClaimId?: string | null;
   lifecycleStub?: ReturnType<typeof getEnvLifecycleStub>;
   cachedMeta?: EnvMeta;
   expectedIncarnationId?: string;
+  /** Alarm-owned effects await Cloudflare's full durable-stop handshake. */
+  awaitRunnerDispatch?: boolean;
 }): Promise<RouteResult> {
   const { env, slug } = args;
   const storedMeta = args.cachedMeta ?? await loadEnvView(env, slug);
@@ -448,6 +641,47 @@ export async function stopEnvAction(args: {
     : projectAndPersistEnvSummary(env, getHub(env), slug);
   if (await lifecycleStub.isInitialCreationPending()) {
     return { status: 409, body: { error: "Environment creation is still in progress.", code: "environment_creation_in_progress" } };
+  }
+  if (storedMeta.scmOperationType) {
+    return {
+      status: 409,
+      body: { error: `Environment has an active SCM operation (${storedMeta.scmOperationType}). Wait for it to finish before stopping.` },
+    };
+  }
+  const stopReviewWorkloadsForCurrentEnv = async (): Promise<RouteResult | null> => {
+    try {
+      await stopEnvReviewWorkloads(
+        env,
+        slug,
+        "Reviewer run cancelled because the environment was stopped.",
+      );
+      return null;
+    } catch (error) {
+      console.warn(
+        `[envs] Failed to stop environment review workloads before stopping ${slug}:`,
+        actionErrorMessage(error),
+      );
+      return {
+        status: 409,
+        body: {
+          error: "Environment review cleanup must finish before stopping the environment.",
+          code: "environment_stop_blocked",
+        },
+      };
+    }
+  };
+
+  const resumedStopLifecycle = args.expectedStopOpId
+    ? await lifecycleStub.resumeStopRetry(args.expectedStopOpId)
+    : null;
+  if (args.expectedStopOpId && !resumedStopLifecycle) {
+    return {
+      status: 409,
+      body: {
+        error: "The Stop retry no longer matches the active persistence operation.",
+        code: "stale_stop_operation",
+      },
+    };
   }
 
   const scheduledRecord = await lifecycleStub.getScheduledRun();
@@ -528,43 +762,93 @@ export async function stopEnvAction(args: {
 
   const hub = getHub(env);
   const backendKind = storedMeta.backend;
+  const ownedMeta = (await lifecycleStub.getOwnedEnvView()) ?? storedMeta;
+  if (ownedMeta.scmOperationType) {
+    return {
+      status: 409,
+      body: { error: `Environment has an active SCM operation (${ownedMeta.scmOperationType}). Wait for it to finish before stopping.` },
+      ...(scheduledStop ? { scheduledRunTransitionApplied: true } : {}),
+    };
+  }
+  let currentLifecycle = resumedStopLifecycle ?? await lifecycleStub.getState();
+  let existingLifecycle = scheduledClaim?.lifecycle
+    ?? resumedStopLifecycle
+    ?? (currentLifecycle && isLifecycleStopInProgress(currentLifecycle) ? currentLifecycle : null);
+  if (
+    !existingLifecycle
+    && currentLifecycle?.phase === "failed"
+    && currentLifecycle.activeOperation === "stop"
+    && currentLifecycle.desiredState === "stopped"
+    && currentLifecycle.activeOpId
+  ) {
+    currentLifecycle = await lifecycleStub.resumeStopRetry(currentLifecycle.activeOpId);
+    existingLifecycle = currentLifecycle;
+  }
   const hostUnavailable = await requireHostConnection(
     env,
     backendKind,
-    storedMeta.executionPlacement?.backend === "host"
-      ? storedMeta.executionPlacement.machineId
+    ownedMeta.executionPlacement?.backend === "host"
+      ? ownedMeta.executionPlacement.machineId
       : null,
   );
   if (hostUnavailable) {
-    const stopOpId = scheduledClaim?.lifecycle?.activeOpId;
-    if (scheduledStop && stopOpId) {
-      await lifecycleStub.recordScheduledRunnerUncertainty({ stopOpId, error: hostUnavailable });
+    const canClaimStop = scheduledStop
+      || ownedMeta.status === "running"
+      || ownedMeta.status === "starting";
+    if (!canClaimStop && !existingLifecycle?.activeOpId) {
+      return {
+        status: 409,
+        body: { error: "Environment is not currently running." },
+        ...(scheduledStop ? { scheduledRunTransitionApplied: true } : {}),
+      };
     }
+    const reviewStopFailure = await stopReviewWorkloadsForCurrentEnv();
+    if (reviewStopFailure) {
+      return {
+        ...reviewStopFailure,
+        ...(scheduledStop ? { scheduledRunTransitionApplied: true } : {}),
+      };
+    }
+    const lifecycle = existingLifecycle ?? await lifecycleStub.requestStop();
+    const stopOpId = lifecycle?.activeOpId;
+    if (!stopOpId) return { status: 500, body: { error: "Stop operation did not return an operation id." } };
+    let credentialCleanupComplete: boolean | undefined;
+    if (!scheduledStop) {
+      credentialCleanupComplete = (await cleanupLaunchCredentialsBestEffort(env, slug)).complete;
+    }
+    const failure = projectRuntimeFailure(
+      "runner_control_failed",
+      hostUnavailable,
+      { slug, opId: stopOpId, source: "stop-host-unavailable" },
+    );
+    await lifecycleStub.noteStopDispatchFailed(stopOpId, failure.message);
+    if (scheduledStop) {
+      await lifecycleStub.recordScheduledRunnerUncertainty({ stopOpId, error: failure.message });
+    }
+    await projectSummary().catch((error) => {
+      console.error(`[envs] Failed to project unavailable-runner Stop for ${slug}:`, error);
+      return null;
+    });
     return {
-      status: 409,
-      body: { error: hostUnavailable },
-      ...(scheduledStop ? { scheduledRunTransitionApplied: true, runnerUncertain: true } : {}),
+      status: 200,
+      body: { ok: true, slug, status: "saving" },
+      operationId: stopOpId,
+      ...(credentialCleanupComplete == null ? {} : { credentialCleanupComplete }),
+      ...(scheduledStop ? { scheduledRunTransitionApplied: true } : {}),
+      runnerUncertain: true,
     };
   }
   const backend = await getRunnerBackend(env, backendKind);
   const { meta, liveStatus } = args.lifecycleStub
     ? {
-        meta: (await lifecycleStub.getOwnedEnvView()) ?? storedMeta,
-        liveStatus: normalizeRunnerStatus(await backend.getStatus(storedMeta).catch(() => "unknown")),
+        meta: ownedMeta,
+        liveStatus: normalizeRunnerStatus((await inspectRunnerBackend(backend, ownedMeta)).status),
       }
-    : await projectEnvMetaForAction(env, storedMeta, backend);
-  if (meta.scmOperationType) {
-    return {
-      status: 409,
-      body: { error: `Environment has an active SCM operation (${meta.scmOperationType}). Wait for it to finish before stopping.` },
-      ...(scheduledStop ? { scheduledRunTransitionApplied: true } : {}),
-    };
-  }
+    : await projectEnvMetaForAction(env, ownedMeta, backend);
 
-  const existingLifecycle = scheduledClaim?.lifecycle
-    ?? (isLifecycleStopInProgress(meta)
-      ? args.lifecycleStub ? await lifecycleStub.getState() : await readLifecycleState(env, meta)
-      : null);
+  if (!existingLifecycle && isLifecycleStopInProgress(meta)) {
+    existingLifecycle = args.lifecycleStub ? await lifecycleStub.getState() : await readLifecycleState(env, meta);
+  }
   const canAttemptStop = scheduledStop
     || liveStatus === "running"
     || meta.status === "running"
@@ -572,18 +856,25 @@ export async function stopEnvAction(args: {
   if (!canAttemptStop && !existingLifecycle?.activeOpId) {
     return { status: 409, body: { error: "Environment is not currently running." } };
   }
+  const reviewStopFailure = await stopReviewWorkloadsForCurrentEnv();
+  if (reviewStopFailure) {
+    return {
+      ...reviewStopFailure,
+      ...(scheduledStop ? { scheduledRunTransitionApplied: true } : {}),
+    };
+  }
 
   const lifecycle = existingLifecycle ?? await lifecycleStub.requestStop();
   const stopOpId = lifecycle.activeOpId;
   if (!stopOpId) return { status: 500, body: { error: "Stop operation did not return an operation id." } };
   let credentialCleanupComplete: boolean | undefined;
   if (!scheduledStop) {
-    credentialCleanupComplete = (await cleanupLaunchCredentialsBestEffort(env, slug, hub)).complete;
+    credentialCleanupComplete = (await cleanupLaunchCredentialsBestEffort(env, slug)).complete;
   }
   const savingMeta = await projectSummary();
   if (!savingMeta) return { status: 404, body: { error: "Environment state not found" } };
 
-  args.executionCtx.waitUntil((async () => {
+  const dispatchStop = async () => {
     try {
       await dispatchStopAndFinalizeIfNoCallback({
         env,
@@ -592,22 +883,39 @@ export async function stopEnvAction(args: {
         meta: savingMeta,
         hub,
         stopOpId,
+        idleClaimId: args.idleClaimId,
         lifecycleStub,
         projectSummary,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[envs] Failed to stop runner for ${slug}:`, message);
+      const failure = projectRuntimeFailure(
+        "runner_control_failed",
+        message,
+        { slug, opId: stopOpId, source: "stop-dispatch" },
+      );
       if (scheduledStop) {
-        await lifecycleStub.recordScheduledRunnerUncertainty({ stopOpId, error: message });
-        await projectSummary().catch(() => null);
-        return;
+        await lifecycleStub.recordScheduledRunnerUncertainty({ stopOpId, error: failure.message });
       }
-      if (backendKind === "host" && isAmbiguousHostRunnerResponse(err)) return;
-      await lifecycleStub.noteStopDispatchFailed(stopOpId, message);
-      await projectSummary();
+      await lifecycleStub.noteStopDispatchFailed(stopOpId, failure.message);
+      await projectSummary().catch(() => null);
     }
-  })());
+  };
+
+  if (backendKind === "cf" && !args.awaitRunnerDispatch) {
+    const queued = await lifecycleStub.ensureStopDispatchScheduled(stopOpId);
+    if (!queued) {
+      console.warn(`[envs] Cloudflare Stop dispatch was superseded before it could be queued: ${JSON.stringify({
+        slug,
+        stopOpId,
+      })}`);
+    }
+  } else if (args.awaitRunnerDispatch) {
+    await dispatchStop();
+  } else {
+    args.executionCtx.waitUntil(dispatchStop());
+  }
 
   return {
     status: 200,
@@ -620,7 +928,7 @@ export async function stopEnvAction(args: {
 
 export async function createEnvAction(args: {
   env: Env;
-  executionCtx: ExecutionContext;
+  executionCtx: WaitUntilExecutionContext;
   request: Request;
   requestUrl: string;
   repoId: string;
@@ -703,9 +1011,10 @@ export async function createEnvAction(args: {
     return { status: 409, body: { error: "Environment already exists", slug } };
   }
   const createdAt = new Date().toISOString();
+  const incarnationId = `env-${crypto.randomUUID()}`;
   let meta: EnvMeta = {
     slug,
-    incarnationId: `env-${crypto.randomUUID()}`,
+    incarnationId,
     repoUrl: repo.meta.repoUrl,
     repoId: repo.meta.repoId,
     backend: backendKind,
@@ -716,12 +1025,43 @@ export async function createEnvAction(args: {
     createdAt,
     updatedAt: createdAt,
     status: "creating",
+    implementorAttentionToken: null,
     ...createInitialEnvScmState({
       slug,
+      incarnationId,
       githubBaseBranch: repo.meta.githubDefaultBranch ?? null,
       githubBaseCommitSha: repo.meta.githubDefaultBranchHeadSha ?? null,
     }),
   };
+  let backend: RunnerBackend;
+  try {
+    backend = await getRunnerBackend(env, backendKind);
+    if (backend.inspect) {
+      const inspection = await backend.inspect(meta);
+      if (inspection.state !== "absent") {
+        return {
+          status: inspection.state === "unknown" ? 503 : 409,
+          body: {
+            error: inspection.state === "unknown"
+              ? "The environment runtime state could not be confirmed. The existing runner was left untouched."
+              : "A runner with this environment name still exists. It was left untouched.",
+            code: inspection.state === "unknown"
+              ? "runtime_state_unknown"
+              : "runtime_already_exists",
+          },
+        };
+      }
+    }
+  } catch (error) {
+    console.error(`[envs] Failed to inspect runner before Create for ${slug}:`, actionErrorMessage(error));
+    return {
+      status: 503,
+      body: {
+        error: "The environment runtime state could not be confirmed. The existing runner was left untouched.",
+        code: "runtime_state_unknown",
+      },
+    };
+  }
   const artifactStore = getArtifactStoreStub(
     env,
     repo.meta.repoId,
@@ -742,17 +1082,15 @@ export async function createEnvAction(args: {
   if (schedule && startupPlanSelection.mode !== "specific") {
     return { status: 400, body: { error: "Scheduled Runs require a specific startup plan." } };
   }
+  let selectedPlan: Awaited<ReturnType<typeof resolveSelectedPlanArtifact>>;
   try {
-    meta = {
-      ...meta,
-      startupPlanId: await resolveSelectedPlanId(
-        repo,
-        artifactStore,
-        meta,
-        meta.githubBaseCommitSha,
-        startupPlanSelection,
-      ),
-    };
+    selectedPlan = await resolveSelectedPlanArtifact(
+      repo,
+      artifactStore,
+      meta,
+      meta.githubBaseCommitSha,
+      startupPlanSelection,
+    );
   } catch (error) {
     return {
       status: 409,
@@ -793,32 +1131,33 @@ export async function createEnvAction(args: {
     }
   };
 
+  let sidebarSlotClaimId: string | null;
+  try {
+    sidebarSlotClaimId = await claimSidebarSlot();
+  } catch (error) {
+    return projectedRuntimeFailureResult(
+      "runtime_start_failed",
+      error,
+      { slug, source: schedule ? "scheduled-create-sidebar-slot" : "create-sidebar-slot" },
+    ).result;
+  }
+  if (!sidebarSlotClaimId) {
+    return { status: 409, body: { error: "Environment already exists", slug } };
+  }
+
+  const sidebarSlot = meta.sidebarSlot!;
+  const renderedPlanDocument = renderResolvedStartupPlanDocument(selectedPlan);
+  const startupPlanVersion = selectedPlan?.version ?? 1;
+  meta = {
+    ...meta,
+    startupPlanId: selectedPlan?.id ?? null,
+    displayName: deriveEnvDisplayName(selectedPlan, sidebarSlot),
+  };
+
   if (schedule) {
-    let selectedPlan: Awaited<ReturnType<typeof resolveSpecificStartupPlanArtifact>>;
-    let renderedPlanDocument: string | null;
-    try {
-      selectedPlan = await resolveSpecificStartupPlanArtifact(
-        artifactStore,
-        meta.startupPlanId!,
-      );
-      renderedPlanDocument = renderResolvedStartupPlanDocument(selectedPlan);
-    } catch (error) {
-      return {
-        status: 409,
-        body: { error: error instanceof Error ? error.message : "Failed to capture the selected startup plan." },
-      };
-    }
-    if (!renderedPlanDocument) {
+    if (!selectedPlan || !renderedPlanDocument) {
+      await releaseSidebarSlotClaim(sidebarSlotClaimId);
       return { status: 409, body: { error: "The selected startup plan could not be rendered." } };
-    }
-    let sidebarSlotClaimId: string | null;
-    try {
-      sidebarSlotClaimId = await claimSidebarSlot();
-    } catch (error) {
-      return { status: 502, body: { error: `Failed to allocate environment sidebar slot: ${actionErrorMessage(error)}` } };
-    }
-    if (!sidebarSlotClaimId) {
-      return { status: 409, body: { error: "Environment already exists", slug } };
     }
     meta = { ...meta, status: "stopped", updatedAt: new Date().toISOString() };
     const incarnationId = meta.incarnationId!;
@@ -840,17 +1179,18 @@ export async function createEnvAction(args: {
           },
           plan: {
             artifactId: selectedPlan.id,
-            version: selectedPlan.version ?? 1,
+            version: startupPlanVersion,
             renderedPlanDocument,
           },
         },
       );
     } catch (error) {
       await releaseSidebarSlotClaim(sidebarSlotClaimId);
-      return {
-        status: 502,
-        body: { error: `Failed to initialize scheduled environment: ${actionErrorMessage(error)}` },
-      };
+      return projectedRuntimeFailureResult(
+        "runtime_start_failed",
+        error,
+        { slug, source: "scheduled-create-initialize" },
+      ).result;
     }
     if (!initialization.created) {
       await releaseSidebarSlotClaim(sidebarSlotClaimId);
@@ -869,10 +1209,11 @@ export async function createEnvAction(args: {
         return false;
       });
       await releaseSidebarSlotClaim(sidebarSlotClaimId);
-      return {
-        status: 502,
-        body: { error: `Failed to publish scheduled environment: ${actionErrorMessage(error)}` },
-      };
+      return projectedRuntimeFailureResult(
+        "runtime_start_failed",
+        error,
+        { slug, source: "scheduled-create-publish" },
+      ).result;
     }
 
     let commitError: unknown = null;
@@ -894,10 +1235,11 @@ export async function createEnvAction(args: {
     }
     if (commitError) {
       console.error(`[envs] Scheduled environment ${slug} publication commit was not confirmed:`, commitError);
-      return {
-        status: 502,
-        body: { error: `Failed to confirm scheduled environment creation: ${actionErrorMessage(commitError)}` },
-      };
+      return projectedRuntimeFailureResult(
+        "runtime_start_failed",
+        commitError,
+        { slug, source: "scheduled-create-commit" },
+      ).result;
     }
     await commitSidebarSlotClaim(sidebarSlotClaimId);
     await lifecycleStub.persistOwnedProjection().catch((error) => {
@@ -916,15 +1258,6 @@ export async function createEnvAction(args: {
     };
   }
 
-  let sidebarSlotClaimId: string | null;
-  try {
-    sidebarSlotClaimId = await claimSidebarSlot();
-  } catch (error) {
-    return { status: 502, body: { error: `Failed to allocate environment sidebar slot: ${actionErrorMessage(error)}` } };
-  }
-  if (!sidebarSlotClaimId) {
-    return { status: 409, body: { error: "Environment already exists", slug } };
-  }
   const lifecycleStub = getEnvLifecycleStub(env, slug);
   let ordinaryStartAuthClaim: EnvironmentStartAuthClaim;
   try {
@@ -943,8 +1276,11 @@ export async function createEnvAction(args: {
     );
   } catch (err) {
     await releaseSidebarSlotClaim(sidebarSlotClaimId);
-    const message = err instanceof Error ? err.message : String(err);
-    return { status: 502, body: { error: `Failed to initialize environment state: ${message}` } };
+    return projectedRuntimeFailureResult(
+      "runtime_start_failed",
+      err,
+      { slug, source: "create-initialize" },
+    ).result;
   }
   if (!startClaim.dispatchGranted || !startClaim.lifecycle?.activeOpId || !startClaim.harnessSettings) {
     await releaseSidebarSlotClaim(sidebarSlotClaimId);
@@ -965,21 +1301,30 @@ export async function createEnvAction(args: {
   const hub = getHub(env);
   const workspaceStub = getWorkspaceStub(env, slug);
   let launchConfig: Awaited<ReturnType<typeof buildContainerLaunchConfig>>;
-  let backend: RunnerBackend;
   let persistedMeta: Awaited<ReturnType<typeof projectAndPersistEnvSummary>>;
   try {
     await lifecycleStub.beginStartupDiagnostics({
       opId: startOpId,
       backend: backendKind,
+      implementationMode: selectedPlan ? "plan" : "fresh",
       stepId: "workspace-sync",
       message: "Preparing workspace start...",
     });
     await workspaceStub.destroyWorkspace();
   } catch (err) {
     const message = actionErrorMessage(err);
-    await lifecycleStub.reportStartupFailure({ opId: startOpId, stepId: "workspace-sync", message });
+    const projected = projectedRuntimeFailureResult(
+      "workspace_hydration_failed",
+      message,
+      { slug, opId: startOpId, source: "create-workspace-reset" },
+    );
+    await lifecycleStub.reportStartupFailure({
+      opId: startOpId,
+      stepId: "workspace-sync",
+      message: projected.failure.message,
+    });
     await projectAndPersistEnvSummary(env, hub, slug).catch(() => null);
-    return { status: 502, body: { error: message } };
+    return projected.result;
   }
   try {
     launchConfig = await buildContainerLaunchConfig(env, requestUrl, slug, repo.meta.repoUrl, repo.meta, meta, {
@@ -987,7 +1332,7 @@ export async function createEnvAction(args: {
       startAuthClaim: claimedStart.authClaim,
     });
   } catch (err) {
-    await cleanupLaunchCredentialsBestEffort(env, slug, hub);
+    await cleanupLaunchCredentialsBestEffort(env, slug);
     const message = actionErrorMessage(err);
     await lifecycleStub.reportStartupFailure({ opId: startOpId, stepId: "harness-launch", message });
     await projectAndPersistEnvSummary(env, hub, slug).catch(() => null);
@@ -995,41 +1340,45 @@ export async function createEnvAction(args: {
   }
   try {
     meta = { ...meta, ...launchConfig.meta };
-    const startupPlanDocument = await resolveStartupPlanDocument(
-      repo,
-      artifactStore,
-      meta,
-      meta.githubBaseCommitSha,
-      meta.startupPlanId ? { mode: "specific", artifactId: meta.startupPlanId } : { mode: "none" },
-    );
-    launchConfig = {
-      ...launchConfig,
-      envVars: withStartupPlanDocumentEnvVar(launchConfig.envVars, startupPlanDocument),
-    };
+    await materializeStartupPlanDocument(workspaceStub, renderedPlanDocument);
     meta = {
       ...meta,
       bootMessage: `GitHub base ${meta.githubBaseCommitSha?.slice(0, 12) ?? "unknown"}`,
     };
     await persistEnvDefinition(env, buildEnvDefinition(meta));
     await lifecycleStub.clearLeadHarnessState({ opId: startOpId });
-    backend = await getRunnerBackend(env, backendKind);
     persistedMeta = await projectAndPersistEnvSummary(env, hub, slug);
   } catch (err) {
-    await cleanupLaunchCredentialsBestEffort(env, slug, hub);
+    await cleanupLaunchCredentialsBestEffort(env, slug);
     const message = err instanceof Error ? err.message : String(err);
     await workspaceStub.destroyWorkspace().catch(() => {});
-    await lifecycleStub.reportStartupFailure({ opId: startOpId, stepId: "workspace-sync", message });
-    await projectAndPersistEnvSummary(env, hub, slug).catch(() => null);
-    return { status: 502, body: { error: message } };
-  }
-  if (!persistedMeta) {
-    await cleanupLaunchCredentialsBestEffort(env, slug, hub);
+    const projected = projectedRuntimeFailureResult(
+      "workspace_hydration_failed",
+      message,
+      { slug, opId: startOpId, source: "create-workspace-state" },
+    );
     await lifecycleStub.reportStartupFailure({
       opId: startOpId,
       stepId: "workspace-sync",
-      message: "Failed to project initialized environment state",
+      message: projected.failure.message,
     });
-    return { status: 500, body: { error: "Failed to initialize environment state" } };
+    await projectAndPersistEnvSummary(env, hub, slug).catch(() => null);
+    return projected.result;
+  }
+  if (!persistedMeta) {
+    await cleanupLaunchCredentialsBestEffort(env, slug);
+    const projected = projectedRuntimeFailureResult(
+      "workspace_hydration_failed",
+      "Failed to project initialized environment state",
+      { slug, opId: startOpId, source: "create-project-state" },
+      500,
+    );
+    await lifecycleStub.reportStartupFailure({
+      opId: startOpId,
+      stepId: "workspace-sync",
+      message: projected.failure.message,
+    });
+    return projected.result;
   }
 
   let createRunnerCommand: Awaited<ReturnType<typeof lifecycleStub.claimRunnerCommand>> | undefined;
@@ -1039,9 +1388,18 @@ export async function createEnvAction(args: {
     }
   } catch (error) {
     const message = `Failed to claim runner create command: ${actionErrorMessage(error)}`;
-    await cleanupLaunchCredentialsBestEffort(env, slug, hub);
-    await lifecycleStub.reportStartupFailure({ opId: startOpId, stepId: "harness-launch", message });
-    return { status: 502, body: { error: message } };
+    const projected = projectedRuntimeFailureResult(
+      "runner_control_failed",
+      message,
+      { slug, opId: startOpId, source: "create-runner-command" },
+    );
+    await cleanupLaunchCredentialsBestEffort(env, slug);
+    await lifecycleStub.reportStartupFailure({
+      opId: startOpId,
+      stepId: "harness-launch",
+      message: projected.failure.message,
+    });
+    return projected.result;
   }
 
   args.executionCtx.waitUntil(
@@ -1084,7 +1442,7 @@ export async function createEnvAction(args: {
               await lifecycleStub.finalizeDeletion();
             }
           } catch { /* best effort */ }
-          await cleanupLaunchCredentialsBestEffort(env, slug, hub);
+          await cleanupLaunchCredentialsBestEffort(env, slug);
           return;
         }
         await lifecycleStub.setRunnerBinding({
@@ -1093,13 +1451,20 @@ export async function createEnvAction(args: {
         });
         await projectAndPersistEnvSummary(env, hub, slug);
       } catch (err) {
-        const message = redactEnvValues(err instanceof Error ? err.message : String(err), launchConfig.envVars);
-        console.error(`[envs] Failed to create runner for ${slug}:`, message);
-        await cleanupLaunchCredentialsBestEffort(env, slug, hub);
+        const detail = redactEnvValues(err instanceof Error ? err.message : String(err), launchConfig.envVars);
+        console.error(`[envs] Failed to create runner for ${slug}:`, detail);
+        const failure = projectRuntimeFailure(
+          backendKind === "cf" && isCloudflareContainerAllocationTimeout(err)
+            ? "runtime_start_failed"
+            : "runner_control_failed",
+          detail,
+          { slug, opId: startOpId, source: "runner-create" },
+        );
+        await cleanupLaunchCredentialsBestEffort(env, slug);
         await getEnvLifecycleStub(env, slug).reportStartupFailure({
           opId: startOpId,
           stepId: "harness-launch",
-          message,
+          message: failure.message,
           runnerMayExist: true,
         });
         await projectAndPersistEnvSummary(env, hub, slug);
@@ -1112,18 +1477,26 @@ export async function createEnvAction(args: {
 
 export async function startEnvAction(args: {
   env: Env;
-  executionCtx: ExecutionContext;
+  executionCtx: WaitUntilExecutionContext;
   request: Request;
   requestUrl: string;
   slug: string;
   harnessSettings?: unknown;
+  implementationMode?: "fresh" | "plan";
   intent?: EnvStartCause;
   schedulerDeadlineAtMs?: number;
   expectedIncarnationId?: string;
   lifecycleStub?: ReturnType<typeof getEnvLifecycleStub>;
   cachedMeta?: EnvMeta;
 }): Promise<RouteResult> {
-  const { env, request, requestUrl, slug, harnessSettings: submittedHarnessSettings } = args;
+  const {
+    env,
+    request,
+    requestUrl,
+    slug,
+    harnessSettings: submittedHarnessSettings,
+    implementationMode,
+  } = args;
   const lifecycleStub = args.lifecycleStub ?? getEnvLifecycleStub(env, slug);
   const projectSummary = () => args.lifecycleStub
     ? lifecycleStub.persistOwnedProjection()
@@ -1175,7 +1548,7 @@ export async function startEnvAction(args: {
     };
   };
   const storedMeta = cachedMeta;
-  const projectedMeta = storedMeta;
+  let projectedMeta = storedMeta;
   if (!storedMeta.executionPlacement) {
     const body = {
       error: "This workload was created by an unsupported version and cannot be run. Delete and recreate it.",
@@ -1183,12 +1556,6 @@ export async function startEnvAction(args: {
     };
     return startIntent === "scheduled"
       ? failScheduledPreStart(409, body, false)
-      : { status: 409, body };
-  }
-  if (isLifecycleStopInProgress(projectedMeta)) {
-    const body = { error: getStopFinalizationInProgressError("starting") };
-    return startIntent === "scheduled"
-      ? failScheduledPreStart(409, body, true)
       : { status: 409, body };
   }
   const backendKind = storedMeta.backend;
@@ -1208,6 +1575,120 @@ export async function startEnvAction(args: {
           code !== "host_runtime_update_required",
         )
       : hostGate.result;
+  }
+  let backend: RunnerBackend;
+  try {
+    backend = await getRunnerBackend(env, backendKind);
+  } catch (error) {
+    const body = {
+      error: "The environment runtime could not be inspected. The existing runner was left untouched.",
+      code: "runtime_inspection_failed",
+    };
+    console.error(`[envs] Failed to construct runner backend for ${slug}:`, actionErrorMessage(error));
+    return startIntent === "scheduled"
+      ? failScheduledPreStart(503, body, true)
+      : { status: 503, body };
+  }
+  const inspection = await inspectRunnerBackend(backend, storedMeta);
+  const [initialLifecycleBeforeStart, runnerCommandBeforeStart] = await Promise.all([
+    lifecycleStub.getState().catch((error) => {
+      console.error(`[envs] Failed to read lifecycle before Start for ${slug}:`, actionErrorMessage(error));
+      return null;
+    }),
+    lifecycleStub.getRunnerCommandClaim().catch((error) => {
+      console.error(`[envs] Failed to read runner command before Start for ${slug}:`, actionErrorMessage(error));
+      return null;
+    }),
+  ]);
+  let lifecycleBeforeStart = initialLifecycleBeforeStart;
+  const rejectUnsafeInspection = (
+    error: string,
+    code: string,
+  ): Promise<RouteResult> | RouteResult => {
+    const body = { error, code };
+    return startIntent === "scheduled"
+      ? failScheduledPreStart(409, body, true)
+      : { status: 409, body };
+  };
+  if (inspection.state === "live") {
+    return rejectUnsafeInspection(
+      "An existing runner is still active. Stop it and wait for workspace saving to finish before starting again.",
+      "runtime_still_active",
+    );
+  }
+  if (inspection.state === "unknown" || (!lifecycleBeforeStart && backend.inspect)) {
+    return rejectUnsafeInspection(
+      "The environment runtime state could not be confirmed. The existing runner was left untouched.",
+      "runtime_state_unknown",
+    );
+  }
+  if (inspection.state === "stopped") {
+    const safeFailedStart = Boolean(
+      inspection.safeReplacement?.reason === "failed_before_harness"
+      && lifecycleBeforeStart?.phase === "failed"
+      && lifecycleBeforeStart.activeOperation === "start"
+      && lifecycleBeforeStart.desiredState === "running"
+      && lifecycleBeforeStart.activeOpId === inspection.safeReplacement.operationId
+      && runnerCommandBeforeStart?.operationId === inspection.safeReplacement.operationId
+      && runnerCommandBeforeStart.commandGeneration === inspection.safeReplacement.commandGeneration
+      && runnerCommandBeforeStart.desiredState === "running",
+    );
+    const acknowledgedStop = lifecycleBeforeStart?.activeOperation === "stop"
+      && lifecycleBeforeStart.activeOpId != null
+      && lifecycleBeforeStart.lastWorkspaceSyncedAckOpId === lifecycleBeforeStart.activeOpId;
+    const safeStoppedRunner = lifecycleBeforeStart == null
+      ? !backend.inspect
+      : lifecycleBeforeStart.phase === "stopped" || acknowledgedStop || safeFailedStart;
+    if (!safeStoppedRunner) {
+      return rejectUnsafeInspection(
+        "The previous runner is stopped, but its workspace save was not acknowledged. It was left untouched.",
+        "runtime_persistence_unconfirmed",
+      );
+    }
+    if (!safeFailedStart && lifecycleBeforeStart?.phase !== "stopped" && lifecycleBeforeStart?.activeOpId) {
+      await lifecycleStub.noteRunnerStopped(
+        lifecycleBeforeStart.activeOpId,
+        "confirmed stopped during Start inspection",
+      );
+      projectedMeta = (await projectSummary()) ?? projectedMeta;
+    }
+  } else if (inspection.state === "absent") {
+    if (
+      lifecycleBeforeStart
+      && (lifecycleBeforeStart.phase === "starting" || lifecycleBeforeStart.phase === "running")
+      && lifecycleBeforeStart.activeOpId
+    ) {
+      await lifecycleStub.noteRunnerStopped(
+        lifecycleBeforeStart.activeOpId,
+        "confirmed absent during Start inspection",
+      );
+      lifecycleBeforeStart = await lifecycleStub.getState();
+      projectedMeta = (await projectSummary()) ?? projectedMeta;
+    }
+    if (
+      lifecycleBeforeStart
+      && (
+        isLifecycleStopInProgress(lifecycleBeforeStart)
+        || lifecycleBeforeStart.phase === "failed"
+      )
+    ) {
+      const reconciled = await lifecycleStub.confirmRunnerAbsentForRestart(
+        lifecycleBeforeStart.activeOpId,
+      );
+      if (!reconciled) {
+        return rejectUnsafeInspection(
+          "The previous lifecycle operation changed during runtime inspection. Start was not dispatched.",
+          "runtime_state_changed",
+        );
+      }
+      projectedMeta = (await projectSummary()) ?? projectedMeta;
+    }
+  }
+  if (isLifecycleStopInProgress(projectedMeta)) {
+    const body = { error: getStopFinalizationInProgressError("starting") };
+    return startIntent === "scheduled"
+      ? failScheduledPreStart(409, body, true)
+      : { status: 409, body };
   }
   const metaBeforeClaim = projectedMeta;
   const status = metaBeforeClaim.status ?? "unknown";
@@ -1236,9 +1717,20 @@ export async function startEnvAction(args: {
       ? failScheduledPreStart(400, body, false)
       : { status: 400, body };
   }
+  if (startIntent === "ordinary" && implementationMode === "plan" && !metaBeforeClaim.startupPlanId) {
+    return {
+      status: 400,
+      body: {
+        error: "This environment does not have a saved plan to implement.",
+        code: "startup_plan_missing",
+      },
+    };
+  }
   const startupPlanSelection: StartupPlanSelection = startIntent === "scheduled"
     ? { mode: "specific", artifactId: scheduledPlan!.artifactId }
-    : storedStartupPlanSelection(metaBeforeClaim.startupPlanId);
+    : implementationMode === "fresh"
+      ? { mode: "none" }
+      : storedStartupPlanSelection(metaBeforeClaim.startupPlanId);
   if (startIntent === "scheduled" && schedulerDeadlineAtMs != null && Date.now() >= schedulerDeadlineAtMs) {
     return failScheduledPreStart(409, {
       error: "The Scheduled Run deadline passed before a runner could start.",
@@ -1453,12 +1945,12 @@ export async function startEnvAction(args: {
   };
   let claimedStartCredentialsMayExist = false;
   const cleanupScheduledCredentials = async (): Promise<{ complete: boolean }> => {
-    if (!scheduledScope) return cleanupLaunchCredentialsBestEffort(env, slug, hub);
+    if (!scheduledScope) return cleanupLaunchCredentialsBestEffort(env, slug);
     const record = await lifecycleStub.getScheduledRun();
     const ids = record?.kind === "active" && record.startOpId === claimedStart.opId
       ? record.credentialIds
       : {};
-    return cleanupLaunchCredentialsBestEffort(env, slug, hub, { scope: scheduledScope, ids });
+    return cleanupLaunchCredentialsBestEffort(env, slug, { scope: scheduledScope, ids });
   };
   const failClaimedStart = async (
     responseStatus: number,
@@ -1466,7 +1958,18 @@ export async function startEnvAction(args: {
     stepId: "workspace-sync" | "harness-launch" = "workspace-sync",
     credentialCleanupComplete?: boolean,
   ): Promise<RouteResult> => {
-    const message = typeof body.error === "string" ? body.error : "Environment startup failed";
+    const rawMessage = typeof body.error === "string" ? body.error : "Environment startup failed";
+    const failure = responseStatus >= 500 && !isProjectedRuntimeFailure(rawMessage)
+      ? projectRuntimeFailure(
+          stepId === "workspace-sync" ? "workspace_hydration_failed" : "runtime_start_failed",
+          rawMessage,
+          { slug, opId: claimedStart.opId, source: "start-preparation" },
+        )
+      : null;
+    const message = failure?.message ?? rawMessage;
+    const publicBody = failure
+      ? { ...body, error: failure.message, code: failure.code, referenceId: failure.referenceId }
+      : body;
     stopPreparationHeartbeat();
     await lifecycleStub.reportStartupFailure({ opId: claimedStart.opId, stepId, message });
     await finishPreparationBestEffort();
@@ -1477,7 +1980,7 @@ export async function startEnvAction(args: {
     }
     return {
       status: responseStatus,
-      body,
+      body: publicBody,
       operationId: claimedStart.opId,
       ...(credentialCleanupComplete == null ? {} : { credentialCleanupComplete }),
       retryDisposition: "terminal",
@@ -1509,6 +2012,7 @@ export async function startEnvAction(args: {
     await lifecycleStub.beginStartupDiagnostics({
       opId: claimedStart.opId,
       backend: backendKind,
+      implementationMode: startupPlanSelection.mode === "none" ? "fresh" : "plan",
       stepId: "workspace-sync",
       message: "Preparing workspace start...",
     });
@@ -1520,10 +2024,8 @@ export async function startEnvAction(args: {
     if (superseded) return superseded;
   }
 
-  let backend: RunnerBackend;
   let meta: EnvMeta;
   try {
-    backend = await getRunnerBackend(env, backendKind);
     ({ meta } = args.lifecycleStub
       ? {
           meta: (await lifecycleStub.getOwnedEnvView()) ?? metaBeforeClaim,
@@ -1581,7 +2083,7 @@ export async function startEnvAction(args: {
     repo.meta.repoId,
     repo.meta.artifactStoreGeneration,
   );
-  let startupPlanId: string | null;
+  let implementationPlanId: string | null;
   if (meta.scmModel === "github") {
     let overlayEmpty = false;
     try {
@@ -1744,7 +2246,7 @@ export async function startEnvAction(args: {
       const superseded = await abortIfClaimWasSuperseded();
       if (superseded) return superseded;
     }
-    startupPlanId = scheduledPlan?.artifactId ?? await resolveSelectedPlanId(
+    implementationPlanId = scheduledPlan?.artifactId ?? await resolveSelectedPlanId(
         repo,
         artifactStore,
         syncedMeta,
@@ -1768,7 +2270,13 @@ export async function startEnvAction(args: {
 
   const planMeta: EnvMeta = {
     ...syncedMeta,
-    startupPlanId,
+    // The plan association belongs to the environment and survives a fresh
+    // interactive start. implementationPlanId only controls whether this run
+    // receives the automatic implementation prompt.
+    startupPlanId: scheduledPlan?.artifactId
+      ?? metaBeforeClaim.startupPlanId
+      ?? syncedMeta.startupPlanId
+      ?? null,
     branchStatus: deriveBranchBackedEnvStatus(
       syncedMeta,
       repo.meta,
@@ -1787,19 +2295,18 @@ export async function startEnvAction(args: {
             artifactStore,
             planMeta,
             planMeta.githubBaseCommitSha,
-            startupPlanId ? { mode: "specific", artifactId: startupPlanId } : { mode: "none" },
+            implementationPlanId
+              ? { mode: "specific", artifactId: implementationPlanId }
+              : { mode: "none" },
           );
       {
         const superseded = await abortIfClaimWasSuperseded();
         if (superseded) return superseded;
       }
-      launchConfig = {
-        ...launchConfig,
-        envVars: withStartupPlanDocumentEnvVar(
-          launchConfig.envVars,
-          withStartCausePreamble(startupPlanDocument, startIntent),
-        ),
-      };
+      await runPreparationEffect(() => materializeStartupPlanDocument(
+        workspaceStub,
+        withStartCausePreamble(startupPlanDocument, startIntent),
+      ));
     } else {
       {
         const superseded = await abortIfClaimWasSuperseded();
@@ -1817,7 +2324,9 @@ export async function startEnvAction(args: {
           workspaceStub,
           planMeta,
           repo.meta.mainCommit,
-          startupPlanId ? { mode: "specific", artifactId: startupPlanId } : { mode: "none" },
+          implementationPlanId
+            ? { mode: "specific", artifactId: implementationPlanId }
+            : { mode: "none" },
         ));
       }
       {
@@ -1979,10 +2488,10 @@ export async function startEnvAction(args: {
         });
         await projectSummary();
       } catch (err) {
-        const message = redactEnvValues(err instanceof Error ? err.message : String(err), launchConfig.envVars);
+        const detail = redactEnvValues(err instanceof Error ? err.message : String(err), launchConfig.envVars);
         const controlErrorCode = getRunnerControlErrorCode(err);
         const rejectedBeforeMutation = controlErrorCode === "runner_command_superseded_before_mutation";
-        console.error(`[envs] Failed to start runner for ${slug}:`, message);
+        console.error(`[envs] Failed to start runner for ${slug}:`, detail);
         if (
           rejectedBeforeMutation
           && startIntent === "scheduled"
@@ -1996,7 +2505,13 @@ export async function startEnvAction(args: {
         const failureInput = {
           opId: claimedStartOpId,
           stepId: "harness-launch" as const,
-          message,
+          message: projectRuntimeFailure(
+            backendKind === "cf" && isCloudflareContainerAllocationTimeout(err)
+              ? "runtime_start_failed"
+              : "runner_control_failed",
+            detail,
+            { slug, opId: claimedStartOpId, source: "runner-start" },
+          ).message,
           runnerMayExist: !rejectedBeforeMutation,
         };
         let failedLifecycle: Awaited<ReturnType<typeof lifecycleStub.reportStartupFailure>>;
@@ -2050,7 +2565,7 @@ export async function startEnvAction(args: {
 
 export async function deleteEnvAction(args: {
   env: Env;
-  executionCtx: ExecutionContext;
+  executionCtx: WaitUntilExecutionContext;
   slug: string;
 }): Promise<RouteResult> {
   const { env, slug } = args;
@@ -2067,21 +2582,21 @@ export async function deleteEnvAction(args: {
       body: { error: getStopFinalizationInProgressError("deleting the environment") },
     };
   }
-  const reviewWorkloads = await getEnvReviewStub(env, slug).listWorkloadStateForPredeploy();
-  const blockingReview = reviewWorkloads.find((run) =>
-    run.hasRuntime
-    || run.status === "syncing"
-    || run.status === "preparing"
-    || run.status === "queued"
-    || run.status === "running"
-    || run.status === "saving");
-  if (blockingReview) {
+  try {
+    await stopEnvReviewWorkloads(
+      env,
+      slug,
+      "Reviewer run cancelled because the environment was deleted.",
+    );
+  } catch (error) {
+    console.warn(
+      `[envs] Failed to stop environment review workloads before deleting ${slug}:`,
+      actionErrorMessage(error),
+    );
     return {
       status: 409,
       body: {
-        error: blockingReview.hasRuntime
-          ? "Environment review cleanup must finish before deleting the environment."
-          : "Environment has an active review. Cancel or finish it before deleting the environment.",
+        error: "Environment review cleanup must finish before deleting the environment.",
         code: "environment_delete_blocked",
       },
     };
@@ -2158,7 +2673,7 @@ export async function deleteEnvAction(args: {
     return { status: 409, body: { error: deleteClaim.error, code: "scheduled_run_active" } };
   }
   const hub = getHub(env);
-  await cleanupLaunchCredentialsBestEffort(env, slug, hub);
+  await cleanupLaunchCredentialsBestEffort(env, slug);
   await projectAndPersistEnvSummary(env, hub, slug).catch(() => null);
 
   args.executionCtx.waitUntil(

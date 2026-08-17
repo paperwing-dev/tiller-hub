@@ -1,24 +1,19 @@
 import type { Env } from "../types";
-import { readHubUpdateRepoState, resolveHubUpdateRepoState } from "./hub-repo";
 import {
-  fetchLatestReleaseUpdateMetadata,
-  getBuildChannel,
+  currentReleaseInfoForEnvironment,
   getBuildDiagnostics,
-  getCurrentUpdateMetadata,
-  UPDATE_CACHE_TTL_SECONDS,
-  UPDATE_CHECK_CACHE_KEY,
-} from "./metadata";
+  getCurrentReleaseInfo,
+} from "./release-info";
 import type {
-  HubUpdateRepoState,
-  LegacyUpdateCheckResult,
+  ReleaseInfo,
   StableReleaseSummary,
-  TillerUpdateMetadata,
+  UpdateCheckError,
   UpdateCheckResult,
-  UpdateIssue,
 } from "./types";
 
 export const INSTALLER_STABLE_URL = "https://install.paperwing.dev/stable";
-export const INSTALLER_STABLE_CACHE_KEY = "tiller:installer-stable:v1";
+export const INSTALLER_STABLE_CACHE_KEY = "tiller:installer-stable:v2";
+export const UPDATE_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const INSTALLER_STABLE_TIMEOUT_MS = 1_500;
 const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
@@ -38,8 +33,8 @@ export function parseStableReleaseSummary(value: unknown): StableReleaseSummary 
   const releaseNotesUrl = typeof value.releaseNotesUrl === "string" ? value.releaseNotesUrl.trim() : "";
   if (!/^[0-9a-f]{40}$/.test(releaseId) || /^0{40}$/.test(releaseId) || !parseVersion(version)) return null;
   try {
-    const parsedUrl = new URL(releaseNotesUrl);
-    if (parsedUrl.protocol !== "https:" || parsedUrl.href !== releaseNotesUrl) return null;
+    const parsed = new URL(releaseNotesUrl);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) return null;
   } catch {
     return null;
   }
@@ -52,11 +47,9 @@ async function fetchInstallerStableRelease(): Promise<StableReleaseSummary> {
   try {
     const response = await fetch(INSTALLER_STABLE_URL, {
       signal: controller.signal,
-      headers: { Accept: "application/json" },
+      headers: { Accept: "application/json", "Cache-Control": "no-cache" },
     });
-    if (!response.ok) {
-      throw new Error(`Installer stable release lookup failed: HTTP ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`Installer stable release lookup failed: HTTP ${response.status}`);
     const summary = parseStableReleaseSummary(await response.json());
     if (!summary) throw new Error("Installer stable release summary is invalid.");
     return summary;
@@ -67,43 +60,31 @@ async function fetchInstallerStableRelease(): Promise<StableReleaseSummary> {
 
 async function readInstallerStableRelease(
   env: Env,
-  installedReleaseId: string,
+  forceRefresh: boolean,
 ): Promise<StableReleaseSummary> {
-  const cacheKey = `${INSTALLER_STABLE_CACHE_KEY}:${installedReleaseId}`;
-  let summary: StableReleaseSummary;
+  const cached = parseStableReleaseSummary(
+    await env.ENVS_KV.get(INSTALLER_STABLE_CACHE_KEY, "json"),
+  );
+  if (cached && !forceRefresh) return cached;
+
   try {
-    summary = await fetchInstallerStableRelease();
+    const summary = await fetchInstallerStableRelease();
+    await env.ENVS_KV.put(INSTALLER_STABLE_CACHE_KEY, JSON.stringify(summary), {
+      expirationTtl: UPDATE_CACHE_TTL_SECONDS,
+    });
+    return summary;
   } catch (error) {
-    const cached = parseStableReleaseSummary(
-      await env.ENVS_KV.get(cacheKey, "json"),
-    );
     if (cached) return cached;
     throw error;
   }
-
-  await env.ENVS_KV.put(
-    cacheKey,
-    JSON.stringify(summary),
-    { expirationTtl: UPDATE_CACHE_TTL_SECONDS },
-  );
-  return summary;
-}
-
-function normalizeVersionTag(tagName: string): string {
-  return tagName.trim().replace(/^tiller-hub-v/i, "").replace(/^v/i, "");
 }
 
 function parseVersion(version: string): ParsedVersion | null {
-  const match = SEMVER_PATTERN.exec(normalizeVersionTag(version));
+  const match = SEMVER_PATTERN.exec(version.trim().replace(/^tiller-hub-v/i, "").replace(/^v/i, ""));
   if (!match) return null;
   const prerelease = match[4]?.split(".") ?? [];
-  if (prerelease.some((part) => /^\d+$/.test(part) && part.length > 1 && part.startsWith("0"))) {
-    return null;
-  }
-  return {
-    core: [match[1]!, match[2]!, match[3]!],
-    prerelease,
-  };
+  if (prerelease.some((part) => /^\d+$/.test(part) && part.length > 1 && part.startsWith("0"))) return null;
+  return { core: [match[1]!, match[2]!, match[3]!], prerelease };
 }
 
 function compareNumericIdentifiers(left: string, right: string): number {
@@ -114,27 +95,20 @@ function compareNumericIdentifiers(left: string, right: string): number {
 export function compareVersions(left: string, right: string): number {
   const leftVersion = parseVersion(left);
   const rightVersion = parseVersion(right);
-  if (!leftVersion || !rightVersion) {
-    throw new Error(`Cannot compare invalid release versions: ${left} and ${right}.`);
-  }
-
+  if (!leftVersion || !rightVersion) throw new Error(`Cannot compare invalid release versions: ${left} and ${right}.`);
   for (let index = 0; index < leftVersion.core.length; index += 1) {
     const result = compareNumericIdentifiers(leftVersion.core[index]!, rightVersion.core[index]!);
     if (result !== 0) return result;
   }
-
   if (leftVersion.prerelease.length === 0 || rightVersion.prerelease.length === 0) {
     if (leftVersion.prerelease.length === rightVersion.prerelease.length) return 0;
     return leftVersion.prerelease.length === 0 ? 1 : -1;
   }
-
   const length = Math.max(leftVersion.prerelease.length, rightVersion.prerelease.length);
   for (let index = 0; index < length; index += 1) {
     const leftPart = leftVersion.prerelease[index];
     const rightPart = rightVersion.prerelease[index];
-    if (leftPart === undefined || rightPart === undefined) {
-      return leftPart === undefined ? -1 : 1;
-    }
+    if (leftPart === undefined || rightPart === undefined) return leftPart === undefined ? -1 : 1;
     if (leftPart === rightPart) continue;
     const leftNumeric = /^\d+$/.test(leftPart);
     const rightNumeric = /^\d+$/.test(rightPart);
@@ -145,173 +119,74 @@ export function compareVersions(left: string, right: string): number {
   return 0;
 }
 
-function isHubRepoConfigured(state: HubUpdateRepoState): boolean {
-  return state.status === "detected";
+export function isUpdateAvailable(current: ReleaseInfo, stable: StableReleaseSummary): boolean {
+  if (current.channel === "development") return false;
+  const direction = compareVersions(current.hubVersion, stable.version);
+  return direction < 0 || (direction === 0 && current.releaseId !== stable.releaseId);
 }
 
-function updateMethodForState(hubRepo: HubUpdateRepoState): LegacyUpdateCheckResult["updateMethod"] {
-  if (isHubRepoConfigured(hubRepo)) return "github_repo";
-  return "connect_hub_repo";
+function errorResult(kind: UpdateCheckResult["kind"], currentRelease: ReleaseInfo, error: unknown): UpdateCheckResult {
+  const message = error instanceof Error ? error.message : "Unknown stable release lookup error";
+  const errors: UpdateCheckError[] = [{
+    code: "stable_release_unavailable",
+    message,
+    retryable: true,
+  }];
+  return {
+    kind,
+    currentRelease,
+    stableRelease: null,
+    updateAvailable: false,
+    buildDiagnostics: getBuildDiagnostics(),
+    errors,
+  };
 }
 
-function issueForState(
-  updateAvailable: boolean,
-  hubRepo: HubUpdateRepoState,
-): UpdateIssue | undefined {
-  if (!updateAvailable || hubRepo.status === "detected") return undefined;
-  if (hubRepo.status === "ambiguous") {
+export async function checkForUpdate(
+  env: Env,
+  options: { forceRefresh?: boolean } = {},
+): Promise<UpdateCheckResult> {
+  const kind: UpdateCheckResult["kind"] = env.TILLER_INSTALLER_SCHEMA?.trim()
+    ? "installer-managed"
+    : "unmanaged";
+  let currentRelease: ReleaseInfo;
+  try {
+    currentRelease = currentReleaseInfoForEnvironment(getCurrentReleaseInfo(), env.TILLER_RELEASE_ID);
+  } catch (error) {
+    const diagnostics = getBuildDiagnostics();
+    currentRelease = {
+      schemaVersion: 1,
+      channel: diagnostics.channel,
+      hubVersion: diagnostics.version,
+    };
     return {
-      code: "hub_repo_ambiguous",
-      message: "Multiple selected GitHub repositories look like Tiller deploy-button hubs. Choose the self-update repo before updating.",
+      kind,
+      currentRelease,
+      stableRelease: null,
+      updateAvailable: false,
+      buildDiagnostics: diagnostics,
+      errors: [{
+        code: "release_info_invalid",
+        message: error instanceof Error ? error.message : "Current release info is invalid.",
+        retryable: false,
+      }],
     };
   }
-  return {
-    code: "hub_repo_not_configured",
-    message: "No GitHub self-update repository is connected. Use Cloudflare update with a temporary API token, or install the Tiller GitHub App on the generated deploy-button repo if one exists.",
-  };
-}
-
-function buildUpdateCheckResult(
-  currentUpdate: TillerUpdateMetadata,
-  latestUpdate: TillerUpdateMetadata,
-  hubRepo: HubUpdateRepoState,
-  releaseNotesUrl: string,
-): LegacyUpdateCheckResult {
-  const updateAvailable = currentUpdate.sourceId !== latestUpdate.sourceId;
-  return {
-    kind: "legacy",
-    updateAvailable,
-    currentUpdate,
-    latestUpdate,
-    buildDiagnostics: getBuildDiagnostics(),
-    hubRepo,
-    updateMethod: updateMethodForState(hubRepo),
-    ...(issueForState(updateAvailable, hubRepo) ? { issue: issueForState(updateAvailable, hubRepo) } : {}),
-    releaseNotesUrl,
-  };
-}
-
-function isCacheableUpdateResult(value: unknown, currentUpdate: TillerUpdateMetadata): value is LegacyUpdateCheckResult {
-  if (!value || typeof value !== "object") return false;
-  const result = value as Partial<LegacyUpdateCheckResult>;
-  return result.kind === "legacy" &&
-    typeof result.updateAvailable === "boolean" &&
-    result.currentUpdate?.sourceId === currentUpdate.sourceId &&
-    result.buildDiagnostics?.channel === getBuildChannel() &&
-    typeof result.currentUpdate.version === "string" &&
-    typeof result.latestUpdate?.sourceId === "string" &&
-    typeof result.latestUpdate.version === "string" &&
-    typeof result.releaseNotesUrl === "string";
-}
-
-export async function checkForUpdate(env: Env): Promise<UpdateCheckResult> {
   try {
-    const currentUpdate = getCurrentUpdateMetadata();
-    if (env.TILLER_INSTALLER_SCHEMA?.trim()) {
-      const installedReleaseId = env.TILLER_RELEASE_ID?.trim() || currentUpdate.sourceId;
-      const stableRelease = await readInstallerStableRelease(env, installedReleaseId);
-      const versionDirection = compareVersions(currentUpdate.version, stableRelease.version);
-      return {
-        kind: "installer-maintenance",
-        updateAvailable: versionDirection < 0 ||
-          (versionDirection === 0 && installedReleaseId !== stableRelease.releaseId),
-        installedReleaseId,
-        stableRelease,
-        currentUpdate,
-        buildDiagnostics: getBuildDiagnostics(),
-      };
-    }
-
-    if (getBuildChannel() === "development") {
-      return {
-        kind: "legacy",
-        updateAvailable: false,
-        currentUpdate,
-        latestUpdate: currentUpdate,
-        buildDiagnostics: getBuildDiagnostics(),
-        hubRepo: { status: "not_checked", lastDetectedAt: null },
-        updateMethod: "advanced_repair",
-        releaseNotesUrl: `https://github.com/${currentUpdate.sourceRepo}`,
-      };
-    }
-
-    const hubRepo = await resolveHubUpdateRepoState(env, { autoDetect: true });
-    const cached = await env.ENVS_KV.get(UPDATE_CHECK_CACHE_KEY, "json");
-    if (isCacheableUpdateResult(cached, currentUpdate)) {
-      const updateAvailable = currentUpdate.sourceId !== cached.latestUpdate.sourceId;
-      const currentIssue = issueForState(updateAvailable, hubRepo);
-      const { issue: _cachedIssue, hubRepo: _cachedHubRepo, updateMethod: _cachedUpdateMethod, ...cachedResult } = cached;
-      return {
-        ...cachedResult,
-        updateAvailable,
-        currentUpdate,
-        buildDiagnostics: getBuildDiagnostics(),
-        hubRepo,
-        updateMethod: updateMethodForState(hubRepo),
-        ...(currentIssue ? { issue: currentIssue } : {}),
-      };
-    }
-
-    const buildDiagnostics = getBuildDiagnostics();
-    const latestRelease = await fetchLatestReleaseUpdateMetadata({
-      currentVersion: buildDiagnostics.version || currentUpdate.version,
-      channel: buildDiagnostics.channel,
-      updateServiceDisabled: env.TILLER_UPDATE_SERVICE_DISABLED,
-    });
-    const result = buildUpdateCheckResult(
-      currentUpdate,
-      latestRelease.update,
-      hubRepo,
-      latestRelease.releaseNotesUrl,
-    );
-
-    await env.ENVS_KV.put(
-      UPDATE_CHECK_CACHE_KEY,
-      JSON.stringify(result),
-      { expirationTtl: UPDATE_CACHE_TTL_SECONDS },
-    );
-
-    return result;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    const currentUpdate = getCurrentUpdateMetadata();
-    const installerManaged = Boolean(env.TILLER_INSTALLER_SCHEMA?.trim());
-    if (installerManaged) {
-      return {
-        kind: "installer-maintenance",
-        updateAvailable: false,
-        installedReleaseId: env.TILLER_RELEASE_ID?.trim() || currentUpdate.sourceId,
-        stableRelease: null,
-        currentUpdate,
-        buildDiagnostics: getBuildDiagnostics(),
-        issue: {
-          code: "update_check_failed",
-          message: `Self-update check failed: ${message}`,
-        },
-      };
-    }
-    const latestUpdate = currentUpdate;
-    const hubRepo = await readHubUpdateRepoState(env).catch((): HubUpdateRepoState => ({
-      status: "not_checked",
-      lastDetectedAt: null,
-    }));
+    const stableRelease = await readInstallerStableRelease(env, options.forceRefresh === true);
     return {
-      kind: "legacy",
-      updateAvailable: false,
-      currentUpdate,
-      latestUpdate,
+      kind,
+      currentRelease,
+      stableRelease,
+      updateAvailable: isUpdateAvailable(currentRelease, stableRelease),
       buildDiagnostics: getBuildDiagnostics(),
-      hubRepo,
-      updateMethod: "advanced_repair",
-      issue: {
-        code: "update_check_failed",
-        message: `Self-update check failed: ${message}`,
-      },
-      releaseNotesUrl: `https://github.com/${currentUpdate.sourceRepo}`,
+      errors: [],
     };
+  } catch (error) {
+    return errorResult(kind, currentRelease, error);
   }
 }
 
 export async function clearUpdateCheckCache(env: Env): Promise<void> {
-  await env.ENVS_KV.delete(UPDATE_CHECK_CACHE_KEY);
+  await env.ENVS_KV.delete(INSTALLER_STABLE_CACHE_KEY);
 }

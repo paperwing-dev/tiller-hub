@@ -15,6 +15,7 @@ function makeEnv(overrides: Partial<PresentationEnv> = {}): PresentationEnv {
     lifecycleOpId: "start-1",
     lifecycleOperation: "start",
     lifecycleDesiredState: "running",
+    lifecycleInfraState: "unknown",
     ...overrides,
   };
 }
@@ -45,7 +46,7 @@ function makeDiagnostics(
 
 describe("getEnvWaitingPresentation", () => {
   it.each([
-    ["saving", "saving", "Saving your work", "Syncing your latest changes before shutdown…"],
+    ["saving", "saving", "Saving your work", "Saving workspace…"],
     ["stopping", "stopping", "Stopping your environment", "Your work is saved. Finishing shutdown…"],
     ["deleting", "deleting", "Removing your environment", "Deleting the environment and its stored workspace…"],
   ] as const)(
@@ -126,9 +127,9 @@ describe("getEnvWaitingPresentation", () => {
     ["desired state is absent", { lifecycleDesiredState: null }, {}, "failure"],
     ["desired state is stopped", { lifecycleDesiredState: "stopped" }, {}, "failure"],
     ["lifecycle op ID is absent", { lifecycleOpId: null }, {}, "failure"],
-    ["active diagnostics are absent", {}, { active: null }, "failure"],
-    ["diagnostics belong to another op", {}, { activeOpId: "old-start" }, "failure"],
-    ["active diagnostics have no failure", {}, { failure: null }, "failure"],
+    ["active diagnostics are absent", {}, { active: null }, "runtime-failure"],
+    ["diagnostics belong to another op", {}, { activeOpId: "old-start" }, "runtime-failure"],
+    ["active diagnostics have no failure", {}, { failure: null }, "runtime-failure"],
   ] as const)(
     "requires exact startup failure correlation when %s",
     (_label, envOverrides, diagnosticOverrides, displayState) => {
@@ -150,7 +151,9 @@ describe("getEnvWaitingPresentation", () => {
 
       expect(presentation.displayState).toBe(displayState);
       expect(presentation.primaryAction).toBe(
-        displayState === "startup-failure" ? "retry" : "none",
+        displayState === "startup-failure" || displayState === "runtime-failure"
+          ? "retry"
+          : "none",
       );
     },
   );
@@ -166,13 +169,33 @@ describe("getEnvWaitingPresentation", () => {
         makeEnv({ status: "failed" }),
         makeDiagnostics(null, previousFailure),
       ).displayState,
-    ).toBe("failure");
+    ).toBe("runtime-failure");
+  });
+
+  it("offers recovery from the last saved workspace after an unacknowledged Stop", () => {
+    expect(
+      getEnvWaitingPresentation(
+        makeEnv({
+          status: "failed",
+          lifecycleOpId: "stop-1",
+          lifecycleOperation: "stop",
+          lifecycleDesiredState: "stopped",
+          lifecycleInfraState: "stopped",
+        }),
+        makeDiagnostics(),
+      ),
+    ).toMatchObject({
+      displayState: "save-failure",
+      heading: "Workspace saving wasn’t confirmed",
+      actionText: "Start again to restore the latest saved workspace. Recent changes may be missing.",
+      primaryAction: "retry",
+    });
   });
 
   it.each([
     ["stopped", makeDiagnostics(), "stopped", "start"],
     ["failed", makeDiagnostics(makeSnapshot({ failure: { message: "failed" } })), "startup-failure", "retry"],
-    ["failed", makeDiagnostics(), "failure", "none"],
+    ["failed", makeDiagnostics(), "runtime-failure", "retry"],
     ["running", makeDiagnostics(), "running", "none"],
     ["unknown", makeDiagnostics(), "unknown", "none"],
   ] as const)(

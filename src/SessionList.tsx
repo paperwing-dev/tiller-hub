@@ -21,6 +21,7 @@ import {
 import { canStopEnvStatus, isEnvRunningStatus } from "./env-runtime";
 import { getRepoMainStatusDetail, getRepoMainStatusLabel, isRepoMainReady } from "./repo-status";
 import { listPlanArtifacts } from "./plan-artifacts";
+import ConfirmationDialog from "./ConfirmationDialog";
 
 interface SessionListProps {
   repos: RepoMeta[];
@@ -220,6 +221,7 @@ function EnvCard({
   sidebarCollapsed: boolean;
 }) {
   const [busy, setBusy] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [actionError, setActionError] = useState<{ message: string; hint: string | null } | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const previewAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -246,6 +248,7 @@ function EnvCard({
     && !scheduledRunActive
     && scheduledRun?.state !== "scheduled";
   const branchStatus = getDisplayEnvBranchStatus(env, repo);
+  const needsImplementorAttention = Boolean(env.implementorAttentionToken);
 
   const showActionError = (err: unknown, fallback: string) => {
     console.error("[tiller] env action failed:", err);
@@ -267,7 +270,24 @@ function EnvCard({
     }
   };
 
-  const dotColor = scheduledRun?.state === "completed"
+  const deleteEnvironment = async () => {
+    if (busy) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await deleteEnv(hubUrl, env.slug);
+      onRecoverEnv?.(env.slug, "deleting");
+    } catch (err) {
+      showActionError(err, "Failed to delete environment.");
+    } finally {
+      setBusy(false);
+      setDeleteDialogOpen(false);
+    }
+  };
+
+  const dotColor = needsImplementorAttention
+    ? "bg-kumo-info"
+    : scheduledRun?.state === "completed"
     ? STATUS_COLORS.running
     : scheduledRun?.state === "failed" || scheduledRun?.state === "interrupted"
       ? STATUS_COLORS.failed
@@ -286,19 +306,27 @@ function EnvCard({
   else if (isDeleting) label = "Deleting...";
   else if (isCreating) label = "Creating...";
   else if (isStarting) label = "Starting...";
-  else if (isSaving) label = "Saving changes...";
+  else if (isSaving) label = "Saving workspace…";
   else if (isStopping) label = "Stopping...";
   else if (isPublishPending) label = "Publishing draft PR...";
   else if (isFailed) label = "Failed";
   else if (canStart) label = "Stopped";
   else if (isEnvRunningStatus(status)) label = "Running";
   else label = status;
+  const dotLabel = needsImplementorAttention ? "Needs attention" : label;
 
   const harness = env.harness;
   const displayName = getEnvDisplayName(env);
-  const showShip = Boolean(onShipSelect && hasShipTarget(env, branchStatus));
+  const hasDistinctDisplayName = displayName !== env.slug;
+  const environmentIdentity = `"${displayName}" (slug: ${env.slug})`;
+  const deleteControlLabel = hasDistinctDisplayName
+    ? `Delete ${displayName} (slug: ${env.slug})`
+    : `Delete ${displayName}`;
+  const showShip = Boolean(
+    status === "stopped" && onShipSelect && hasShipTarget(env, branchStatus),
+  );
   const railLabel = env.sidebarSlot ? String(env.sidebarSlot) : "?";
-  const railLabelText = `${displayName} - Plan: ${planLabel} - ${getHarnessBadgeLabel(harness)} - ${label}`;
+  const railLabelText = `${hasDistinctDisplayName ? `${displayName} - Slug: ${env.slug}` : displayName} - Plan: ${planLabel} - ${getHarnessBadgeLabel(harness)} - ${dotLabel}`;
   const attentionMessages = Array.from(new Set([
     scheduledRun?.state === "failed" ? scheduledRun.error || "Scheduled run failed." : null,
     scheduledRunInterrupted ? scheduledRun?.error || "Scheduled run interrupted." : null,
@@ -374,13 +402,13 @@ function EnvCard({
     >
       <div className="flex min-w-0 max-w-full items-center gap-2 group-data-[state=collapsed]/sidebar:relative group-data-[state=collapsed]/sidebar:h-8 group-data-[state=collapsed]/sidebar:w-8 group-data-[state=collapsed]/sidebar:justify-center">
         <Tooltip
-          content={label}
+          content={dotLabel}
           side="right"
           delay={250}
           render={(
             <span
               role="img"
-              aria-label={`Status: ${label}`}
+              aria-label={`Status: ${dotLabel}`}
               className={`h-2 w-2 shrink-0 rounded-full group-data-[state=collapsed]/sidebar:absolute group-data-[state=collapsed]/sidebar:bottom-0 group-data-[state=collapsed]/sidebar:right-0 group-data-[state=collapsed]/sidebar:ring-2 group-data-[state=collapsed]/sidebar:ring-kumo-recessed ${dotColor}`}
             />
           )}
@@ -399,6 +427,11 @@ function EnvCard({
           {railLabel}
         </span>
       </div>
+      {hasDistinctDisplayName && (
+        <div className="tiller-sidebar-open-text mt-0.5 ml-4 truncate text-[11px] leading-4 text-kumo-subtle group-data-[state=collapsed]/sidebar:hidden">
+          Slug: {env.slug}
+        </div>
+      )}
       <div className="tiller-sidebar-open-text mt-1 ml-4 flex min-w-0 items-start gap-1 text-xs leading-4 text-kumo-subtle group-data-[state=collapsed]/sidebar:hidden">
         <span className="shrink-0">Plan:</span>
         <PlanValueLink
@@ -467,28 +500,15 @@ function EnvCard({
         )}
         {!isDeleting && (
           <Tooltip
-            content={`Delete ${displayName}`}
+            content={deleteControlLabel}
             side="top"
             delay={250}
             render={(
               <button
                 type="button"
                 className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-kumo-subtle transition-colors hover:bg-kumo-danger-tint hover:text-kumo-danger disabled:cursor-not-allowed disabled:opacity-40"
-                aria-label={`Delete ${displayName}`}
-                onClick={async () => {
-                  if (confirm(`Delete environment "${displayName}"? This will destroy the container and wipe R2 storage.`)) {
-                    setBusy(true);
-                    setActionError(null);
-                    try {
-                      await deleteEnv(hubUrl, env.slug);
-                      onRecoverEnv?.(env.slug, "deleting");
-                    } catch (err) {
-                      showActionError(err, "Failed to delete environment.");
-                    } finally {
-                      setBusy(false);
-                    }
-                  }
-                }}
+                aria-label={deleteControlLabel}
+                onClick={() => setDeleteDialogOpen(true)}
                 disabled={busy || isPublishPending || isSaving || isStopping || scheduledRunFinalizing || scheduledRunActive || scheduledRunCleanupRequired}
               />
             )}
@@ -538,9 +558,10 @@ function EnvCard({
             </span>
           </div>
           <div className="mt-2 grid gap-1 text-xs text-kumo-subtle">
-            <EnvPreviewRow label="Status" value={label} />
+            <EnvPreviewRow label="Status" value={dotLabel} />
             <EnvPreviewRow label="Backend" value={getBackendBadgeLabel(env.backend)} />
-            {env.sidebarSlot && <EnvPreviewRow label="Slot" value={`#${env.sidebarSlot}`} />}
+            <EnvPreviewRow label="Slug" value={env.slug} />
+            <EnvPreviewRow label="Sidebar slot" value={env.sidebarSlot ? `#${env.sidebarSlot}` : "Unassigned"} />
             <EnvPreviewPlanRow
               repoId={repo.repoId}
               planArtifactId={env.startupPlanId}
@@ -557,6 +578,16 @@ function EnvCard({
           </span>
         </div>
       </Popover.Content>
+      <ConfirmationDialog
+        open={deleteDialogOpen}
+        title="Delete environment?"
+        description={`${environmentIdentity} and its container and R2 storage will be permanently deleted.`}
+        confirmLabel="Delete environment"
+        busyLabel="Deleting…"
+        busy={busy}
+        onOpenChange={setDeleteDialogOpen}
+        onConfirm={deleteEnvironment}
+      />
     </Popover>
   );
 }

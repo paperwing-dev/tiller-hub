@@ -10,6 +10,8 @@ import {
   buildCfAccessEnvVars,
   buildProviderAuthEnvVars,
   destroyPlannerJob,
+  plannerDispatchTargetFromLaunch,
+  plannerLaunchProvenanceFromExecution,
   resolvePlannerExecution,
   runnerJobCommand,
   type PlannerDispatchTarget,
@@ -77,17 +79,7 @@ export async function resolveNewEnvReviewLaunchProvenance(
       ? execution.reason
       : "Environment Review requires a dispatched CLI runtime backend for this provider.");
   }
-  return {
-    schemaVersion: 1,
-    backend: execution.backend,
-    machineId: execution.machineId,
-    ...(execution.claudeAuthMode
-      ? { claudeAuthMode: execution.claudeAuthMode }
-      : {}),
-    ...(execution.codexExecutionProfile
-      ? { codexExecution: execution.codexExecutionProfile }
-      : {}),
-  };
+  return plannerLaunchProvenanceFromExecution(execution);
 }
 
 export async function resolveEnvReviewDispatchTarget(
@@ -100,15 +92,8 @@ export async function resolveEnvReviewDispatchTarget(
     );
   }
   return {
-    backend: run.launchProvenance.backend,
+    ...plannerDispatchTargetFromLaunch(run.launchProvenance),
     jobSlug: envReviewJobSlug(run.runId),
-    machineId: run.launchProvenance.machineId,
-    ...(run.launchProvenance.claudeAuthMode
-      ? { claudeAuthMode: run.launchProvenance.claudeAuthMode }
-      : {}),
-    ...(run.launchProvenance.codexExecution
-      ? { codexExecutionProfile: run.launchProvenance.codexExecution }
-      : {}),
   };
 }
 
@@ -139,7 +124,9 @@ export async function dispatchEnvReviewRun(options: DispatchEnvReviewRunOptions)
     : {};
   const envVars: Record<string, string> = {
     TILLER_BOOTSTRAP_MODE: "env-review-run",
+    TILLER_REVIEWER_ISOLATION_PROTOCOL: "1",
     TILLER_HARNESS: options.run.provider,
+    RUNNER_BACKEND: backend,
     HUB_URL: hubUrl,
     REPO_URL: options.repoUrl,
     TILLER_ENV_REVIEW_CALLBACK_BASE:

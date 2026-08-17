@@ -1,16 +1,19 @@
 {
   "name": "tiller-hub",
-  "version": "0.2.53",
+  "version": "0.4.5",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "deploy": "TILLER_REQUIRE_SELF_HOST_RUNTIME=1 TILLER_BUILD_CHANNEL=development vite build && node scripts/deploy-with-region.mjs",
+    "postbuild": "node scripts/check-client-bundle.mjs",
+    "check:client-bundle": "node scripts/check-client-bundle.mjs",
     "log": "wrangler tail",
     "test": "vitest run --config vitest.config.ts",
-    "test:watch": "vitest --config vitest.config.ts"
+    "test:watch": "vitest --config vitest.config.ts",
+    "typecheck:api:production": "tsc -p tsconfig.api.production.json --pretty false",
+    "typecheck:ui:production": "tsc -p tsconfig.ui.production.json --pretty false"
   },
   "dependencies": {
     "@ai-sdk/react": "^4.0.55",
@@ -28,7 +31,6 @@
     "@noble/hashes": "2.2.0",
     "agents": "0.20.1",
     "ai": "^7.0.52",
-    "animejs": "^4.5.0",
     "diff": "^9.0.0",
     "hono": "^4.13.0",
     "jose": "^6.2.8",

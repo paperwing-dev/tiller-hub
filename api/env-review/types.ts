@@ -5,6 +5,8 @@ import type {
   PlannerRunLaunchProvenance,
   SkillDefinitionSnapshot,
   SkillInvocationStatus,
+  FrozenReviewRoute,
+  ReviewNodeKind,
   SkillRunRole,
   SkillAutomationMode,
 } from "../coordination";
@@ -14,6 +16,14 @@ export type EnvReviewRunStatus = "preparing" | "queued" | "running" | "ready" | 
 export type EnvReviewTaskKind = "correctness" | "tests" | "architecture" | "security" | "custom" | "recipe-role";
 export type EnvReviewFeedbackStatus = "ready" | "pending" | "sent" | "dismissed";
 export type EnvReviewPreparationStatus = "preparing" | "succeeded" | "failed" | "timed_out";
+
+export function reviewSkillRerunRunId(requestId: string, agentId: string): string {
+  return `env-review-skill-rerun:${requestId}:${agentId}`;
+}
+
+export function reviewSkillRerunMessageId(requestId: string, agentId: string): string {
+  return `env-review-skill-rerun-message:${requestId}:${agentId}`;
+}
 
 export type EnvReviewSnapshotSource = "live-harness" | "saved-workspace";
 export type EnvReviewSnapshotMode = "github-overlay" | "full";
@@ -154,6 +164,8 @@ export interface EnvReviewTab {
   updatedAt: string;
   skillInvocationId: string | null;
   skillAgentId: string | null;
+  nodeKind: ReviewNodeKind;
+  skillRootThreadId: string | null;
 }
 
 export interface EnvReviewRunEvent {
@@ -210,10 +222,22 @@ export interface ReviewSkillInvocation {
   overviewMode: SkillAutomationMode;
   includedMessageIds: string[];
   overviewRunId: string | null;
+  overviewRoute: FrozenReviewRoute | null;
   error: string | null;
   cancelledAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface EnvReviewFanoutHandoff {
+  schemaVersion: 1;
+  kind: "fanout_overview";
+  skillLabel: string;
+  reviewerCount: number;
+  models: Array<{
+    provider: string;
+    model: string;
+  }>;
 }
 
 export interface EnvReviewFeedback {
@@ -231,7 +255,7 @@ export interface EnvReviewFeedback {
   text: string;
   status: EnvReviewFeedbackStatus;
   deliveredText: string | null;
-  metadata: Record<string, unknown>;
+  metadata: Record<string, unknown> & { reviewHandoff?: EnvReviewFanoutHandoff };
   createdAt: string;
   updatedAt: string;
   sentAt: string | null;

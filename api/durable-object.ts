@@ -1,7 +1,7 @@
 import { isPlacementRegion } from "../shared/placement";
 import type { Env } from "./types";
 
-type LocationEnv = Pick<Env, "DO_LOCATION_HINT">;
+type LocationEnv = Pick<Env, "DO_LOCATION_HINT" | "TILLER_INSTALLER_SCHEMA">;
 
 type NamedDurableObjectNamespace = Pick<
   DurableObjectNamespace,
@@ -13,9 +13,17 @@ export function durableObjectOptions(
   env: LocationEnv | undefined,
 ): DurableObjectNamespaceGetDurableObjectOptions {
   const value = env?.DO_LOCATION_HINT;
-  if (value === undefined) return {};
+  const installerManaged = Boolean(env?.TILLER_INSTALLER_SCHEMA?.trim());
+  if (value === undefined) {
+    if (installerManaged) {
+      throw new Error("Installer-managed Durable Object placement requires DO_LOCATION_HINT");
+    }
+    return {};
+  }
   if (!isPlacementRegion(value)) {
-    throw new Error("DO_LOCATION_HINT is invalid");
+    throw new Error(installerManaged
+      ? "Installer-managed DO_LOCATION_HINT is invalid"
+      : "DO_LOCATION_HINT is invalid");
   }
   return { locationHint: value };
 }

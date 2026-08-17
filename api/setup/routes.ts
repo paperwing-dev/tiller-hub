@@ -16,6 +16,7 @@ import {
 } from "../../shared/cloudflare-timeout";
 import { normalizeBillingMode, type BillingMode } from "../../shared/billing";
 import { getDurableObjectStub } from "../durable-object";
+import { isPlacementRegion } from "../../shared/placement";
 
 // Keys that can be managed via the settings page.
 const CONFIGURABLE_KEYS = new Set([
@@ -41,7 +42,16 @@ const setupRoutes = new Hono<HonoEnv>();
 
 setupRoutes.get("/api/setup/status", async (c) => {
   c.header("Cache-Control", "no-store");
-  if (!isLocalDevRequest(c.env, c.req.raw)) {
+  const isLocalDev = isLocalDevRequest(c.env, c.req.raw);
+  if (!isLocalDev
+    && c.env.TILLER_INSTALLER_SCHEMA?.trim()
+    && !isPlacementRegion(c.env.DO_LOCATION_HINT)) {
+    return c.json({
+      error: "Installer-managed installation region binding is missing or invalid.",
+      code: "installation_region_configuration_error",
+    }, 503);
+  }
+  if (!isLocalDev) {
     const lifecycle = await readWorkersDevAccessLifecycle(c.env);
     if (!lifecycle.configured) {
       return c.json({
@@ -142,9 +152,15 @@ setupRoutes.post("/api/setup/onboarding/dismiss", async (c) => {
 });
 
 setupRoutes.post("/api/setup/verify-model-auth", async (c) => {
-  const anthropicKey = (await getSecret(c.env, "ANTHROPIC_API_KEY"))?.trim();
-  const oauthToken = (await getSecret(c.env, "CLAUDE_CODE_OAUTH_TOKEN"))?.trim();
-  const openaiKey = (await getSecret(c.env, "OPENAI_API_KEY"))?.trim();
+  const body = await c.req.json<{ key?: unknown } | null>().catch(() => null);
+  const requestedKey = typeof body?.key === "string" ? body.key : null;
+  if (requestedKey && requestedKey !== "ANTHROPIC_API_KEY" && requestedKey !== "OPENAI_API_KEY") {
+    return c.json({ error: "Unsupported credential", results: [] }, 400);
+  }
+
+  const anthropicKey = (await getSecret(c.env, "ANTHROPIC_API_KEY", { fresh: true }))?.trim();
+  const oauthToken = (await getSecret(c.env, "CLAUDE_CODE_OAUTH_TOKEN", { fresh: true }))?.trim();
+  const openaiKey = (await getSecret(c.env, "OPENAI_API_KEY", { fresh: true }))?.trim();
 
   const results: Array<{
     key: string;
@@ -155,7 +171,7 @@ setupRoutes.post("/api/setup/verify-model-auth", async (c) => {
     note?: string;
   }> = [];
 
-  if (anthropicKey) {
+  if (anthropicKey && (!requestedKey || requestedKey === "ANTHROPIC_API_KEY")) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -185,11 +201,11 @@ setupRoutes.post("/api/setup/verify-model-auth", async (c) => {
     }
   }
 
-  if (oauthToken) {
+  if (oauthToken && !requestedKey) {
     results.push({ key: "CLAUDE_CODE_OAUTH_TOKEN", mode: "subscription", ok: true, note: "Token stored (cannot verify programmatically)" });
   }
 
-  if (openaiKey) {
+  if (openaiKey && (!requestedKey || requestedKey === "OPENAI_API_KEY")) {
     try {
       const res = await fetch("https://api.openai.com/v1/models", {
         headers: { Authorization: `Bearer ${openaiKey}` },
@@ -207,7 +223,11 @@ setupRoutes.post("/api/setup/verify-model-auth", async (c) => {
   }
 
   if (results.length === 0) {
-    return c.json({ ok: false, error: "No credentials configured", results: [] });
+    return c.json({
+      ok: false,
+      error: requestedKey ? "Credential is not configured" : "No credentials configured",
+      results: [],
+    });
   }
 
   const allOk = results.every((r) => r.ok);

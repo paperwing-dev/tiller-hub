@@ -297,6 +297,7 @@ function createLifecycleStub() {
       operationId,
       desiredState,
     })),
+    getRunnerCommandClaim: vi.fn().mockResolvedValue(null),
     rebaseRejectedRunnerCommand: vi.fn().mockImplementation(async ({
       rejectedCommand,
       currentCommandGeneration,
@@ -345,6 +346,7 @@ function createLifecycleStub() {
             ? meta.lifecycleRuntimeReady
             : current.lifecycleRuntimeReady,
         runnerId: typeof meta.runnerId === "string" ? meta.runnerId : current.runnerId,
+        startupPlanId: typeof meta.startupPlanId === "string" ? meta.startupPlanId : null,
         bootMessage: typeof meta.bootMessage === "string" ? meta.bootMessage : current.bootMessage,
         branchStatus: typeof meta.branchStatus === "string" ? meta.branchStatus : current.branchStatus,
         workspaceDirty: typeof meta.workspaceDirty === "boolean" ? meta.workspaceDirty : current.workspaceDirty,
@@ -374,11 +376,45 @@ function createLifecycleStub() {
       return current;
     }),
     initializeAndBeginStart: vi.fn().mockImplementation(async (
-      _definition: Record<string, unknown>,
+      definition: Record<string, unknown>,
       initial: Record<string, unknown>,
       settings: Record<string, unknown>,
       authClaim: Record<string, unknown> = {},
-    ) => ({ ...await claimStart(settings, initial), ...authClaim })),
+    ) => {
+      const placement = definition.executionPlacement as { backend?: unknown } | undefined;
+      current = {
+        ...current,
+        ...definition,
+        ...(placement?.backend === "cf" || placement?.backend === "host"
+          ? { backend: placement.backend }
+          : {}),
+      };
+      return { ...await claimStart(settings, initial), ...authClaim };
+    }),
+    initializeStoppedEnvironment: vi.fn().mockImplementation(async (
+      definition: Record<string, unknown>,
+      initial: Record<string, unknown>,
+    ) => {
+      if (hydrated) return { created: false, claimId: null, mutableState: current };
+      const placement = definition.executionPlacement as { backend?: unknown } | undefined;
+      current = {
+        ...current,
+        ...definition,
+        ...initial,
+        ...(placement?.backend === "cf" || placement?.backend === "host"
+          ? { backend: placement.backend }
+          : {}),
+      };
+      hydrated = true;
+      return {
+        created: true,
+        claimId: definition.incarnationId,
+        mutableState: current,
+      };
+    }),
+    publishStoppedInitialization: vi.fn().mockResolvedValue(true),
+    commitStoppedInitialization: vi.fn().mockResolvedValue(true),
+    rollbackStoppedInitialization: vi.fn().mockResolvedValue(true),
     beginStart: vi.fn().mockImplementation(async (
       settings: Record<string, unknown>,
       authClaim: Record<string, unknown> = {},
@@ -401,6 +437,7 @@ function createLifecycleStub() {
         desiredState: "stopped",
       });
     }),
+    resumeStopRetry: vi.fn().mockResolvedValue(null),
     reconcile: vi.fn().mockResolvedValue(null),
     clearLeadHarnessState: vi.fn().mockResolvedValue(current),
     beginStartupDiagnostics: vi.fn().mockResolvedValue(current),
@@ -533,7 +570,6 @@ async function createOpenCodeStartFixture(options: {
         broadcastRepoMainChange: vi.fn(),
         addMessage: vi.fn(),
         resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
-        revokeCloudflareMcpProxyTokensForEnv: vi.fn().mockResolvedValue(undefined),
         getHostService: vi.fn().mockResolvedValue(backend === "host" ? hostService : null),
         getRoutableHostService: vi.fn().mockResolvedValue(backend === "host" ? hostService : null),
         isHostRoutable: vi.fn().mockResolvedValue(backend === "host"),
@@ -563,7 +599,6 @@ function createOpenCodeCreateEnv(overrides: Record<string, unknown> = {}) {
         addMessage: vi.fn(),
         resolveNewExecutionPlacement: vi.fn().mockResolvedValue({ backend: "cf", machineId: null }),
         resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
-        revokeCloudflareMcpProxyTokensForEnv: vi.fn().mockResolvedValue(undefined),
       }),
     },
     BUCKET: {
@@ -691,7 +726,7 @@ describe("OpenCode environment routes", () => {
 
   it.each([
     [{ model: "gpt-5.5" }],
-    [{ model: "claude-fable-5", effort: "max" }],
+    [{ model: "claude-opus-4.8", effort: "max" }],
   ])("rejects incomplete or cross-harness creation settings before claiming", async (harnessSettings) => {
     const lifecycleStub = createLifecycleStub();
     mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
@@ -713,6 +748,37 @@ describe("OpenCode environment routes", () => {
 
     expect(response.status).toBe(400);
     expect(lifecycleStub.initializeAndBeginStart).not.toHaveBeenCalled();
+  });
+
+  it("leaves an existing runner and workspace untouched before Create claims state", async () => {
+    const lifecycleStub = createLifecycleStub();
+    const destroyWorkspace = vi.fn();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    mocks.getWorkspaceStub.mockReturnValue({ destroyWorkspace });
+    mocks.getRunnerBackend.mockResolvedValue({
+      kind: "cf",
+      inspect: vi.fn().mockResolvedValue({ state: "live", status: "running" }),
+    });
+
+    const response = await createTestApp().request(
+      "https://example.com/api/envs",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoId: "repo-1",
+          slug: "opencode-env",
+          harness: "opencode",
+        }),
+      },
+      createOpenCodeCreateEnv() as any,
+      createExecutionCtx() as any,
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ code: "runtime_already_exists" });
+    expect(lifecycleStub.initializeAndBeginStart).not.toHaveBeenCalled();
+    expect(destroyWorkspace).not.toHaveBeenCalled();
   });
 
   it("creates an OpenCode env on the selected Cloudflare backend and injects the hub proxy auth", async () => {
@@ -773,6 +839,7 @@ describe("OpenCode environment routes", () => {
     expect(res.status).toBe(201);
     await expect(res.json()).resolves.toMatchObject({
       slug: "opencode-env",
+      displayName: "Scratch #1",
       backend: "cf",
       harness: "opencode",
       status: "starting",
@@ -811,6 +878,161 @@ describe("OpenCode environment routes", () => {
       expect.anything(),
       { model: "kimi-k2.7-code", effort: "high" },
       { claudeAuthMode: null, codexAuthPreference: null },
+    );
+  });
+
+  it("uses one selected-plan snapshot for an ordinary creation name, identity, and document", async () => {
+    const lifecycleStub = createLifecycleStub();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    const create = vi.fn().mockResolvedValue({ runnerId: "machine-1", backend: "cf" });
+    mocks.getRunnerBackend.mockResolvedValue({
+      inspect: vi.fn().mockResolvedValue({ state: "absent" }),
+      create,
+      getStatus: vi.fn().mockResolvedValue("running"),
+    });
+    const firstPlan = {
+      id: "plan-1",
+      repoId: "repo-1",
+      type: "plan",
+      title: "  Implement\nsettings  ",
+      body: { markdown: "# First snapshot\n\nUse version seven." },
+      basis: { repoId: "repo-1", mainCommit: "main-sha" },
+      status: "todo",
+      version: 7,
+      createdAt: "2026-08-13T00:00:00.000Z",
+    };
+    const laterPlan = {
+      ...firstPlan,
+      title: "Changed afterward",
+      body: { markdown: "# Second snapshot" },
+      version: 8,
+    };
+    const getArtifact = vi.fn()
+      .mockResolvedValueOnce(firstPlan)
+      .mockResolvedValue(laterPlan);
+    mocks.getArtifactStoreStub.mockReturnValue({
+      getArtifact,
+      listLatestTodoPlansForMain: vi.fn().mockResolvedValue([]),
+      reconcileEnvironmentSidebarSlots: vi.fn().mockResolvedValue([]),
+      claimEnvironmentSidebarSlot: vi.fn().mockResolvedValue({ status: "claimed", slot: 6 }),
+      commitEnvironmentSidebarSlot: vi.fn().mockResolvedValue(true),
+      releaseEnvironmentSidebarSlotClaim: vi.fn().mockResolvedValue(true),
+    });
+    const executionCtx = createExecutionCtx();
+
+    const response = await createTestApp().request(
+      "https://example.com/api/envs",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoId: "repo-1",
+          slug: "opencode-env",
+          harness: "opencode",
+          planSelection: { mode: "specific", artifactId: "plan-1" },
+        }),
+      },
+      createOpenCodeCreateEnv() as any,
+      executionCtx as any,
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      displayName: "Implement settings",
+      sidebarSlot: 6,
+      startupPlanId: "plan-1",
+    });
+    await executionCtx.waitUntil.mock.calls[0][0];
+
+    expect(getArtifact).toHaveBeenCalledTimes(1);
+    expect(lifecycleStub.initializeAndBeginStart.mock.calls[0]?.[0]).toMatchObject({
+      displayName: "Implement settings",
+      sidebarSlot: 6,
+      startupPlanId: "plan-1",
+    });
+    expect(create.mock.calls[0]?.[1]?.TILLER_STARTUP_PLAN_DOCUMENT_B64).toBeUndefined();
+    const workspaceStub = mocks.getWorkspaceStub.mock.results[0]?.value;
+    const document = workspaceStub.writeWorkspaceFile.mock.calls.find(
+      ([path]: [string]) => path === "/.tiller/plan.md",
+    )?.[1];
+    expect(document).toContain("# First snapshot");
+    expect(document).not.toContain("# Second snapshot");
+  });
+
+  it("stores one selected-plan snapshot for scheduled creation", async () => {
+    const lifecycleStub = createLifecycleStub();
+    mocks.getEnvLifecycleStub.mockReturnValue(lifecycleStub);
+    mocks.getRunnerBackend.mockResolvedValue({
+      inspect: vi.fn().mockResolvedValue({ state: "absent" }),
+      getStatus: vi.fn().mockResolvedValue("stopped"),
+    });
+    const firstPlan = {
+      id: "plan-1",
+      repoId: "repo-1",
+      type: "plan",
+      title: "Scheduled implementation",
+      body: { markdown: "# Scheduled snapshot\n\nUse version eleven." },
+      basis: { repoId: "repo-1", mainCommit: "main-sha" },
+      status: "todo",
+      version: 11,
+      createdAt: "2026-08-13T00:00:00.000Z",
+    };
+    const getArtifact = vi.fn()
+      .mockResolvedValueOnce(firstPlan)
+      .mockResolvedValue({
+        ...firstPlan,
+        title: "Changed afterward",
+        body: { markdown: "# Changed scheduled snapshot" },
+        version: 12,
+      });
+    mocks.getArtifactStoreStub.mockReturnValue({
+      getArtifact,
+      listLatestTodoPlansForMain: vi.fn().mockResolvedValue([]),
+      reconcileEnvironmentSidebarSlots: vi.fn().mockResolvedValue([]),
+      claimEnvironmentSidebarSlot: vi.fn().mockResolvedValue({ status: "claimed", slot: 3 }),
+      commitEnvironmentSidebarSlot: vi.fn().mockResolvedValue(true),
+      releaseEnvironmentSidebarSlotClaim: vi.fn().mockResolvedValue(true),
+    });
+    const runAtMs = Date.now() + 3_600_000;
+
+    const response = await createTestApp().request(
+      "https://example.com/api/envs",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoId: "repo-1",
+          slug: "scheduled-env",
+          harness: "codex",
+          planSelection: { mode: "specific", artifactId: "plan-1" },
+          schedule: { runAtMs, timeZone: "UTC" },
+        }),
+      },
+      createOpenCodeCreateEnv({ OPENAI_API_KEY: "selected-openai-key" }) as any,
+      createExecutionCtx() as any,
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      displayName: "Scheduled implementation",
+      sidebarSlot: 3,
+      startupPlanId: "plan-1",
+    });
+    expect(getArtifact).toHaveBeenCalledTimes(1);
+    expect(lifecycleStub.initializeStoppedEnvironment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        displayName: "Scheduled implementation",
+        sidebarSlot: 3,
+        startupPlanId: "plan-1",
+      }),
+      expect.anything(),
+      expect.objectContaining({
+        plan: {
+          artifactId: "plan-1",
+          version: 11,
+          renderedPlanDocument: expect.stringContaining("# Scheduled snapshot"),
+        },
+      }),
     );
   });
 
@@ -854,7 +1076,6 @@ describe("OpenCode environment routes", () => {
         addMessage: vi.fn(),
         resolveNewExecutionPlacement: vi.fn().mockResolvedValue({ backend: "host", machineId: "machine-1" }),
         resolveRepoSessionEnvVars: vi.fn().mockResolvedValue({}),
-        revokeCloudflareMcpProxyTokensForEnv: vi.fn().mockResolvedValue(undefined),
         getRoutableHostService: vi.fn().mockResolvedValue(hostService),
       }),
     };
@@ -916,11 +1137,17 @@ describe("OpenCode environment routes", () => {
     );
 
     expect(response.status).toBe(502);
-    await expect(response.json()).resolves.toEqual({ error: "workspace cleanup failed" });
+    const body = await response.json() as { error: string; code: string; referenceId: string };
+    expect(body).toMatchObject({
+      error: expect.stringMatching(/^Tiller couldn’t restore the workspace\. Retry Start\. Reference ID: TLR-/),
+      code: "workspace_hydration_failed",
+      referenceId: expect.stringMatching(/^TLR-/),
+    });
+    expect(JSON.stringify(body)).not.toContain("workspace cleanup failed");
     expect(lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
       opId: "start-op-1",
       stepId: "workspace-sync",
-      message: "workspace cleanup failed",
+      message: body.error,
     });
     expect((await lifecycleStub.getMutableState()).harnessSettings).toEqual({
       model: "kimi-k2.7-code",
@@ -1012,7 +1239,7 @@ describe("OpenCode environment routes", () => {
     expect(lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
       opId: "start-op-1",
       stepId: "harness-launch",
-      message: "creation dispatch failed",
+      message: expect.stringMatching(/^Tiller couldn’t complete the runtime operation\. Reference ID: TLR-/),
       runnerMayExist: true,
     });
   });
@@ -1130,19 +1357,14 @@ describe("OpenCode environment routes", () => {
       .mockRejectedValueOnce(rejection)
       .mockResolvedValueOnce({ runnerId: "machine-1", backend: "host" });
     const fixture = await createOpenCodeStartFixture({ start, backend: "host" });
-    (globalThis as typeof globalThis & { __TILLER_CURRENT_UPDATE__?: unknown }).__TILLER_CURRENT_UPDATE__ = {
+    (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__ = {
       schemaVersion: 1,
-      channel: "deploy-button",
-      updateMode: "full-source",
-      sourceRepo: "paperwing-dev/tiller-hub",
-      sourceId: "hub-source",
-      version: "test",
-      label: "test",
-      managedFiles: ["package.json"],
-      selfHostRuntime: {
-        imageSourceId: fixture.runtimeSourceId,
-        sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${fixture.runtimeSourceId}`,
-      },
+      channel: "development",
+      hubVersion: "0.2.54",
+    };
+    (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__ = {
+      imageSourceId: fixture.runtimeSourceId,
+      sandboxImage: `docker.io/jamieatlason/tiller-sandbox:${fixture.runtimeSourceId}`,
     };
     const executionCtx = createExecutionCtx();
 
@@ -1173,7 +1395,8 @@ describe("OpenCode environment routes", () => {
         .toEqual([1, 61]);
       expect(mocks.refreshGitHubDefaultBranchHeadForRequest).toHaveBeenCalledTimes(1);
     } finally {
-      delete (globalThis as typeof globalThis & { __TILLER_CURRENT_UPDATE__?: unknown }).__TILLER_CURRENT_UPDATE__;
+      delete (globalThis as typeof globalThis & { __TILLER_RELEASE_INFO__?: unknown }).__TILLER_RELEASE_INFO__;
+      delete (globalThis as typeof globalThis & { __TILLER_DEVELOPMENT_RUNTIME__?: unknown }).__TILLER_DEVELOPMENT_RUNTIME__;
     }
   });
 
@@ -1204,9 +1427,37 @@ describe("OpenCode environment routes", () => {
 
     expect(response.status).toBe(200);
     await executionCtx.waitUntil.mock.calls[0][0];
-    const encoded = fixture.start.mock.calls[0]?.[1]?.TILLER_STARTUP_PLAN_DOCUMENT_B64;
-    expect(Buffer.from(encoded, "base64").toString("utf8")).toBe(capturedPlan);
+    expect(fixture.start.mock.calls[0]?.[1]?.TILLER_STARTUP_PLAN_DOCUMENT_B64).toBeUndefined();
+    const workspaceStub = mocks.getWorkspaceStub.mock.results[0]?.value;
+    expect(workspaceStub.writeWorkspaceFile).toHaveBeenCalledWith(
+      "/.tiller/plan.md",
+      capturedPlan,
+    );
     expect(artifactStore.getArtifact).not.toHaveBeenCalled();
+  });
+
+  it("keeps the saved plan association while starting fresh without an implementation prompt", async () => {
+    const fixture = await createOpenCodeStartFixture({ startupPlanId: "plan-1" });
+    const executionCtx = createExecutionCtx();
+
+    const response = await fixture.app.request(
+      "https://hub.example.com/api/envs/opencode-env/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ implementationMode: "fresh" }),
+      },
+      fixture.env as any,
+      executionCtx as any,
+    );
+
+    expect(response.status).toBe(200);
+    await executionCtx.waitUntil.mock.calls[0][0];
+    expect(fixture.start.mock.calls[0]?.[1]?.TILLER_STARTUP_PLAN_DOCUMENT_B64).toBeUndefined();
+    const workspaceStub = mocks.getWorkspaceStub.mock.results[0]?.value;
+    expect(workspaceStub.clearWorkspacePlanFile).toHaveBeenCalledTimes(1);
+    const definition = JSON.parse(await fixture.env.ENVS_KV.get("envdef:opencode-env"));
+    expect(definition.startupPlanId).toBe("plan-1");
   });
 
   it("rejects incomplete restart settings before claiming", async () => {
@@ -1254,13 +1505,45 @@ describe("OpenCode environment routes", () => {
     expect(fixture.lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
       opId: "start-op-1",
       stepId: "harness-launch",
-      message: "Sol capacity unavailable for this account",
+      message: expect.stringMatching(/^Tiller couldn’t complete the runtime operation\. Reference ID: TLR-/),
       runnerMayExist: true,
     });
     expect((await fixture.lifecycleStub.getMutableState()).harnessSettings).toEqual({
       model: "gpt-5.6-sol",
       effort: "xhigh",
     });
+  });
+
+  it("makes a Cloudflare allocation timeout actionable without exposing provider detail", async () => {
+    const providerDetail = "there is no container instance that can be provided to this durable object";
+    const start = vi.fn().mockRejectedValue(new Error(providerDetail));
+    const fixture = await createOpenCodeStartFixture({ start });
+    const executionCtx = createExecutionCtx();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = await fixture.app.request(
+        "https://hub.example.com/api/envs/opencode-env/start",
+        { method: "POST" },
+        fixture.env as any,
+        executionCtx as any,
+      );
+
+      expect(response.status).toBe(200);
+      await executionCtx.waitUntil.mock.calls[0][0];
+      expect(fixture.lifecycleStub.reportStartupFailure).toHaveBeenCalledWith({
+        opId: "start-op-1",
+        stepId: "harness-launch",
+        message: expect.stringMatching(
+          /^Tiller couldn’t start the environment runtime\. Retry Start\. Reference ID: TLR-/,
+        ),
+        runnerMayExist: true,
+      });
+      expect(JSON.stringify(fixture.lifecycleStub.reportStartupFailure.mock.calls))
+        .not.toContain(providerDetail);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("retries an exact startup-failure acknowledgement when the first response is lost", async () => {
@@ -1282,7 +1565,7 @@ describe("OpenCode environment routes", () => {
     expect(fixture.lifecycleStub.reportStartupFailure).toHaveBeenLastCalledWith({
       opId: "start-op-1",
       stepId: "harness-launch",
-      message: "runner dispatch failed",
+      message: expect.stringMatching(/^Tiller couldn’t complete the runtime operation\. Reference ID: TLR-/),
       runnerMayExist: true,
     });
   });

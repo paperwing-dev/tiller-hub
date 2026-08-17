@@ -28,7 +28,7 @@ describe("resolveCodexExecution", () => {
     }
   });
 
-  it.each(targets)("uses the surface-appropriate direct API profile for $backend", (target) => {
+  it.each(targets)("uses the surface-appropriate API profile for $backend", (target) => {
     expect(resolveCodexExecution({
       ...target,
       surface: "plan-writer",
@@ -39,6 +39,14 @@ describe("resolveCodexExecution", () => {
     expect(resolveCodexExecution({
       ...target,
       surface: "implementor",
+      authPreference: "api-key",
+      subscriptionStatus: "connected",
+      apiKeyAvailable: true,
+    })).toMatchObject({ kind: "ready", profile: { kind: "api-key-app-server", ...target } });
+
+    expect(resolveCodexExecution({
+      ...target,
+      surface: "plan-reviewer",
       authPreference: "api-key",
       subscriptionStatus: "connected",
       apiKeyAvailable: true,

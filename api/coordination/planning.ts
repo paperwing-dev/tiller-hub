@@ -5,6 +5,28 @@ import type {
 } from "./types";
 
 export const MAX_PLAN_MARKDOWN_BYTES = 1024 * 1024;
+export const PLAN_MARKDOWN_NORMALIZATION_VERSION = 1 as const;
+
+export type PlanMarkdownNormalizationVersion =
+  typeof PLAN_MARKDOWN_NORMALIZATION_VERSION;
+
+/** Canonical representation used by every plan-content writer and comparison. */
+export function normalizePlanMarkdown(markdown: string): string {
+  const lineNormalized = markdown.replace(/\r\n?/g, "\n");
+  if (!lineNormalized.trim()) return "";
+  const normalized = lineNormalized.replace(/(?:\n[ \t]*)+$/u, "");
+  return normalized ? `${normalized}\n` : "";
+}
+
+export function normalizePlanMarkdownAtVersion(
+  markdown: string,
+  version: PlanMarkdownNormalizationVersion,
+): string {
+  if (version !== PLAN_MARKDOWN_NORMALIZATION_VERSION) {
+    throw new Error(`Unsupported plan Markdown normalization version: ${version}`);
+  }
+  return normalizePlanMarkdown(markdown);
+}
 
 const ATX_HEADING_PATTERN = /^[ \t]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*$/u;
 const FENCE_PATTERN = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/u;

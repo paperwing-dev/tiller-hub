@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { authenticateAccessRequest } from "../auth";
 import type { HonoEnv } from "../types";
 import { getDurableObjectStub } from "../durable-object";
 
@@ -19,10 +18,9 @@ voiceApp.get("/api/voice/session", async (c) => {
     return c.json({ error: "Missing sessionId" }, 400);
   }
 
-  try {
-    await authenticateAccessRequest(c.req.raw, c.env);
-  } catch {
-    return c.json({ error: "Unauthorized" }, 401);
+  const authorization = c.get("authorization");
+  if (!authorization || authorization.kind !== "global") {
+    return c.json({ error: "Global authority required" }, 403);
   }
 
   const stub = getDurableObjectStub<DurableObjectStub>(

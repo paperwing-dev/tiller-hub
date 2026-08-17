@@ -29,6 +29,7 @@ export function buildGitHubPublishJobMeta(args: {
     workspaceDirty: null,
     workspaceNeedsAttention: null,
     workspaceLastSyncedAt: null,
+    implementorAttentionToken: null,
     baseMainCommit: null,
     lastKnownMainCommit: null,
     scmOperationType: null,

@@ -10,6 +10,10 @@ const mocks = vi.hoisted(() => ({
     operation: null as any,
   },
   getArtifactStoreStub: vi.fn(),
+  getRetainedTerminalPlanCleanupWork: vi.fn(),
+  updateArtifactStatus: vi.fn(),
+  broadcastPlanArtifactUpdated: vi.fn(),
+  broadcastPlanArtifactUpdatedHint: vi.fn(),
   getEnvLifecycleStub: vi.fn(),
   getGitHubJobStub: vi.fn(),
   getWorkspaceStub: vi.fn(),
@@ -54,6 +58,10 @@ vi.mock("../helpers", () => ({
   getEnvLifecycleStub: mocks.getEnvLifecycleStub,
   getGitHubJobStub: mocks.getGitHubJobStub,
   getWorkspaceStub: mocks.getWorkspaceStub,
+}));
+
+vi.mock("../plan-artifact-hints", () => ({
+  broadcastPlanArtifactUpdatedHint: mocks.broadcastPlanArtifactUpdatedHint,
 }));
 
 vi.mock("../env/hub-url", () => ({
@@ -110,7 +118,8 @@ vi.mock("../github/metadata-validation", () => ({
   assertSupportedGitHubBaseMetadata: mocks.assertSupportedGitHubBaseMetadata,
 }));
 
-vi.mock("../github/app", () => ({
+vi.mock("../github/app", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github/app")>()),
   mintGitHubInstallationToken: mocks.mintGitHubInstallationToken,
   resolveGitHubAppBotCommitIdentity: mocks.resolveGitHubAppBotCommitIdentity,
 }));
@@ -193,7 +202,9 @@ describe("GitHub draft PR publish service", () => {
     mocks.projectEnvMetaForAction.mockImplementation(async () => ({
       meta: mocks.state.meta,
     }));
-    mocks.getHub.mockReturnValue({});
+    mocks.getHub.mockReturnValue({
+      broadcastPlanArtifactUpdated: mocks.broadcastPlanArtifactUpdated,
+    });
     mocks.isLifecycleStopInProgress.mockReturnValue(false);
     mocks.createRunner.mockResolvedValue(undefined);
     mocks.destroyRunner.mockResolvedValue(undefined);
@@ -239,10 +250,31 @@ describe("GitHub draft PR publish service", () => {
     });
     mocks.getArtifactStoreStub.mockReturnValue({
       getArtifact: vi.fn().mockResolvedValue({
+        id: "plan-1",
         repoId: "repo-1",
+        type: "plan",
+        status: "todo",
         title: "Implementation Plan: Improve draft PR descriptions",
         body: "## Summary\n\nExplain the feature and its GitHub changes.\n\n## Implementation\n\nInternal details.",
       }),
+      getRetainedTerminalPlanCleanupWork: mocks.getRetainedTerminalPlanCleanupWork,
+      updateArtifactStatus: mocks.updateArtifactStatus,
+    });
+    mocks.getRetainedTerminalPlanCleanupWork.mockResolvedValue({
+      terminalWriter: null,
+      runtimeCleanupRuns: [],
+      cleanupTargets: [],
+    });
+    mocks.updateArtifactStatus.mockResolvedValue({
+      artifact: {
+        id: "plan-1",
+        repoId: "repo-1",
+        type: "plan",
+        status: "completed",
+      },
+      terminalWriter: null,
+      runtimeCleanupRuns: [],
+      cleanupTargets: [],
     });
     mocks.asPlanArtifact.mockImplementation((artifact) => artifact);
     mocks.renderArtifactBodyMarkdown.mockImplementation((body) => String(body));
@@ -312,7 +344,7 @@ describe("GitHub draft PR publish service", () => {
     });
   });
 
-  it("carries feature content, change statuses, and bot identity through publish finalization", async () => {
+  it("carries the complete plan and bot identity through publish finalization", async () => {
     const started = await startGitHubDraftPrPublish({
       env: {} as any,
       requestUrl:
@@ -329,17 +361,14 @@ describe("GitHub draft PR publish service", () => {
       jobSlug: expect.stringContaining("github-publish-demo-env-"),
       executionPlacement: { backend: "cf", machineId: null },
     });
-    expect(operation.pullRequestContent.featureMarkdown).toContain(
-      "3 files changed (1 added, 1 modified, 1 deleted).",
+    expect(operation.pullRequestContent.featureMarkdown).toBe(
+      "## Summary\n\nExplain the feature and its GitHub changes.\n\n## Implementation\n\nInternal details.",
     );
-    expect(operation.pullRequestContent.featureMarkdown).toContain(
-      "- Added `src/new.ts`",
-    );
-    expect(operation.pullRequestContent.featureMarkdown).toContain(
-      "- Modified `src/existing.ts`",
-    );
-    expect(operation.pullRequestContent.featureMarkdown).toContain(
-      "- Deleted `src/old.ts`",
+    expect(mocks.createGitHubBridgeRecord).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        subject: expect.objectContaining({ tokenAccess: "write" }),
+      }),
     );
     expect(mocks.startJob).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -377,16 +406,75 @@ describe("GitHub draft PR publish service", () => {
         head: "tiller/env/demo-env",
         base: "main",
         draft: true,
-        body: expect.stringContaining(
-          "3 files changed (1 added, 1 modified, 1 deleted).",
-        ),
+        body: expect.stringContaining("## Implementation\n\nInternal details."),
       }),
     );
     const prBody = mocks.createPullRequest.mock.calls[0]?.[1].body as string;
     expect(prBody).toContain("Explain the feature and its GitHub changes.");
-    expect(prBody).toContain("- Added `src/new.ts`");
-    expect(prBody).toContain("- Modified `src/existing.ts`");
-    expect(prBody).toContain("- Deleted `src/old.ts`");
+    expect(prBody).toContain("## Implementation\n\nInternal details.");
+    expect(prBody).not.toContain("3 files changed");
+    expect(prBody).not.toContain("- Added `src/new.ts`");
+    expect(mocks.updateArtifactStatus).toHaveBeenCalledWith({
+      repoId: "repo-1",
+      id: "plan-1",
+      status: "completed",
+    });
+    expect(mocks.broadcastPlanArtifactUpdatedHint).toHaveBeenCalledWith(
+      expect.anything(),
+      "repo-1",
+      "plan-1",
+    );
+  });
+
+  it("reuses durable cleanup ownership for an already-completed startup plan", async () => {
+    const retainedRun = { runId: "retained-reviewer-run" } as any;
+    const retainedWriter = { generation: 3 } as any;
+    const reviewerTarget = { cleanupId: "cleanup-reviewer", ownerId: retainedRun.runId } as any;
+    const writerTarget = { cleanupId: "cleanup-writer", ownerId: "writer-3" } as any;
+    mocks.getRetainedTerminalPlanCleanupWork.mockResolvedValue({
+      terminalWriter: retainedWriter,
+      runtimeCleanupRuns: [retainedRun],
+      cleanupTargets: [reviewerTarget, writerTarget],
+    });
+    mocks.getArtifactStoreStub.mockReturnValue({
+      getArtifact: vi.fn().mockResolvedValue({
+        id: "plan-1",
+        repoId: "repo-1",
+        type: "plan",
+        status: "completed",
+        title: "Implementation Plan: Improve draft PR descriptions",
+        body: "## Summary\n\nExplain the feature and its GitHub changes.",
+      }),
+      getRetainedTerminalPlanCleanupWork: mocks.getRetainedTerminalPlanCleanupWork,
+      updateArtifactStatus: mocks.updateArtifactStatus,
+    });
+
+    const publish = async () => {
+      expect((await startGitHubDraftPrPublish({
+        env: {} as any,
+        requestUrl: "https://hub.example.test/api/envs/demo-env/github/publish-draft-pr",
+        slug: "demo-env",
+      })).status).toBe(202);
+      const operation = mocks.beginGitHubPublishOperation.mock.calls.at(-1)?.[0];
+      return handleGitHubDraftPrPublishResult({
+        env: {} as any,
+        slug: "demo-env",
+        operationId: operation.operationId,
+        body: {
+          status: "published",
+          branchHeadSha: "published-head-sha",
+          callbackToken: operation.callbackToken,
+          workspaceHash: operation.workspaceHash,
+        },
+      });
+    };
+
+    expect((await publish()).status).toBe(200);
+    mocks.state.meta = createMeta();
+    expect((await publish()).status).toBe(200);
+    expect(mocks.updateArtifactStatus).not.toHaveBeenCalled();
+    expect(mocks.broadcastPlanArtifactUpdatedHint).not.toHaveBeenCalled();
+    expect(mocks.getRetainedTerminalPlanCleanupWork).toHaveBeenCalledTimes(2);
   });
 
   it("pins a machine publish runtime before dispatch and cleans up that exact machine", async () => {
@@ -437,6 +525,7 @@ describe("GitHub draft PR publish service", () => {
     });
 
     expect(completed.status).toBe(200);
+    expect(mocks.updateArtifactStatus).not.toHaveBeenCalled();
     expect(mocks.destroyRunner).toHaveBeenCalledWith(
       expect.objectContaining({
         executionPlacement: { backend: "host", machineId: "machine-1" },
@@ -448,6 +537,135 @@ describe("GitHub draft PR publish service", () => {
           desiredState: "absent",
         },
       },
+    );
+  });
+
+  it("uses a workflow-capable bridge token only when workflow files change", async () => {
+    mocks.getWorkspaceStub.mockReturnValue({
+      getHashedManifest: vi.fn().mockResolvedValue([
+        { path: "/.github/workflows/ci.yml", size: 20, sha256: "workflow-file-hash" },
+      ]),
+      readGitHubDeletedWorkspacePaths: vi.fn().mockResolvedValue([]),
+    });
+    mocks.mintGitHubInstallationToken.mockResolvedValue({ token: "publish-token" });
+
+    const started = await startGitHubDraftPrPublish({
+      env: {} as any,
+      requestUrl: "https://hub.example.test/api/envs/demo-env/github/publish-draft-pr",
+      slug: "demo-env",
+    });
+
+    expect(started.status).toBe(202);
+    expect(mocks.mintGitHubInstallationToken).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ fullName: "example/repo" }),
+      { access: "publish" },
+    );
+    expect(mocks.resolveGitHubAppBotCommitIdentity).toHaveBeenCalledWith(
+      expect.anything(),
+      "publish-token",
+    );
+    expect(mocks.createGitHubBridgeRecord).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        subject: expect.objectContaining({ tokenAccess: "publish" }),
+      }),
+    );
+  });
+
+  it("moves an unpublished legacy environment onto an incarnation-specific branch", async () => {
+    mocks.state.meta = {
+      ...mocks.state.meta,
+      incarnationId: "env-12345678-90ab-cdef-1234-567890abcdef",
+      githubHeadCommitSha: null,
+      githubPrNumber: null,
+      githubPrUrl: null,
+      githubPrState: null,
+      githubPublishStatus: "failed",
+      workspaceNeedsAttention: true,
+    };
+
+    const started = await startGitHubDraftPrPublish({
+      env: {} as any,
+      requestUrl: "https://hub.example.test/api/envs/demo-env/github/publish-draft-pr",
+      slug: "demo-env",
+    });
+
+    expect(started.status).toBe(202);
+    expect(mocks.beginGitHubPublishOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        branch: "tiller/env/demo-env-1234567890ab",
+        expectedPriorHead: null,
+      }),
+    );
+    expect(mocks.startJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        TILLER_GITHUB_BRANCH: "tiller/env/demo-env-1234567890ab",
+      }),
+    );
+  });
+
+  it("keeps an unconfirmed push rejection retryable", async () => {
+    const started = await startGitHubDraftPrPublish({
+      env: {} as any,
+      requestUrl: "https://hub.example.test/api/envs/demo-env/github/publish-draft-pr",
+      slug: "demo-env",
+    });
+    const operation = mocks.beginGitHubPublishOperation.mock.calls[0]?.[0];
+
+    const completed = await handleGitHubDraftPrPublishResult({
+      env: {} as any,
+      slug: "demo-env",
+      operationId: operation.operationId,
+      body: {
+        status: "failed",
+        error: "Failed to push tiller/env/demo-env: remote: Repository not found.",
+        code: "branch_changed_on_github",
+        callbackToken: operation.callbackToken,
+        workspaceHash: operation.workspaceHash,
+      },
+    });
+
+    expect(started.status).toBe(202);
+    expect(completed.status).toBe(200);
+    expect(mocks.finishGitHubPublishOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        patch: expect.objectContaining({
+          workspaceNeedsAttention: false,
+          branchStatus: "ready-to-merge",
+        }),
+      }),
+    );
+  });
+
+  it("requires attention when a publish confirms that the GitHub branch moved", async () => {
+    await startGitHubDraftPrPublish({
+      env: {} as any,
+      requestUrl: "https://hub.example.test/api/envs/demo-env/github/publish-draft-pr",
+      slug: "demo-env",
+    });
+    const operation = mocks.beginGitHubPublishOperation.mock.calls[0]?.[0];
+
+    await handleGitHubDraftPrPublishResult({
+      env: {} as any,
+      slug: "demo-env",
+      operationId: operation.operationId,
+      body: {
+        status: "failed",
+        error: "GitHub branch tiller/env/demo-env moved from old-sha to new-sha.",
+        code: "branch_changed_on_github",
+        callbackToken: operation.callbackToken,
+        workspaceHash: operation.workspaceHash,
+      },
+    });
+
+    expect(mocks.finishGitHubPublishOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        patch: expect.objectContaining({
+          workspaceNeedsAttention: true,
+          branchStatus: "needs-attention",
+        }),
+      }),
     );
   });
 

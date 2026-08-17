@@ -28,7 +28,6 @@ describe("destroyEnv", () => {
     const kvDelete = vi.fn().mockResolvedValue(undefined);
     const destroyWorkspace = vi.fn().mockResolvedValue(undefined);
     const finalizeDeletion = vi.fn().mockResolvedValue(undefined);
-    const revokeTokens = vi.fn().mockResolvedValue(undefined);
     let attempts = 0;
     const requestLocalRunner = vi.fn().mockImplementation(async (
       _machineId: string,
@@ -86,7 +85,6 @@ describe("destroyEnv", () => {
       broadcastEnvRemove: vi.fn().mockResolvedValue(undefined),
       getAllSessions: vi.fn().mockResolvedValue([]),
       deleteSession: vi.fn(),
-      revokeCloudflareMcpProxyTokensForEnv: revokeTokens,
     };
     const initial = {
       commandGeneration: 1,
@@ -110,7 +108,6 @@ describe("destroyEnv", () => {
     expect(requestLocalRunner).toHaveBeenCalledTimes(2);
     expect(requestLocalRunner.mock.calls.map((call) => call[3].commandGeneration))
       .toEqual([1, 61]);
-    expect(revokeTokens).toHaveBeenCalledTimes(1);
     expect(destroyWorkspace).toHaveBeenCalledTimes(1);
     expect(finalizeDeletion).toHaveBeenCalledTimes(1);
   });
@@ -162,7 +159,6 @@ describe("destroyEnv", () => {
       broadcastEnvRemove: broadcast,
       getAllSessions,
       deleteSession: vi.fn(),
-      revokeCloudflareMcpProxyTokensForEnv: vi.fn(),
     };
 
     await expect(destroyEnv(env, meta, hub)).rejects.toThrow();
@@ -219,7 +215,6 @@ describe("destroyEnv", () => {
       broadcastEnvRemove: broadcast,
       getAllSessions,
       deleteSession: vi.fn(),
-      revokeCloudflareMcpProxyTokensForEnv: vi.fn(),
     };
 
     await destroyEnv(env, meta, hub);
@@ -265,7 +260,6 @@ describe("destroyEnv", () => {
       broadcastEnvRemove: broadcast,
       getAllSessions: vi.fn().mockResolvedValue([]),
       deleteSession: vi.fn(),
-      revokeCloudflareMcpProxyTokensForEnv: vi.fn(),
     };
 
     await expect(destroyEnv(env, createEnvMeta(), hub)).rejects.toThrow("durable finalization unavailable");

@@ -19,6 +19,11 @@ export function buildOpenCodeRuntimeEnv(options: {
     TILLER_OPENCODE_MODEL_ID: auth.model,
     TILLER_OPENCODE_MODEL_ALIAS: model.binding.modelAlias,
     TILLER_OPENCODE_MODEL_LABEL: model.label,
+    TILLER_OPENCODE_MODEL_CONTEXT_LIMIT: String(model.limits.context),
+    ...(model.limits.input
+      ? { TILLER_OPENCODE_MODEL_INPUT_LIMIT: String(model.limits.input) }
+      : {}),
+    TILLER_OPENCODE_MODEL_OUTPUT_LIMIT: String(model.limits.output),
     TILLER_OPENCODE_PROVIDER_KIND: model.binding.provider,
     TILLER_OPENCODE_PROVIDER_ALIAS: model.binding.providerAlias,
     TILLER_OPENCODE_PROVIDER_LABEL: model.binding.providerLabel,

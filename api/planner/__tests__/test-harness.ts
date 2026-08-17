@@ -43,20 +43,42 @@ export class FakeSqlStorage {
 
 export class FakeStorage {
   readonly sql = new FakeSqlStorage();
+  private alarmAt: number | null = null;
 
   transactionSync<T>(closure: () => T): T {
     return closure();
   }
+
+  async getAlarm(): Promise<number | null> {
+    return this.alarmAt;
+  }
+
+  async setAlarm(scheduledTime: number | Date): Promise<void> {
+    this.alarmAt = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+  }
+
+  async deleteAlarm(): Promise<void> {
+    this.alarmAt = null;
+  }
+}
+
+function durableContext(storage: FakeStorage) {
+  return {
+    storage,
+    waitUntil(promise: Promise<unknown>) {
+      void promise.catch(() => undefined);
+    },
+  };
 }
 
 export function createStore() {
   const storage = new FakeStorage();
-  return new ArtifactStoreDO({ storage } as any, {} as any);
+  return new ArtifactStoreDO(durableContext(storage) as any, {} as any);
 }
 
 export function createThread() {
   const storage = new FakeStorage();
-  return new ThreadDO({ storage } as any, {} as any);
+  return new ThreadDO(durableContext(storage) as any, {} as any);
 }
 
 export function asAsyncStub<T extends object>(target: T): T {

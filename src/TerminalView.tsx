@@ -9,24 +9,87 @@ import { useResolvedTheme } from "./theme";
 import {
   TerminalRecoveryController,
   type DurableTerminalMessage,
+  type TerminalRecoveryFaultCode,
   type TerminalRecoveryState,
 } from "./terminal-recovery";
+import { BrowserTerminalMetricRecorder } from "./browser-terminal-metrics";
 import LoadingIndicator from "./LoadingIndicator";
 
 export const TERMINAL_MINIMUM_CONTRAST_RATIO = 4.5;
+export const TERMINAL_DEFAULT_FONT_SIZE = 12;
+export const TERMINAL_FONT_SIZE_STORAGE_KEY = "tiller:terminal-font-size";
+
+const TERMINAL_FONT_SIZE_CHANGE_EVENT = "tiller:terminal-font-size-change";
+const TERMINAL_MIN_FONT_SIZE = 8;
+const TERMINAL_MAX_FONT_SIZE = 24;
+export const TERMINAL_CHECKPOINT_INTERVAL_MS = 2_000;
+const MAX_PENDING_INPUT_METRIC_SAMPLES = 1_024;
+const RECENT_OUTPUT_NOTICE_DURATION_MS = 8_000;
+const RECENT_OUTPUT_NOTICE = "Showing recent output; older terminal output was skipped.";
 
 // LRU cache for serialized terminal state (max 8 sessions)
 const MAX_CACHE = 8;
-const terminalCache = new Map<string, { serialized: string; lastSeq: number }>();
-const RECENT_OUTPUT_NOTICE = "Showing recent output; older missed output was skipped.";
+interface TerminalCheckpoint {
+  serialized: string;
+  seq: number;
+}
 
-function cacheSet(sessionId: string, serialized: string, lastSeq: number) {
+const terminalCache = new Map<string, TerminalCheckpoint>();
+
+type TerminalFontSizeShortcut = "increase" | "decrease" | "reset";
+
+function clampTerminalFontSize(value: number): number {
+  return Math.min(TERMINAL_MAX_FONT_SIZE, Math.max(TERMINAL_MIN_FONT_SIZE, Math.round(value)));
+}
+
+function readTerminalFontSize(defaultFontSize: number): number {
+  try {
+    const stored = window.localStorage.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY);
+    if (stored !== null) {
+      const parsed = Number(stored);
+      if (Number.isFinite(parsed)) return clampTerminalFontSize(parsed);
+    }
+  } catch {
+    // Storage may be unavailable in privacy-restricted browser contexts.
+  }
+  return clampTerminalFontSize(defaultFontSize);
+}
+
+function getTerminalFontSizeShortcut(event: KeyboardEvent): TerminalFontSizeShortcut | null {
+  if ((!event.metaKey && !event.ctrlKey) || event.altKey) return null;
+  if (event.key === "+" || event.key === "=") return "increase";
+  if (event.key === "-" || event.key === "_") return "decrease";
+  if (event.key === "0") return "reset";
+  return null;
+}
+
+export function translateTerminalKeyEvent(event: KeyboardEvent): string | null {
+  if (
+    event.type !== "keydown"
+    || event.key !== "Backspace"
+    || !event.metaKey
+    || event.shiftKey
+    || event.altKey
+    || event.ctrlKey
+    || event.isComposing
+  ) {
+    return null;
+  }
+  return "\x15";
+}
+
+function cacheSet(sessionId: string, checkpoint: TerminalCheckpoint) {
   terminalCache.delete(sessionId); // re-insert at end for LRU order
-  terminalCache.set(sessionId, { serialized, lastSeq });
+  terminalCache.set(sessionId, checkpoint);
   if (terminalCache.size > MAX_CACHE) {
     const oldest = terminalCache.keys().next().value;
     terminalCache.delete(oldest!);
   }
+}
+
+function readTerminalMetricsOverride(): boolean {
+  try { return window.localStorage.getItem("tiller:terminal-metrics") === "true"; }
+  catch { return false; }
 }
 
 export interface TerminalViewHandle {
@@ -34,16 +97,27 @@ export interface TerminalViewHandle {
   recover: () => void;
   clear: () => void;
   refit: () => void;
+  markInputEnqueued: (inputSeq: number) => void;
+  markInputAcknowledged: (inputSeq: number, ok: boolean) => void;
+}
+
+export interface TerminalResizeRequest {
+  /** True takes the controller lease; false reports a passive layout change. */
+  claim?: boolean;
 }
 
 interface TerminalViewProps {
   session: StoredSession;
   hubUrl: string;
   fontSize?: number;
+  surface?: "default" | "implementation";
   updateLastSeq?: (sessionId: string, seq: number) => void;
   interactive?: boolean;
+  metricsEnabled?: boolean;
+  visible?: boolean;
   onInput?: (data: string) => void;
-  onResize?: (cols: number, rows: number) => void;
+  onPaste?: (text: string) => void;
+  onResize?: (cols: number, rows: number, request?: TerminalResizeRequest) => void;
   onRecoveryState?: (state: TerminalRecoveryState) => void;
   onDetach?: () => void;
   onDurableMessageComplete?: (message: DurableTerminalMessage) => void;
@@ -104,10 +178,14 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
   {
     session,
     hubUrl,
-    fontSize = 15,
+    fontSize = TERMINAL_DEFAULT_FONT_SIZE,
+    surface = "default",
     updateLastSeq,
     interactive = false,
+    metricsEnabled = false,
+    visible = true,
     onInput,
+    onPaste,
     onResize,
     onRecoveryState,
     onDetach,
@@ -117,43 +195,66 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
-  const serializeRef = useRef<SerializeAddon | null>(null);
   const recoveryRef = useRef<TerminalRecoveryController | null>(null);
   const lastSeqRef = useRef(0);
-  const stableSerializedRef = useRef("");
-  const fallbackSessionRef = useRef(session.id);
-  const fallbackAttemptedRef = useRef(false);
-  const fallbackPendingRef = useRef(false);
+  const checkpointRef = useRef<TerminalCheckpoint | null>(null);
+  const recentOutputResetSessionRef = useRef<string | null>(null);
+  const quietRecoveryRef = useRef(false);
   const [loading, setLoading] = useState(true);
-  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyFault, setHistoryFault] = useState<TerminalRecoveryFaultCode | null>(null);
   const [historyNotice, setHistoryNotice] = useState<string | null>(null);
   const [recoveryEpoch, setRecoveryEpoch] = useState(0);
   const [showNewOutput, setShowNewOutput] = useState(false);
   const userScrolledUpRef = useRef(false);
   const interactiveRef = useRef(interactive);
+  const [metricsOverrideEnabled] = useState(readTerminalMetricsOverride);
+  const metricsEnabledRef = useRef(metricsEnabled || metricsOverrideEnabled);
+  const visibleRef = useRef(visible);
+  const previousVisibleRef = useRef(visible);
   const onInputRef = useRef(onInput);
+  const onPasteRef = useRef(onPaste);
   const onResizeRef = useRef(onResize);
   const onRecoveryStateRef = useRef(onRecoveryState);
   const onDurableMessageCompleteRef = useRef(onDurableMessageComplete);
   const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const scheduleFitRef = useRef<(() => void) | null>(null);
+  const scheduleClaimRef = useRef<(() => void) | null>(null);
+  const scheduleCheckpointRef = useRef<(() => void) | null>(null);
+  const recordBrowserMetricRef = useRef<((label: string, durationMs: number) => void) | null>(null);
+  const browserMetricRecorderRef = useRef<BrowserTerminalMetricRecorder | null>(null);
+  const pendingInputAckMetricsRef = useRef(new Map<number, number>());
+  const pendingInputPaintMetricsRef = useRef(new Map<number, number>());
   const resolvedTheme = useResolvedTheme();
 
   interactiveRef.current = interactive;
+  metricsEnabledRef.current = metricsEnabled || metricsOverrideEnabled;
+  visibleRef.current = visible;
   onInputRef.current = onInput;
+  onPasteRef.current = onPaste;
   onResizeRef.current = onResize;
   onRecoveryStateRef.current = onRecoveryState;
   onDurableMessageCompleteRef.current = onDurableMessageComplete;
 
-  if (fallbackSessionRef.current !== session.id) {
-    fallbackSessionRef.current = session.id;
-    fallbackAttemptedRef.current = false;
-    fallbackPendingRef.current = false;
-  }
-
   useEffect(() => {
+    recentOutputResetSessionRef.current = null;
     setHistoryNotice(null);
   }, [session.id]);
+
+  useEffect(() => {
+    if (!historyNotice) return;
+    const timer = window.setTimeout(
+      () => setHistoryNotice(null),
+      RECENT_OUTPUT_NOTICE_DURATION_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [historyNotice]);
+
+  useEffect(() => {
+    if (metricsEnabledRef.current) return;
+    pendingInputAckMetricsRef.current.clear();
+    pendingInputPaintMetricsRef.current.clear();
+    browserMetricRecorderRef.current?.reset();
+  }, [metricsEnabled, metricsOverrideEnabled]);
 
   // Re-theme the live terminal when the app theme changes.
   useEffect(() => {
@@ -168,42 +269,121 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
     userScrolledUpRef.current = false;
   }, []);
 
-  const recover = useCallback(() => {
+  const restartFromRecentOutput = useCallback(() => {
+    const controller = recoveryRef.current;
+    if (!controller) return;
+    const state = controller.recoveryState;
+    if (
+      state.status !== "fault"
+      || (state.code !== "overflow" && state.code !== "deadline")
+    ) return;
+    terminalCache.delete(session.id);
+    checkpointRef.current = null;
+    recentOutputResetSessionRef.current = session.id;
+    quietRecoveryRef.current = false;
+    setHistoryFault(null);
+    setHistoryNotice(null);
+    setLoading(true);
+    onRecoveryStateRef.current?.({ status: "recovering" });
+    setRecoveryEpoch((epoch) => epoch + 1);
+  }, [session.id]);
+
+  const retryHistory = useCallback(() => {
+    const controller = recoveryRef.current;
+    if (!controller) return;
+    if (
+      controller.recoveryState.status === "fault"
+      && controller.recoveryState.code === "overflow"
+    ) {
+      restartFromRecentOutput();
+      return;
+    }
+    controller.retry();
+  }, [restartFromRecentOutput]);
+
+  const recover = useCallback((quiet = false) => {
     const controller = recoveryRef.current;
     if (!controller) return;
     const state = controller.recoveryState;
     if (state.status !== "fault") {
+      quietRecoveryRef.current = quiet && state.status === "ready";
       controller.recoverGap();
       return;
     }
+    quietRecoveryRef.current = false;
     if (state.code === "fetch_failed" || state.code === "deadline") controller.retry();
   }, []);
 
   useEffect(() => {
-    if (!interactive || !lastSizeRef.current) return;
-    onResize?.(lastSizeRef.current.cols, lastSizeRef.current.rows);
-  }, [interactive, onResize]);
+    if (!interactive || !visible || document.hidden || !document.hasFocus()) return;
+    scheduleClaimRef.current?.();
+  }, [interactive, visible]);
+
+  useEffect(() => {
+    const wasVisible = previousVisibleRef.current;
+    previousVisibleRef.current = visible;
+    if (!wasVisible && visible) {
+      scheduleFitRef.current?.();
+      if (interactive && !document.hidden && document.hasFocus()) {
+        scheduleClaimRef.current?.();
+      }
+    }
+  }, [interactive, visible]);
 
   useImperativeHandle(ref, () => ({
     acceptMessage: (message) => recoveryRef.current?.acceptLive(message),
-    recover,
+    recover: () => recover(false),
     refit: () => scheduleFitRef.current?.(),
     clear: () => {
       termRef.current?.clear();
-      try {
-        stableSerializedRef.current = serializeRef.current?.serialize() ?? "";
-      } catch {
-        // A user clear remains local even if serialization is unavailable.
+      scheduleCheckpointRef.current?.();
+    },
+    markInputEnqueued: (inputSeq) => {
+      if (!metricsEnabledRef.current) return;
+      const startedAt = performance.now();
+      if (pendingInputAckMetricsRef.current.size >= MAX_PENDING_INPUT_METRIC_SAMPLES) {
+        const oldest = pendingInputAckMetricsRef.current.keys().next().value;
+        if (oldest !== undefined) pendingInputAckMetricsRef.current.delete(oldest);
+      }
+      if (pendingInputPaintMetricsRef.current.size >= MAX_PENDING_INPUT_METRIC_SAMPLES) {
+        const oldest = pendingInputPaintMetricsRef.current.keys().next().value;
+        if (oldest !== undefined) pendingInputPaintMetricsRef.current.delete(oldest);
+      }
+      pendingInputAckMetricsRef.current.set(inputSeq, startedAt);
+      pendingInputPaintMetricsRef.current.set(inputSeq, startedAt);
+    },
+    markInputAcknowledged: (inputSeq, ok) => {
+      const startedAt = pendingInputAckMetricsRef.current.get(inputSeq);
+      pendingInputAckMetricsRef.current.delete(inputSeq);
+      if (!ok) pendingInputPaintMetricsRef.current.delete(inputSeq);
+      if (ok && startedAt !== undefined) {
+        recordBrowserMetricRef.current?.(
+          "browser_input_to_pty_ack",
+          performance.now() - startedAt,
+        );
       }
     },
   }), [recover]);
 
   useEffect(() => {
     const onVisibility = () => {
-      if (!document.hidden) recover();
+      if (document.hidden) return;
+      recover(true);
+      if (!visibleRef.current) return;
+      scheduleFitRef.current?.();
+      if (interactiveRef.current && document.hasFocus()) scheduleClaimRef.current?.();
+    };
+    const onWindowFocus = () => {
+      if (document.hidden || !visibleRef.current) return;
+      scheduleFitRef.current?.();
+      if (interactiveRef.current) scheduleClaimRef.current?.();
     };
     document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", onWindowFocus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", onWindowFocus);
+    };
   }, [recover]);
 
   // Effect: Terminal setup + replay (depends on session.id and hubUrl)
@@ -211,18 +391,22 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
     if (!containerRef.current) return;
 
     lastSeqRef.current = 0;
-    stableSerializedRef.current = "";
+    checkpointRef.current = null;
+    pendingInputAckMetricsRef.current.clear();
+    pendingInputPaintMetricsRef.current.clear();
     userScrolledUpRef.current = false;
-    setHistoryError(null);
+    setLoading(true);
+    setHistoryFault(null);
     setShowNewOutput(false);
     lastSizeRef.current = null;
 
+    const defaultFontSize = clampTerminalFontSize(fontSize);
     const term = new Terminal({
       cols: 120,
       rows: 40,
       theme: getTerminalTheme(document.documentElement.dataset.mode === "dark" ? "dark" : "light"),
       minimumContrastRatio: TERMINAL_MINIMUM_CONTRAST_RATIO,
-      fontSize,
+      fontSize: readTerminalFontSize(defaultFontSize),
       scrollback: 10000,
       convertEol: false,
       disableStdin: false,
@@ -235,47 +419,133 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
     term.loadAddon(new WebLinksAddon());
     term.loadAddon(serializeAddon);
     term.open(containerRef.current);
-    fitAddon.fit();
-    const reportSize = () => {
+    const reportSize = (claim = false) => {
       const cols = term.cols;
       const rows = term.rows;
       const previous = lastSizeRef.current;
-      if (previous?.cols === cols && previous?.rows === rows) {
+      if (previous?.cols === cols && previous?.rows === rows && !claim) {
         return;
       }
       lastSizeRef.current = { cols, rows };
-      onResizeRef.current?.(cols, rows);
+      onResizeRef.current?.(cols, rows, { claim });
     };
-    reportSize();
+    if (visibleRef.current) {
+      fitAddon.fit();
+      reportSize(
+        interactiveRef.current && !document.hidden && document.hasFocus(),
+      );
+    }
     termRef.current = term;
-    serializeRef.current = serializeAddon;
 
     const viewportEl = containerRef.current.querySelector(".xterm-viewport");
     let resizeFrame: number | null = null;
-    const scheduleFit = () => {
+    let pendingFit = false;
+    let pendingClaim = false;
+    const scheduleUpdate = (fit: boolean, claim: boolean) => {
+      if (!visibleRef.current) return;
+      pendingFit ||= fit || lastSizeRef.current === null;
+      pendingClaim ||=
+        claim && interactiveRef.current && !document.hidden && document.hasFocus();
+      if (!pendingFit && !pendingClaim) return;
       if (resizeFrame !== null) return;
       resizeFrame = window.requestAnimationFrame(() => {
         resizeFrame = null;
-        const activeBuffer = term.buffer.active;
-        const wasFollowingOutput = !userScrolledUpRef.current
-          && activeBuffer.viewportY >= activeBuffer.baseY;
-        fitAddon.fit();
-        if (wasFollowingOutput) term.scrollToBottom();
-        reportSize();
+        const fitOnReport = pendingFit;
+        const claimOnReport =
+          pendingClaim && interactiveRef.current && !document.hidden && document.hasFocus();
+        pendingFit = false;
+        pendingClaim = false;
+        if (!visibleRef.current) return;
+        if (fitOnReport) {
+          const activeBuffer = term.buffer.active;
+          const wasFollowingOutput = !userScrolledUpRef.current
+            && activeBuffer.viewportY >= activeBuffer.baseY;
+          fitAddon.fit();
+          if (wasFollowingOutput) term.scrollToBottom();
+        }
+        reportSize(claimOnReport);
       });
     };
+    const scheduleFit = () => scheduleUpdate(true, false);
+    const scheduleClaim = () => scheduleUpdate(false, true);
+    const schedulePassiveFit = () => scheduleFit();
     scheduleFitRef.current = scheduleFit;
-    window.addEventListener("resize", scheduleFit);
+    scheduleClaimRef.current = scheduleClaim;
+    window.addEventListener("resize", schedulePassiveFit);
     const resizeObserver = typeof ResizeObserver !== "undefined"
-      ? new ResizeObserver(scheduleFit)
+      ? new ResizeObserver(schedulePassiveFit)
       : null;
     resizeObserver?.observe(containerRef.current);
     const inputDisposable = term.onData((data) => {
       if (!interactiveRef.current) return;
       onInputRef.current?.(data);
     });
-    const focusTerminal = () => term.focus();
-    containerRef.current.addEventListener("mousedown", focusTerminal);
+    term.attachCustomKeyEventHandler((event) => {
+      const translated = translateTerminalKeyEvent(event);
+      if (translated === null) return true;
+
+      event.preventDefault();
+      event.stopPropagation();
+      term.input(translated, true);
+      return false;
+    });
+    const handlePaste = (event: ClipboardEvent) => {
+      const paste = onPasteRef.current;
+      if (!interactiveRef.current || !paste || !event.clipboardData) return;
+      const text = event.clipboardData.getData("text/plain");
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      if (text) paste(text);
+    };
+    containerRef.current.addEventListener("paste", handlePaste, true);
+    const focusTerminal = () => {
+      term.focus();
+      scheduleClaim();
+    };
+    const claimFocusedTerminal = () => scheduleClaim();
+    containerRef.current.addEventListener("pointerdown", focusTerminal);
+    containerRef.current.addEventListener("focusin", claimFocusedTerminal);
+
+    const applyFontSize = (nextFontSize: number) => {
+      const normalized = clampTerminalFontSize(nextFontSize);
+      if (term.options.fontSize === normalized) return;
+      term.options.fontSize = normalized;
+      scheduleFit();
+    };
+    const persistFontSize = (nextFontSize: number) => {
+      try {
+        window.localStorage.setItem(TERMINAL_FONT_SIZE_STORAGE_KEY, String(nextFontSize));
+      } catch {
+        // Resizing should still work when browser storage is unavailable.
+      }
+      window.dispatchEvent(new CustomEvent<number>(TERMINAL_FONT_SIZE_CHANGE_EVENT, {
+        detail: nextFontSize,
+      }));
+    };
+    const handleFontSizeShortcut = (event: KeyboardEvent) => {
+      const shortcut = getTerminalFontSizeShortcut(event);
+      if (!shortcut) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      const currentFontSize = typeof term.options.fontSize === "number"
+        ? term.options.fontSize
+        : defaultFontSize;
+      const nextFontSize = shortcut === "reset"
+        ? defaultFontSize
+        : clampTerminalFontSize(currentFontSize + (shortcut === "increase" ? 1 : -1));
+      applyFontSize(nextFontSize);
+      persistFontSize(nextFontSize);
+    };
+    const handleSharedFontSize = (event: Event) => {
+      const nextFontSize = (event as CustomEvent<unknown>).detail;
+      if (typeof nextFontSize === "number" && Number.isFinite(nextFontSize)) {
+        applyFontSize(nextFontSize);
+      }
+    };
+    containerRef.current.addEventListener("keydown", handleFontSizeShortcut, true);
+    window.addEventListener(TERMINAL_FONT_SIZE_CHANGE_EVENT, handleSharedFontSize);
 
     // Scroll detection via xterm viewport
     let scrollHandler: (() => void) | null = null;
@@ -294,53 +564,44 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
     }
 
     let cancelled = false;
+    let initialScreenAvailable = false;
+    let coldMountTargetSeq: number | null = null;
+    const revealInitialScreen = () => {
+      if (cancelled || initialScreenAvailable) return;
+      initialScreenAvailable = true;
+      setLoading(false);
+    };
 
+    let checkpointTimer: number | null = null;
+    let lastCheckpointAt = Number.NEGATIVE_INFINITY;
+    const cancelPendingCheckpoint = () => {
+      if (checkpointTimer === null) return;
+      window.clearTimeout(checkpointTimer);
+      checkpointTimer = null;
+    };
     const restoreStableScreen = (callback: () => void) => {
+      cancelPendingCheckpoint();
       if (cancelled) {
         callback();
         return;
       }
       term.reset();
-      if (stableSerializedRef.current) {
-        term.write(stableSerializedRef.current, callback);
+      const checkpoint = checkpointRef.current;
+      if (checkpoint?.serialized) {
+        term.write(checkpoint.serialized, callback);
       } else {
         callback();
       }
     };
-    const captureStableScreen = () => {
-      if (cancelled) return;
-      try {
-        stableSerializedRef.current = serializeAddon.serialize();
-      } catch {
-        // Keep the preceding stable serialization as the rollback point.
-      }
+    const browserMetrics = new BrowserTerminalMetricRecorder(
+      session.id,
+      () => metricsEnabledRef.current,
+    );
+    browserMetricRecorderRef.current = browserMetrics;
+    const recordBrowserMetric = (label: string, durationMs: number) => {
+      browserMetrics.record(label, durationMs);
     };
-    const terminalMetricsEnabled = (() => {
-      try { return window.localStorage.getItem("tiller:terminal-metrics") === "true"; }
-      catch { return false; }
-    })();
-    const parseSamples: number[] = [];
-    let peakRecoveryMessages = 0;
-    let peakRecoveryBytes = 0;
-    const reportParseSample = (durationMs: number) => {
-      if (!terminalMetricsEnabled) return;
-      parseSamples.push(durationMs);
-      if (parseSamples.length < 256) return;
-      const sorted = [...parseSamples].sort((left, right) => left - right);
-      const at = (fraction: number) => sorted[Math.ceil(sorted.length * fraction) - 1] ?? 0;
-      console.info("[tiller] terminal metrics", {
-        label: "browser_xterm_parse",
-        count: sorted.length,
-        p50Ms: at(0.5),
-        p95Ms: at(0.95),
-        p99Ms: at(0.99),
-        peakRecoveryMessages,
-        peakRecoveryBytes,
-      });
-      parseSamples.length = 0;
-      peakRecoveryMessages = 0;
-      peakRecoveryBytes = 0;
-    };
+    recordBrowserMetricRef.current = recordBrowserMetric;
     const normalizeFetched = async (opts: {
       limit: number;
       afterSeq?: number;
@@ -349,15 +610,49 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
       onBytes(receivedBytes: number): void;
     }) => {
       const messages = await fetchMessages(hubUrl, session.id, opts);
-      return messages.map((message): DurableTerminalMessage => ({
+      const normalized = messages.map((message): DurableTerminalMessage => ({
         id: message.id,
         sessionId: message.session_id,
         seq: message.seq,
         content: message.content,
         ...(message.local_id !== null ? { localId: message.local_id } : {}),
       }));
+      if (opts.afterSeq === undefined) {
+        coldMountTargetSeq = normalized.reduce(
+          (max, message) => Math.max(max, message.seq),
+          0,
+        );
+        if (coldMountTargetSeq === 0) revealInitialScreen();
+      }
+      return normalized;
     };
-    const recovery = new TerminalRecoveryController({
+    let recovery: TerminalRecoveryController;
+    const scheduleCheckpoint = () => {
+      if (cancelled || document.hidden || !visibleRef.current || checkpointTimer !== null) return;
+      const delayMs = Math.max(
+        0,
+        lastCheckpointAt + TERMINAL_CHECKPOINT_INTERVAL_MS - performance.now(),
+      );
+      checkpointTimer = window.setTimeout(() => {
+        checkpointTimer = null;
+        if (cancelled || document.hidden || !visibleRef.current || !recovery.isSettled) return;
+        const checkpointStartedAt = performance.now();
+        try {
+          const checkpoint = {
+            serialized: serializeAddon.serialize(),
+            seq: recovery.lastSeq,
+          };
+          checkpointRef.current = checkpoint;
+          cacheSet(session.id, checkpoint);
+          lastCheckpointAt = performance.now();
+          recordBrowserMetric("browser_checkpoint", lastCheckpointAt - checkpointStartedAt);
+        } catch {
+          // Keep the preceding completed checkpoint as the rollback point.
+        }
+      }, delayMs);
+    };
+    scheduleCheckpointRef.current = scheduleCheckpoint;
+    recovery = new TerminalRecoveryController({
       sessionId: session.id,
       fetchPage: normalizeFetched,
       write: (message, callback) => {
@@ -367,7 +662,15 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
           : "";
         const parseStartedAt = performance.now();
         term.write(data, () => {
-          reportParseSample(performance.now() - parseStartedAt);
+          recordBrowserMetric("browser_xterm_write", performance.now() - parseStartedAt);
+          const paintedAt = performance.now();
+          for (const startedAt of pendingInputPaintMetricsRef.current.values()) {
+            recordBrowserMetric(
+              "browser_input_to_first_xterm_write_callback",
+              paintedAt - startedAt,
+            );
+          }
+          pendingInputPaintMetricsRef.current.clear();
           if (data && userScrolledUpRef.current) setShowNewOutput(true);
           onDurableMessageCompleteRef.current?.(message);
           callback();
@@ -377,54 +680,66 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
         if (cancelled || seq <= lastSeqRef.current) return;
         lastSeqRef.current = seq;
         updateLastSeq?.(session.id, seq);
+        if (coldMountTargetSeq !== null && seq >= coldMountTargetSeq) {
+          revealInitialScreen();
+        }
       },
       onStateChange: (state) => {
         if (cancelled) return;
         if (
-          state.status === "fault" &&
-          (state.code === "overflow" || state.code === "deadline") &&
-          !fallbackAttemptedRef.current
+          state.status === "fault"
+          && state.code === "deadline"
+          && recentOutputResetSessionRef.current !== session.id
         ) {
-          fallbackAttemptedRef.current = true;
-          fallbackPendingRef.current = true;
-          terminalCache.delete(session.id);
-          setHistoryError(null);
-          setLoading(true);
-          onRecoveryStateRef.current?.({ status: "recovering" });
-          setRecoveryEpoch((epoch) => epoch + 1);
+          // A slow initial catch-up is recoverable and does not imply corrupt
+          // history. Retry once from the bounded recent tail, as the CLI does.
+          restartFromRecentOutput();
           return;
         }
-        onRecoveryStateRef.current?.(state);
-        setLoading(state.status === "recovering");
-        if (state.status === "ready" && fallbackPendingRef.current) {
-          fallbackPendingRef.current = false;
-          fallbackAttemptedRef.current = false;
-          setHistoryNotice(RECENT_OUTPUT_NOTICE);
+        if (state.status === "fault") cancelPendingCheckpoint();
+        // A healthy terminal already has a stable screen. Background catch-up
+        // after visibility restoration should not replace it with a loading
+        // overlay (or make the Scribe tab look disconnected).
+        if (state.status === "recovering" && quietRecoveryRef.current) {
+          return;
         }
-        setHistoryError(state.status === "fault"
-          ? `Terminal recovery stopped (${state.code.replace("_", " ")}).`
-          : null);
+        quietRecoveryRef.current = false;
+        if (state.status === "fault") {
+          initialScreenAvailable = checkpointRef.current !== null;
+        } else if (state.status === "ready") {
+          revealInitialScreen();
+          if (recentOutputResetSessionRef.current === session.id) {
+            recentOutputResetSessionRef.current = null;
+            setHistoryNotice(RECENT_OUTPUT_NOTICE);
+          }
+        }
+        onRecoveryStateRef.current?.(state);
+        setLoading(state.status === "recovering" && !initialScreenAvailable);
+        setHistoryFault(state.status === "fault" ? state.code : null);
       },
-      onStableWriteComplete: captureStableScreen,
+      getStableSequence: () => checkpointRef.current?.seq,
       restoreStableScreen,
       onQueueUsage: (messages, bytes) => {
-        peakRecoveryMessages = Math.max(peakRecoveryMessages, messages);
-        peakRecoveryBytes = Math.max(peakRecoveryBytes, bytes);
+        browserMetrics.observeRecoveryQueue(messages, bytes);
       },
       onSettled: (lastSeq) => {
         if (cancelled) return;
-        captureStableScreen();
-        cacheSet(session.id, stableSerializedRef.current, lastSeq);
+        if (lastSeq === recovery.lastSeq) scheduleCheckpoint();
       },
     });
     recoveryRef.current = recovery;
 
     const cached = terminalCache.get(session.id);
     if (cached) {
+      checkpointRef.current = cached;
+      lastCheckpointAt = performance.now();
       recovery.startCacheRestore(
-        cached.lastSeq,
+        cached.seq,
         new TextEncoder().encode(cached.serialized).byteLength,
-        (callback) => term.write(cached.serialized, callback),
+        (callback) => term.write(cached.serialized, () => {
+          revealInitialScreen();
+          callback();
+        }),
       );
     } else {
       void recovery.startCold();
@@ -432,28 +747,55 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
 
     return () => {
       cancelled = true;
+      cancelPendingCheckpoint();
+      browserMetrics.dispose();
+      if (browserMetricRecorderRef.current === browserMetrics) {
+        browserMetricRecorderRef.current = null;
+      }
+      recordBrowserMetricRef.current = null;
+      if (scheduleCheckpointRef.current === scheduleCheckpoint) {
+        scheduleCheckpointRef.current = null;
+      }
+      pendingInputAckMetricsRef.current.clear();
+      pendingInputPaintMetricsRef.current.clear();
       recovery.dispose();
       recoveryRef.current = null;
       if (viewportEl && scrollHandler) {
         viewportEl.removeEventListener("scroll", scrollHandler);
       }
       inputDisposable.dispose();
-      containerRef.current?.removeEventListener("mousedown", focusTerminal);
-      window.removeEventListener("resize", scheduleFit);
+      containerRef.current?.removeEventListener("paste", handlePaste, true);
+      containerRef.current?.removeEventListener("pointerdown", focusTerminal);
+      containerRef.current?.removeEventListener("focusin", claimFocusedTerminal);
+      containerRef.current?.removeEventListener("keydown", handleFontSizeShortcut, true);
+      window.removeEventListener("resize", schedulePassiveFit);
+      window.removeEventListener(TERMINAL_FONT_SIZE_CHANGE_EVENT, handleSharedFontSize);
       resizeObserver?.disconnect();
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
       if (scheduleFitRef.current === scheduleFit) scheduleFitRef.current = null;
+      if (scheduleClaimRef.current === scheduleClaim) scheduleClaimRef.current = null;
       term.dispose();
       termRef.current = null;
-      serializeRef.current = null;
     };
-  }, [session.id, hubUrl, fontSize, updateLastSeq, recoveryEpoch]);
+  }, [session.id, hubUrl, fontSize, updateLastSeq, recoveryEpoch, restartFromRecentOutput]);
+
+  const historyError = historyFault === "overflow"
+    ? "Terminal history is too large to restore safely."
+    : historyFault
+      ? `Terminal recovery stopped (${historyFault.replace(/_/g, " ")}).`
+      : null;
 
   return (
-    <div className="flex-1 min-h-0 overflow-hidden relative">
+    <div className={`tiller-terminal flex-1 min-h-0 overflow-hidden relative ${
+      surface === "implementation" ? "tiller-terminal--implementation" : "tiller-terminal--default"
+    }`}>
       <div
         ref={containerRef}
-        className={`absolute inset-0 px-2 py-1 ${resolvedTheme === "dark" ? "bg-[#1c1c1c]" : "bg-white"}`}
+        className={`tiller-terminal-canvas absolute inset-0 ${
+          surface === "implementation"
+            ? "tiller-terminal-canvas--implementation"
+            : "tiller-terminal-canvas--default"
+        } ${resolvedTheme === "dark" ? "bg-[#1c1c1c]" : "bg-white"}`}
       />
       {loading && (
         <LoadingIndicator label="Loading terminal history" className="pointer-events-none absolute inset-0" />
@@ -465,9 +807,9 @@ export default forwardRef<TerminalViewHandle, TerminalViewProps>(function Termin
             <button
               type="button"
               className="rounded border border-kumo-line bg-kumo-base px-3 py-1.5 text-kumo-default hover:bg-kumo-tint"
-              onClick={() => recoveryRef.current?.retry()}
+              onClick={retryHistory}
             >
-              Retry
+              {historyFault === "overflow" ? "Show recent output" : "Retry"}
             </button>
             {onDetach && (
               <button

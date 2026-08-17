@@ -2,7 +2,6 @@ const MANAGED_SECTION_VERSION = "v2";
 const MANAGED_SECTION_START = `<!-- tiller:env-draft:${MANAGED_SECTION_VERSION}:start -->`;
 const MANAGED_SECTION_END = `<!-- tiller:env-draft:${MANAGED_SECTION_VERSION}:end -->`;
 const MAX_TITLE_LENGTH = 240;
-const MAX_SUMMARY_LENGTH = 600;
 const MAX_LISTED_FILES = 20;
 
 export type DraftPrChangeStatus = "added" | "modified" | "deleted";
@@ -146,44 +145,6 @@ function fallbackTitle(envSlug: string, files: DraftPrChangedFile[]): string {
   return normalizeTitle(`${verb} ${primary.path}`);
 }
 
-function markdownToPlainText(value: string): string {
-  return value
-    .replace(/^\s*```.*$/gm, "")
-    .replace(/!\[([^\]]*)\]\([^\)]+\)/g, "$1")
-    .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
-    .replace(/^\s*(?:[-*+] |\d+[.)]\s+)/gm, "")
-    .replace(/[*_`~]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function planSummary(markdown: string, title: string): string {
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  const headings = markdownHeadings(lines);
-  const preferred =
-    /^(?:summary|overview|goal|objective|outcome|problem|context)\s*$/i;
-  const summaryHeading = headings.find((heading) =>
-    preferred.test(heading.text),
-  );
-  let selected = lines;
-  if (summaryHeading) {
-    const nextHeading = headings.find(
-      (heading) => heading.lineIndex > summaryHeading.lineIndex,
-    );
-    selected = lines.slice(
-      summaryHeading.lineIndex + 1,
-      nextHeading?.lineIndex ?? lines.length,
-    );
-  }
-  const summary = truncate(
-    markdownToPlainText(selected.join("\n")),
-    MAX_SUMMARY_LENGTH,
-  );
-  return summary || `${title}.`;
-}
-
 function inlineCode(value: string): string {
   const longestRun = Math.max(
     0,
@@ -244,15 +205,15 @@ export function buildDraftPrContent(args: {
   planMarkdown?: string | null;
 }): DraftPrContent {
   const files = normalizeChangedFiles(args.changedFiles);
+  const planMarkdown = args.planMarkdown?.trim() ?? "";
   const suppliedTitle = normalizeTitle(args.planTitle ?? "");
   const title = isUsefulTitle(suppliedTitle)
     ? suppliedTitle
-    : firstMeaningfulHeading(args.planMarkdown ?? "") ||
+    : firstMeaningfulHeading(planMarkdown) ||
       fallbackTitle(args.envSlug, files);
-  const summary = planSummary(args.planMarkdown ?? "", title);
   return {
     title,
-    featureMarkdown: buildFeatureMarkdown(summary, files),
+    featureMarkdown: planMarkdown || buildFeatureMarkdown(`${title}.`, files),
   };
 }
 
@@ -292,7 +253,7 @@ export function upsertManagedPrSection(
   const body = existingBody?.trim() ?? "";
   if (!body) return section;
   const start = body.indexOf(MANAGED_SECTION_START);
-  const end = body.indexOf(MANAGED_SECTION_END);
+  const end = body.lastIndexOf(MANAGED_SECTION_END);
   if (start === -1 || end === -1 || start >= end)
     return `${body}\n\n${section}`;
   return [

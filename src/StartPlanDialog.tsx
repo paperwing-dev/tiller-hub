@@ -143,17 +143,17 @@ export default function StartPlanDialog({
         if (!open) onClose();
       }}
     >
-      <Dialog className="flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-2xl flex-col overflow-hidden p-0 sm:min-w-[42rem]">
-        <div className="shrink-0 border-b border-kumo-line px-5 py-4">
-          <Dialog.Title className="text-sm font-semibold text-kumo-strong">
+      <Dialog className="tiller-dialog-shell flex h-[calc(100vh-2rem)] max-h-[52rem] w-full max-w-2xl flex-col overflow-hidden p-0 sm:min-w-[42rem]">
+        <div className="tiller-dialog-header shrink-0 border-b border-kumo-line px-5 py-4">
+          <Dialog.Title className="tiller-dialog-title text-sm font-semibold text-kumo-strong">
             Start Container
           </Dialog.Title>
-          <Dialog.Description className="mt-1 text-xs text-kumo-subtle">
+          <Dialog.Description className="tiller-dialog-description mt-1 text-xs text-kumo-subtle">
             The startup plan was selected when this environment was created.
           </Dialog.Description>
         </div>
 
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+        <div className="tiller-dialog-body min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
           <div>
             <div className="text-xs font-medium text-kumo-subtle">Repository</div>
             <div className="mt-1 text-sm text-kumo-default">
@@ -229,11 +229,12 @@ export default function StartPlanDialog({
           {startError && <p className="text-xs text-kumo-danger">{startError}</p>}
         </div>
 
-        <div className="flex shrink-0 justify-end gap-2 border-t border-kumo-line px-5 py-4">
+        <div className="tiller-dialog-footer flex shrink-0 justify-end gap-2 border-t border-kumo-line px-5 py-4">
           <Button
             type="button"
             variant="secondary"
             size="sm"
+            className="tiller-dialog-button tiller-dialog-button--secondary"
             onClick={onClose}
             disabled={starting}
           >
@@ -243,6 +244,7 @@ export default function StartPlanDialog({
             type="button"
             variant="primary"
             size="sm"
+            className="tiller-dialog-button tiller-dialog-button--primary"
             onClick={() => void handleStart()}
             loading={starting}
             disabled={starting || !isStartable || !selectedAvailability?.available}

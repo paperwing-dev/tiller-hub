@@ -24,6 +24,7 @@ export type HarnessCredentialRequirement = (typeof HARNESS_CREDENTIAL_REQUIREMEN
 export const HARNESS_PROVIDER_KINDS = [
   "codex",
   "claude",
+  "anthropic",
   "openai",
   "cloudflare-workers-ai",
 ] as const;
@@ -45,6 +46,11 @@ export interface HarnessModelCatalogEntry {
   label: string;
   harness: EnvHarness;
   efforts: readonly HarnessEffort[];
+  limits: {
+    readonly context: number;
+    readonly input?: number;
+    readonly output: number;
+  };
   supportsFastMode?: boolean;
   credential: HarnessCredentialRequirement;
   binding:
@@ -52,7 +58,7 @@ export interface HarnessModelCatalogEntry {
     | { kind: "claude"; model: string; providerLabel: string }
     | {
         kind: "opencode";
-        provider: "openai" | "cloudflare-workers-ai";
+        provider: "openai" | "anthropic" | "cloudflare-workers-ai";
         providerAlias: string;
         providerLabel: string;
         modelAlias: string;
@@ -65,6 +71,11 @@ const LOW_TO_XHIGH = ["low", "medium", "high", "xhigh"] as const;
 const LOW_TO_MAX = ["low", "medium", "high", "xhigh", "max"] as const;
 const LOW_TO_MAX_AND_ULTRA = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 const LOW_TO_HIGH = ["low", "medium", "high"] as const;
+// Direct-provider token limits projected into custom OpenCode models. Keep
+// these catalog-owned so every launch surface uses the same compaction budget.
+const OPENAI_LIMITS = { context: 1_050_000, input: 922_000, output: 128_000 } as const;
+const ANTHROPIC_LIMITS = { context: 1_000_000, output: 128_000 } as const;
+const KIMI_K2_7_LIMITS = { context: 262_144, output: 262_144 } as const;
 
 export const KIMI_K2_7_CODE = {
   id: "kimi-k2.7-code",
@@ -82,6 +93,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "GPT-5.6 Sol",
     harness: "codex",
     efforts: LOW_TO_MAX_AND_ULTRA,
+    limits: OPENAI_LIMITS,
     supportsFastMode: true,
     credential: "codex-auth",
     binding: { kind: "codex", model: "gpt-5.6-sol", providerLabel: "Codex" },
@@ -91,6 +103,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "GPT-5.5",
     harness: "codex",
     efforts: LOW_TO_XHIGH,
+    limits: OPENAI_LIMITS,
     supportsFastMode: true,
     credential: "codex-auth",
     binding: { kind: "codex", model: "gpt-5.5", providerLabel: "Codex" },
@@ -100,6 +113,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "Opus 4.8",
     harness: "claude-code",
     efforts: LOW_TO_MAX,
+    limits: ANTHROPIC_LIMITS,
     supportsFastMode: true,
     credential: "claude-auth",
     binding: { kind: "claude", model: "claude-opus-4-8", providerLabel: "Claude" },
@@ -109,6 +123,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "Fable 5",
     harness: "claude-code",
     efforts: LOW_TO_MAX,
+    limits: ANTHROPIC_LIMITS,
     credential: "anthropic-api-key",
     binding: { kind: "claude", model: "claude-fable-5", providerLabel: "Claude" },
   },
@@ -117,6 +132,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "GPT-5.6 Sol",
     harness: "opencode",
     efforts: LOW_TO_MAX_AND_ULTRA,
+    limits: OPENAI_LIMITS,
     credential: "openai-api-key",
     binding: {
       kind: "opencode",
@@ -133,6 +149,7 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     label: "GPT-5.5",
     harness: "opencode",
     efforts: LOW_TO_XHIGH,
+    limits: OPENAI_LIMITS,
     credential: "openai-api-key",
     binding: {
       kind: "opencode",
@@ -145,10 +162,45 @@ export const HARNESS_MODEL_CATALOG: readonly HarnessModelCatalogEntry[] = [
     },
   },
   {
+    id: "claude-opus-5",
+    label: "Opus 5",
+    harness: "opencode",
+    efforts: LOW_TO_MAX,
+    limits: ANTHROPIC_LIMITS,
+    credential: "anthropic-api-key",
+    binding: {
+      kind: "opencode",
+      provider: "anthropic",
+      providerAlias: "tiller-anthropic",
+      providerLabel: "Anthropic",
+      modelAlias: "claude-opus-5",
+      model: "claude-opus-5",
+      baseUrl: "https://api.anthropic.com/v1",
+    },
+  },
+  {
+    id: "claude-fable-5",
+    label: "Fable 5",
+    harness: "opencode",
+    efforts: LOW_TO_MAX,
+    limits: ANTHROPIC_LIMITS,
+    credential: "anthropic-api-key",
+    binding: {
+      kind: "opencode",
+      provider: "anthropic",
+      providerAlias: "tiller-anthropic",
+      providerLabel: "Anthropic",
+      modelAlias: "claude-fable-5",
+      model: "claude-fable-5",
+      baseUrl: "https://api.anthropic.com/v1",
+    },
+  },
+  {
     id: KIMI_K2_7_CODE.id,
     label: KIMI_K2_7_CODE.label,
     harness: "opencode",
     efforts: LOW_TO_HIGH,
+    limits: KIMI_K2_7_LIMITS,
     credential: "workers-ai",
     binding: {
       kind: "opencode",

@@ -58,6 +58,7 @@ export function parseManagedSelfHostRuntime(value) {
  *   imageCommitSha: string;
  *   sandboxImage: string;
  *   scmImage: string;
+ *   reviewerIsolationProtocol?: 1;
  *   recordedAt: string;
  * }}
  */
@@ -88,6 +89,10 @@ export function normalizeSelfHostDeployRecord(record) {
   if (scmSourceId !== imageCommitSha) {
     throw new Error("deploy record scmImage tag must match imageCommitSha.");
   }
+  const reviewerIsolationProtocol = record.reviewerIsolationProtocol;
+  if (reviewerIsolationProtocol !== undefined && reviewerIsolationProtocol !== 1) {
+    throw new Error("deploy record reviewerIsolationProtocol must be 1 when present.");
+  }
 
   return {
     schemaVersion: 2,
@@ -95,6 +100,7 @@ export function normalizeSelfHostDeployRecord(record) {
     imageCommitSha,
     sandboxImage: runtime.sandboxImage,
     scmImage,
+    ...(reviewerIsolationProtocol === 1 ? { reviewerIsolationProtocol: 1 } : {}),
     recordedAt: readTrimmedString(record.recordedAt),
   };
 }

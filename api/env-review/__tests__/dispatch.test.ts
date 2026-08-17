@@ -18,6 +18,19 @@ vi.mock("../../planner/dispatch", () => ({
   buildProviderAuthEnvVars: mocks.buildProviderAuthEnvVars,
   buildCfAccessEnvVars: mocks.buildCfAccessEnvVars,
   destroyPlannerJob: mocks.destroyPlannerJob,
+  plannerLaunchProvenanceFromExecution: (execution: any) => ({
+    schemaVersion: 1,
+    backend: execution.backend,
+    machineId: execution.backend === "host" ? execution.machineId : null,
+    ...(execution.claudeAuthMode ? { claudeAuthMode: execution.claudeAuthMode } : {}),
+    ...(execution.codexExecutionProfile ? { codexExecution: execution.codexExecutionProfile } : {}),
+  }),
+  plannerDispatchTargetFromLaunch: (launch: any) => ({
+    backend: launch.backend,
+    machineId: launch.backend === "host" ? launch.machineId : null,
+    ...(launch.claudeAuthMode ? { claudeAuthMode: launch.claudeAuthMode } : {}),
+    ...(launch.codexExecution ? { codexExecutionProfile: launch.codexExecution } : {}),
+  }),
   runnerJobCommand: (jobSlug: string, desiredState: "running" | "absent") => {
     const commandGeneration = desiredState === "running" ? 1 : 2;
     return {
@@ -166,7 +179,9 @@ describe("env review dispatch", () => {
     expect(options.repoUrl).toBe("https://github.com/test/repo");
     expect(options.envVars).toMatchObject({
       TILLER_BOOTSTRAP_MODE: "env-review-run",
+      TILLER_REVIEWER_ISOLATION_PROTOCOL: "1",
       TILLER_HARNESS: "codex",
+      RUNNER_BACKEND: "host",
       HUB_URL: "http://hub.test",
       REPO_URL: "https://github.com/test/repo",
       TILLER_GITHUB_BASE_COMMIT_SHA: "main-1",
@@ -175,6 +190,7 @@ describe("env review dispatch", () => {
       TILLER_GITHUB_ALLOWED_REPO: "test/repo",
       OPENAI_API_KEY: "test-openai-key",
     });
+    expect(options.envVars).not.toHaveProperty("TILLER_REVIEWER_ISOLATION_IMAGE");
     expect(options.envVars.TILLER_ENV_REVIEW_CALLBACK_BASE).toBe(
       "http://hub.test/api/env-review-runtime/envs/env-1/runs/run-1",
     );

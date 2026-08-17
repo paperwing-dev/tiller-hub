@@ -76,6 +76,7 @@ import { revokeGitHubBridgesForEnvPublish } from "./github/bridge";
 import { resolveCanonicalHubOrigin } from "./canonical-origin";
 import { isLoopbackHostname } from "../shared/local-dev";
 import { getDurableObjectStub } from "./durable-object";
+import { isProjectedRuntimeFailure } from "./env/runtime-failure";
 
 const MUTABLE_STATE_KEY = "env-mutable-state";
 const ENV_SLUG_KEY = "env-slug";
@@ -91,13 +92,38 @@ const PROJECTION_DIRTY_KEY = "env-projection-dirty-version";
 const INITIAL_CREATE_CLAIM_KEY = "env-initial-create-claim";
 const INITIAL_CREATE_CLAIM_TTL_MS = 5 * 60_000;
 const STOP_WORKSPACE_SYNCED_META_KEY = "stop-workspace-synced-meta";
+const STOP_RETRY_KEY = "stop-retry-v1";
+const STOP_RETRY_INITIAL_DELAY_MS = 2_000;
+const STOP_RETRY_MAX_DELAY_MS = 30_000;
 const GITHUB_PUBLISH_OPERATION_KEY = "github-publish-operation";
+const GITHUB_PUBLISH_OPERATION_TIMEOUT_MS = 10 * 60_000;
 const GITHUB_PUBLISH_RESULT_CLAIM_TTL_MS = 10 * 60_000;
 const STARTUP_DIAGNOSTICS_ACTIVE_KEY = "startup-diagnostics-active";
 const STARTUP_DIAGNOSTICS_LAST_FAILED_KEY = "startup-diagnostics-last-failed";
 const CODEX_EXECUTION_PROFILE_KEY = "codex-execution-profile-v1";
 const STARTUP_DIAGNOSTICS_MAX_EVENTS = 50;
 const STARTUP_DIAGNOSTICS_MAX_LOG_TAIL_CHARS = 4000;
+
+interface StopRetryRecord {
+  opId: string;
+  attempt: number;
+  nextAttemptAtMs: number;
+  idleClaimId?: string;
+}
+
+function stopRetryDelayMs(attempt: number): number {
+  return Math.min(
+    STOP_RETRY_MAX_DELAY_MS,
+    STOP_RETRY_INITIAL_DELAY_MS * (2 ** Math.min(20, Math.max(0, attempt))),
+  );
+}
+
+function stopRetryProgressMessage(error: string): string {
+  if (/active agent turn.+(?:idle|finish)/iu.test(error)) {
+    return "Waiting for the active agent turn to finish safely…";
+  }
+  return "Retrying workspace save…";
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -185,11 +211,13 @@ function mergeDiagnosticLogTails(
 function createEmptyStartupDiagnostics(
   opId: string,
   backend: "cf" | "host",
+  implementationMode: "fresh" | "plan" | null = null,
   startedAt = nowIso(),
 ): StartupDiagnosticsSnapshot {
   return {
     opId,
     backend,
+    implementationMode,
     startedAt,
     updatedAt: startedAt,
     currentStepId: null,
@@ -239,6 +267,9 @@ function normalizeStartupDiagnosticsSnapshot(
   return {
     opId: normalizeDiagnosticMessage(value.opId) ?? "",
     backend: value.backend === "host" ? "host" : "cf",
+    implementationMode: value.implementationMode === "fresh" || value.implementationMode === "plan"
+      ? value.implementationMode
+      : null,
     startedAt,
     updatedAt,
     currentStepId: value.currentStepId ?? null,
@@ -890,6 +921,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         SCHEDULED_RUN_LEASE_RELEASE_KEY,
       ),
     );
+    const stopRetry = await this.ctx.storage.get<StopRetryRecord>(STOP_RETRY_KEY);
     const stateAlarmAt = lifecycleAlarmAt == null
       ? scheduledAlarmAt
       : scheduledAlarmAt == null ? lifecycleAlarmAt : Math.min(lifecycleAlarmAt, scheduledAlarmAt);
@@ -901,18 +933,26 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       : projectionAlarmAt == null ? stateAlarmAt : Math.min(stateAlarmAt, projectionAlarmAt);
     const publishAlarmAt = publishOperation?.cleanupPending
       ? Date.now()
-      : publishOperation?.resultClaim?.expiresAtMs ?? null;
+      : publishOperation?.resultClaim?.expiresAtMs
+        ?? (publishOperation
+          ? parseTimestamp(publishOperation.startedAt) + GITHUB_PUBLISH_OPERATION_TIMEOUT_MS
+          : null);
     const baseAlarmAt = publishAlarmAt == null
       ? scheduledBaseAlarmAt
       : scheduledBaseAlarmAt == null
         ? publishAlarmAt
         : Math.min(scheduledBaseAlarmAt, publishAlarmAt);
     const pendingLeaseReleaseAt = nextPendingScheduledRunLeaseReleaseAt(pendingLeaseReleases);
-    const alarmAt = pendingLeaseReleaseAt == null
+    const baseWithLeaseAlarmAt = pendingLeaseReleaseAt == null
       ? baseAlarmAt
       : baseAlarmAt == null
         ? pendingLeaseReleaseAt
         : Math.min(baseAlarmAt, pendingLeaseReleaseAt);
+    const alarmAt = stopRetry == null
+      ? baseWithLeaseAlarmAt
+      : baseWithLeaseAlarmAt == null
+        ? stopRetry.nextAttemptAtMs
+        : Math.min(baseWithLeaseAlarmAt, stopRetry.nextAttemptAtMs);
     const now = Date.now();
     const existingAlarm = await this.ctx.storage.getAlarm();
     if (alarmAt === null) {
@@ -1249,6 +1289,24 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     );
   }
 
+  private isImplementorCodexRuntimeAuthAllowed(
+    current: EnvMutableState,
+    startOpId: string | null,
+  ): boolean {
+    if (this.isExactActiveStart(current, startOpId)) return true;
+    // Stop must first quiesce the exact running harness before it can persist
+    // the workspace. Keep that harness's already-fenced subscription subject
+    // usable only through this bounded save/termination window; otherwise a
+    // token refresh can terminate the harness before stop-control reaches it.
+    return Boolean(
+      startOpId
+      && current.lifecycleOperation === "stop"
+      && current.lifecycleDesiredState === "stopped"
+      && current.lifecycleLastRunnerState === "running"
+      && (current.lifecyclePhase === "saving" || current.lifecyclePhase === "stopping"),
+    );
+  }
+
   private async mutateExistingMutableState(
     options: {
       opId?: string | null;
@@ -1287,7 +1345,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       codexAuthPreference?: CodexAuthPreference | null;
     } = {},
   ): EnvMutableState {
-    return normalizeMutableState({
+    const starting = normalizeMutableState({
       ...applyLifecycleState({ ...current, harnessSettings }, {
         phase: "starting",
         activeOpId: opId,
@@ -1305,6 +1363,14 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       startCodexAuthPreference: authClaim.codexAuthPreference ?? null,
       bootMessage: null,
       bootStepId: null,
+    });
+    return normalizeMutableState({
+      ...starting,
+      implementorAttentionState: {
+        ...current.implementorAttentionState,
+        runtimeStartOpId: starting.lifecycleOpId,
+        lastCompletionSequence: 0,
+      },
     });
   }
 
@@ -1526,6 +1592,43 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     return buildLifecycleState(current);
   }
 
+  async getEnvironmentRuntimeSubject(): Promise<{
+    envSlug: string;
+    incarnationId: string;
+    startOperationId: string;
+    lifecycle: EnvLifecycleState;
+    failedStopFinalizationAuthorized: boolean;
+  } | null> {
+    const snapshot = await this.ctx.storage.transaction(async (txn) => {
+      const [mutable, slug, publication, stopRetry] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<string>(ENV_SLUG_KEY),
+        txn.get<EnvPublicationRecord>(ENV_PUBLICATION_KEY),
+        txn.get<StopRetryRecord>(STOP_RETRY_KEY),
+      ]);
+      if (!mutable || !slug || !publication || publication.state !== "visible") return null;
+      const normalized = normalizeMutableState(mutable);
+      const startOperationId = normalized.implementorAttentionState.runtimeStartOpId?.trim() ?? "";
+      if (!startOperationId) return null;
+      const lifecycle = buildLifecycleState(normalized)!;
+      return {
+        envSlug: slug,
+        incarnationId: publication.incarnationId,
+        startOperationId,
+        lifecycle,
+        failedStopFinalizationAuthorized: Boolean(
+          lifecycle.phase === "failed"
+          && lifecycle.activeOperation === "stop"
+          && lifecycle.desiredState === "stopped"
+          && lifecycle.activeOpId
+          && stopRetry?.opId === lifecycle.activeOpId
+          && lifecycle.infraState !== "stopped"
+        ),
+      };
+    });
+    return snapshot;
+  }
+
   async claimCodexExecutionProfile(
     startOpId: string,
     profile: CodexExecutionProfile,
@@ -1581,7 +1684,10 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         || storedProfile.startOpId !== resolvedOpId
         || storedProfile.profile.kind !== "subscription-app-server"
         || storedProfile.profile.surface !== "implementor"
-        || !this.isExactActiveStart(normalizeMutableState(storedMutable), resolvedOpId)
+        || !this.isImplementorCodexRuntimeAuthAllowed(
+          normalizeMutableState(storedMutable),
+          resolvedOpId,
+        )
       ) {
         return "inactive";
       }
@@ -1613,7 +1719,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       ]);
       if (!mutable || !slug || !publication || publication.state !== "visible" || !storedProfile) return null;
       const normalized = normalizeMutableState(mutable);
-      if (!this.isExactActiveStart(normalized, storedProfile.startOpId)) return null;
+      if (!this.isImplementorCodexRuntimeAuthAllowed(normalized, storedProfile.startOpId)) return null;
       return {
         envSlug: slug,
         incarnationId: publication.incarnationId,
@@ -1699,6 +1805,22 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       }
       return existing;
     });
+  }
+
+  async getRunnerCommandClaim(): Promise<RunnerCommandClaim | null> {
+    const claim = await this.ctx.storage.get<RunnerCommandClaim>(RUNNER_COMMAND_CLAIM_KEY);
+    if (
+      !claim
+      || !Number.isSafeInteger(claim.commandGeneration)
+      || claim.commandGeneration <= 0
+      || !claim.operationId?.trim()
+      || (
+        claim.desiredState !== "running"
+        && claim.desiredState !== "stopped"
+        && claim.desiredState !== "absent"
+      )
+    ) return null;
+    return { ...claim, operationId: claim.operationId.trim() };
   }
 
   /**
@@ -2716,6 +2838,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
   async beginStartupDiagnostics(options: {
     opId: string | null | undefined;
     backend: "cf" | "host";
+    implementationMode?: "fresh" | "plan" | null;
     stepId?: StartupDiagnosticStepId | null;
     message?: string | null;
     detail?: string | null;
@@ -2735,7 +2858,11 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         return { diagnostics: existing, mutableState: null, changed: false };
       }
 
-      let active = createEmptyStartupDiagnostics(resolvedOpId!, options.backend);
+      let active = createEmptyStartupDiagnostics(
+        resolvedOpId!,
+        options.backend,
+        options.implementationMode ?? null,
+      );
       const initialEvent =
         options.stepId && options.message
           ? buildStartupDiagnosticEvent({
@@ -2964,6 +3091,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
   async clearMutableState(): Promise<null> {
     await this.writeMutableState(null);
     await this.ctx.storage.delete(STOP_WORKSPACE_SYNCED_META_KEY);
+    await this.ctx.storage.delete(STOP_RETRY_KEY);
     await this.clearStartupDiagnosticsState();
     return null;
   }
@@ -3001,7 +3129,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
   }
 
   async requestStop(expectedIncarnationId?: string): Promise<EnvLifecycleState> {
-    await this.getMutableState();
+    const currentAtRequest = await this.getMutableState();
     const scheduled = await this.readScheduledRun();
     if (scheduled?.kind === "active") {
       if (expectedIncarnationId && scheduled.incarnationId !== expectedIncarnationId) {
@@ -3015,6 +3143,15 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     }
     if (scheduled?.kind === "finished" && scheduled.cleanupRequired) {
       throw new Error(EXISTING_EXECUTION_UNAVAILABLE_MESSAGE);
+    }
+    if (
+      currentAtRequest?.lifecyclePhase === "failed"
+      && currentAtRequest.lifecycleOperation === "stop"
+      && currentAtRequest.lifecycleDesiredState === "stopped"
+      && currentAtRequest.lifecycleOpId
+    ) {
+      const resumed = await this.resumeStopRetry(currentAtRequest.lifecycleOpId);
+      if (resumed) return resumed;
     }
     const next = await this.ctx.storage.transaction(async (txn) => {
       const [storedMutable, creationClaim] = await Promise.all([
@@ -3053,6 +3190,144 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     });
     await this.scheduleNextAlarm(next, await this.readScheduledRun());
     return buildLifecycleState(next)!;
+  }
+
+  /**
+   * Durably queue the exact active Stop for alarm-owned dispatch.
+   *
+   * Cloudflare Stop can spend longer than the HTTP invocation's post-response
+   * waitUntil window quiescing the harness and synchronizing the workspace.
+   * Recording the dispatch before returning lets the lifecycle alarm own that
+   * long-running work without minting a second Stop operation.
+   */
+  async ensureStopDispatchScheduled(
+    opId: string | null | undefined,
+    options?: { idleClaimId?: string | null },
+  ): Promise<boolean> {
+    const resolvedOpId = this.resolveLifecycleOpId(opId);
+    if (!resolvedOpId) return false;
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, retry, scheduledRun] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StopRetryRecord>(STOP_RETRY_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const exactStop = Boolean(
+        current
+        && current.lifecycleOpId === resolvedOpId
+        && current.lifecycleOperation === "stop"
+        && current.lifecycleDesiredState === "stopped"
+        && (
+          current.lifecyclePhase === "saving"
+          || current.lifecyclePhase === "stopping"
+          || current.lifecyclePhase === "failed"
+        ),
+      );
+      if (!current || !exactStop) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, queued: false };
+      }
+      if (retry?.opId !== resolvedOpId) {
+        await txn.put(STOP_RETRY_KEY, {
+          opId: resolvedOpId,
+          attempt: 0,
+          nextAttemptAtMs: Date.now(),
+          ...(options?.idleClaimId?.trim()
+            ? { idleClaimId: options.idleClaimId.trim() }
+            : {}),
+        } satisfies StopRetryRecord);
+      } else if (options?.idleClaimId?.trim() && !retry.idleClaimId) {
+        await txn.put(STOP_RETRY_KEY, {
+          ...retry,
+          idleClaimId: options.idleClaimId.trim(),
+        } satisfies StopRetryRecord);
+      }
+      return { mutable: current, scheduledRun: scheduledRun ?? null, queued: true };
+    });
+    if (!result.queued) return false;
+    await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    return true;
+  }
+
+  /**
+   * Re-arm the exact active Stop operation, preserving its runtime fence.
+   * This deliberately reads storage without resolving lifecycle timeouts first:
+   * an alarm or explicit retry may arrive after the save deadline has moved the
+   * operation to failed. A missing or stale retry timer must never mint a new
+   * Stop ID while the runtime still owns the original fence.
+   */
+  async resumeStopRetry(opId: string | null | undefined): Promise<EnvLifecycleState | null> {
+    const resolvedOpId = this.resolveLifecycleOpId(opId);
+    if (!resolvedOpId) return null;
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, retry, scheduledRun] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<StopRetryRecord>(STOP_RETRY_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const exactStop = Boolean(
+        current
+        && current.lifecycleOpId === resolvedOpId
+        && current.lifecycleOperation === "stop"
+        && current.lifecycleDesiredState === "stopped"
+        && (
+          current.lifecyclePhase === "saving"
+          || current.lifecyclePhase === "stopping"
+          || current.lifecyclePhase === "failed"
+        ),
+      );
+      if (!current || !exactStop) {
+        return { mutable: current, scheduledRun: scheduledRun ?? null, resumed: false };
+      }
+
+      const acknowledged = current.lifecycleLastWorkspaceSyncedAckOpId === resolvedOpId;
+      const updatedAt = nowIso();
+      const lifecycleUpdatedAt = current.lifecyclePhase === "failed"
+        ? updatedAt
+        : current.lifecycleUpdatedAt ?? current.updatedAt;
+      const next = normalizeMutableState({
+        ...applyLifecycleState(current, {
+          phase: acknowledged ? "stopping" : "saving",
+          activeOpId: resolvedOpId,
+          activeOperation: "stop",
+          desiredState: "stopped",
+          lastRunnerState: current.lifecycleLastRunnerState,
+          lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
+          infraState: current.lifecycleInfraState,
+          runtimeReady: false,
+          lastError: null,
+          lastErrorAt: null,
+          updatedAt: lifecycleUpdatedAt,
+        }),
+        ...(!acknowledged
+          ? { bootMessage: "Saving workspace…", bootStepId: "workspace-sync" as const }
+          : {}),
+        error: null,
+        errorAt: null,
+        updatedAt,
+      });
+      const nextScheduledRun = scheduledRun?.kind === "active" && scheduledRun.stopOpId === resolvedOpId
+        ? {
+            ...scheduledRun,
+            persistenceConfirmed: acknowledged || scheduledRun.persistenceConfirmed,
+            updatedAt,
+          }
+        : scheduledRun ?? null;
+      if (retry?.opId !== resolvedOpId) {
+        await txn.put(STOP_RETRY_KEY, {
+          opId: resolvedOpId,
+          attempt: 0,
+          nextAttemptAtMs: Date.now() + STOP_RETRY_INITIAL_DELAY_MS,
+        } satisfies StopRetryRecord);
+      }
+      await this.allocateRunnerCommandInTransaction(txn, resolvedOpId, "stopped");
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      return { mutable: projected, scheduledRun: nextScheduledRun, resumed: true };
+    });
+    if (!result.resumed) return null;
+    await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    return buildLifecycleState(result.mutable);
   }
 
   async beginStart(
@@ -3116,6 +3391,121 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       ...(result.claudeAuthMode ? { claudeAuthMode: result.claudeAuthMode } : {}),
       ...(result.codexAuthPreference ? { codexAuthPreference: result.codexAuthPreference } : {}),
     };
+  }
+
+  async reportImplementorCompletion(
+    runtimeStartOpId: string,
+    sequence: number,
+  ): Promise<{ accepted: boolean; changed: boolean }> {
+    const normalizedOpId = runtimeStartOpId.trim();
+    if (!normalizedOpId || !Number.isSafeInteger(sequence) || sequence <= 0) {
+      return { accepted: false, changed: false };
+    }
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const stored = await txn.get<EnvMutableState>(MUTABLE_STATE_KEY);
+      if (!stored) return { accepted: false, changed: false };
+      const current = normalizeMutableState(stored);
+      const attention = current.implementorAttentionState;
+      if (attention.runtimeStartOpId !== normalizedOpId) {
+        return { accepted: false, changed: false };
+      }
+      if (sequence <= attention.lastCompletionSequence) {
+        return { accepted: true, changed: false };
+      }
+      const updatedAt = nowIso();
+      const next = normalizeMutableState({
+        ...current,
+        implementorAttentionState: {
+          ...attention,
+          runtimeStartOpId: normalizedOpId,
+          lastCompletionSequence: sequence,
+          unreadToken: crypto.randomUUID(),
+        },
+        updatedAt,
+      });
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { accepted: true, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(
+        await this.readStoredMutableState(),
+        await this.readScheduledRun(),
+      );
+    }
+    return result;
+  }
+
+  async reportReviewerCompletion(
+    runId: string,
+  ): Promise<{ accepted: boolean; changed: boolean }> {
+    const normalizedRunId = runId.trim();
+    if (!normalizedRunId) return { accepted: false, changed: false };
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const stored = await txn.get<EnvMutableState>(MUTABLE_STATE_KEY);
+      if (!stored) return { accepted: false, changed: false };
+      const current = normalizeMutableState(stored);
+      const attention = current.implementorAttentionState;
+      if (attention.lastReviewerCompletionRunId === normalizedRunId) {
+        return { accepted: true, changed: false };
+      }
+      const next = normalizeMutableState({
+        ...current,
+        implementorAttentionState: {
+          ...attention,
+          lastReviewerCompletionRunId: normalizedRunId,
+          unreadToken: crypto.randomUUID(),
+        },
+        updatedAt: nowIso(),
+      });
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { accepted: true, changed: true };
+    });
+    if (result.changed) {
+      await this.scheduleNextAlarm(
+        await this.readStoredMutableState(),
+        await this.readScheduledRun(),
+      );
+    }
+    return result;
+  }
+
+  async acknowledgeImplementorAttention(
+    token: string,
+  ): Promise<"acknowledged" | "conflict" | "missing"> {
+    const normalizedToken = token.trim();
+    if (!normalizedToken) return "conflict";
+    const outcome = await this.ctx.storage.transaction(async (txn) => {
+      const stored = await txn.get<EnvMutableState>(MUTABLE_STATE_KEY);
+      if (!stored) return { result: "missing", changed: false } as const;
+      const current = normalizeMutableState(stored);
+      const unreadToken = current.implementorAttentionState.unreadToken;
+      if (unreadToken === null) {
+        return { result: "acknowledged", changed: false } as const;
+      }
+      if (unreadToken !== normalizedToken) {
+        return { result: "conflict", changed: false } as const;
+      }
+      const next = normalizeMutableState({
+        ...current,
+        implementorAttentionState: {
+          ...current.implementorAttentionState,
+          unreadToken: null,
+        },
+        updatedAt: nowIso(),
+      });
+      await txn.put(MUTABLE_STATE_KEY, next);
+      await this.markProjectionDirtyInTransaction(txn);
+      return { result: "acknowledged", changed: true } as const;
+    });
+    if (outcome.changed) {
+      await this.scheduleNextAlarm(
+        await this.readStoredMutableState(),
+        await this.readScheduledRun(),
+      );
+    }
+    return outcome.result;
   }
 
   async noteInfraReady(opId?: string | null): Promise<EnvLifecycleState | null> {
@@ -3316,8 +3706,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
             )
           ),
         );
-        const matchingSelfStop = this.isExactActiveStart(current, resolvedStopFinalizeOpId);
-        if (!matchingStop && !matchingSelfStop) {
+        if (!matchingStop) {
           console.warn(
             `[env-lifecycle] stale workspace-synced ack ignored: ${JSON.stringify({
               opId: resolvedStopFinalizeOpId,
@@ -3383,7 +3772,8 @@ export class EnvLifecycleDO extends DurableObject<Env> {
             bootStepId: null,
           });
           await txn.delete(STOP_WORKSPACE_SYNCED_META_KEY);
-        } else if (current.lifecycleOperation === "stop") {
+          await txn.delete(STOP_RETRY_KEY);
+        } else {
           await txn.put(STOP_WORKSPACE_SYNCED_META_KEY, {
             opId: resolvedOpId,
             patch,
@@ -3411,37 +3801,6 @@ export class EnvLifecycleDO extends DurableObject<Env> {
               fromPhase: current.lifecyclePhase,
               toPhase: "stopping",
               currentOpId: current.lifecycleOpId,
-            })}`,
-          );
-        } else {
-          await txn.put(STOP_WORKSPACE_SYNCED_META_KEY, {
-            opId: resolvedOpId,
-            patch,
-          } satisfies PendingStopWorkspaceSyncedMeta);
-          next = applyLifecycleState(
-            next,
-            {
-              phase: "stopping",
-              activeOpId: current.lifecycleOpId,
-              activeOperation: "stop",
-              desiredState: "stopped",
-              lastRunnerState: current.lifecycleLastRunnerState,
-              lastWorkspaceSyncedAckOpId: current.lifecycleOpId,
-              infraState: current.lifecycleInfraState,
-              runtimeReady: false,
-              lastError: null,
-              lastErrorAt: null,
-              updatedAt,
-            },
-            { status: "stopping" },
-          );
-          console.info(
-            `[env-lifecycle] workspace-synced ack treated as self-stop: ${JSON.stringify({
-              opId: resolvedOpId,
-              fromPhase: current.lifecyclePhase,
-              toPhase: "stopping",
-              currentOpId: current.lifecycleOpId,
-              desiredState: current.lifecycleDesiredState,
             })}`,
           );
         }
@@ -3492,6 +3851,34 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       },
     );
     return buildLifecycleState(next);
+  }
+
+  async acceptStopWorkspaceSynced(
+    opId: string | null | undefined,
+    workspacePatch?: Partial<StopWorkspaceSyncedMetaPatch> | null,
+  ): Promise<{ accepted: boolean; opId: string | null; state: EnvLifecycleState | null }> {
+    const resolvedOpId = this.resolveLifecycleOpId(opId);
+    const next = await this.recordStopWorkspaceSynced(
+      { ...(workspacePatch ?? {}) } as StopWorkspaceSyncedMetaPatch,
+      {
+        opId: resolvedOpId,
+        stopFinalize: true,
+        clearError: true,
+      },
+    );
+    const accepted = Boolean(
+      next
+      && resolvedOpId
+      && next.lifecycleOpId === resolvedOpId
+      && next.lifecycleOperation === "stop"
+      && next.lifecycleDesiredState === "stopped"
+      && next.lifecycleLastWorkspaceSyncedAckOpId === resolvedOpId,
+    );
+    return {
+      accepted,
+      opId: accepted ? resolvedOpId : null,
+      state: buildLifecycleState(next),
+    };
   }
 
   async getStopWorkspaceSyncedMeta(): Promise<PendingStopWorkspaceSyncedMeta | null> {
@@ -3647,7 +4034,9 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     if (result.changed) {
       await this.scheduleNextAlarm(result.state, await this.readScheduledRun());
     }
-    return { claimed: result.claimed, state: result.state };
+    return result.claimed
+      ? { claimed: true, state: result.state }
+      : { claimed: false, state: result.state };
   }
 
   async updateGitHubPublishOperation(input: {
@@ -3823,6 +4212,31 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     });
   }
 
+  private async expireGitHubPublishWithoutResult(): Promise<void> {
+    const now = Date.now();
+    await this.ctx.storage.transaction(async (txn) => {
+      const [operation, current] = await Promise.all([
+        txn.get<GitHubPublishOperationRecord>(GITHUB_PUBLISH_OPERATION_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      if (
+        !operation
+        || operation.resultClaim
+        || operation.cleanupPending
+        || parseTimestamp(operation.startedAt) + GITHUB_PUBLISH_OPERATION_TIMEOUT_MS > now
+        || !current
+        || current.githubPublishOperationId !== operation.operationId
+      ) return;
+      await txn.put(GITHUB_PUBLISH_OPERATION_KEY, {
+        ...operation,
+        cleanupPending: {
+          terminalError: "GitHub publish timed out before reporting a result. Retry publishing.",
+        },
+      } satisfies GitHubPublishOperationRecord);
+      await txn.setAlarm(now);
+    });
+  }
+
   private async runGitHubPublishCleanupEffect(): Promise<void> {
     const operation = await this.getGitHubPublishOperation();
     if (!operation?.cleanupPending) return;
@@ -3872,21 +4286,62 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       if (!current || !matchingStop) {
         return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false };
       }
-      const runnerStoppedConfirmed = current.lifecycleInfraState === "stopped"
-        && current.lifecycleLastRunnerState === "stopped";
-      const next = applyLifecycleState(current, buildFailureState(current, error));
-      const nextScheduledRun = scheduledRun?.kind === "active" && scheduledRun.stopOpId === resolvedOpId
-        ? this.settleActiveScheduledRun({
-            ...scheduledRun,
-            failure: error,
-            persistenceConfirmed: true,
-            runnerStoppedConfirmed: scheduledRun.runnerStoppedConfirmed || runnerStoppedConfirmed,
-            updatedAt: nowIso(),
+      const acknowledged = current.lifecycleLastWorkspaceSyncedAckOpId === resolvedOpId
+        && (current.lifecyclePhase === "stopping" || current.lifecyclePhase === "stopped");
+      const updatedAt = nowIso();
+      const next = acknowledged
+        ? normalizeMutableState({
+            ...current,
+            error: null,
+            errorAt: null,
+            lifecycleUpdatedAt: updatedAt,
+            updatedAt,
           })
+        : normalizeMutableState({
+            ...applyLifecycleState(current, {
+              phase: "saving",
+              activeOpId: resolvedOpId,
+              activeOperation: "stop",
+              desiredState: "stopped",
+              lastRunnerState: current.lifecycleLastRunnerState,
+              lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
+              infraState: current.lifecycleInfraState,
+              runtimeReady: false,
+              lastError: null,
+              lastErrorAt: null,
+              updatedAt,
+            }),
+            bootMessage: stopRetryProgressMessage(error),
+            bootStepId: "workspace-sync",
+            error: null,
+            errorAt: null,
+          });
+      const nextScheduledRun = scheduledRun?.kind === "active" && scheduledRun.stopOpId === resolvedOpId
+        ? {
+            ...scheduledRun,
+            persistenceConfirmed: acknowledged || scheduledRun.persistenceConfirmed,
+            updatedAt,
+          }
         : scheduledRun ?? null;
+      const existingRetry = await txn.get<StopRetryRecord>(STOP_RETRY_KEY);
+      const attempt = existingRetry?.opId === resolvedOpId ? existingRetry.attempt : 0;
+      await txn.put(STOP_RETRY_KEY, {
+        opId: resolvedOpId!,
+        attempt,
+        nextAttemptAtMs: Date.now() + stopRetryDelayMs(attempt),
+        ...(existingRetry?.opId === resolvedOpId && existingRetry.idleClaimId
+          ? { idleClaimId: existingRetry.idleClaimId }
+          : {}),
+      } satisfies StopRetryRecord);
       const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
       return { mutable: projected, scheduledRun: nextScheduledRun, changed: true };
     });
+    if (result.changed) {
+      console.error(`[env-lifecycle] Stop persistence will retry automatically: ${JSON.stringify({
+        opId: resolvedOpId,
+        detail: error,
+      })}`);
+    }
     if (result.changed) {
       await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
     }
@@ -4092,13 +4547,15 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         });
         runnerStoppedBeforeWorkspace = true;
       } else if (current.lifecyclePhase === "starting" || current.lifecyclePhase === "running") {
-        failure = current.lifecyclePhase === "starting"
-          ? reason?.trim()
-            ? `Container exited before the environment finished starting (${reason.trim()}).`
-            : "Container exited before the environment finished starting."
-          : reason?.trim()
-            ? `Container exited unexpectedly while the environment was running (${reason.trim()}).`
-            : ENV_LIFECYCLE_RUNNER_EXIT_WHILE_RUNNING_ERROR;
+        failure = isProjectedRuntimeFailure(reason)
+          ? reason!.trim()
+          : current.lifecyclePhase === "starting"
+            ? reason?.trim()
+              ? `Container exited before the environment finished starting (${reason.trim()}).`
+              : "Container exited before the environment finished starting."
+            : reason?.trim()
+              ? `Container exited unexpectedly while the environment was running (${reason.trim()}).`
+              : ENV_LIFECYCLE_RUNNER_EXIT_WHILE_RUNNING_ERROR;
         let diagnostics = storedDiagnostics
           ? normalizeStartupDiagnosticsSnapshot(storedDiagnostics)
           : null;
@@ -4133,6 +4590,18 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         return { mutable: current, scheduledRun: scheduledRun ?? null, changed: false, runnerStoppedBeforeWorkspace: false };
       }
 
+      // A stopped runner can still have an exact prepared receipt in SandboxDO.
+      // Keep the Stop retry until both persistence and runner exit converge so
+      // LifecycleDO can recover that receipt after an early onStop callback.
+      if (
+        current.lifecycleOperation === "stop"
+        && current.lifecycleDesiredState === "stopped"
+        && next.lifecyclePhase === "stopped"
+        && next.lifecycleLastWorkspaceSyncedAckOpId === resolvedOpId
+      ) {
+        await txn.delete(STOP_RETRY_KEY);
+      }
+
       let nextScheduledRun = scheduledRun ?? null;
       if (
         scheduledRun?.kind === "active"
@@ -4155,6 +4624,106 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     }
     if (result.changed) await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
     return buildLifecycleState(result.mutable);
+  }
+
+  /**
+   * Reconciles a fresh execution-owner proof that no runner exists before a
+   * replacement Start. This never treats a merely stopped host container as
+   * absent; callers must supply an exact fresh `absent` inspection result.
+   * When a Stop lost its final acknowledgement with the runner itself, the
+   * next Start intentionally recovers from the latest fully converged
+   * WorkspaceDO state.
+   */
+  async confirmRunnerAbsentForRestart(
+    expectedOpId: string | null,
+  ): Promise<boolean> {
+    const normalizedExpectedOpId = this.resolveLifecycleOpId(expectedOpId);
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const [storedMutable, scheduledRun] = await Promise.all([
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+        txn.get<ScheduledRunRecord>(SCHEDULED_RUN_RECORD_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      if (
+        !current
+        || current.lifecycleOpId !== normalizedExpectedOpId
+        || current.lifecyclePhase === "starting"
+        || current.lifecyclePhase === "running"
+      ) {
+        return { changed: false, mutable: current, scheduledRun: scheduledRun ?? null };
+      }
+
+      const stopRecovery = current.lifecycleOperation === "stop"
+        && current.lifecycleDesiredState === "stopped"
+        && (
+          current.lifecyclePhase === "saving"
+          || current.lifecyclePhase === "stopping"
+          || current.lifecyclePhase === "failed"
+          || current.lifecyclePhase === "stopped"
+        );
+      const failedStartRecovery = current.lifecycleOperation === "start"
+        && current.lifecycleDesiredState === "running"
+        && current.lifecyclePhase === "failed";
+      const alreadyRestartable = current.lifecyclePhase === "stopped"
+        || current.status === "stopped"
+        || current.status === "failed"
+        || current.status === "unknown";
+      if (!stopRecovery && !failedStartRecovery && !alreadyRestartable) {
+        return { changed: false, mutable: current, scheduledRun: scheduledRun ?? null };
+      }
+
+      const updatedAt = nowIso();
+      const runnerAbsent = normalizeMutableState({
+        ...current,
+        lifecycleLastRunnerState: "stopped",
+        lifecycleInfraState: "stopped",
+        lifecycleRuntimeReady: false,
+        lifecycleUpdatedAt: updatedAt,
+        updatedAt,
+      });
+      const next = stopRecovery
+        ? normalizeMutableState({
+            ...applyLifecycleState(runnerAbsent, {
+              phase: "stopped",
+              activeOpId: current.lifecycleOpId,
+              activeOperation: "stop",
+              desiredState: "stopped",
+              lastRunnerState: "stopped",
+              lastWorkspaceSyncedAckOpId: current.lifecycleLastWorkspaceSyncedAckOpId,
+              infraState: "stopped",
+              runtimeReady: false,
+              lastError: null,
+              lastErrorAt: null,
+              updatedAt,
+            }),
+            bootMessage: null,
+            bootStepId: null,
+          })
+        : runnerAbsent;
+
+      let nextScheduledRun = scheduledRun ?? null;
+      if (
+        nextScheduledRun?.kind === "active"
+        && (
+          nextScheduledRun.stopOpId === normalizedExpectedOpId
+          || nextScheduledRun.startOpId === normalizedExpectedOpId
+        )
+      ) {
+        nextScheduledRun = this.settleActiveScheduledRun({
+          ...nextScheduledRun,
+          runnerStoppedConfirmed: true,
+          runnerCleanupRequired: false,
+          runnerUncertaintyError: null,
+          updatedAt,
+        });
+      }
+      if (stopRecovery) await txn.delete(STOP_WORKSPACE_SYNCED_META_KEY);
+      if (stopRecovery) await txn.delete(STOP_RETRY_KEY);
+      const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
+      return { changed: true, mutable: projected, scheduledRun: nextScheduledRun };
+    });
+    if (result.changed) await this.scheduleNextAlarm(result.mutable, result.scheduledRun);
+    return result.changed;
   }
 
   private getScheduledRunCapacityStub(): ScheduledRunCapacityDO {
@@ -4280,6 +4849,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         lifecycleStub: this,
         cachedMeta: meta,
         expectedIncarnationId: record.incarnationId,
+        awaitRunnerDispatch: true,
       });
       if (result.status >= 400 && result.runnerUncertain) {
         const message = typeof (result.body as { error?: unknown } | null)?.error === "string"
@@ -4339,7 +4909,6 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       const cleanup = await cleanupLaunchCredentialsBestEffort(
         this.env,
         record.slug,
-        undefined,
         {
           scope: { incarnationId: record.incarnationId, startOpId: record.startOpId },
           ids: record.credentialIds,
@@ -4382,6 +4951,97 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     await this.scheduleNextAlarm(result.mutable, result.record);
   }
 
+  /** Returns true while an exact Stop retry record owns retry dispatch. */
+  private async runStopRetryEffect(): Promise<boolean> {
+    const storedRetry = await this.ctx.storage.get<StopRetryRecord>(STOP_RETRY_KEY);
+    if (!storedRetry) return false;
+    const now = Date.now();
+    const claim = await this.ctx.storage.transaction(async (txn) => {
+      const [retry, storedMutable] = await Promise.all([
+        txn.get<StopRetryRecord>(STOP_RETRY_KEY),
+        txn.get<EnvMutableState>(MUTABLE_STATE_KEY),
+      ]);
+      const current = storedMutable ? normalizeMutableState(storedMutable) : null;
+      const exactStop = Boolean(
+        retry
+        && current
+        && current.lifecycleOpId === retry.opId
+        && current.lifecycleOperation === "stop"
+        && current.lifecycleDesiredState === "stopped"
+        && (
+          current.lifecyclePhase === "saving"
+          || current.lifecyclePhase === "stopping"
+          || current.lifecyclePhase === "failed"
+        ),
+      );
+      if (!retry || !current || !exactStop) {
+        if (retry) await txn.delete(STOP_RETRY_KEY);
+        return { owned: false, due: false, retry: null as StopRetryRecord | null };
+      }
+      if (now < retry.nextAttemptAtMs) {
+        return { owned: true, due: false, retry };
+      }
+      const updatedAt = nowIso();
+      const attempt = retry.attempt + 1;
+      const nextRetry: StopRetryRecord = {
+        ...retry,
+        opId: retry.opId,
+        attempt,
+        nextAttemptAtMs: now + stopRetryDelayMs(attempt),
+      };
+      await txn.put(STOP_RETRY_KEY, nextRetry);
+      await txn.put(MUTABLE_STATE_KEY, normalizeMutableState({
+        ...current,
+        updatedAt,
+      }));
+      await this.markProjectionDirtyInTransaction(txn);
+      return { owned: true, due: true, retry: nextRetry };
+    });
+    if (!claim.owned || !claim.retry) return false;
+    if (!claim.due) return true;
+
+    const meta = await this.getOwnedEnvView();
+    if (!meta) return true;
+    const scheduledRun = await this.readScheduledRun();
+    const matchingScheduledRun = scheduledRun?.kind === "active"
+      && scheduledRun.stopOpId === claim.retry.opId
+      ? scheduledRun
+      : null;
+    try {
+      const result = await stopEnvAction({
+        env: this.env,
+        executionCtx: this.alarmExecutionContext(),
+        slug: meta.slug,
+        ...(matchingScheduledRun
+          ? {
+              intent: "scheduled" as const,
+              requestedOutcome: matchingScheduledRun.requestedOutcome ?? "interrupted" as const,
+              expectedStartOpId: matchingScheduledRun.startOpId,
+              expectedIncarnationId: matchingScheduledRun.incarnationId,
+            }
+          : {}),
+        lifecycleStub: this,
+        cachedMeta: meta,
+        expectedStopOpId: claim.retry.opId,
+        idleClaimId: claim.retry.idleClaimId ?? null,
+        awaitRunnerDispatch: true,
+      });
+      if (result.status >= 400) {
+        console.warn(`[env-lifecycle] Stop retry was not dispatched: ${JSON.stringify({
+          opId: claim.retry.opId,
+          status: result.status,
+          detail: result.body,
+        })}`);
+      }
+    } catch (error) {
+      console.error(`[env-lifecycle] Stop retry failed: ${JSON.stringify({
+        opId: claim.retry.opId,
+        detail: error instanceof Error ? error.message : String(error),
+      })}`);
+    }
+    return true;
+  }
+
   private async runAlarmPass(): Promise<void> {
     await this.runScheduledRunLeaseReleaseEffect();
     const creationClaim = await this.ctx.storage.get<InitialCreateClaim>(INITIAL_CREATE_CLAIM_KEY);
@@ -4407,6 +5067,8 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     }
 
     await this.getMutableState();
+    const stopRetryOwnsDispatch = await this.runStopRetryEffect();
+    await this.expireGitHubPublishWithoutResult();
     await this.expireGitHubPublishResultClaim();
     await this.runGitHubPublishCleanupEffect();
     let record = await this.readScheduledRun();
@@ -4449,7 +5111,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       ) await this.runScheduledRunStartEffect(record);
     } else if (record?.kind === "active") {
       if (!record.preparation && (record.requestedOutcome || record.failure)) {
-        await this.runScheduledRunCleanupEffect(record);
+        if (!stopRetryOwnsDispatch) await this.runScheduledRunCleanupEffect(record);
       }
     }
 

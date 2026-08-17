@@ -6,12 +6,8 @@ import type {
 } from "../../api/coordination/types";
 import {
   newestReviewerRun,
-  planReviewerFinishedAckStorageKey,
   planWriterTabStatus,
-  readPlanReviewerFinishedAcks,
-  removePlanReviewerFinishedAcks,
   reviewerTabStatus,
-  writePlanReviewerFinishedAcks,
 } from "../plan-tab-status";
 
 const reviewer: ReviewerRegistryEntry = {
@@ -87,8 +83,17 @@ describe("reviewerTabStatus", () => {
     expect(reviewerTabStatus({
       reviewer,
       latestRun: completed,
-      acknowledgedRunId: completed.runId,
+      hasUnreadResult: false,
     })).toMatchObject({ kind: "viewed", label: "Viewed", runId: completed.runId });
+  });
+
+  it("keeps failed reviewers in the error state after acknowledgement", () => {
+    const failed = run("failed", { error: "Container exited." });
+    expect(reviewerTabStatus({
+      reviewer,
+      latestRun: failed,
+      hasUnreadResult: false,
+    })).toMatchObject({ kind: "error", label: "Error", runId: failed.runId });
   });
 });
 
@@ -106,6 +111,14 @@ describe("planWriterTabStatus", () => {
 
   it("describes transitional, stopped, and error states", () => {
     expect(planWriterTabStatus(writer("not_running"), { operation: "starting" }).kind).toBe("starting");
+    expect(planWriterTabStatus(writer("running"), {
+      connecting: true,
+      connectingDetail: "The Hub connection is offline.",
+    })).toMatchObject({
+      kind: "starting",
+      label: "Connecting",
+      detail: expect.stringContaining("Hub connection is offline"),
+    });
     expect(planWriterTabStatus(writer("running"), { operation: "stopping" }).kind).toBe("stopping");
     expect(planWriterTabStatus({ ...writer("running"), synchronization: { state: "saving" } }).kind).toBe("saving");
     expect(planWriterTabStatus({ ...writer("not_running"), generation: 1, stopReason: "user" })).toMatchObject({
@@ -144,26 +157,5 @@ describe("newestReviewerRun", () => {
     });
     expect(newestReviewerRun(newer, older)).toBe(newer);
     expect(newestReviewerRun(older, newer)).toBe(newer);
-  });
-});
-
-describe("finished acknowledgement storage", () => {
-  it("stores acknowledgements per repository and plan and can remove them", () => {
-    const values = new Map<string, string>();
-    const storage = {
-      getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => { values.set(key, value); },
-      removeItem: (key: string) => { values.delete(key); },
-    };
-
-    expect(planReviewerFinishedAckStorageKey("repo-1", "plan-1"))
-      .not.toBe(planReviewerFinishedAckStorageKey("repo-1", "plan-2"));
-    expect(writePlanReviewerFinishedAcks(storage, "repo-1", "plan-1", { "reviewer-1": "run-1" }))
-      .toBe(true);
-    expect(readPlanReviewerFinishedAcks(storage, "repo-1", "plan-1"))
-      .toEqual({ "reviewer-1": "run-1" });
-    expect(readPlanReviewerFinishedAcks(storage, "repo-1", "plan-2")).toEqual({});
-    expect(removePlanReviewerFinishedAcks(storage, "repo-1", "plan-1")).toBe(true);
-    expect(readPlanReviewerFinishedAcks(storage, "repo-1", "plan-1")).toEqual({});
   });
 });

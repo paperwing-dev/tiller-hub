@@ -169,6 +169,7 @@ async function buildManifest(env: Env, request: Request) {
       metadata: "read",
       contents: "write",
       pull_requests: "write",
+      workflows: "write",
     },
     default_events: ["pull_request", "push"],
     request_oauth_on_install: false,

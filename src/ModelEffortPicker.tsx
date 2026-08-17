@@ -24,6 +24,7 @@ interface ModelEffortPickerProps<Effort extends string> {
   className?: string;
   modelLabel?: string;
   effortLabel?: string;
+  effortControl?: "select" | "status-bar";
 }
 
 export default function ModelEffortPicker<Effort extends string>({
@@ -34,11 +35,13 @@ export default function ModelEffortPicker<Effort extends string>({
   className = "",
   modelLabel = "Model",
   effortLabel = "Effort",
+  effortControl = "select",
 }: ModelEffortPickerProps<Effort>) {
   const selected = options.find((option) => option.value === value.model) ?? null;
+  const availableEfforts = selected?.efforts ?? [];
 
   return (
-    <div className={`grid grid-cols-[minmax(0,1fr)_8.5rem] gap-3 ${className}`.trim()}>
+    <div className={`grid ${effortControl === "status-bar" ? "grid-cols-1 gap-4" : "grid-cols-[minmax(0,1fr)_8.5rem] gap-3"} ${className}`.trim()}>
       <div className="min-w-0 text-xs font-medium text-kumo-subtle">
         <span className="mb-1.5 block">{modelLabel}</span>
         <Select
@@ -72,25 +75,48 @@ export default function ModelEffortPicker<Effort extends string>({
 
       <div className="text-xs font-medium text-kumo-subtle">
         <span className="mb-1.5 block">{effortLabel}</span>
-        <Select
-          aria-label={effortLabel}
-          className="w-full"
-          size="sm"
-          value={value.effort}
-          onValueChange={(nextValue) => {
-            if (!nextValue || !selected) return;
-            const effort = selected.efforts.find((candidate) => candidate.value === nextValue);
-            if (effort) onChange({ ...value, effort: effort.value });
-          }}
-          disabled={disabled || !selected || selected.efforts.length === 0}
-          renderValue={(selectedValue) =>
-            selected?.efforts.find((effort) => effort.value === selectedValue)?.label ?? String(selectedValue)
-          }
-        >
-          {(selected?.efforts ?? []).map((effort) => (
-            <Select.Option key={effort.value} value={effort.value}>{effort.label}</Select.Option>
-          ))}
-        </Select>
+        {effortControl === "status-bar" ? (
+          <div
+            role="group"
+            aria-label={effortLabel}
+            className="tiller-effort-status-bar grid w-full"
+            style={{ gridTemplateColumns: `repeat(${Math.max(availableEfforts.length, 1)}, minmax(0, 1fr))` }}
+          >
+            {availableEfforts.map((effort) => (
+              <button
+                key={effort.value}
+                type="button"
+                aria-label={`${effortLabel}: ${effort.label}`}
+                aria-pressed={effort.value === value.effort}
+                disabled={disabled || !selected}
+                onClick={() => onChange({ ...value, effort: effort.value })}
+                className="tiller-effort-status-segment min-w-0 truncate px-2 py-1.5 text-[12px] font-medium"
+              >
+                {effort.label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <Select
+            aria-label={effortLabel}
+            className="w-full"
+            size="sm"
+            value={value.effort}
+            onValueChange={(nextValue) => {
+              if (!nextValue || !selected) return;
+              const effort = selected.efforts.find((candidate) => candidate.value === nextValue);
+              if (effort) onChange({ ...value, effort: effort.value });
+            }}
+            disabled={disabled || !selected || selected.efforts.length === 0}
+            renderValue={(selectedValue) =>
+              selected?.efforts.find((effort) => effort.value === selectedValue)?.label ?? String(selectedValue)
+            }
+          >
+            {availableEfforts.map((effort) => (
+              <Select.Option key={effort.value} value={effort.value}>{effort.label}</Select.Option>
+            ))}
+          </Select>
+        )}
       </div>
     </div>
   );

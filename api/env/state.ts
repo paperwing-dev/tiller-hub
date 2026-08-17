@@ -87,6 +87,30 @@ function inferRuntimeReady(
   return (phase ?? status) === "running";
 }
 
+function normalizeImplementorAttentionState(
+  value: EnvMutableState["implementorAttentionState"] | undefined,
+): EnvMutableState["implementorAttentionState"] {
+  const runtimeStartOpId = typeof value?.runtimeStartOpId === "string"
+    ? value.runtimeStartOpId.trim()
+    : "";
+  const unreadToken = typeof value?.unreadToken === "string"
+    ? value.unreadToken.trim()
+    : "";
+  const lastReviewerCompletionRunId = typeof value?.lastReviewerCompletionRunId === "string"
+    ? value.lastReviewerCompletionRunId.trim()
+    : "";
+  return {
+    runtimeStartOpId: runtimeStartOpId || null,
+    lastCompletionSequence: typeof value?.lastCompletionSequence === "number"
+      && Number.isSafeInteger(value.lastCompletionSequence)
+      && value.lastCompletionSequence >= 0
+      ? value.lastCompletionSequence
+      : 0,
+    ...(lastReviewerCompletionRunId ? { lastReviewerCompletionRunId } : {}),
+    unreadToken: unreadToken || null,
+  };
+}
+
 export function createEmptyMutableState(overrides: Partial<EnvMutableState> = {}): EnvMutableState {
   const updatedAt = overrides.updatedAt ?? new Date().toISOString();
   return {
@@ -110,6 +134,9 @@ export function createEmptyMutableState(overrides: Partial<EnvMutableState> = {}
     lifecycleInfraState: overrides.lifecycleInfraState ?? "unknown",
     lifecycleRuntimeReady: overrides.lifecycleRuntimeReady ?? false,
     lifecycleUpdatedAt: overrides.lifecycleUpdatedAt ?? null,
+    implementorAttentionState: normalizeImplementorAttentionState(
+      overrides.implementorAttentionState,
+    ),
     runnerId: overrides.runnerId ?? null,
     bootMessage: overrides.bootMessage ?? null,
     bootStepId: overrides.bootStepId ?? null,
@@ -178,6 +205,13 @@ export function buildMutableStateFromMeta(meta: EnvMeta): EnvMutableState {
         ? meta.lifecycleRuntimeReady
         : inferRuntimeReady(lifecyclePhase, meta.status),
     lifecycleUpdatedAt,
+    implementorAttentionState: {
+      runtimeStartOpId: meta.lifecycleOperation === "start"
+        ? meta.lifecycleOpId ?? null
+        : null,
+      lastCompletionSequence: 0,
+      unreadToken: meta.implementorAttentionToken ?? null,
+    },
     runnerId: meta.runnerId ?? null,
     bootMessage: meta.bootMessage ?? null,
     bootStepId: meta.bootStepId ?? null,
@@ -247,7 +281,8 @@ export function buildEnvMetaFromLayers(
   const harnessPresentation = buildHarnessPresentation(definition, mutableState);
   const next: EnvMeta = {
     slug: definition.slug,
-    ...(definition.incarnationId ? { incarnationId: definition.incarnationId } : {}),
+    ...(definition.displayName ? { displayName: definition.displayName } : {}),
+    incarnationId: definition.incarnationId,
     ...(definition.sidebarSlot ? { sidebarSlot: definition.sidebarSlot } : {}),
     repoUrl,
     repoId: definition.repoId,
@@ -303,6 +338,7 @@ export function buildEnvMetaFromLayers(
     lifecycleInfraState: mutableState.lifecycleInfraState,
     lifecycleRuntimeReady: mutableState.lifecycleRuntimeReady,
     lifecycleUpdatedAt: mutableState.lifecycleUpdatedAt,
+    implementorAttentionToken: mutableState.implementorAttentionState.unreadToken,
     leadHarnessStatus: mutableState.leadHarnessStatus,
     leadHarnessError: mutableState.leadHarnessError,
     leadHarnessUpdatedAt: mutableState.leadHarnessUpdatedAt,

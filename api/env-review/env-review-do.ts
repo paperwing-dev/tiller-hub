@@ -1,23 +1,25 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../types";
-import type {
-  EnvReviewChangeContext,
-  EnvReviewFeedback,
-  EnvReviewFeedbackStatus,
-  EnvReviewPlanBasis,
-  EnvReviewPreparationOperation,
-  EnvReviewPreparationResult,
-  EnvReviewRun,
-  EnvReviewRunEvent,
-  EnvReviewRunStatus,
-  EnvReviewSession,
-  EnvReviewSnapshot,
-  EnvReviewSnapshotRequestContract,
-  EnvReviewState,
-  EnvReviewTab,
-  EnvReviewTabStatus,
-  EnvReviewTaskKind,
-  ReviewSkillInvocation,
+import {
+  reviewSkillRerunRunId,
+  type EnvReviewChangeContext,
+  type EnvReviewFeedback,
+  type EnvReviewFanoutHandoff,
+  type EnvReviewFeedbackStatus,
+  type EnvReviewPlanBasis,
+  type EnvReviewPreparationOperation,
+  type EnvReviewPreparationResult,
+  type EnvReviewRun,
+  type EnvReviewRunEvent,
+  type EnvReviewRunStatus,
+  type EnvReviewSession,
+  type EnvReviewSnapshot,
+  type EnvReviewSnapshotRequestContract,
+  type EnvReviewState,
+  type EnvReviewTab,
+  type EnvReviewTabStatus,
+  type EnvReviewTaskKind,
+  type ReviewSkillInvocation,
 } from "./types";
 import type {
   AgentSkillDefinition,
@@ -36,6 +38,8 @@ import {
   parseStoredRuntimeProvenance,
 } from "../coordination/execution-provenance";
 import { processEnvReviewOrchestration } from "./orchestrator";
+import { composeReviewerInstructions } from "../reviewer-instructions";
+import { REVIEW_SKILL_RERUN_INSTRUCTION } from "./active-instructions";
 
 const MAX_STORED_RUN_EVENTS = 200;
 
@@ -68,6 +72,8 @@ interface TabRow {
   updated_at: string;
   skill_invocation_id: string | null;
   skill_agent_id: string | null;
+  node_kind: string | null;
+  skill_root_thread_id: string | null;
 }
 
 interface RunRow {
@@ -120,6 +126,7 @@ interface ReviewSkillInvocationRow {
   cancelled_at: string | null;
   created_at: string;
   updated_at: string;
+  overview_route_json: string | null;
 }
 
 interface EventRow {
@@ -152,6 +159,7 @@ interface FeedbackRow {
   feedback_id: string;
   env_slug: string;
   repo_id: string;
+  main_session_id: string;
   thread_id: string;
   run_id: string;
   message_id: string;
@@ -279,7 +287,13 @@ function skillInvocationStatus(status: string): SkillInvocationStatus {
 }
 
 function skillRunRole(status: string | null): SkillRunRole | null {
-  return status === "child_initial" || status === "child_followup" || status === "overview" ? status : null;
+  return status === "root_initial"
+    || status === "root_followup"
+    || status === "report_initial"
+    || status === "report_followup"
+    || status === "overview"
+    ? status
+    : null;
 }
 
 function snapshotIdentityMatches(left: EnvReviewSnapshot, right: EnvReviewSnapshot): boolean {
@@ -359,7 +373,9 @@ export class EnvReviewDO extends DurableObject<Env> {
         latest_run_id TEXT,
         removed_at TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        node_kind TEXT NOT NULL DEFAULT 'generic',
+        skill_root_thread_id TEXT
       )
     `);
     db.exec(`
@@ -406,6 +422,8 @@ export class EnvReviewDO extends DurableObject<Env> {
       "ALTER TABLE env_review_tabs ADD COLUMN effort TEXT NOT NULL DEFAULT 'high'",
       "ALTER TABLE env_review_tabs ADD COLUMN skill_invocation_id TEXT",
       "ALTER TABLE env_review_tabs ADD COLUMN skill_agent_id TEXT",
+      "ALTER TABLE env_review_tabs ADD COLUMN node_kind TEXT NOT NULL DEFAULT 'generic'",
+      "ALTER TABLE env_review_tabs ADD COLUMN skill_root_thread_id TEXT",
       "ALTER TABLE env_review_runs ADD COLUMN effort TEXT NOT NULL DEFAULT 'high'",
       "ALTER TABLE env_review_runs ADD COLUMN recipe_instructions TEXT",
       "ALTER TABLE env_review_runs ADD COLUMN skill_invocation_id TEXT",
@@ -447,8 +465,14 @@ export class EnvReviewDO extends DurableObject<Env> {
         cancelled_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+        ,overview_route_json TEXT
       )
     `);
+    try {
+      db.exec("ALTER TABLE env_review_skill_invocations ADD COLUMN overview_route_json TEXT");
+    } catch {
+      // Column already exists.
+    }
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_env_review_skill_invocations_history
       ON env_review_skill_invocations(env_slug, main_session_id, created_at DESC, invocation_id DESC)
@@ -568,6 +592,11 @@ export class EnvReviewDO extends DurableObject<Env> {
       updatedAt: row.updated_at,
       skillInvocationId: row.skill_invocation_id,
       skillAgentId: row.skill_agent_id,
+      nodeKind:
+        row.node_kind === "skill_root" || row.node_kind === "report"
+          ? row.node_kind
+          : "generic",
+      skillRootThreadId: row.skill_root_thread_id,
     };
   }
 
@@ -626,6 +655,7 @@ export class EnvReviewDO extends DurableObject<Env> {
       overviewMode: row.overview_mode === "manual" ? "manual" : "auto",
       includedMessageIds: parseJson<string[]>(row.included_message_ids_json) ?? [],
       overviewRunId: row.overview_run_id,
+      overviewRoute: parseJson(row.overview_route_json),
       error: row.error,
       cancelledAt: row.cancelled_at,
       createdAt: row.created_at,
@@ -723,24 +753,115 @@ export class EnvReviewDO extends DurableObject<Env> {
     return this.parseSession(row);
   }
 
+  private getSessionForState(input: {
+    envSlug: string;
+    repoId: string;
+    mainSessionId: string;
+  }): EnvReviewSession {
+    this.assertSessionWritable(input.mainSessionId);
+    const existing = this.db.exec(
+      "SELECT * FROM env_review_sessions WHERE env_slug = ? AND main_session_id = ? LIMIT 1",
+      input.envSlug,
+      input.mainSessionId,
+    ).toArray()[0] as unknown as SessionRow | undefined;
+    if (existing) return this.parseSession(existing);
+    return this.getOrCreateSession(input);
+  }
+
   getState(input: { envSlug: string; repoId: string; mainSessionId: string }): EnvReviewState {
-    const session = this.getOrCreateSession(input);
+    const session = this.getSessionForState(input);
     const tabs = (this.db.exec(
-      "SELECT * FROM env_review_tabs WHERE env_slug = ? AND main_session_id = ? AND removed_at IS NULL AND skill_invocation_id IS NULL ORDER BY created_at ASC",
+      "SELECT * FROM env_review_tabs WHERE env_slug = ? AND main_session_id = ? AND removed_at IS NULL ORDER BY created_at ASC",
       input.envSlug,
       input.mainSessionId,
     ).toArray() as unknown as TabRow[]).map((row) => this.parseTab(row));
     const runs = (this.db.exec(
-      "SELECT * FROM env_review_runs WHERE env_slug = ? AND main_session_id = ? AND skill_invocation_id IS NULL ORDER BY started_at DESC LIMIT 50",
+      "SELECT * FROM env_review_runs WHERE env_slug = ? ORDER BY started_at DESC LIMIT 100",
       input.envSlug,
-      input.mainSessionId,
     ).toArray() as unknown as RunRow[]).map((row) => this.parseRun(row));
     const feedback = (this.db.exec(
-      "SELECT * FROM env_review_feedback WHERE env_slug = ? AND main_session_id = ? AND status != 'dismissed' ORDER BY created_at DESC LIMIT 100",
+      "SELECT * FROM env_review_feedback WHERE env_slug = ? AND status != 'dismissed' ORDER BY created_at DESC LIMIT 100",
       input.envSlug,
-      input.mainSessionId,
     ).toArray() as unknown as FeedbackRow[]).map((row) => this.parseFeedback(row));
     return { session, tabs, runs, feedback };
+  }
+
+  inheritReviewerTabsFromLatestSession(input: {
+    envSlug: string;
+    repoId: string;
+    mainSessionId: string;
+  }): { status: "existing" | "inherited" | "empty"; tabs: EnvReviewTab[] } {
+    this.assertSessionWritable(input.mainSessionId);
+    return this.ctx.storage.transactionSync(() => {
+      const currentSession = this.db.exec(
+        "SELECT main_session_id FROM env_review_sessions WHERE env_slug = ? AND main_session_id = ? LIMIT 1",
+        input.envSlug,
+        input.mainSessionId,
+      ).toArray()[0] as { main_session_id: string } | undefined;
+      if (currentSession) {
+        const tabs = (this.db.exec(
+          "SELECT * FROM env_review_tabs WHERE env_slug = ? AND main_session_id = ? AND removed_at IS NULL ORDER BY created_at ASC",
+          input.envSlug,
+          input.mainSessionId,
+        ).toArray() as unknown as TabRow[]).map((row) => this.parseTab(row));
+        return { status: "existing" as const, tabs };
+      }
+
+      const sourceSession = this.db.exec(
+        `
+          SELECT sessions.main_session_id
+          FROM env_review_sessions AS sessions
+          WHERE sessions.env_slug = ?
+            AND sessions.repo_id = ?
+            AND sessions.main_session_id != ?
+            AND EXISTS (
+              SELECT 1
+              FROM env_review_tabs AS tabs
+              WHERE tabs.env_slug = sessions.env_slug
+                AND tabs.main_session_id = sessions.main_session_id
+                AND tabs.removed_at IS NULL
+            )
+          ORDER BY sessions.updated_at DESC, sessions.created_at DESC
+          LIMIT 1
+        `,
+        input.envSlug,
+        input.repoId,
+        input.mainSessionId,
+      ).toArray()[0] as { main_session_id: string } | undefined;
+
+      this.getOrCreateSession(input);
+      if (!sourceSession) return { status: "empty" as const, tabs: [] };
+
+      const sourceTabs = this.db.exec(
+        "SELECT * FROM env_review_tabs WHERE env_slug = ? AND main_session_id = ? AND removed_at IS NULL ORDER BY created_at ASC",
+        input.envSlug,
+        sourceSession.main_session_id,
+      ).toArray() as unknown as TabRow[];
+      const now = nowIso();
+      for (const row of sourceTabs) {
+        // A reviewer is an environment-level collaborator. Move its registry
+        // row to the new lead session so the same ThreadDO (and conversation)
+        // survives a stop/start cycle, while prior runs remain session-scoped.
+        this.db.exec(
+          `
+            UPDATE env_review_tabs
+            SET repo_id = ?, main_session_id = ?, status = 'idle', latest_run_id = NULL,
+                removed_at = NULL, updated_at = ?
+            WHERE thread_id = ?
+          `,
+          input.repoId,
+          input.mainSessionId,
+          now,
+          row.thread_id,
+        );
+      }
+      const tabs = (this.db.exec(
+        "SELECT * FROM env_review_tabs WHERE env_slug = ? AND main_session_id = ? AND removed_at IS NULL ORDER BY created_at ASC",
+        input.envSlug,
+        input.mainSessionId,
+      ).toArray() as unknown as TabRow[]).map((row) => this.parseTab(row));
+      return { status: "inherited" as const, tabs };
+    });
   }
 
   addReviewerTab(input: {
@@ -756,6 +877,8 @@ export class EnvReviewDO extends DurableObject<Env> {
     customTask?: string | null;
     skillInvocationId?: string | null;
     skillAgentId?: string | null;
+    nodeKind?: "generic" | "skill_root" | "report";
+    skillRootThreadId?: string | null;
   }): EnvReviewTab {
     this.getOrCreateSession(input);
     const now = nowIso();
@@ -765,7 +888,8 @@ export class EnvReviewDO extends DurableObject<Env> {
           thread_id, env_slug, repo_id, main_session_id, provider, model, effort, role_label,
           task_kind, custom_task, status, latest_run_id, removed_at, created_at, updated_at,
           skill_invocation_id, skill_agent_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', NULL, NULL, ?, ?, ?, ?)
+          ,node_kind, skill_root_thread_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', NULL, NULL, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(thread_id) DO UPDATE SET
           provider = excluded.provider,
           model = excluded.model,
@@ -775,6 +899,8 @@ export class EnvReviewDO extends DurableObject<Env> {
           custom_task = excluded.custom_task,
           skill_invocation_id = excluded.skill_invocation_id,
           skill_agent_id = excluded.skill_agent_id,
+          node_kind = excluded.node_kind,
+          skill_root_thread_id = excluded.skill_root_thread_id,
           removed_at = NULL,
           updated_at = excluded.updated_at
       `,
@@ -792,10 +918,49 @@ export class EnvReviewDO extends DurableObject<Env> {
       now,
       input.skillInvocationId ?? null,
       input.skillAgentId ?? null,
+      input.nodeKind ?? "generic",
+      input.skillRootThreadId ?? null,
     );
     const tab = this.getTab(input.threadId);
     if (!tab) throw new Error("Failed to create env reviewer tab.");
     return tab;
+  }
+
+  ensurePrimaryReviewerTab(input: {
+    envSlug: string;
+    repoId: string;
+    mainSessionId: string;
+    provider: string;
+    model: string;
+    effort: PlannerEffort;
+  }): { status: "created" | "existing"; tab: EnvReviewTab } {
+    this.assertSessionWritable(input.mainSessionId);
+    return this.ctx.storage.transactionSync(() => {
+      const existing = this.db.exec(
+        `
+          SELECT * FROM env_review_tabs
+          WHERE env_slug = ?
+            AND main_session_id = ?
+            AND removed_at IS NULL
+            AND node_kind = 'generic'
+          ORDER BY created_at ASC
+          LIMIT 1
+        `,
+        input.envSlug,
+        input.mainSessionId,
+      ).toArray()[0] as unknown as TabRow | undefined;
+      if (existing) {
+        return { status: "existing" as const, tab: this.parseTab(existing) };
+      }
+
+      const tab = this.addReviewerTab({
+        ...input,
+        threadId: `env-review:${input.envSlug}:${crypto.randomUUID()}`,
+        roleLabel: "Reviewer",
+        taskKind: "correctness",
+      });
+      return { status: "created" as const, tab };
+    });
   }
 
   getTab(threadId: string): EnvReviewTab | null {
@@ -1262,12 +1427,11 @@ export class EnvReviewDO extends DurableObject<Env> {
       ? this.db.exec(
         `
           SELECT * FROM env_review_skill_invocations
-          WHERE env_slug = ? AND main_session_id = ?
+          WHERE env_slug = ?
             AND (created_at < ? OR (created_at = ? AND invocation_id < ?))
           ORDER BY created_at DESC, invocation_id DESC LIMIT ?
         `,
         input.envSlug,
-        input.mainSessionId,
         input.cursor.createdAt,
         input.cursor.createdAt,
         input.cursor.invocationId,
@@ -1276,20 +1440,26 @@ export class EnvReviewDO extends DurableObject<Env> {
       : this.db.exec(
         `
           SELECT * FROM env_review_skill_invocations
-          WHERE env_slug = ? AND main_session_id = ?
+          WHERE env_slug = ?
           ORDER BY created_at DESC, invocation_id DESC LIMIT ?
         `,
         input.envSlug,
-        input.mainSessionId,
         limit,
       ).toArray();
     return (rows as unknown as ReviewSkillInvocationRow[]).map((row) => this.parseSkillInvocation(row));
   }
 
   listSkillInvocationTabs(invocationId: string): EnvReviewTab[] {
+    const invocation = this.getSkillInvocation(invocationId);
+    if (!invocation) return [];
     const rows = this.db.exec(
-      "SELECT * FROM env_review_tabs WHERE skill_invocation_id = ? ORDER BY created_at ASC, thread_id ASC",
-      invocationId,
+      `SELECT * FROM env_review_tabs
+       WHERE (thread_id = ? OR skill_root_thread_id = ?)
+         AND skill_agent_id IS NOT NULL
+       ORDER BY CASE WHEN thread_id = ? THEN 0 ELSE 1 END, created_at ASC, thread_id ASC`,
+      invocation.parentThreadId,
+      invocation.parentThreadId,
+      invocation.parentThreadId,
     ).toArray() as unknown as TabRow[];
     return rows.map((row) => this.parseTab(row));
   }
@@ -1302,15 +1472,24 @@ export class EnvReviewDO extends DurableObject<Env> {
     return rows.map((row) => this.parseRun(row));
   }
 
-  getActiveSkillInvocationForParent(parentThreadId: string, mainSessionId: string): ReviewSkillInvocation | null {
+  getActiveSkillInvocationForParent(parentThreadId: string, _mainSessionId?: string): ReviewSkillInvocation | null {
     const row = this.db.exec(
       `
         SELECT * FROM env_review_skill_invocations
-        WHERE parent_thread_id = ? AND main_session_id = ? AND status IN ('setting_up', 'active')
+        WHERE parent_thread_id = ? AND status IN ('setting_up', 'active')
         ORDER BY created_at DESC LIMIT 1
       `,
       parentThreadId,
-      mainSessionId,
+    ).toArray()[0] as unknown as ReviewSkillInvocationRow | undefined;
+    return row ? this.parseSkillInvocation(row) : null;
+  }
+
+  getLatestSkillInvocationForRoot(rootThreadId: string): ReviewSkillInvocation | null {
+    const row = this.db.exec(
+      `SELECT * FROM env_review_skill_invocations
+       WHERE parent_thread_id = ?
+       ORDER BY created_at DESC, invocation_id DESC LIMIT 1`,
+      rootThreadId,
     ).toArray()[0] as unknown as ReviewSkillInvocationRow | undefined;
     return row ? this.parseSkillInvocation(row) : null;
   }
@@ -1388,6 +1567,11 @@ export class EnvReviewDO extends DurableObject<Env> {
     overviewMode: SkillAutomationMode;
     preparationOpId: string;
     requestUrl: string;
+    overviewRoute?: {
+      provider: string;
+      model: string;
+      effort: PlannerEffort;
+    } | null;
     agents: Array<{
       id: string;
       provider: string;
@@ -1401,6 +1585,12 @@ export class EnvReviewDO extends DurableObject<Env> {
     | { status: "parent_locked"; invocation?: ReviewSkillInvocation } {
     this.assertSessionWritable(input.mainSessionId);
     return this.ctx.storage.transactionSync(() => {
+      if (input.definitionSnapshot.agents.length === 0) {
+        throw new Error("A Review skill must contain at least one agent.");
+      }
+      if (input.definitionSnapshot.agents.length > 1 && !input.overviewRoute) {
+        throw new Error("A multi-agent Review skill requires an Overview route.");
+      }
       const existing = this.getSkillInvocation(input.invocationId);
       if (existing) {
         if (
@@ -1419,29 +1609,8 @@ export class EnvReviewDO extends DurableObject<Env> {
           runs: this.listSkillInvocationRuns(existing.invocationId),
         };
       }
-      const locked = this.getActiveSkillInvocationForParent(input.parentThreadId, input.mainSessionId);
+      const locked = this.getActiveSkillInvocationForParent(input.parentThreadId);
       if (locked) return { status: "parent_locked" as const, invocation: locked };
-      const parent = this.getTab(input.parentThreadId);
-      if (
-        !parent
-        || parent.envSlug !== input.envSlug
-        || parent.repoId !== input.repoId
-        || parent.mainSessionId !== input.mainSessionId
-        || parent.removedAt
-        || parent.skillInvocationId
-      ) {
-        return { status: "parent_locked" as const };
-      }
-      const parentActive = this.db.exec(
-        `
-          SELECT run_id FROM env_review_runs
-          WHERE thread_id = ? AND main_session_id = ? AND status IN ('syncing', 'queued', 'running')
-          LIMIT 1
-        `,
-        input.parentThreadId,
-        input.mainSessionId,
-      ).toArray()[0];
-      if (parentActive) return { status: "parent_locked" as const };
       const now = nowIso();
       const preparationStart = this.beginPreparationOperation({
         opId: input.preparationOpId,
@@ -1456,8 +1625,9 @@ export class EnvReviewDO extends DurableObject<Env> {
           INSERT INTO env_review_skill_invocations (
             invocation_id, env_slug, repo_id, main_session_id, parent_thread_id,
             definition_snapshot_json, preparation_op_id, status, overview_mode,
-            included_message_ids_json, overview_run_id, error, cancelled_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'setting_up', ?, '[]', NULL, NULL, NULL, ?, ?)
+            included_message_ids_json, overview_run_id, error, cancelled_at, created_at, updated_at,
+            overview_route_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'setting_up', ?, '[]', NULL, NULL, NULL, ?, ?, ?)
         `,
         input.invocationId,
         input.envSlug,
@@ -1469,28 +1639,53 @@ export class EnvReviewDO extends DurableObject<Env> {
         input.overviewMode,
         now,
         now,
+        input.overviewRoute ? JSON.stringify(input.overviewRoute) : null,
       );
+      const singleAgent = input.definitionSnapshot.agents.length === 1;
+      const rootAgentRoute = singleAgent ? input.agents[0] : null;
+      const rootAgent = singleAgent ? input.definitionSnapshot.agents[0] : null;
+      const rootRoute = singleAgent ? rootAgentRoute : input.overviewRoute;
+      if (!rootRoute) throw new Error("The Review skill root route is unavailable.");
+      const root = this.addReviewerTab({
+        envSlug: input.envSlug,
+        repoId: input.repoId,
+        mainSessionId: input.mainSessionId,
+        threadId: input.parentThreadId,
+        provider: rootRoute.provider,
+        model: rootRoute.model,
+        effort: rootAgent?.effort ?? input.overviewRoute!.effort,
+        roleLabel: input.definitionSnapshot.label,
+        taskKind: "custom",
+        customTask: rootAgent?.instructions ?? input.definitionSnapshot.overviewInstructions,
+        skillInvocationId: input.invocationId,
+        ...(rootAgent ? { skillAgentId: rootAgent.id } : {}),
+        nodeKind: "skill_root",
+        skillRootThreadId: input.parentThreadId,
+      });
       for (const agentRoute of input.agents) {
         const agent = input.definitionSnapshot.agents.find((candidate) => candidate.id === agentRoute.id);
         if (!agent) throw new Error(`Skill agent not found: ${agentRoute.id}`);
-        const threadId = `env-review-skill:${input.invocationId}:${crypto.randomUUID()}`;
-        this.addReviewerTab({
-          envSlug: input.envSlug,
-          repoId: input.repoId,
-          mainSessionId: input.mainSessionId,
-          threadId,
-          provider: agentRoute.provider,
-          model: agentRoute.model,
-          effort: agentRoute.effort,
-          roleLabel: agent.label,
-          taskKind: "custom",
-          customTask: agent.instructions,
-          skillInvocationId: input.invocationId,
-          skillAgentId: agent.id,
-        });
+        const tab = singleAgent
+          ? root
+          : this.addReviewerTab({
+              envSlug: input.envSlug,
+              repoId: input.repoId,
+              mainSessionId: input.mainSessionId,
+              threadId: `env-review-report:${input.invocationId}:${agent.id}`,
+              provider: agentRoute.provider,
+              model: agentRoute.model,
+              effort: agentRoute.effort,
+              roleLabel: agent.label,
+              taskKind: "custom",
+              customTask: agent.instructions,
+              skillInvocationId: input.invocationId,
+              skillAgentId: agent.id,
+              nodeKind: "report",
+              skillRootThreadId: input.parentThreadId,
+            });
         this.createRun({
           runId: crypto.randomUUID(),
-          threadId,
+          threadId: tab.threadId,
           envSlug: input.envSlug,
           repoId: input.repoId,
           mainSessionId: input.mainSessionId,
@@ -1500,11 +1695,11 @@ export class EnvReviewDO extends DurableObject<Env> {
           roleLabel: agent.label,
           taskKind: "custom",
           customTask: agent.instructions,
-          recipeInstructions: [input.definitionSnapshot.sharedInstructions, agent.instructions].filter(Boolean).join("\n\n"),
+          recipeInstructions: composeReviewerInstructions(input.definitionSnapshot.sharedInstructions, agent.instructions),
           preparationOpId,
           skillInvocationId: input.invocationId,
           skillAgentId: agent.id,
-          skillRunRole: "child_initial",
+          skillRunRole: singleAgent ? "root_initial" : "report_initial",
           skillDefinitionSnapshot: input.definitionSnapshot,
           launchProvenance: agentRoute.launchProvenance,
         });
@@ -1516,6 +1711,186 @@ export class EnvReviewDO extends DurableObject<Env> {
         invocation,
         tabs: this.listSkillInvocationTabs(input.invocationId),
         runs: this.listSkillInvocationRuns(input.invocationId),
+      };
+    });
+  }
+
+  restartSkillInvocation(input: {
+    invocationId: string;
+    requestId: string;
+    envSlug: string;
+    repoId: string;
+    mainSessionId: string;
+    requestUrl: string;
+    overviewRoute?: {
+      provider: string;
+      model: string;
+      effort: PlannerEffort;
+    } | null;
+    agents: Array<{
+      id: string;
+      launchProvenance?: PlannerRunLaunchProvenance;
+    }>;
+  }):
+    | { status: "created" | "existing"; invocation: ReviewSkillInvocation; tabs: EnvReviewTab[]; runs: EnvReviewRun[] }
+    | { status: "conflict" | "not_found" | "parent_locked"; invocation?: ReviewSkillInvocation } {
+    this.assertSessionWritable(input.mainSessionId);
+    return this.ctx.storage.transactionSync(() => {
+      const invocation = this.getSkillInvocation(input.invocationId);
+      if (
+        !invocation
+        || invocation.envSlug !== input.envSlug
+        || invocation.repoId !== input.repoId
+      ) {
+        return { status: "not_found" as const };
+      }
+      const definitionAgents = invocation.definitionSnapshot.agents;
+      if (
+        input.agents.length !== definitionAgents.length
+        || definitionAgents.some((agent) => !input.agents.some((candidate) => candidate.id === agent.id))
+      ) {
+        return { status: "conflict" as const, invocation };
+      }
+      const replay = this.getSkillInvocation(input.requestId);
+      if (replay) {
+        if (
+          replay.envSlug !== invocation.envSlug
+          || replay.repoId !== invocation.repoId
+          || replay.parentThreadId !== invocation.parentThreadId
+          || replay.definitionSnapshot.id !== invocation.definitionSnapshot.id
+        ) return { status: "conflict" as const, invocation: replay };
+        return {
+          status: "existing" as const,
+          invocation: replay,
+          tabs: this.listSkillInvocationTabs(replay.invocationId),
+          runs: this.listSkillInvocationRuns(replay.invocationId),
+        };
+      }
+      if (
+        invocation.status !== "completed"
+        && invocation.status !== "failed"
+        && invocation.status !== "cancelled"
+      ) {
+        return { status: "parent_locked" as const, invocation };
+      }
+      const latest = this.db.exec(
+        `SELECT invocation_id FROM env_review_skill_invocations
+         WHERE parent_thread_id = ?
+         ORDER BY created_at DESC, invocation_id DESC LIMIT 1`,
+        invocation.parentThreadId,
+      ).toArray()[0] as { invocation_id: string } | undefined;
+      if (latest?.invocation_id !== invocation.invocationId) {
+        return { status: "conflict" as const, invocation };
+      }
+      const locked = this.getActiveSkillInvocationForParent(invocation.parentThreadId);
+      if (locked) {
+        return { status: "parent_locked" as const, invocation: locked };
+      }
+      const parent = this.getTab(invocation.parentThreadId);
+      if (
+        !parent
+        || parent.envSlug !== input.envSlug
+        || parent.repoId !== input.repoId
+        || parent.mainSessionId !== input.mainSessionId
+        || parent.removedAt
+        || parent.nodeKind !== "skill_root"
+      ) {
+        return { status: "not_found" as const, invocation };
+      }
+      if (this.listSkillInvocationRuns(invocation.invocationId).some((run) => !isTerminalRunStatus(run.status))) {
+        return { status: "parent_locked" as const, invocation };
+      }
+      const tabs = this.listSkillInvocationTabs(invocation.invocationId);
+      const tabByAgentId = new Map(tabs.map((tab) => [tab.skillAgentId, tab]));
+      if (definitionAgents.some((agent) => !tabByAgentId.get(agent.id))) {
+        return { status: "conflict" as const, invocation };
+      }
+      if (input.agents.some((agent) => !agent.launchProvenance)) {
+        return { status: "conflict" as const, invocation };
+      }
+
+      const preparation = this.beginPreparationOperation({
+        opId: input.requestId,
+        envSlug: input.envSlug,
+        sessionId: input.mainSessionId,
+        timeoutMs: ACTIVE_SYNC_TIMEOUT_MS,
+        requestUrl: input.requestUrl,
+      }).operation;
+      const now = nowIso();
+      this.db.exec(
+        `
+          INSERT INTO env_review_skill_invocations (
+            invocation_id, env_slug, repo_id, main_session_id, parent_thread_id,
+            definition_snapshot_json, preparation_op_id,
+            status, overview_mode, included_message_ids_json, overview_run_id,
+            error, cancelled_at, created_at, updated_at, overview_route_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'setting_up', ?, '[]', NULL, NULL, NULL, ?, ?, ?)
+        `,
+        input.requestId,
+        input.envSlug,
+        input.repoId,
+        input.mainSessionId,
+        invocation.parentThreadId,
+        JSON.stringify(invocation.definitionSnapshot),
+        preparation.opId,
+        invocation.overviewMode,
+        now,
+        now,
+        input.overviewRoute ? JSON.stringify(input.overviewRoute) : null,
+      );
+      this.db.exec(
+        `UPDATE env_review_tabs
+         SET skill_invocation_id = ?, updated_at = ?
+         WHERE thread_id = ? OR skill_root_thread_id = ?`,
+        input.requestId,
+        now,
+        invocation.parentThreadId,
+        invocation.parentThreadId,
+      );
+      if (input.overviewRoute) {
+        this.db.exec(
+          `UPDATE env_review_tabs
+           SET provider = ?, model = ?, effort = ?, updated_at = ?
+           WHERE thread_id = ?`,
+          input.overviewRoute.provider,
+          input.overviewRoute.model,
+          input.overviewRoute.effort,
+          now,
+          invocation.parentThreadId,
+        );
+      }
+      const runs = definitionAgents.map((agent) => {
+        const tab = tabByAgentId.get(agent.id)!;
+        const launchProvenance = input.agents.find((candidate) => candidate.id === agent.id)!.launchProvenance!;
+        return this.createRun({
+          runId: reviewSkillRerunRunId(input.requestId, agent.id),
+          threadId: tab.threadId,
+          envSlug: input.envSlug,
+          repoId: input.repoId,
+          mainSessionId: input.mainSessionId,
+          provider: tab.provider,
+          model: tab.model,
+          effort: tab.effort,
+          roleLabel: tab.roleLabel,
+          taskKind: "custom",
+          customTask: REVIEW_SKILL_RERUN_INSTRUCTION,
+          recipeInstructions: composeReviewerInstructions(invocation.definitionSnapshot.sharedInstructions, agent.instructions),
+          preparationOpId: preparation.opId,
+          skillInvocationId: input.requestId,
+          skillAgentId: agent.id,
+          skillRunRole:
+            definitionAgents.length === 1 ? "root_initial" : "report_initial",
+          skillDefinitionSnapshot: invocation.definitionSnapshot,
+          launchProvenance,
+        });
+      });
+      const restarted = this.getSkillInvocation(input.requestId);
+      if (!restarted) throw new Error("Failed to restart Review skill invocation.");
+      return {
+        status: "created" as const,
+        invocation: restarted,
+        tabs: this.listSkillInvocationTabs(input.requestId),
+        runs,
       };
     });
   }
@@ -1533,9 +1908,15 @@ export class EnvReviewDO extends DurableObject<Env> {
 
   recordSkillReport(runId: string, messageId: string): ReviewSkillInvocation | null {
     const run = this.getRun(runId);
-    if (run?.status !== "ready" || !run.skillInvocationId || run.skillRunRole !== "child_initial" || !run.skillAgentId) return null;
+    if (run?.status !== "ready" || !run.skillInvocationId || run.skillRunRole !== "report_initial" || !run.skillAgentId) return null;
     const invocation = this.getSkillInvocation(run.skillInvocationId);
-    if (!invocation || invocation.overviewRunId || invocation.status !== "active") return invocation;
+    if (
+      !invocation
+      || invocation.definitionSnapshot.agents.length === 1
+      || run.preparationOpId !== invocation.preparationOpId
+      || invocation.overviewRunId
+      || invocation.status !== "active"
+    ) return invocation;
     const agent = invocation.definitionSnapshot.agents.find((candidate) => candidate.id === run.skillAgentId);
     if (!agent || agent.reportMode !== "auto") return invocation;
     const included = [...new Set([...invocation.includedMessageIds, messageId])];
@@ -1592,6 +1973,9 @@ export class EnvReviewDO extends DurableObject<Env> {
     return this.ctx.storage.transactionSync(() => {
       const invocation = this.getSkillInvocation(input.invocationId);
       if (!invocation) return null;
+      if (invocation.definitionSnapshot.agents.length === 1) {
+        return { status: "not_active" as const, invocation, run: null };
+      }
       if (invocation.overviewRunId) {
         return { status: "existing" as const, invocation, run: this.getRun(invocation.overviewRunId) };
       }
@@ -1602,6 +1986,16 @@ export class EnvReviewDO extends DurableObject<Env> {
         invocation.overviewMode !== input.expectedOverviewMode
         || !sameStringSet(invocation.includedMessageIds, input.expectedIncludedMessageIds)
       ) {
+        return { status: "controls_changed" as const, invocation, run: null };
+      }
+      const activeRootRun = this.db.exec(
+        `SELECT run_id FROM env_review_runs
+         WHERE skill_invocation_id = ?
+           AND status IN ('syncing', 'queued', 'running')
+         LIMIT 1`,
+        invocation.invocationId,
+      ).toArray()[0];
+      if (activeRootRun) {
         return { status: "controls_changed" as const, invocation, run: null };
       }
       this.db.exec(
@@ -1672,7 +2066,7 @@ export class EnvReviewDO extends DurableObject<Env> {
     const rows = this.db.exec(
       `
         SELECT * FROM env_review_skill_invocations
-        WHERE env_slug = ? AND main_session_id = ? AND status = 'setting_up' AND created_at < ?
+        WHERE env_slug = ? AND main_session_id = ? AND status = 'setting_up' AND updated_at < ?
       `,
       envSlug,
       mainSessionId,
@@ -1713,10 +2107,94 @@ export class EnvReviewDO extends DurableObject<Env> {
     return this.getSkillInvocation(invocationId);
   }
 
+  removeSkillInvocation(input: {
+    invocationId: string;
+    envSlug: string;
+    mainSessionId: string;
+  }):
+    | { status: "removed"; parentThreadId: string; childThreadIds: string[] }
+    | { status: "not_found" }
+    | { status: "active" }
+    | { status: "runtime_retained" } {
+    return this.ctx.storage.transactionSync(() => {
+      const invocation = this.getSkillInvocation(input.invocationId);
+      if (
+        !invocation
+        || invocation.envSlug !== input.envSlug
+      ) {
+        return { status: "not_found" as const };
+      }
+
+      const runs = (this.db.exec(
+        `SELECT runs.* FROM env_review_runs AS runs
+         JOIN env_review_skill_invocations AS invocations
+           ON invocations.invocation_id = runs.skill_invocation_id
+         WHERE invocations.parent_thread_id = ?`,
+        invocation.parentThreadId,
+      ).toArray() as unknown as RunRow[]).map((row) => this.parseRun(row));
+      const activeInvocation = this.getActiveSkillInvocationForParent(
+        invocation.parentThreadId,
+      );
+      if (
+        activeInvocation
+        || runs.some((run) => !isTerminalRunStatus(run.status))
+      ) {
+        return { status: "active" as const };
+      }
+      if (runs.some((run) => Boolean(run.runtime))) {
+        return { status: "runtime_retained" as const };
+      }
+
+      const childThreadIds = (this.db.exec(
+        `SELECT thread_id FROM env_review_tabs
+         WHERE thread_id = ? OR skill_root_thread_id = ?
+         ORDER BY created_at ASC, thread_id ASC`,
+        invocation.parentThreadId,
+        invocation.parentThreadId,
+      ).toArray() as Array<{ thread_id: string }>).map((row) => row.thread_id);
+      const removedAt = nowIso();
+      this.db.exec(
+        `UPDATE env_review_tabs
+         SET removed_at = ?, updated_at = ?
+         WHERE thread_id = ? OR skill_root_thread_id = ?`,
+        removedAt,
+        removedAt,
+        invocation.parentThreadId,
+        invocation.parentThreadId,
+      );
+
+      return {
+        status: "removed" as const,
+        parentThreadId: invocation.parentThreadId,
+        childThreadIds,
+      };
+    });
+  }
+
   private refreshSkillInvocationForRun(run: EnvReviewRun): void {
     if (!run.skillInvocationId || !run.skillRunRole || !isTerminalRunStatus(run.status)) return;
     const invocation = this.getSkillInvocation(run.skillInvocationId);
     if (!invocation || invocation.status !== "active") return;
+    if (invocation.definitionSnapshot.agents.length === 1) {
+      if (run.skillRunRole !== "root_initial" && run.skillRunRole !== "root_followup") return;
+      const status = run.status === "ready"
+        ? "completed"
+        : run.status === "cancelled"
+          ? "cancelled"
+          : "failed";
+      const now = nowIso();
+      this.db.exec(
+        `UPDATE env_review_skill_invocations
+         SET status = ?, error = ?, cancelled_at = ?, updated_at = ?
+         WHERE invocation_id = ? AND status = 'active'`,
+        status,
+        status === "completed" ? null : (run.error ?? `One-agent reviewer ${status}.`),
+        status === "cancelled" ? now : null,
+        now,
+        invocation.invocationId,
+      );
+      return;
+    }
     if (run.skillRunRole === "overview") {
       this.db.exec(
         "UPDATE env_review_skill_invocations SET status = ?, error = ?, updated_at = ? WHERE invocation_id = ? AND status = 'active'",
@@ -1728,13 +2206,17 @@ export class EnvReviewDO extends DurableObject<Env> {
       return;
     }
     if (
-      (run.skillRunRole !== "child_initial" && run.skillRunRole !== "child_followup")
+      (run.skillRunRole !== "report_initial" && run.skillRunRole !== "report_followup")
       || invocation.overviewMode !== "manual"
       || invocation.overviewRunId
     ) return;
-    const initialRuns = this.listSkillInvocationRuns(invocation.invocationId).filter((candidate) => candidate.skillRunRole === "child_initial");
+    const initialRuns = this.listSkillInvocationRuns(invocation.invocationId).filter((candidate) => (
+      candidate.skillRunRole === "report_initial"
+      && candidate.preparationOpId === invocation.preparationOpId
+    ));
     const childRuns = this.listSkillInvocationRuns(invocation.invocationId).filter((candidate) =>
-      candidate.skillRunRole === "child_initial" || candidate.skillRunRole === "child_followup"
+      candidate.preparationOpId === invocation.preparationOpId
+      && (candidate.skillRunRole === "report_initial" || candidate.skillRunRole === "report_followup")
     );
     if (
       initialRuns.length > 0
@@ -1799,6 +2281,41 @@ export class EnvReviewDO extends DurableObject<Env> {
     const run = this.getRun(input.runId);
     if (!run) throw new Error("Failed to create env review run.");
     return run;
+  }
+
+  createSkillFollowupIfNoActive(input: CreateEnvReviewRunInput):
+    | { ok: true; run: EnvReviewRun }
+    | { ok: false; active: EnvReviewRun } {
+    this.assertSessionWritable(input.mainSessionId);
+    return this.ctx.storage.transactionSync(() => {
+      if (!input.skillInvocationId) {
+        throw new Error("A skill follow-up requires a Review round.");
+      }
+      const invocation = this.getSkillInvocation(input.skillInvocationId);
+      if (
+        !invocation
+        || invocation.envSlug !== input.envSlug
+        || invocation.repoId !== input.repoId
+        || invocation.mainSessionId !== input.mainSessionId
+      ) {
+        throw new Error("Review round not found.");
+      }
+      const activeRow = this.db.exec(
+        `SELECT r.run_id
+         FROM env_review_runs r
+         JOIN env_review_skill_invocations i
+           ON i.invocation_id = r.skill_invocation_id
+         WHERE i.parent_thread_id = ?
+           AND r.status IN ('syncing', 'queued', 'running')
+         LIMIT 1`,
+        invocation.parentThreadId,
+      ).toArray()[0] as { run_id: string } | undefined;
+      if (activeRow) {
+        const active = this.getRun(activeRow.run_id);
+        if (active) return { ok: false as const, active };
+      }
+      return { ok: true as const, run: this.createRun(input) };
+    });
   }
 
   getRun(runId: string): EnvReviewRun | null {
@@ -2018,10 +2535,14 @@ export class EnvReviewDO extends DurableObject<Env> {
     return this.ctx.storage.transactionSync(() => {
       const existing = this.getRun(input.runId);
       if (!existing) return { status: "not_found" as const, run: null, feedback: null };
+      const invocation = existing.skillInvocationId ? this.getSkillInvocation(existing.skillInvocationId) : null;
+      const directSkillFeedback = invocation?.definitionSnapshot.agents.length === 1
+        && (existing.skillRunRole === "root_initial" || existing.skillRunRole === "root_followup");
       const feedbackId = existing.skillInvocationId && existing.skillRunRole === "overview"
         ? `skill-overview:${existing.runId}`
         : `env-review:${existing.runId}`;
-      const shouldCreateFeedback = !existing.skillInvocationId || existing.skillRunRole === "overview";
+      const shouldCreateFeedback = !existing.skillInvocationId || existing.skillRunRole === "overview" || directSkillFeedback;
+      const reviewHandoff = this.fanoutHandoffForRun(existing);
       if (isTerminalRunStatus(existing.status)) {
         return {
           status: "terminal" as const,
@@ -2051,8 +2572,9 @@ export class EnvReviewDO extends DurableObject<Env> {
               runId: existing.runId,
               ...(existing.skillInvocationId ? {
                 skillInvocationId: existing.skillInvocationId,
-                overviewMode: existing.frozenOverview?.mode,
+                ...(existing.frozenOverview?.mode ? { overviewMode: existing.frozenOverview.mode } : {}),
               } : {}),
+              ...(reviewHandoff ? { reviewHandoff } : {}),
             },
           })
         : null;
@@ -2072,7 +2594,7 @@ export class EnvReviewDO extends DurableObject<Env> {
       if (!run || run.status !== "ready") {
         return { status: "terminal" as const, run: run ?? existing, feedback: null };
       }
-      if (run.skillInvocationId && run.skillRunRole === "child_initial") {
+      if (run.skillInvocationId && run.skillRunRole === "report_initial") {
         this.recordSkillReport(run.runId, input.messageId);
       }
       this.appendRunEvent({
@@ -2082,6 +2604,32 @@ export class EnvReviewDO extends DurableObject<Env> {
       });
       return { status: "completed" as const, run, feedback };
     });
+  }
+
+  private fanoutHandoffForRun(run: EnvReviewRun): EnvReviewFanoutHandoff | null {
+    if (!run.skillInvocationId || run.skillRunRole !== "overview" || !run.frozenOverview) return null;
+    const definition = run.skillDefinitionSnapshot;
+    if (!definition) return null;
+    const childRuns = this.listSkillInvocationRuns(run.skillInvocationId)
+      .filter((candidate) => (
+        candidate.skillRunRole === "report_initial"
+        && candidate.preparationOpId === run.preparationOpId
+      ));
+    const models = definition.agents.reduce<EnvReviewFanoutHandoff["models"]>((unique, agent) => {
+      const childRun = childRuns.find((candidate) => candidate.skillAgentId === agent.id);
+      if (!childRun) return unique;
+      if (!unique.some((target) => target.provider === childRun.provider && target.model === childRun.model)) {
+        unique.push({ provider: childRun.provider, model: childRun.model });
+      }
+      return unique;
+    }, []);
+    return {
+      schemaVersion: 1,
+      kind: "fanout_overview",
+      skillLabel: definition.label,
+      reviewerCount: definition.agents.length,
+      models,
+    };
   }
 
   recordRunContact(runId: string): void {

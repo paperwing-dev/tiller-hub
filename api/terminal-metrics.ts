@@ -28,6 +28,7 @@ export class HopMetricRecorder {
   private samples: number[] = [];
   private bytes = 0;
   private windowStartedAt = performance.now();
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly label: string,
@@ -39,10 +40,26 @@ export class HopMetricRecorder {
     if (!this.enabled) return;
     this.samples.push(Math.max(0, durationMs));
     this.bytes += Math.max(0, bytes);
-    if (this.samples.length >= 256) this.flush();
+    if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => this.flush(), 30_000);
+    }
+    if (durationMs >= 100) {
+      console.warn("[terminal-metric] slow sample", {
+        label: this.label,
+        durationMs,
+        bytes,
+      });
+    }
+    if (this.samples.length >= 64 || performance.now() - this.windowStartedAt >= 30_000) {
+      this.flush();
+    }
   }
 
   flush(): HopMetricSummary | null {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     if (this.samples.length === 0) return null;
     const now = performance.now();
     const elapsedSeconds = Math.max(0.001, (now - this.windowStartedAt) / 1000);

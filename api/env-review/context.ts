@@ -9,11 +9,11 @@ import { canonicalizeGitHubRepo } from "../github/repo";
 import { getArtifactStoreStub, getWorkspaceStub } from "../helpers";
 import type { RepoWorkspace } from "../repo/access";
 import type { Env, EnvMeta } from "../types";
+import { buildReviewSnapshotTar, type ReviewSnapshotTarEntry } from "./snapshots";
 import type {
   EnvReviewChangeContext,
   EnvReviewChangedFile,
   EnvReviewPlanBasis,
-  EnvReviewPreparationResult,
   EnvReviewRun,
 } from "./types";
 
@@ -23,6 +23,36 @@ export const ENV_REVIEW_CONTEXT_LIMITS = {
   maxTotalDiffBytes: 60_000,
   maxFileBytesForDiff: 200_000,
 };
+
+export const ENV_REVIEW_INSPECTION_BUNDLE_FORMAT_VERSION = 1;
+
+export const EMPTY_ENV_REVIEW_PLAN_BASIS: EnvReviewPlanBasis = {
+  source: "none",
+  artifactId: null,
+  version: null,
+  title: null,
+  markdown: null,
+};
+
+export function normalizeEnvReviewPlanBasis(
+  basis: EnvReviewPlanBasis | null | undefined,
+): EnvReviewPlanBasis {
+  return basis ?? EMPTY_ENV_REVIEW_PLAN_BASIS;
+}
+
+export interface EnvReviewInspectionManifest {
+  formatVersion: typeof ENV_REVIEW_INSPECTION_BUNDLE_FORMAT_VERSION;
+  files: Array<{
+    path: string;
+    status: EnvReviewChangedFile["status"];
+    beforeObject: string | null;
+  }>;
+}
+
+export interface EnvReviewInspectionBundle {
+  manifest: EnvReviewInspectionManifest;
+  tarBytes: Uint8Array;
+}
 
 interface ManifestEntry {
   path: string;
@@ -345,6 +375,88 @@ export async function buildEnvReviewChangeContext(args: {
   };
 }
 
+/**
+ * Build exact pre-change material for tool-driven review. Prompt excerpts stay
+ * bounded, while this bundle lets the runtime expose every modified/deleted
+ * file's complete prior bytes beside the immutable current checkout.
+ */
+export async function buildEnvReviewInspectionBundle(args: {
+  env: Env;
+  repo: RepoWorkspace;
+  meta: EnvMeta;
+  envWorkspace?: EnvReviewWorkspaceSource;
+  githubBaseCommitSha?: string | null;
+  allowGitHubBaseFallback?: boolean;
+  changeContext: EnvReviewChangeContext;
+}): Promise<EnvReviewInspectionBundle> {
+  const envWorkspace = args.envWorkspace
+    ?? getWorkspaceStub(args.env, args.meta.slug) as unknown as EnvReviewWorkspaceSource;
+  const entries = args.changeContext.summary.files.map(({ path, status, oldSize, newSize }) => ({
+    path,
+    status,
+    oldSize,
+    newSize,
+  }));
+  const baseSource = args.meta.scmModel === "github"
+    ? await readGitHubBaseSource(
+      args.env,
+      args.repo,
+      args.meta,
+      args.githubBaseCommitSha,
+      args.allowGitHubBaseFallback ?? true,
+    )
+    : await readWorkspaceBaseSource(args.repo.workspace as unknown as EnvReviewWorkspaceSource);
+  if (entries.some((entry) => entry.status !== "added") && !baseSource) {
+    throw new Error("Complete pre-change review material is unavailable for this snapshot.");
+  }
+
+  const archiveEntries: ReviewSnapshotTarEntry[] = [];
+  const manifest: EnvReviewInspectionManifest = {
+    formatVersion: ENV_REVIEW_INSPECTION_BUNDLE_FORMAT_VERSION,
+    files: [],
+  };
+  for (const [index, entry] of entries.entries()) {
+    if (entry.status !== "deleted") {
+      const current = await envWorkspace.readWorkspaceFileBytes(entry.path);
+      if (!current) {
+        throw new Error(`Complete review material is missing the current file ${entry.path}.`);
+      }
+    }
+    let beforeObject: string | null = null;
+    if (entry.status !== "added") {
+      const before = await baseSource!.readWorkspaceFileBytes(entry.path);
+      if (!before) {
+        throw new Error(`Complete review material is missing the pre-change file ${entry.path}.`);
+      }
+      beforeObject = `objects/${String(index + 1).padStart(6, "0")}.before`;
+      archiveEntries.push({ path: beforeObject, content: before });
+    }
+    manifest.files.push({ path: entry.path, status: entry.status, beforeObject });
+  }
+
+  const encoder = new TextEncoder();
+  archiveEntries.push({
+    path: "manifest.json",
+    content: encoder.encode(`${JSON.stringify(manifest, null, 2)}\n`),
+  });
+  archiveEntries.push({
+    path: "README.md",
+    content: encoder.encode([
+      "# Tiller review context",
+      "",
+      "This directory contains the complete pre-change side of the frozen review change set.",
+      "Current files are in the repository checkout. Prior versions of modified and deleted files are under `before/` at the same relative path.",
+      "`manifest.json` records every changed path and whether it was added, modified, or deleted.",
+      "Use `git diff --no-index -- .tiller/review-context/before/<path> <path>` when the checkout's own Git history is unavailable.",
+      "",
+    ].join("\n")),
+  });
+  return {
+    manifest,
+    tarBytes: buildReviewSnapshotTar(archiveEntries, { excludePrefixes: [] }),
+  };
+}
+
 export async function readEnvReviewPlanBasis(args: {
   env: Env;
   repo: RepoWorkspace;
@@ -392,10 +504,10 @@ function taskInstruction(run: Pick<EnvReviewRun, "taskKind" | "customTask" | "ro
 
 export function buildEnvReviewPrompt(args: {
   run: EnvReviewRun;
-  preparation: EnvReviewPreparationResult;
   changeContext: EnvReviewChangeContext;
   planBasis: EnvReviewPlanBasis;
   recipeInstructions?: string;
+  currentInstruction?: string;
   priorMessages?: Array<{ role: string; text: string }>;
 }): string {
   const summary = args.changeContext.summary;
@@ -405,64 +517,53 @@ export function buildEnvReviewPrompt(args: {
       "",
       args.planBasis.markdown ?? "",
     ].join("\n")
-    : "No startup or selected plan is available. For plan-compliance review, explicitly state that no plan basis was available.";
-  const fileSummary = summary.files.map((file) => {
-    const suffix = file.omittedReason
-      ? ` (${file.omittedReason}${file.truncated ? ", truncated" : ""})`
-      : file.truncated
-        ? " (truncated)"
-        : "";
-    return `- ${file.status}: ${file.path}${suffix}`;
-  }).join("\n") || "- No changed files detected.";
-  const diffs = args.changeContext.files.map((file) => {
-    if (file.diff) {
-      return [`### ${file.path}`, `status: ${file.status}`, "```diff", file.diff.trimEnd(), "```"].join("\n");
-    }
-    return [`### ${file.path}`, `status: ${file.status}`, `diff omitted: ${file.omittedReason ?? "unavailable"}`].join("\n");
-  }).join("\n\n");
+    : "No pinned startup or selected plan is available. Do not invent plan-compliance claims.";
+  const fileSummary = summary.files
+    .map((file) => `- ${file.status}: ${file.path}`)
+    .join("\n") || "- No changed files detected.";
+  const diffs = args.changeContext.files
+    .filter((file): file is EnvReviewChangedFile & { diff: string } => Boolean(file.diff))
+    .map((file) => [
+      `### ${file.path}`,
+      `status: ${file.status}; navigation excerpt only`,
+      "```diff",
+      file.diff.trimEnd(),
+      "```",
+    ].join("\n"))
+    .join("\n\n");
   const prior = args.priorMessages?.length
     ? args.priorMessages.map((message) => `${message.role}: ${message.text}`).join("\n\n")
     : "None.";
 
   return [
     "You are a Tiller live environment reviewer.",
-    "You are read-only and advisory. Do not attempt to edit files, control the harness, or ask the harness to run commands.",
-    "Return concise Markdown findings. Prioritize actionable issues with file paths where possible.",
+    "The complete immutable workspace snapshot is checked out read-only in your current working directory.",
+    "Read and search any relevant files before reaching conclusions. You may run non-mutating inspection commands.",
+    "Do not modify, create, or delete repository files, control the harness, or ask the harness to run commands.",
+    "Give brief, user-facing progress updates as you inspect and when your understanding changes. Summarize intent and conclusions; do not expose private chain-of-thought.",
+    "Treat this checkout as the complete authoritative review basis for this run.",
+    "Inline patch excerpts are navigation aids, not the boundary of what you can inspect. A missing excerpt does not make the current file unavailable.",
+    "Use repository history or `.tiller/review-context` when exact pre-change content matters; its README and manifest cover every changed path.",
+    "Return concise Markdown with only substantive, actionable findings and relevant file paths.",
+    "State an inspection limitation only when it blocks a specific finding, and place it with that finding.",
     "",
-    `Reviewer role: ${args.run.roleLabel}`,
-    `Model: ${args.run.provider}/${args.run.model}`,
+    "Review assignment:",
+    `- role: ${args.run.roleLabel}`,
     `Task: ${taskInstruction(args.run, args.recipeInstructions)}`,
+    ...(args.currentInstruction?.trim()
+      ? ["", "Current instruction:", args.currentInstruction.trim()]
+      : []),
     "",
-    "Stale-feedback warning:",
-    `This review is based on a workspace snapshot prepared at ${args.preparation.completedAt}. The live harness may have changed after that. Treat findings as advisory and stale until the user decides what to send.`,
-    "",
-    "Preparation metadata:",
-    `- op id: ${args.preparation.opId}`,
-    `- changed files uploaded: ${args.preparation.changedCount}`,
-    `- deleted files: ${args.preparation.deletedCount}`,
-    `- uploaded bytes: ${args.preparation.uploadedBytes}`,
-    "",
-    "Changed-file summary:",
-    `- total: ${summary.total}`,
-    `- added: ${summary.added}`,
-    `- modified: ${summary.modified}`,
-    `- deleted: ${summary.deleted}`,
-    `- omitted/truncated: ${summary.omitted}/${summary.truncated}`,
+    "Changed paths:",
     fileSummary,
     "",
-    "Context limits:",
-    `- max files: ${args.changeContext.limits.maxFiles}`,
-    `- max diff bytes per file: ${args.changeContext.limits.maxDiffBytesPerFile}`,
-    `- max total diff bytes: ${args.changeContext.limits.maxTotalDiffBytes}`,
-    "Omitted, binary, too-large, and truncated diffs are explicitly marked above and below.",
-    "",
-    "Plan basis:",
+    "Pinned plan basis:",
     planText,
     "",
     "Prior reviewer transcript:",
     prior,
     "",
-    "Budgeted diffs:",
-    diffs || "No inline diffs are available.",
+    "Inline patch excerpts:",
+    diffs || "No inline patch excerpts were preloaded. Inspect the checkout directly.",
   ].join("\n");
 }

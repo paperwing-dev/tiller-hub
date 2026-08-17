@@ -1,10 +1,13 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LayerCard } from "@cloudflare/kumo/components/layer-card";
 import { Textarea } from "@cloudflare/kumo/components/input";
+import { Popover } from "@cloudflare/kumo/components/popover";
+import { CaretRightIcon, DotsThreeIcon, GearSixIcon, StopIcon } from "@phosphor-icons/react";
 import {
   ApiActionError,
   addEnvReviewer,
   cancelEnvReviewRun,
+  cancelReviewSkillInvocation,
   fetchEnvReviewMessages,
   fetchEnvReviewRun,
   fetchEnvReviewState,
@@ -15,13 +18,15 @@ import {
   invokeReviewSkill,
   markEnvReviewFeedback,
   removeEnvReviewer,
+  removeReviewSkillInvocation,
+  rerunReviewSkillInvocation,
   sendEnvReviewMessage,
   sendReviewSkillOverview,
   updateReviewSkillControls,
-  cancelReviewSkillInvocation,
   type AgentRoute,
   type AgentSkillDefinition,
   type EnvReviewFeedback,
+  type EnvReviewFanoutHandoff,
   type EnvReviewRun,
   type EnvReviewRunEvent,
   type EnvReviewState,
@@ -36,16 +41,25 @@ import PlanChatInput from "./PlanChatInput";
 import SkillAutomationToggle from "./SkillAutomationToggle";
 import SkillEditorDialog from "./SkillEditorDialog";
 import { codexAuthModeLabel } from "./codex-auth-ui";
-import AgentTabButton from "./AgentTabButton";
 import AgentTabStatusIndicator from "./AgentTabStatusIndicator";
+import ReviewerActivityDetails from "./ReviewerActivityDetails";
+import {
+  BottomPaneResizeHandle,
+  useResizableBottomPane,
+} from "./ResizableBottomPane";
 import {
   envReviewTabStatus,
   implementationReviewStatus,
   readEnvReviewViewedRuns,
   writeEnvReviewViewedRuns,
 } from "./env-review-tab-status";
+import { useSerializedRefresh } from "./useSerializedRefresh";
+import { resolveReviewerRailKeyboardAction } from "./reviewer-rail-keyboard";
 
 const DEFAULT_REVIEWERS_HEIGHT = 320;
+const MIN_REVIEWERS_HEIGHT = 160;
+const MIN_TERMINAL_HEIGHT = 120;
+const REVIEWERS_HEIGHT_STORAGE_KEY = "tiller:implementor-reviewers-height";
 const TRANSCRIPT_BOTTOM_THRESHOLD = 24;
 
 function getSessionStorage(): Storage | null {
@@ -62,12 +76,16 @@ interface EnvReviewPanelProps {
   sessionId: string;
   hubUrl: string;
   harnessInputReady: boolean;
-  onSendToHarness: (text: string) => Promise<{ ok: boolean; error?: string }>;
+  onSendToHarness: (text: string, deliveryId?: string) => Promise<{ ok: boolean; error?: string }>;
   onLayoutChange?: () => void;
 }
 
 function isActiveStatus(status: string): boolean {
   return status === "preparing" || status === "queued" || status === "running";
+}
+
+function isActiveInvocationRow(row: { status?: unknown }): boolean {
+  return row.status === "active" || row.status === "setting_up";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -87,6 +105,15 @@ function messageRole(message: ThreadMessage): "user" | "assistant" {
 
 function messageRunId(message: ThreadMessage): string | null {
   return isRecord(message.body) && typeof message.body.runId === "string" ? message.body.runId : null;
+}
+
+function mergeThreadMessages(
+  current: ThreadMessage[],
+  incoming: ThreadMessage[],
+): ThreadMessage[] {
+  const byId = new Map(current.map((message) => [message.id, message]));
+  for (const message of incoming) byId.set(message.id, message);
+  return [...byId.values()].sort((left, right) => left.seq - right.seq);
 }
 
 function tabStatusForRunStatus(status: EnvReviewRun["status"]): EnvReviewTab["status"] {
@@ -111,60 +138,89 @@ function formatEffortLabel(providers: PlannerProviderMetadata[], providerId: str
   return provider?.efforts.find((candidate) => candidate.id === effortId)?.displayName ?? effortId;
 }
 
-function formatFeedbackForHarness(feedback: EnvReviewFeedback, text: string): string {
+function readFanoutHandoff(feedback: EnvReviewFeedback): EnvReviewFanoutHandoff | null {
+  const handoff = feedback.metadata?.reviewHandoff;
+  const isTarget = (value: unknown): value is EnvReviewFanoutHandoff["models"][number] => isRecord(value)
+    && typeof value.provider === "string"
+    && typeof value.model === "string";
+  if (
+    !isRecord(handoff)
+    || handoff.schemaVersion !== 1
+    || handoff.kind !== "fanout_overview"
+    || typeof handoff.skillLabel !== "string"
+    || typeof handoff.reviewerCount !== "number"
+    || !Array.isArray(handoff.models)
+    || !handoff.models.every(isTarget)
+  ) return null;
+  return handoff as unknown as EnvReviewFanoutHandoff;
+}
+
+function formatModelList(models: EnvReviewFanoutHandoff["models"]): string {
+  const labels = models.map((target) => `${target.provider}/${target.model}`);
+  if (labels.length <= 1) return labels[0] ?? "";
+  if (labels.length === 2) return `${labels[0]} and ${labels[1]}`;
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
+}
+
+function formatFanoutFeedbackForHarness(handoff: EnvReviewFanoutHandoff, text: string): string {
+  const models = formatModelList(handoff.models);
+  const reviewerCount = `${handoff.reviewerCount} reviewer${handoff.reviewerCount === 1 ? "" : "s"}`;
   return [
-    `[Tiller reviewer feedback]`,
-    `Role: ${feedback.roleLabel}`,
-    `Model: ${feedback.provider}/${feedback.model}`,
-    `Snapshot prepared: ${feedback.preparationCompletedAt ?? "unknown"}`,
-    `Run: ${feedback.runId}`,
+    "[Tiller reviewer feedback]",
+    `${handoff.skillLabel}: synthesized from ${reviewerCount}${models ? ` (${models})` : ""}.`,
     "",
     text.trim(),
     "",
   ].join("\n");
 }
 
-function formatPreparationTime(value: string | null | undefined): string {
-  if (!value) return "unknown";
-  const date = new Date(value);
-  return Number.isFinite(date.getTime()) ? date.toLocaleString() : value;
+export function formatFeedbackForHarness(feedback: EnvReviewFeedback, text: string): string {
+  const handoff = readFanoutHandoff(feedback);
+  if (handoff) return formatFanoutFeedbackForHarness(handoff, text);
+  return [
+    `[Tiller reviewer feedback]`,
+    `${feedback.roleLabel} (${feedback.provider}/${feedback.model}).`,
+    "",
+    text.trim(),
+    "",
+  ].join("\n");
 }
 
-function formatRelativeAge(value: string | null | undefined): string {
-  if (!value) return "unknown time ago";
-  const then = Date.parse(value);
-  if (!Number.isFinite(then)) return formatPreparationTime(value);
-  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
-  if (seconds < 60) return "just now";
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
-  const days = Math.round(hours / 24);
-  return `${days} day${days === 1 ? "" : "s"} ago`;
+function formatSnapshotTime(value: string): string {
+  if (!value) return "unknown";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "long",
+  }).format(date);
+}
+
+type ReviewSnapshot = NonNullable<NonNullable<EnvReviewRun["preparation"]>["snapshot"]>;
+
+export function formatReviewBasis(snapshot: ReviewSnapshot): string {
+  const source = snapshot.source === "saved-workspace" ? "saved workspace" : "live workspace";
+  const staleNotice = snapshot.stale
+    ? " It may not include the latest changes from the live workspace."
+    : "";
+  return `Review basis: ${source} snapshot captured ${formatSnapshotTime(snapshot.createdAt)}.${staleNotice}`;
 }
 
 function runPreparation(run: EnvReviewRun) {
   return run.preparation;
 }
 
-function reviewBasisCopy(run: EnvReviewRun): string {
+export function formatReviewBasisSummary(run: EnvReviewRun): string {
   const preparation = runPreparation(run);
   const snapshot = preparation?.snapshot;
   if (!snapshot) {
-    return "Reviewer needs a fresh snapshot. Start a fresh reviewer run.";
+    return "Frozen review snapshot";
   }
-  const source = snapshot.source === "saved-workspace" ? "saved workspace" : "live workspace";
-  return `Reviewing ${source} from ${formatRelativeAge(snapshot.createdAt)}.`;
-}
-
-function BranchIcon() {
-  return (
-    <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-      <path d="M4 2v5a3 3 0 0 0 3 3h5" />
-      <path d="m10 8 2 2-2 2" />
-    </svg>
-  );
+  const summary = run.changeContext?.summary;
+  const basis = summary
+    ? `${summary.total} file${summary.total === 1 ? "" : "s"} changed`
+    : "Frozen review snapshot";
+  return snapshot.stale ? `${basis} · Snapshot may be out of date` : basis;
 }
 
 function ReviewSkillOverview({
@@ -188,7 +244,11 @@ function ReviewSkillOverview({
 }) {
   const { invocation } = detail;
   const editable = invocation.status === "active" && !invocation.overviewRunId;
-  const overviewRun = detail.runs.find((run) => run.skillRunRole === "overview") ?? null;
+  const overviewRun = detail.runs.find((run) => (
+    run.runId === invocation.overviewRunId
+    && run.skillRunRole === "overview"
+    && run.preparationOpId === invocation.preparationOpId
+  )) ?? null;
   return (
     <LayerCard className="mx-auto w-full max-w-3xl border-kumo-info/30 bg-kumo-info/5">
       <div className="flex items-start justify-between gap-3 border-b border-kumo-info/20 px-4 py-3">
@@ -202,9 +262,9 @@ function ReviewSkillOverview({
           value={invocation.overviewMode}
           onChange={onModeChange}
           disabled={!editable}
-          ariaLabel="Overview forwarding mode"
-          manualTooltip="Choose which responses to send and optionally add guidance first."
-          autoTooltip="Wait for every included response and forward the feedback automatically."
+          ariaLabel="Overview synthesis mode"
+          manualTooltip="Choose which responses to include, optionally add guidance, then create Overview."
+          autoTooltip="Wait for every child response, create Overview, and forward its feedback to the implementor automatically."
         />
       </div>
       <div className="divide-y divide-kumo-line/70">
@@ -266,7 +326,7 @@ function ReviewSkillOverview({
               disabled={invocation.includedMessageIds.length === 0}
               className="rounded bg-kumo-brand px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
             >
-              Send to reviewer
+              Create Overview
             </button>
           </div>
         </div>
@@ -289,7 +349,17 @@ export default function EnvReviewPanel({
   onSendToHarness,
   onLayoutChange,
 }: EnvReviewPanelProps) {
-  const [collapsed, setCollapsed] = useState(false);
+  const {
+    height: reviewersHeight,
+    paneRef: reviewersPaneRef,
+    resizeWithKeyboard,
+    startResize,
+  } = useResizableBottomPane({
+    defaultHeight: DEFAULT_REVIEWERS_HEIGHT,
+    minBottomHeight: MIN_REVIEWERS_HEIGHT,
+    minTopHeight: MIN_TERMINAL_HEIGHT,
+    storageKey: REVIEWERS_HEIGHT_STORAGE_KEY,
+  });
   const [state, setState] = useState<EnvReviewState | null>(null);
   const [providers, setProviders] = useState<PlannerProviderMetadata[]>([]);
   const [skillRoutes, setSkillRoutes] = useState<AgentRoute[]>([]);
@@ -301,7 +371,12 @@ export default function EnvReviewPanel({
   const [activeSkillView, setActiveSkillView] = useState<"overview" | string | null>(null);
   const [overviewGuidance, setOverviewGuidance] = useState("");
   const [invokingSkillId, setInvokingSkillId] = useState<string | null>(null);
+  const [removingInvocationId, setRemovingInvocationId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [expandedSkillRoots, setExpandedSkillRoots] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [reviewerActionsOpen, setReviewerActionsOpen] = useState<string | null>(null);
   const [viewedRunIds, setViewedRunIds] = useState<Record<string, string>>(() => (
     readEnvReviewViewedRuns(getSessionStorage(), envSlug, sessionId)
   ));
@@ -312,12 +387,61 @@ export default function EnvReviewPanel({
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ feedback: EnvReviewFeedback; text: string; formatted: boolean } | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [feedbackDeliveryInFlightIds, setFeedbackDeliveryInFlightIds] = useState<Set<string>>(() => new Set());
+  const [documentVisible, setDocumentVisible] = useState(() => !document.hidden);
+  const [online, setOnline] = useState(() => navigator.onLine);
+  const [convergenceRetryNeeded, setConvergenceRetryNeeded] = useState(false);
+  const [pendingTerminalRefreshCount, setPendingTerminalRefreshCount] = useState(0);
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
+  const railTabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const reviewerActionRefs = useRef(new Map<string, HTMLButtonElement>());
   const transcriptFollowingRef = useRef(true);
   const transcriptThreadRef = useRef<string | null>(null);
-  const feedbackBaselineReadyRef = useRef<Set<string> | null>(null);
-  const autoDeliveryInFlightRef = useRef(new Set<string>());
+  const feedbackDeliveryInFlightRef = useRef(new Set<string>());
+  const autoDeliveryAttemptedRef = useRef(new Set<string>());
+  const previousHarnessInputReadyRef = useRef(false);
   const reviewSkillRequestRef = useRef(new Map<string, string>());
+  const reviewMessageRequestRef = useRef(new Map<string, string>());
+  const messageRequestGenerationRef = useRef(new Map<string, number>());
+  const invocationSelectionRestoredRef = useRef(false);
+  const reviewScopeRef = useRef("");
+  const activeThreadIdRef = useRef<string | null>(activeThreadId);
+  const selectedInvocationIdRef = useRef<string | null>(selectedInvocationId);
+  const invocationTabsRef = useRef<ReviewSkillInvocationDetail["tabs"]>([]);
+  const runEventCursorRef = useRef<{ runId: string | null; afterSeq: number }>({ runId: null, afterSeq: 0 });
+  const unselectedInvocationActiveRef = useRef(false);
+  const handledTerminalSignaturesRef = useRef(new Set<string>());
+  const pendingTerminalRefreshesRef = useRef(new Map<string, { threadId: string; inFlight: Promise<void> | null }>());
+  reviewScopeRef.current = `${envSlug}:${sessionId}`;
+  activeThreadIdRef.current = activeThreadId;
+  selectedInvocationIdRef.current = selectedInvocationId;
+  invocationTabsRef.current = invocationDetail?.tabs ?? [];
+
+  useEffect(() => {
+    const handleVisibility = () => setDocumentVisible(!document.hidden);
+    const handleOnline = () => setOnline(true);
+    const handleOffline = () => setOnline(false);
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  const beginFeedbackDelivery = useCallback((feedbackId: string): boolean => {
+    if (feedbackDeliveryInFlightRef.current.has(feedbackId)) return false;
+    feedbackDeliveryInFlightRef.current.add(feedbackId);
+    setFeedbackDeliveryInFlightIds(new Set(feedbackDeliveryInFlightRef.current));
+    return true;
+  }, []);
+
+  const finishFeedbackDelivery = useCallback((feedbackId: string) => {
+    feedbackDeliveryInFlightRef.current.delete(feedbackId);
+    setFeedbackDeliveryInFlightIds(new Set(feedbackDeliveryInFlightRef.current));
+  }, []);
 
   const acknowledgeViewedRun = useCallback((threadId: string, runId: string) => {
     setViewedRunIds((current) => {
@@ -334,14 +458,63 @@ export default function EnvReviewPanel({
 
   useLayoutEffect(() => {
     onLayoutChange?.();
-  }, [collapsed, onLayoutChange]);
+  }, [onLayoutChange, reviewersHeight]);
 
-  const topLevelTabs = state?.tabs ?? [];
-  const nestedTabs = invocationDetail?.tabs ?? [];
-  const tabs = [...topLevelTabs, ...nestedTabs];
-  const activeTab = tabs.find((tab) => tab.threadId === activeThreadId) ?? tabs[0] ?? null;
-  const overviewSelected = activeSkillView === "overview" && Boolean(invocationDetail);
-  const overviewRun = invocationDetail?.runs.find((run) => run.skillRunRole === "overview") ?? null;
+  const topLevelTabs = (state?.tabs ?? []).filter((tab) => tab.nodeKind !== "report");
+  const tabs = state?.tabs ?? [];
+  useEffect(() => {
+    const active = tabs.find((tab) => tab.threadId === activeThreadId);
+    if (active?.nodeKind !== "report" || !active.skillRootThreadId) return;
+    setExpandedSkillRoots((current) =>
+      current.has(active.skillRootThreadId!)
+        ? current
+        : new Set([...current, active.skillRootThreadId!]),
+    );
+  }, [activeThreadId, tabs]);
+  const railTabs = topLevelTabs.flatMap((tab) => [
+    tab,
+    ...(tab.nodeKind === "skill_root" && expandedSkillRoots.has(tab.threadId)
+      ? tabs.filter(
+          (candidate) =>
+            candidate.nodeKind === "report" &&
+            candidate.skillRootThreadId === tab.threadId,
+        )
+      : []),
+  ]);
+  const railKeyboardNodes = railTabs.map((tab) => {
+    const reports = tab.nodeKind === "skill_root"
+      ? tabs.filter(
+          (candidate) =>
+            candidate.nodeKind === "report" &&
+            candidate.skillRootThreadId === tab.threadId,
+        )
+      : [];
+    return {
+      id: tab.threadId,
+      ...(tab.nodeKind === "report" && tab.skillRootThreadId
+        ? { parentId: tab.skillRootThreadId }
+        : {}),
+      ...(reports.length > 0
+        ? {
+            expandable: true,
+            expanded: expandedSkillRoots.has(tab.threadId),
+            firstChildId: reports[0]!.threadId,
+          }
+        : {}),
+    };
+  });
+  const activeTab = tabs.find((tab) => tab.threadId === activeThreadId) ?? null;
+  const directSkillInvocation =
+    invocationDetail?.invocation.definitionSnapshot.agents.length === 1;
+  const overviewSelected =
+    activeSkillView === "overview" &&
+    Boolean(invocationDetail) &&
+    !directSkillInvocation;
+  const overviewRun = invocationDetail?.runs.find((run) => (
+    run.runId === invocationDetail.invocation.overviewRunId
+    && run.skillRunRole === "overview"
+    && run.preparationOpId === invocationDetail.invocation.preparationOpId
+  )) ?? null;
   const overviewAttentionKey = invocationDetail ? `overview:${invocationDetail.invocation.invocationId}` : null;
   const overviewResultId = overviewRun?.runId
     ?? (invocationDetail?.invocation.status === "completed" ? invocationDetail.invocation.invocationId : null);
@@ -376,109 +549,154 @@ export default function EnvReviewPanel({
   const activeReadyRunId = activeTab && (activeRun?.status === "ready" || (!activeRun && activeTab.status === "ready"))
     ? activeRun?.runId ?? activeTab.latestRunId
     : null;
-  const activeCodexProfile = activeRun?.launchProvenance?.codexExecution;
-  const activeParentLocked = Boolean(activeTab && invocationRows.some((row) =>
-    row.parentThreadId === activeTab.threadId && (row.status === "active" || row.status === "setting_up")
-  ));
-  const activePreparation = activeRun ? runPreparation(activeRun) : null;
-  const activeFeedback = (state?.feedback ?? []).filter((item) => item.threadId === activeTab?.threadId);
+  const activeSkillRootThreadId = activeTab?.nodeKind === "report"
+    ? activeTab.skillRootThreadId
+    : activeTab?.nodeKind === "skill_root"
+      ? activeTab.threadId
+      : null;
+  const listedActiveSkillInvocation = activeSkillRootThreadId
+    ? invocationRows.find((row) =>
+        row.parentThreadId === activeSkillRootThreadId
+        && (row.status === "active" || row.status === "setting_up")
+      ) ?? null
+    : null;
+  const listedDetailInvocation = invocationDetail
+    ? invocationRows.find((row) => row.invocationId === invocationDetail.invocation.invocationId) ?? null
+    : null;
+  const detailActiveSkillInvocation = invocationDetail?.invocation.parentThreadId === activeSkillRootThreadId
+    && (invocationDetail.invocation.status === "active" || invocationDetail.invocation.status === "setting_up")
+    && (!listedDetailInvocation || isActiveInvocationRow(listedDetailInvocation))
+    ? invocationDetail.invocation
+    : null;
+  const activeSkillInvocation = listedActiveSkillInvocation ?? detailActiveSkillInvocation;
+  const activeSkillDetail = invocationDetail?.invocation.invocationId === activeSkillInvocation?.invocationId
+    ? invocationDetail
+    : null;
+  const activeParentLocked = Boolean(
+    activeSkillInvocation
+    && (
+      activeSkillInvocation.status === "setting_up"
+      || !activeSkillDetail
+      || activeSkillDetail.runs.some((run) => isActiveStatus(run.status))
+    )
+  );
+  const selectedRootHistory = invocationDetail
+    ? invocationRows.filter((row) => (
+        row.parentThreadId === invocationDetail.invocation.parentThreadId
+        && typeof row.invocationId === "string"
+      ))
+    : [];
+  const basisRun = activeRun ?? (overviewSelected
+    ? invocationDetail?.runs.find((run) => Boolean(runPreparation(run)?.snapshot)) ?? null
+    : null);
+  const activeFeedback = useMemo(() => (state?.feedback ?? []).filter((item) => (
+    item.threadId === activeTab?.threadId
+    && (!overviewSelected || item.metadata.skillInvocationId === invocationDetail?.invocation.invocationId)
+  )), [activeTab?.threadId, invocationDetail?.invocation.invocationId, overviewSelected, state?.feedback]);
+  const visibleMessages = useMemo(() => {
+    if (!overviewSelected || !invocationDetail) return messages;
+    const invocationRunIds = new Set(invocationDetail.runs.map((run) => run.runId));
+    const invocationFeedbackMessageIds = new Set(activeFeedback.map((feedback) => feedback.messageId));
+    return messages.filter((message) => {
+      const runId = messageRunId(message);
+      return invocationFeedbackMessageIds.has(message.id) || Boolean(runId && invocationRunIds.has(runId));
+    });
+  }, [activeFeedback, invocationDetail, messages, overviewSelected]);
   const feedbackByMessageId = useMemo(
     () => new Map(activeFeedback.map((feedback) => [feedback.messageId, feedback])),
     [activeFeedback],
   );
   const unmatchedFeedback = useMemo(
-    () => activeFeedback.filter((feedback) => !messages.some((message) => message.id === feedback.messageId)),
-    [activeFeedback, messages],
+    () => activeFeedback.filter((feedback) => !visibleMessages.some((message) => message.id === feedback.messageId)),
+    [activeFeedback, visibleMessages],
   );
   const hasActiveRuns = tabs.some((tab) => isActiveStatus(tab.status))
     || (state?.runs ?? []).some((run) => isActiveStatus(run.status))
     || invocationRows.some((row) => row.status === "active" || row.status === "setting_up");
-  const visibleRunEvents = useMemo(
-    () => runEvents.filter((event) => event.type === "model_activity" && event.message?.trim()).slice(-20),
-    [runEvents],
-  );
-  const latestActivity = useMemo(
-    () => visibleRunEvents[visibleRunEvents.length - 1]?.message?.trim() ?? null,
-    [visibleRunEvents],
-  );
+  const commentaryMessages = useMemo(() => runEvents.flatMap((event) => {
+    const text = event.message?.trim();
+    return event.type === "model_commentary" && text
+      ? [{ id: `${event.runId}:${event.seq}`, text }]
+      : [];
+  }), [runEvents]);
+  const latestLiveUpdate = commentaryMessages[commentaryMessages.length - 1]?.text ?? null;
 
   useEffect(() => {
-    if (!activeTab || !activeReadyRunId) return;
+    if (!documentVisible || !activeTab || !activeReadyRunId) return;
     acknowledgeViewedRun(activeTab.threadId, activeReadyRunId);
-  }, [acknowledgeViewedRun, activeReadyRunId, activeTab]);
+  }, [acknowledgeViewedRun, activeReadyRunId, activeTab, documentVisible]);
 
   useEffect(() => {
-    if (!overviewSelected || !overviewAttentionKey || !overviewResultId) return;
+    if (!documentVisible || !overviewSelected || !overviewAttentionKey || !overviewResultId) return;
     if (overviewRun?.status !== "ready" && invocationDetail?.invocation.status !== "completed") return;
     acknowledgeViewedRun(overviewAttentionKey, overviewResultId);
   }, [
     acknowledgeViewedRun,
+    documentVisible,
     invocationDetail?.invocation.status,
     overviewAttentionKey,
     overviewResultId,
     overviewRun?.status,
     overviewSelected,
   ]);
+  const performStateRefresh = useCallback(async (): Promise<EnvReviewState> => {
+    const scope = `${envSlug}:${sessionId}`;
+    const next = await fetchEnvReviewState(hubUrl, envSlug, sessionId);
+    if (reviewScopeRef.current === scope) {
+      setState(next);
+      setActiveThreadId((current) => (
+        current === null
+        || next.tabs.some((tab) => tab.threadId === current)
+        || invocationTabsRef.current.some((tab) => tab.threadId === current)
+          ? current
+          : null
+      ));
+      setError(null);
+    }
+    return next;
+  }, [envSlug, hubUrl, sessionId]);
+  const { invalidateAndWait: invalidateState } = useSerializedRefresh(performStateRefresh);
+
   const loadState = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
     try {
-      const next = await fetchEnvReviewState(hubUrl, envSlug, sessionId);
-      setState(next);
-      setActiveThreadId((current) => current ?? next.tabs[0]?.threadId ?? null);
-      setError(null);
-    } catch (error) {
-      if (!quiet) setError(error instanceof Error ? error.message : "Failed to load reviewers");
+      await invalidateState();
+    } catch (loadError) {
+      if (!quiet) {
+        setError(loadError instanceof Error ? loadError.message : "Failed to load reviewers");
+      }
     } finally {
       if (!quiet) setLoading(false);
     }
-  }, [envSlug, hubUrl, sessionId]);
+  }, [invalidateState]);
 
   useEffect(() => {
-    feedbackBaselineReadyRef.current = null;
-    autoDeliveryInFlightRef.current.clear();
+    setState(null);
+    setInvocationRows([]);
+    setInvocationDetail(null);
+    setActiveThreadId(null);
+    setSelectedInvocationId(null);
+    setActiveSkillView(null);
+    setReviewerActionsOpen(null);
+    setMessages([]);
+    setRunEvents([]);
+    invocationTabsRef.current = [];
+    feedbackDeliveryInFlightRef.current.clear();
+    autoDeliveryAttemptedRef.current.clear();
+    reviewSkillRequestRef.current.clear();
+    reviewMessageRequestRef.current.clear();
+    messageRequestGenerationRef.current.clear();
+    handledTerminalSignaturesRef.current.clear();
+    pendingTerminalRefreshesRef.current.clear();
+    runEventCursorRef.current = { runId: null, afterSeq: 0 };
+    unselectedInvocationActiveRef.current = false;
+    activeThreadIdRef.current = null;
+    selectedInvocationIdRef.current = null;
+    setFeedbackDeliveryInFlightIds(new Set());
+    setPendingTerminalRefreshCount(0);
+    setConvergenceRetryNeeded(false);
+    invocationSelectionRestoredRef.current = false;
   }, [envSlug, sessionId]);
-
-  useEffect(() => {
-    void loadState();
-  }, [loadState]);
-
-  useEffect(() => {
-    if (!state) return;
-    const ready = state.feedback.filter((feedback) => feedback.status === "ready");
-    if (!feedbackBaselineReadyRef.current) {
-      feedbackBaselineReadyRef.current = new Set(ready.map((feedback) => feedback.feedbackId));
-      return;
-    }
-    for (const feedback of ready) {
-      if (feedbackBaselineReadyRef.current.has(feedback.feedbackId)) continue;
-      feedbackBaselineReadyRef.current.add(feedback.feedbackId);
-      if (feedback.metadata.overviewMode !== "auto" || !feedback.metadata.skillInvocationId) continue;
-      if (autoDeliveryInFlightRef.current.has(feedback.feedbackId)) continue;
-      autoDeliveryInFlightRef.current.add(feedback.feedbackId);
-      const delivered = formatFeedbackForHarness(feedback, feedback.text);
-      void (async () => {
-        try {
-          await markEnvReviewFeedback(hubUrl, envSlug, feedback.feedbackId, "pending", {
-            sessionId,
-            deliveredText: delivered,
-          });
-          if (!harnessInputReady) return;
-          const acknowledged = await onSendToHarness(delivered);
-          if (!acknowledged.ok) return;
-          await markEnvReviewFeedback(hubUrl, envSlug, feedback.feedbackId, "sent", {
-            sessionId,
-            deliveredText: delivered,
-          });
-        } catch {
-          // Another mounted client may win the ready -> pending claim. Failed
-          // transport intentionally stays pending for explicit manual retry.
-        } finally {
-          autoDeliveryInFlightRef.current.delete(feedback.feedbackId);
-          void loadState(true);
-        }
-      })();
-    }
-  }, [envSlug, harnessInputReady, hubUrl, loadState, onSendToHarness, sessionId, state]);
 
   useEffect(() => {
     let cancelled = false;
@@ -504,41 +722,43 @@ export default function EnvReviewPanel({
     }
   }, [hubUrl, repoId]);
 
-  const loadInvocationRows = useCallback(async (cursor: string | null = null, preserve = false) => {
-    try {
-      const result = await fetchReviewSkillInvocations(hubUrl, envSlug, sessionId, { limit: 20, cursor });
-      setInvocationRows((current) => {
-        if (cursor) {
-          return [...current, ...result.invocations.filter((row) => !current.some((existing) => existing.invocationId === row.invocationId))];
-        }
-        if (!preserve) return result.invocations;
-        return [
-          ...result.invocations,
-          ...current.filter((row) => !result.invocations.some((fresh) => fresh.invocationId === row.invocationId)),
-        ];
-      });
-    } catch {
-      // Active invocation restoration is best-effort; ordinary reviewer tabs remain usable.
+  const performInvocationRowsRefresh = useCallback(async () => {
+    const scope = `${envSlug}:${sessionId}`;
+    const result = await fetchReviewSkillInvocations(hubUrl, envSlug, sessionId, { limit: 20 });
+    if (reviewScopeRef.current === scope) {
+      setInvocationRows((current) => [
+        ...result.invocations,
+        ...current.filter((row) => !result.invocations.some((fresh) => fresh.invocationId === row.invocationId)),
+      ]);
     }
+    return result;
   }, [envSlug, hubUrl, sessionId]);
+  const { invalidateAndWait: invalidateInvocationRows } = useSerializedRefresh(
+    performInvocationRowsRefresh,
+  );
+
+  const loadInvocationRows = useCallback(async () => {
+    try {
+      await invalidateInvocationRows();
+    } catch {
+      // History restoration is best-effort; ordinary reviewer tabs remain usable.
+    }
+  }, [invalidateInvocationRows]);
 
   useEffect(() => {
-    void loadReviewSkills();
-    void loadInvocationRows();
-  }, [loadInvocationRows, loadReviewSkills]);
-
-  useEffect(() => {
-    if (selectedInvocationId) return;
-    const active = activeThreadId
-      ? invocationRows.find((row) => (
-          row.parentThreadId === activeThreadId
-          && (row.status === "active" || row.status === "setting_up")
-        ))
-      : invocationRows.find((row) => row.status === "active" || row.status === "setting_up");
-    if (!active || typeof active.invocationId !== "string") return;
-    setSelectedInvocationId(active.invocationId);
+    if (selectedInvocationId || !activeThreadId) return;
+    const active = invocationRows.find(
+      (row) => row.parentThreadId === activeThreadId && isActiveInvocationRow(row),
+    );
+    const latestForParent = !invocationSelectionRestoredRef.current && activeThreadId
+      ? invocationRows.find((row) => row.parentThreadId === activeThreadId)
+      : null;
+    const invocation = active ?? latestForParent;
+    if (!invocation || typeof invocation.invocationId !== "string") return;
+    invocationSelectionRestoredRef.current = true;
+    setSelectedInvocationId(invocation.invocationId);
     setActiveSkillView("overview");
-    if (typeof active.parentThreadId === "string") setActiveThreadId(active.parentThreadId);
+    if (typeof invocation.parentThreadId === "string") setActiveThreadId(invocation.parentThreadId);
   }, [activeThreadId, invocationRows, selectedInvocationId]);
 
   const selectedInvocationActive = invocationRows.some((row) =>
@@ -549,84 +769,328 @@ export default function EnvReviewPanel({
     && invocationDetail.runs.some((run) => isActiveStatus(run.status));
   const shouldPollInvocationDetail = selectedInvocationActive || selectedLinkedRunActive;
 
+  const performInvocationDetailRefresh = useCallback(async () => {
+    const invocationId = selectedInvocationId;
+    if (!invocationId) return null;
+    const scope = `${envSlug}:${sessionId}`;
+    const detail = await fetchReviewSkillInvocation(hubUrl, envSlug, sessionId, invocationId);
+    if (reviewScopeRef.current === scope && selectedInvocationIdRef.current === invocationId) {
+      setInvocationDetail(detail);
+      setInvocationRows((current) => current.map((row) => row.invocationId === invocationId
+        ? !isActiveInvocationRow(row) && isActiveInvocationRow(detail.invocation)
+          ? row
+          : { ...row, ...detail.invocation }
+        : row));
+    }
+    return detail;
+  }, [envSlug, hubUrl, selectedInvocationId, sessionId]);
+  const { invalidateAndWait: invalidateInvocationDetail } = useSerializedRefresh(
+    performInvocationDetailRefresh,
+  );
+
   useEffect(() => {
     if (!selectedInvocationId) {
       setInvocationDetail(null);
       setActiveSkillView(null);
       return;
     }
+    setInvocationDetail((current) => current?.invocation.invocationId === selectedInvocationId ? current : null);
+    if (!documentVisible || !online) return;
     let cancelled = false;
-    const load = async () => {
+    let timer: number | null = null;
+    const poll = async () => {
       try {
-        const detail = await fetchReviewSkillInvocation(hubUrl, envSlug, sessionId, selectedInvocationId);
-        if (!cancelled) setInvocationDetail(detail);
+        await invalidateInvocationDetail();
       } catch {
-        if (!cancelled) setInvocationDetail(null);
+        // The ordered state/list convergence loop remains the fallback.
+      }
+      if (!cancelled && shouldPollInvocationDetail) {
+        timer = window.setTimeout(() => void poll(), 2_000);
       }
     };
-    void load();
-    const interval = shouldPollInvocationDetail
-      ? window.setInterval(() => void load(), 2_000)
-      : null;
+    void poll();
     return () => {
       cancelled = true;
-      if (interval !== null) window.clearInterval(interval);
+      if (timer !== null) window.clearTimeout(timer);
     };
-  }, [envSlug, hubUrl, selectedInvocationId, sessionId, shouldPollInvocationDetail]);
+  }, [
+    documentVisible,
+    invalidateInvocationDetail,
+    online,
+    selectedInvocationId,
+    shouldPollInvocationDetail,
+  ]);
 
   useEffect(() => {
     if (!invocationDetail || invocationDetail.invocation.invocationId !== selectedInvocationId) return;
-    setActiveSkillView((current) => current === "overview" || invocationDetail.tabs.some((tab) => tab.threadId === current)
+    const direct = invocationDetail.invocation.definitionSnapshot.agents.length === 1;
+    const defaultView = direct ? invocationDetail.invocation.parentThreadId : "overview";
+    setActiveSkillView((current) => (!direct && current === "overview") || tabs.some((tab) => tab.threadId === current)
       ? current
-      : "overview");
-    if (activeSkillView === "overview") {
+      : defaultView);
+    if (!direct && activeSkillView === "overview") {
+      setActiveThreadId(invocationDetail.invocation.parentThreadId);
+    } else if (direct && activeThreadId !== invocationDetail.invocation.parentThreadId) {
       setActiveThreadId(invocationDetail.invocation.parentThreadId);
     }
-  }, [activeSkillView, invocationDetail, selectedInvocationId]);
+  }, [activeSkillView, activeThreadId, invocationDetail, selectedInvocationId]);
 
   useEffect(() => {
     setOverviewGuidance("");
   }, [selectedInvocationId]);
 
-  useEffect(() => {
-    if (!hasActiveRuns) return;
-    const interval = window.setInterval(() => {
-      void loadState(true);
-      void loadInvocationRows(null, true);
-    }, 2_000);
-    return () => window.clearInterval(interval);
-  }, [hasActiveRuns, loadInvocationRows, loadState]);
+  const performMessageRefresh = useCallback(async () => {
+    const threadId = activeTab?.threadId;
+    if (!threadId) return [];
+    const scope = `${envSlug}:${sessionId}`;
+    const generation = (messageRequestGenerationRef.current.get(threadId) ?? 0) + 1;
+    messageRequestGenerationRef.current.set(threadId, generation);
+    const next = await fetchEnvReviewMessages(hubUrl, envSlug, threadId, sessionId);
+    if (
+      reviewScopeRef.current === scope
+      && activeThreadIdRef.current === threadId
+      && messageRequestGenerationRef.current.get(threadId) === generation
+    ) setMessages((current) => mergeThreadMessages(current, next));
+    return next;
+  }, [activeTab?.threadId, envSlug, hubUrl, sessionId]);
+  const { invalidateAndWait: invalidateMessages } = useSerializedRefresh(performMessageRefresh);
 
   useEffect(() => {
     if (!activeTab) {
       setMessages([]);
       return;
     }
-    let cancelled = false;
-    void fetchEnvReviewMessages(hubUrl, envSlug, activeTab.threadId, sessionId)
+    if (!documentVisible || !online) return;
+    setMessages([]);
+    void invalidateMessages().catch(() => undefined);
+  }, [activeTab?.threadId, documentVisible, invalidateMessages, online]);
+
+  const syncPendingTerminalRefreshCount = useCallback(() => {
+    setPendingTerminalRefreshCount(pendingTerminalRefreshesRef.current.size);
+  }, []);
+
+  const refreshTerminalMessages = useCallback((signature: string, threadId: string): Promise<void> => {
+    if (handledTerminalSignaturesRef.current.has(signature)) return Promise.resolve();
+    const current = pendingTerminalRefreshesRef.current.get(signature);
+    if (current?.inFlight) return current.inFlight;
+    const entry = current ?? { threadId, inFlight: null };
+    entry.threadId = threadId;
+    pendingTerminalRefreshesRef.current.set(signature, entry);
+    syncPendingTerminalRefreshCount();
+    const scope = `${envSlug}:${sessionId}`;
+    const generation = (messageRequestGenerationRef.current.get(threadId) ?? 0) + 1;
+    messageRequestGenerationRef.current.set(threadId, generation);
+    const request = fetchEnvReviewMessages(hubUrl, envSlug, threadId, sessionId)
       .then((next) => {
-        if (!cancelled) setMessages(next);
+        if (reviewScopeRef.current !== scope) return;
+        if (
+          activeThreadIdRef.current === threadId
+          && messageRequestGenerationRef.current.get(threadId) === generation
+        ) setMessages((current) => mergeThreadMessages(current, next));
+        handledTerminalSignaturesRef.current.add(signature);
+        pendingTerminalRefreshesRef.current.delete(signature);
       })
-      .catch(() => {
-        if (!cancelled) setMessages([]);
+      .catch((refreshError) => {
+        if (reviewScopeRef.current === scope) entry.inFlight = null;
+        throw refreshError;
+      })
+      .finally(() => {
+        if (reviewScopeRef.current === scope) syncPendingTerminalRefreshCount();
       });
+    entry.inFlight = request;
+    return request;
+  }, [envSlug, hubUrl, sessionId, syncPendingTerminalRefreshCount]);
+
+  const performConvergenceRefresh = useCallback(async () => {
+    let firstError: unknown = null;
+    try {
+      // The list must settle first: it owns active -> terminal observation.
+      await invalidateInvocationRows();
+    } catch (refreshError) {
+      firstError = refreshError;
+    }
+    try {
+      // This drain is deliberately second so generated feedback cannot be missed.
+      await invalidateState();
+    } catch (refreshError) {
+      firstError ??= refreshError;
+    }
+    if (documentVisible) {
+      for (const [signature, pending] of pendingTerminalRefreshesRef.current) {
+        try {
+          await refreshTerminalMessages(signature, pending.threadId);
+        } catch (refreshError) {
+          firstError ??= refreshError;
+        }
+      }
+    }
+    setConvergenceRetryNeeded(Boolean(firstError));
+    if (firstError) throw firstError;
+  }, [documentVisible, invalidateInvocationRows, invalidateState, refreshTerminalMessages]);
+  const { invalidateAndWait: invalidateConvergence } = useSerializedRefresh(
+    performConvergenceRefresh,
+  );
+
+  useEffect(() => {
+    void loadReviewSkills();
+  }, [loadReviewSkills]);
+
+  useEffect(() => {
+    setLoading(true);
+    void invalidateConvergence()
+      .catch((loadError) => {
+        setError(loadError instanceof Error ? loadError.message : "Failed to load reviewers");
+      })
+      .finally(() => setLoading(false));
+  }, [envSlug, invalidateConvergence, sessionId]);
+
+  const selectedRunActive = Boolean(activeRun && isActiveStatus(activeRun.status));
+  const selectedOwnerActive = shouldPollInvocationDetail || selectedRunActive;
+  const hasUnselectedActiveInvocation = invocationRows.some((row) => (
+    row.invocationId !== selectedInvocationId
+      && (row.status === "active" || row.status === "setting_up")
+  ));
+  const convergenceDrainNeeded = convergenceRetryNeeded || pendingTerminalRefreshCount > 0;
+
+  useEffect(() => {
+    const wasActive = unselectedInvocationActiveRef.current;
+    unselectedInvocationActiveRef.current = hasUnselectedActiveInvocation;
+    if (
+      wasActive
+      && !hasUnselectedActiveInvocation
+      && documentVisible
+      && online
+    ) {
+      void invalidateState().catch(() => setConvergenceRetryNeeded(true));
+    }
+  }, [documentVisible, hasUnselectedActiveInvocation, invalidateState, online]);
+
+  useEffect(() => {
+    if (!online) return;
+    const presentationHidden = !documentVisible;
+    if (presentationHidden && !hasActiveRuns) return;
+    if (!presentationHidden && !convergenceDrainNeeded && !hasActiveRuns) return;
+    if (
+      !presentationHidden
+      && !convergenceDrainNeeded
+      && selectedOwnerActive
+      && !hasUnselectedActiveInvocation
+    ) return;
+
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        if (presentationHidden) {
+          await invalidateState();
+        } else if (convergenceDrainNeeded || !selectedOwnerActive) {
+          if (hasUnselectedActiveInvocation || convergenceDrainNeeded) {
+            await invalidateConvergence();
+          } else {
+            await invalidateState();
+          }
+        } else {
+          await invalidateInvocationRows();
+        }
+      } catch {
+        // The applicable owner remains eligible on its next serialized tick.
+      }
+      if (!cancelled) {
+        const delay = presentationHidden ? 10_000 : selectedOwnerActive ? 5_000 : 2_000;
+        timer = window.setTimeout(() => void poll(), delay);
+      }
+    };
+    if (presentationHidden) timer = window.setTimeout(() => void poll(), 10_000);
+    else void poll();
     return () => {
       cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
     };
-  }, [activeRun?.status, activeTab, envSlug, hubUrl, sessionId, state?.feedback.length]);
+  }, [
+    convergenceDrainNeeded,
+    documentVisible,
+    hasActiveRuns,
+    hasUnselectedActiveInvocation,
+    invalidateConvergence,
+    invalidateInvocationRows,
+    invalidateState,
+    online,
+    selectedOwnerActive,
+  ]);
+
+  const invocationTerminalSignature = invocationDetail
+    && invocationDetail.invocation.invocationId === selectedInvocationId
+    && invocationDetail.invocation.status !== "active"
+    && invocationDetail.invocation.status !== "setting_up"
+    ? `invocation:${invocationDetail.invocation.invocationId}:${invocationDetail.invocation.status}:${invocationDetail.invocation.updatedAt}`
+    : null;
+  const invocationTerminalThreadId = invocationTerminalSignature
+    ? invocationDetail?.invocation.parentThreadId ?? null
+    : null;
+  useEffect(() => {
+    if (
+      !documentVisible
+      || !online
+      || !invocationTerminalSignature
+      || !invocationTerminalThreadId
+    ) return;
+    void refreshTerminalMessages(invocationTerminalSignature, invocationTerminalThreadId)
+      .then(() => invalidateConvergence())
+      .catch(() => {
+        setConvergenceRetryNeeded(true);
+      });
+  }, [
+    documentVisible,
+    invalidateConvergence,
+    invocationTerminalSignature,
+    invocationTerminalThreadId,
+    online,
+    refreshTerminalMessages,
+  ]);
 
   useEffect(() => {
     if (!activeRun) {
       setRunEvents([]);
+      runEventCursorRef.current = { runId: null, afterSeq: 0 };
       return;
     }
-    setRunEvents([]);
+    if (runEventCursorRef.current.runId !== activeRun.runId) {
+      runEventCursorRef.current = { runId: activeRun.runId, afterSeq: 0 };
+      setRunEvents([]);
+    }
+    if (!isActiveStatus(activeRun.status)) return;
+    if (!documentVisible || !online) return;
+    const scope = `${envSlug}:${sessionId}`;
+    const runId = activeRun.runId;
     let cancelled = false;
+    let timer: number | null = null;
+    let requestController: AbortController | null = null;
     const poll = async () => {
+      let keepPolling = isActiveStatus(activeRun.status);
       try {
-        const result = await fetchEnvReviewRun(hubUrl, envSlug, activeRun.runId, sessionId);
-        if (cancelled) return;
-        setRunEvents(result.events.filter((event) => event.type === "model_activity"));
+        requestController = new AbortController();
+        const result = await fetchEnvReviewRun(
+          hubUrl,
+          envSlug,
+          runId,
+          sessionId,
+          runEventCursorRef.current.runId === runId ? runEventCursorRef.current.afterSeq : 0,
+          requestController.signal,
+        );
+        if (cancelled || reviewScopeRef.current !== scope || result.run.runId !== runId) return;
+        const maxSeq = result.events.reduce((maximum, event) => Math.max(maximum, event.seq), 0);
+        if (runEventCursorRef.current.runId === runId) {
+          runEventCursorRef.current.afterSeq = Math.max(runEventCursorRef.current.afterSeq, maxSeq);
+        }
+        setRunEvents((current) => {
+          const merged = new Map(current.map((event) => [`${event.runId}:${event.seq}`, event]));
+          for (const event of result.events) {
+            if (event.type === "model_commentary" && event.message?.trim()) {
+              merged.set(`${event.runId}:${event.seq}`, event);
+            }
+          }
+          return [...merged.values()].sort((left, right) => left.seq - right.seq);
+        });
         setState((current) => current
           ? {
               ...current,
@@ -643,25 +1107,40 @@ export default function EnvReviewPanel({
             ? { ...tab, status: tabStatusForRunStatus(result.run.status) }
             : tab),
         } : current);
-        if (result.run.status === "ready" || result.run.status === "failed" || result.run.status === "cancelled") {
-          const nextMessages = await fetchEnvReviewMessages(hubUrl, envSlug, result.run.threadId, sessionId);
-          if (!cancelled) setMessages(nextMessages);
-          void loadState(true);
+        keepPolling = isActiveStatus(result.run.status);
+        if (!keepPolling) {
+          const terminalSignature = `run:${result.run.runId}:${result.run.status}:${result.run.completedAt ?? result.run.error ?? ""}`;
+          try {
+            await refreshTerminalMessages(terminalSignature, result.run.threadId);
+            await invalidateConvergence();
+          } catch {
+            setConvergenceRetryNeeded(true);
+          }
         }
       } catch {
-        // Polling is best-effort; the state poll remains the fallback.
+        // The visible run probe retries while its last known state is active.
+      } finally {
+        requestController = null;
       }
+      if (!cancelled && keepPolling) timer = window.setTimeout(() => void poll(), 3_000);
     };
     void poll();
-    if (!isActiveStatus(activeRun.status)) return () => {
-      cancelled = true;
-    };
-    const interval = window.setInterval(() => void poll(), 1500);
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      if (timer !== null) window.clearTimeout(timer);
+      requestController?.abort();
     };
-  }, [activeRun?.runId, activeRun?.status, envSlug, hubUrl, loadState, sessionId]);
+  }, [
+    activeRun?.runId,
+    activeRun?.status,
+    documentVisible,
+    envSlug,
+    hubUrl,
+    invalidateConvergence,
+    online,
+    refreshTerminalMessages,
+    sessionId,
+  ]);
 
   useLayoutEffect(() => {
     const transcript = transcriptScrollRef.current;
@@ -677,7 +1156,7 @@ export default function EnvReviewPanel({
     } else {
       transcript.scrollTop = top;
     }
-  }, [activeRun?.status, activeTab?.threadId, latestActivity, messages.length, unmatchedFeedback.length, visibleRunEvents.length]);
+  }, [activeRun?.status, activeTab?.threadId, commentaryMessages.length, latestLiveUpdate, unmatchedFeedback.length, visibleMessages.length]);
 
   const addReviewer = useCallback(async (input: AddReviewerAction) => {
     if (!input.provider || !input.model) return;
@@ -699,6 +1178,70 @@ export default function EnvReviewPanel({
       setLoading(false);
     }
   }, [envSlug, hubUrl, sessionId]);
+
+  const selectRailTab = useCallback(
+    (tab: EnvReviewTab) => {
+      setActiveThreadId(tab.threadId);
+      invocationSelectionRestoredRef.current = true;
+      const rootThreadId =
+        tab.nodeKind === "report"
+          ? tab.skillRootThreadId
+          : tab.nodeKind === "skill_root"
+            ? tab.threadId
+            : null;
+      if (!rootThreadId) {
+        setSelectedInvocationId(null);
+        setActiveSkillView(null);
+        return;
+      }
+      const linked = invocationRows.find(
+        (row) =>
+          row.parentThreadId === rootThreadId && isActiveInvocationRow(row),
+      ) ?? invocationRows.find((row) => row.parentThreadId === rootThreadId);
+      const invocationId =
+        typeof linked?.invocationId === "string" ? linked.invocationId : null;
+      if (!invocationId) {
+        setSelectedInvocationId(null);
+        setActiveSkillView(null);
+        return;
+      }
+      setSelectedInvocationId(invocationId);
+      setActiveSkillView(
+        tab.nodeKind === "report"
+          ? tab.threadId
+          : linked?.agentCount === 1
+            ? rootThreadId
+            : "overview",
+      );
+    },
+    [invocationRows],
+  );
+
+  const handleRailKeyDown = (
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    tab: EnvReviewTab,
+  ) => {
+    const action = resolveReviewerRailKeyboardAction(
+      event.key,
+      tab.threadId,
+      railKeyboardNodes,
+    );
+    if (!action) return;
+    event.preventDefault();
+    if (action.kind === "expand" || action.kind === "collapse") {
+      setExpandedSkillRoots((current) => {
+        const next = new Set(current);
+        if (action.kind === "expand") next.add(action.id);
+        else next.delete(action.id);
+        return next;
+      });
+      return;
+    }
+    const nextTab = tabs.find((candidate) => candidate.threadId === action.id);
+    if (!nextTab) return;
+    selectRailTab(nextTab);
+    railTabRefs.current.get(nextTab.threadId)?.focus();
+  };
 
   const removeTab = useCallback(async (threadId: string) => {
     try {
@@ -724,21 +1267,68 @@ export default function EnvReviewPanel({
     }
   }, [envSlug, hubUrl, sessionId]);
 
+  const cancelSkillInvocation = useCallback(async (invocationId: string) => {
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const cancelled = await cancelReviewSkillInvocation(
+        hubUrl,
+        envSlug,
+        invocationId,
+        sessionId,
+      );
+      setInvocationDetail((current) => current?.invocation.invocationId === invocationId
+        ? { ...current, invocation: cancelled }
+        : current);
+      setInvocationRows((current) => current.map((row) => row.invocationId === invocationId
+        ? { ...row, ...cancelled }
+        : row));
+      await Promise.all([loadState(true), loadInvocationRows()]);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to stop review");
+    } finally {
+      setLoading(false);
+    }
+  }, [envSlug, hubUrl, loadInvocationRows, loadState, loading, sessionId]);
+
   const sendReviewerChatMessage = useCallback(async (text: string): Promise<boolean> => {
-    if (!activeTab || isActiveStatus(activeTab.status) || sendingMessage) return false;
+    if ((activeTab && isActiveStatus(activeTab.status)) || sendingMessage) return false;
+    const actionKey = activeTab ? null : text;
+    const requestId = actionKey
+      ? reviewMessageRequestRef.current.get(actionKey) ?? crypto.randomUUID()
+      : null;
+    if (actionKey && requestId) reviewMessageRequestRef.current.set(actionKey, requestId);
     setSendingMessage(true);
     setError(null);
     try {
-      const result = await sendEnvReviewMessage(hubUrl, envSlug, activeTab.threadId, {
+      const result = await sendEnvReviewMessage(hubUrl, envSlug, activeTab?.threadId ?? null, {
         sessionId,
         text,
+        ...(requestId ? { requestId } : {}),
+        ...(activeTab?.nodeKind !== "generic" &&
+        (invocationDetail?.invocation.invocationId ?? activeTab?.skillInvocationId)
+          ? {
+              expectedRoundId:
+                invocationDetail?.invocation.invocationId ??
+                activeTab!.skillInvocationId!,
+            }
+          : {}),
       });
+      if (actionKey) reviewMessageRequestRef.current.delete(actionKey);
+      const resultThreadId = result.run?.threadId ?? activeTab?.threadId ?? null;
+      if (resultThreadId) {
+        messageRequestGenerationRef.current.set(
+          resultThreadId,
+          (messageRequestGenerationRef.current.get(resultThreadId) ?? 0) + 1,
+        );
+      }
       setState(result.state);
-      setMessages(result.messages);
+      setMessages((current) => mergeThreadMessages(current, result.messages));
       setRunEvents([]);
       if (result.run) {
         setActiveThreadId(result.run.threadId);
-        if (activeTab.skillInvocationId) {
+        if (activeTab?.skillInvocationId) {
           setInvocationDetail((current) => current ? {
             ...current,
             runs: [...current.runs.filter((run) => run.runId !== result.run!.runId), result.run!],
@@ -748,38 +1338,49 @@ export default function EnvReviewPanel({
           } : current);
         }
       }
+      if (overviewSelected) {
+        invocationSelectionRestoredRef.current = true;
+        setSelectedInvocationId(null);
+        setActiveSkillView(null);
+      }
       return true;
     } catch (error) {
+      if (actionKey && error instanceof ApiActionError && error.code !== "message_setup_incomplete") {
+        reviewMessageRequestRef.current.delete(actionKey);
+      }
       setError(error instanceof Error ? error.message : "Failed to send reviewer message");
       void loadState(true);
       return false;
     } finally {
       setSendingMessage(false);
     }
-  }, [activeTab, envSlug, hubUrl, loadState, sendingMessage, sessionId]);
+  }, [activeTab, envSlug, hubUrl, loadState, overviewSelected, sendingMessage, sessionId]);
 
   const invokeSkill = useCallback(async (skill: AgentSkillDefinition) => {
-    if (!activeTab || activeTab.skillInvocationId || isActiveStatus(activeTab.status) || invokingSkillId) return false;
-    const actionKey = `${activeTab.threadId}:${skill.id}`;
+    if (invokingSkillId) return false;
+    const actionKey = `root:${skill.id}`;
     const requestId = reviewSkillRequestRef.current.get(actionKey) ?? crypto.randomUUID();
     reviewSkillRequestRef.current.set(actionKey, requestId);
     setInvokingSkillId(skill.id);
     setError(null);
     try {
-      const result = await invokeReviewSkill(hubUrl, envSlug, activeTab.threadId, skill.id, {
+      const result = await invokeReviewSkill(hubUrl, envSlug, skill.id, {
         sessionId,
         requestId,
         overviewMode: skill.overviewMode,
       });
       reviewSkillRequestRef.current.delete(actionKey);
-      if (result.kind === "fanout") {
-        setSelectedInvocationId(result.invocation.invocationId);
-        setInvocationDetail(result);
-        setActiveSkillView("overview");
-        setActiveThreadId(result.invocation.parentThreadId);
-      }
+      invocationSelectionRestoredRef.current = true;
+      invocationTabsRef.current = result.tabs;
+      setSelectedInvocationId(result.invocation.invocationId);
+      setInvocationDetail(result);
+      const directThreadId = result.invocation.definitionSnapshot.agents.length === 1
+        ? result.invocation.parentThreadId
+        : null;
+      setActiveSkillView(directThreadId ?? "overview");
+      setActiveThreadId(directThreadId ?? result.invocation.parentThreadId);
       await loadState(true);
-      await loadInvocationRows(null, true);
+      await loadInvocationRows();
       return true;
     } catch (error) {
       if (error instanceof ApiActionError && error.code !== "skill_setup_incomplete") {
@@ -790,7 +1391,76 @@ export default function EnvReviewPanel({
     } finally {
       setInvokingSkillId(null);
     }
-  }, [activeTab, envSlug, hubUrl, invokingSkillId, loadInvocationRows, loadState, sessionId]);
+  }, [envSlug, hubUrl, invokingSkillId, loadInvocationRows, loadState, sessionId]);
+
+  const rerunSkill = useCallback(async (detail: ReviewSkillInvocationDetail) => {
+    if (invokingSkillId) return false;
+    const actionKey = `rerun:${detail.invocation.invocationId}`;
+    const requestId = reviewSkillRequestRef.current.get(actionKey) ?? crypto.randomUUID();
+    reviewSkillRequestRef.current.set(actionKey, requestId);
+    setInvokingSkillId(detail.invocation.definitionSnapshot.id);
+    setError(null);
+    try {
+      const result = await rerunReviewSkillInvocation(
+        hubUrl,
+        envSlug,
+        detail.invocation.invocationId,
+        { sessionId, requestId },
+      );
+      reviewSkillRequestRef.current.delete(actionKey);
+      invocationSelectionRestoredRef.current = true;
+      invocationTabsRef.current = result.tabs;
+      setSelectedInvocationId(result.invocation.invocationId);
+      setInvocationDetail(result);
+      const directThreadId = result.invocation.definitionSnapshot.agents.length === 1
+        ? result.invocation.parentThreadId
+        : null;
+      setActiveSkillView(directThreadId ?? "overview");
+      setActiveThreadId(directThreadId ?? result.invocation.parentThreadId);
+      await loadState(true);
+      await loadInvocationRows();
+      return true;
+    } catch (error) {
+      if (error instanceof ApiActionError && error.code !== "skill_setup_incomplete") {
+        reviewSkillRequestRef.current.delete(actionKey);
+      }
+      setError(error instanceof Error ? error.message : "Failed to re-review changes");
+      return false;
+    } finally {
+      setInvokingSkillId(null);
+    }
+  }, [envSlug, hubUrl, invokingSkillId, loadInvocationRows, loadState, sessionId]);
+
+  const removeSkillRound = useCallback(async (detail: ReviewSkillInvocationDetail) => {
+    const invocationId = detail.invocation.invocationId;
+    const parentThreadId = detail.invocation.parentThreadId;
+    if (removingInvocationId || invokingSkillId) return false;
+    setRemovingInvocationId(invocationId);
+    setError(null);
+    try {
+      const result = await removeReviewSkillInvocation(
+        hubUrl,
+        envSlug,
+        invocationId,
+        sessionId,
+      );
+      invocationSelectionRestoredRef.current = true;
+      setSelectedInvocationId(null);
+      setInvocationDetail(null);
+      setActiveSkillView(null);
+      setActiveThreadId(result.state.tabs.find((tab) => tab.nodeKind !== "report")?.threadId ?? null);
+      setState(result.state);
+      setRunEvents([]);
+      setInvocationRows((current) => current.filter((row) => row.parentThreadId !== parentThreadId));
+      await loadInvocationRows();
+      return true;
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to remove review round");
+      return false;
+    } finally {
+      setRemovingInvocationId(null);
+    }
+  }, [envSlug, hubUrl, invokingSkillId, loadInvocationRows, removingInvocationId, sessionId]);
 
   const setOverviewControls = useCallback(async (
     overviewMode: "auto" | "manual",
@@ -805,7 +1475,7 @@ export default function EnvReviewPanel({
         { sessionId, overviewMode, includedMessageIds },
       );
       setInvocationDetail((current) => current ? { ...current, invocation } : current);
-      void loadInvocationRows(null, true);
+      void loadInvocationRows();
     } catch (error) {
       setError(error instanceof Error ? error.message : "Failed to update Overview controls");
     }
@@ -830,91 +1500,119 @@ export default function EnvReviewPanel({
       setOverviewGuidance("");
       const detail = await fetchReviewSkillInvocation(hubUrl, envSlug, sessionId, invocationDetail.invocation.invocationId);
       setInvocationDetail(detail);
-      void loadInvocationRows(null, true);
+      void loadInvocationRows();
       void loadState(true);
     } catch (error) {
       setError(error instanceof Error ? error.message : "Failed to send Manual Overview");
     }
   }, [envSlug, hubUrl, invocationDetail, loadInvocationRows, loadState, overviewGuidance, sessionId]);
 
-  const dismissFeedback = useCallback(async (feedback: EnvReviewFeedback) => {
-    try {
-      await markEnvReviewFeedback(hubUrl, envSlug, feedback.feedbackId, "dismiss", { sessionId });
-      await loadState(true);
-    } catch (error) {
-      setSendError(error instanceof Error ? error.message : "Failed to dismiss feedback");
-    }
-  }, [envSlug, hubUrl, loadState, sessionId]);
-
-  const confirmSend = useCallback(async () => {
-    if (!preview) return;
-    const delivered = preview.feedback.status === "pending"
-      ? preview.feedback.deliveredText ?? preview.text
-      : preview.formatted
-        ? preview.text
-        : formatFeedbackForHarness(preview.feedback, preview.text);
+  const sendFeedback = useCallback(async (
+    feedback: EnvReviewFeedback,
+    text: string,
+    formatted: boolean,
+  ) => {
+    if (!beginFeedbackDelivery(feedback.feedbackId)) return;
+    const delivered = feedback.status === "pending"
+      ? feedback.deliveredText ?? text
+      : formatted
+        ? text
+        : formatFeedbackForHarness(feedback, text);
     setSendError(null);
     try {
-      if (preview.feedback.status === "ready") {
-        await markEnvReviewFeedback(hubUrl, envSlug, preview.feedback.feedbackId, "pending", {
+      if (feedback.status === "ready") {
+        await markEnvReviewFeedback(hubUrl, envSlug, feedback.feedbackId, "pending", {
           sessionId,
           deliveredText: delivered,
         });
       }
-      const sent = await onSendToHarness(delivered);
+      const sent = await onSendToHarness(delivered, feedback.feedbackId);
       if (!sent.ok) {
         setSendError(sent.error || "Harness did not acknowledge feedback");
-        await loadState(true);
         return;
       }
-      await markEnvReviewFeedback(hubUrl, envSlug, preview.feedback.feedbackId, "sent", {
+      await markEnvReviewFeedback(hubUrl, envSlug, feedback.feedbackId, "sent", {
         sessionId,
         deliveredText: delivered,
       });
-      setPreview(null);
-      await loadState(true);
+      setPreview((current) => current?.feedback.feedbackId === feedback.feedbackId ? null : current);
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Failed to send feedback");
+    } finally {
       await loadState(true);
+      finishFeedbackDelivery(feedback.feedbackId);
     }
-  }, [envSlug, hubUrl, loadState, onSendToHarness, preview, sessionId]);
+  }, [
+    beginFeedbackDelivery,
+    envSlug,
+    finishFeedbackDelivery,
+    hubUrl,
+    loadState,
+    onSendToHarness,
+    sessionId,
+  ]);
 
-  const renderFeedbackActions = (feedback: EnvReviewFeedback) => (
-    <div className="mt-2 flex flex-wrap items-center gap-2">
+  useEffect(() => {
+    if (harnessInputReady && !previousHarnessInputReadyRef.current) {
+      autoDeliveryAttemptedRef.current.clear();
+    }
+    previousHarnessInputReadyRef.current = harnessInputReady;
+  }, [harnessInputReady]);
+
+  useEffect(() => {
+    if (!state || !harnessInputReady) return;
+    for (const feedback of state.feedback) {
+      if (
+        (feedback.status !== "ready" && feedback.status !== "pending")
+        || feedback.metadata.overviewMode !== "auto"
+        || !feedback.metadata.skillInvocationId
+        || autoDeliveryAttemptedRef.current.has(
+          `${feedback.feedbackId}:${feedback.status}`,
+        )
+      ) continue;
+      autoDeliveryAttemptedRef.current.add(
+        `${feedback.feedbackId}:${feedback.status}`,
+      );
+      void sendFeedback(feedback, feedback.text, false);
+    }
+  }, [harnessInputReady, sendFeedback, state]);
+
+  const confirmSend = useCallback(async () => {
+    if (!preview) return;
+    await sendFeedback(preview.feedback, preview.text, preview.formatted);
+  }, [preview, sendFeedback]);
+
+  const renderFeedbackActions = (feedback: EnvReviewFeedback) => {
+    const deliveryInFlight = feedbackDeliveryInFlightIds.has(feedback.feedbackId);
+    const deliverable = feedback.status === "ready" || feedback.status === "pending";
+    return <div className="mt-2 flex flex-wrap items-center gap-2">
       <span className="text-[10px] uppercase text-kumo-subtle">{feedback.status}</span>
       <button
         type="button"
-        onClick={() => setPreview({
+        aria-label="Send review feedback"
+        onClick={() => void sendFeedback(
           feedback,
-          text: feedback.deliveredText ?? feedback.text,
-          formatted: Boolean(feedback.deliveredText),
-        })}
-        disabled={feedback.status === "sent"}
+          feedback.deliveredText ?? feedback.text,
+          Boolean(feedback.deliveredText),
+        )}
+        disabled={!deliverable || !harnessInputReady || deliveryInFlight}
         className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
       >
-        {feedback.status === "pending" ? "Retry delivery" : "Send to Harness"}
+        {deliveryInFlight ? "Sending…" : feedback.status === "pending" ? "Retry delivery" : "Send"}
       </button>
       <button
         type="button"
         onClick={() => setPreview({ feedback, text: feedback.text, formatted: false })}
-        disabled={feedback.status !== "ready"}
+        disabled={feedback.status !== "ready" || deliveryInFlight}
         className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
       >
         Edit & Send
       </button>
-      <button
-        type="button"
-        onClick={() => void dismissFeedback(feedback)}
-        disabled={feedback.status === "sent"}
-        className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
-      >
-        Dismiss
-      </button>
       {!harnessInputReady && feedback.status === "pending" && (
         <span className="text-xs text-kumo-subtle">Harness input unavailable.</span>
       )}
-    </div>
-  );
+    </div>;
+  };
   const activeRunLabel = activeRun?.status === "preparing"
     ? "Preparing review snapshot..."
     : activeRun?.status === "queued"
@@ -922,242 +1620,106 @@ export default function EnvReviewPanel({
       : activeRun?.status === "running"
         ? "Reviewer is working..."
         : null;
-  const composerDisabled = !activeTab || loading || sendingMessage || isActiveStatus(activeTab.status) || activeParentLocked;
+  const composerDisabled = loading
+    || sendingMessage
+    || Boolean(activeTab && isActiveStatus(activeTab.status))
+    || activeParentLocked;
   const composerPlaceholder = overviewSelected
     ? activeParentLocked ? "Overview is collecting reports..." : "Message Overview"
     : !activeTab
-    ? "Add a reviewer first"
+    ? "Ask for a review or type / for Review skills"
     : isActiveStatus(activeTab.status) || activeParentLocked
       ? "Reviewer is working..."
       : activeTab.skillInvocationId
         ? `Follow up with ${activeTab.roleLabel}`
         : "Message this reviewer or type / for skills";
-
-  if (collapsed) {
-    return (
-      <div
-        data-testid="env-review-panel"
-        className="shrink-0 border-t border-kumo-line bg-kumo-base px-3 py-2"
-      >
-        <button
-          type="button"
-          onClick={() => setCollapsed(false)}
-          className="text-xs font-medium text-kumo-subtle hover:text-kumo-default"
-        >
-          Reviewers
-        </button>
-      </div>
-    );
-  }
+  const headerRouteSummary = activeRun
+    ? `${formatModelLabel(providers, activeRun.provider, activeRun.model)} · ${formatEffortLabel(providers, activeRun.provider, activeRun.effort)} effort`
+    : null;
+  const headerBasisSummary = basisRun && runPreparation(basisRun)?.snapshot
+    ? formatReviewBasisSummary(basisRun)
+    : null;
+  const headerSummary = [headerRouteSummary, headerBasisSummary].filter(Boolean).join(" · ")
+    || "Choose a reviewer or start from the composer";
+  const headerBasisTitle = basisRun && runPreparation(basisRun)?.snapshot
+    ? formatReviewBasis(runPreparation(basisRun)!.snapshot!)
+    : undefined;
 
   return (
-    <section
-      data-testid="env-review-panel"
-      className="flex shrink-0 flex-col border-t border-kumo-line bg-kumo-base"
-      style={{ height: DEFAULT_REVIEWERS_HEIGHT }}
-      aria-label="Reviewers"
-    >
-      <div className="flex items-start justify-between gap-3 border-b border-kumo-line px-3 py-2">
-        <div className="flex min-w-0 flex-1 items-start gap-2">
-          <button
-            type="button"
-            onClick={() => setCollapsed(true)}
-            className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs text-kumo-subtle hover:bg-kumo-tint"
-            title="Collapse reviewers"
-          >
-            Reviewers
-          </button>
-          <div className="flex max-h-16 min-w-0 flex-1 flex-wrap items-center gap-1 overflow-y-auto pr-1">
-            {topLevelTabs.map((tab) => (
-              <AgentTabButton
-                key={tab.threadId}
-                label={tab.roleLabel}
-                status={topLevelTabStatuses.get(tab.threadId) ?? implementationReviewStatus({
-                  status: tab.status,
-                  runId: tab.latestRunId,
-                })}
-                active={activeTab?.threadId === tab.threadId}
-                onClick={() => {
-                  setActiveThreadId(tab.threadId);
-                  const linkedInvocation = invocationRows.find((row) => (
-                    row.parentThreadId === tab.threadId
-                    && (row.status === "active" || row.status === "setting_up")
-                  ));
-                  if (linkedInvocation && typeof linkedInvocation.invocationId === "string") {
-                    setSelectedInvocationId(linkedInvocation.invocationId);
-                    setActiveSkillView("overview");
-                  } else {
-                    setSelectedInvocationId(null);
-                    setActiveSkillView(null);
-                  }
-                }}
-              />
-            ))}
+    <>
+      <BottomPaneResizeHandle
+        label="Resize terminal and Review"
+        value={reviewersHeight ?? DEFAULT_REVIEWERS_HEIGHT}
+        onKeyDown={resizeWithKeyboard}
+        onPointerDown={startResize}
+      />
+      <div
+        ref={reviewersPaneRef}
+        data-testid="env-review-panel"
+        className="tiller-reviewer-surface flex shrink-0 flex-col bg-kumo-base"
+        style={{ height: reviewersHeight ?? DEFAULT_REVIEWERS_HEIGHT }}
+        role="region"
+        aria-label="Review"
+      >
+      <div className="flex min-h-12 items-center justify-between gap-3 border-b border-kumo-line px-3 py-2">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-xs font-semibold text-kumo-default">
+              {overviewSelected
+                ? `${invocationDetail?.invocation.definitionSnapshot.label ?? "Skill"} Overview`
+                : activeTab?.roleLabel ?? "Implementation Review"}
+            </div>
+            <div className="truncate text-[10px] text-kumo-subtle" title={headerBasisTitle}>
+              {headerSummary}
+            </div>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <AddReviewerMenu
-            activeReviewerCount={topLevelTabs.length}
-            providers={providers}
-            disabled={loading}
-            onAdd={(input) => void addReviewer(input)}
-          />
-          <button
-            type="button"
-            onClick={() => setSkillsOpen(true)}
-            className="h-8 rounded border border-kumo-line bg-kumo-base px-2 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
-          >
-            Review Skills
-          </button>
+          {selectedRootHistory.length > 1 && (
+            <select
+              aria-label="Implementation Review round history"
+              className="max-w-56 rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs"
+              value={selectedInvocationId ?? ""}
+              onChange={(event) => {
+                setSelectedInvocationId(event.target.value);
+                setActiveSkillView("overview");
+              }}
+            >
+              {selectedRootHistory.map((row) => (
+                <option key={String(row.invocationId)} value={String(row.invocationId)}>
+                  {String(row.status ?? "round")}
+                  {typeof row.createdAt === "string"
+                    ? ` · ${new Date(row.createdAt).toLocaleString()}`
+                    : ""}
+                </option>
+              ))}
+            </select>
+          )}
+          {invocationDetail &&
+            ["completed", "failed", "cancelled"].includes(
+              invocationDetail.invocation.status,
+            ) && (
+              <button
+                type="button"
+                onClick={() => void rerunSkill(invocationDetail)}
+                disabled={Boolean(invokingSkillId) || Boolean(removingInvocationId)}
+                className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
+              >
+                Re-review changes
+              </button>
+            )}
         </div>
       </div>
 
       {error && <div className="border-b border-kumo-line px-3 py-2 text-xs text-kumo-danger">{error}</div>}
       {sendError && <div className="border-b border-kumo-line px-3 py-2 text-xs text-kumo-danger">{sendError}</div>}
 
-      {invocationDetail && activeSkillView && (
-        <div className="flex min-h-[48px] items-center gap-2 overflow-x-auto border-b border-kumo-line bg-kumo-base px-3 py-2" data-testid="review-skill-tab-row">
-          <div className="mr-1 flex shrink-0 items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-kumo-subtle">
-            <BranchIcon /> /{invocationDetail.invocation.definitionSnapshot.command}
-          </div>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveSkillView("overview");
-              setActiveThreadId(invocationDetail.invocation.parentThreadId);
-            }}
-            aria-label={`Overview, ${overviewTabStatus.label}`}
-            className={`flex h-8 shrink-0 items-center gap-1.5 rounded border px-2 text-xs ${overviewSelected ? "border-kumo-focus bg-kumo-base text-kumo-default" : "border-kumo-line bg-kumo-recessed text-kumo-subtle hover:bg-kumo-tint"}`}
-          >
-            <AgentTabStatusIndicator status={overviewTabStatus} />
-            Overview
-          </button>
-          {invocationDetail.tabs.map((tab) => {
-            const tabRuns = invocationDetail.runs.filter((run) => run.threadId === tab.threadId);
-            const latestRun = tabRuns[tabRuns.length - 1];
-            const visualStatus = envReviewTabStatus({
-              tab,
-              latestRun,
-              acknowledgedRunId: viewedRunIds[tab.threadId] ?? null,
-              modelLabel: latestRun ? formatModelLabel(providers, latestRun.provider, latestRun.model) : null,
-              effortLabel: latestRun ? formatEffortLabel(providers, latestRun.provider, latestRun.effort) : null,
-            });
-            return (
-              <button
-                key={tab.threadId}
-                type="button"
-                onClick={() => {
-                  setActiveSkillView(tab.threadId);
-                  setActiveThreadId(tab.threadId);
-                }}
-                aria-label={`${tab.roleLabel}, ${visualStatus.label}`}
-                className={`flex h-8 shrink-0 items-center gap-1.5 rounded border px-2 text-xs ${activeSkillView === tab.threadId ? "border-kumo-focus bg-kumo-base text-kumo-default" : "border-kumo-line bg-kumo-recessed text-kumo-subtle hover:bg-kumo-tint"}`}
-              >
-                <AgentTabStatusIndicator status={visualStatus} />
-                {tab.roleLabel}
-              </button>
-            );
-          })}
-          {(invocationDetail.invocation.status === "active" || invocationDetail.invocation.status === "setting_up") && (
-            <button
-              type="button"
-              onClick={() => void cancelReviewSkillInvocation(hubUrl, envSlug, invocationDetail.invocation.invocationId, sessionId).then(() => {
-                void loadInvocationRows(null, true);
-                void loadState(true);
-              })}
-              className="ml-auto shrink-0 rounded border border-kumo-danger/30 px-2 py-1 text-xs text-kumo-danger"
-            >Cancel fanout</button>
-          )}
-        </div>
-      )}
-
-      <div className="grid min-h-0 flex-1 grid-cols-[220px_minmax(0,1fr)] overflow-hidden">
-        <aside className="min-h-0 overflow-y-auto border-r border-kumo-line p-3 pb-6 text-xs text-kumo-subtle">
-          {activeTab ? (
-            <div className="space-y-3">
-              <div className="flex flex-wrap gap-2">
-                {activeRun && isActiveStatus(activeRun.status) && (
-                  <button
-                    type="button"
-                    onClick={() => void cancelRun(activeRun)}
-                    disabled={loading}
-                    className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
-                  >
-                    Stop
-                  </button>
-                )}
-                {!overviewSelected && (
-                  <button
-                    type="button"
-                    onClick={() => activeTab && void removeTab(activeTab.threadId)}
-                    disabled={loading || Boolean(activeTab.skillInvocationId) || activeParentLocked}
-                    title={activeTab.skillInvocationId ? "Skill child tabs are retained in history" : activeParentLocked ? "Parent reviewer is locked by the active Overview" : undefined}
-                    className="rounded border border-kumo-line bg-kumo-base px-2 py-1 text-xs font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
-                  >
-                    Remove
-                  </button>
-                )}
-              </div>
-              {activeRun?.planBasis && (
-                <div>
-                  <div className="font-medium text-kumo-default">Plan</div>
-                  {activeRun.planBasis.source === "none" ? (
-                    <div>No startup plan</div>
-                  ) : (
-                    <>
-                      <div className="truncate">{activeRun.planBasis.title || "Startup plan"}</div>
-                      {activeRun.planBasis.version != null && <div>v{activeRun.planBasis.version}</div>}
-                    </>
-                  )}
-                </div>
-              )}
-              <div>
-                <div className="font-medium text-kumo-default">{overviewSelected ? "Overview" : activeTab.roleLabel}</div>
-                <div>{formatModelLabel(providers, activeTab.provider, activeTab.model)}</div>
-                <div>{formatEffortLabel(providers, activeTab.provider, activeTab.effort)} effort</div>
-                {activeCodexProfile && (
-                  <div className="mt-1">
-                    <span className="rounded border border-kumo-line bg-kumo-base px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide">
-                      {codexAuthModeLabel(activeCodexProfile.kind === "subscription-app-server" ? "subscription" : "api-key")}
-                    </span>
-                  </div>
-                )}
-              </div>
-              {activePreparation && (
-                <div>
-                  <div className="font-medium text-kumo-default">{activePreparation.snapshot ? "Snapshot" : "Preparation"}</div>
-                  <div>{formatPreparationTime(activePreparation.snapshot?.createdAt ?? activePreparation.completedAt)}</div>
-                  {activePreparation.snapshot && (
-                    <div>{activePreparation.snapshot.source === "saved-workspace" ? "Saved workspace" : "Live workspace"}</div>
-                  )}
-                  <div>{activePreparation.changedCount} changed, {activePreparation.deletedCount} deleted</div>
-                </div>
-              )}
-              {activeRun?.changeContext && (
-                <div>
-                  <div className="font-medium text-kumo-default">Files</div>
-                  <div>{activeRun.changeContext.summary.total} total</div>
-                  <div>{activeRun.changeContext.summary.omitted} omitted, {activeRun.changeContext.summary.truncated} truncated</div>
-                  <ul className="mt-1 space-y-0.5">
-                    {activeRun.changeContext.summary.files.map((file) => (
-                      <li key={file.path} className="truncate">
-                        {file.status}: {file.path}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          ) : (
-            <p>No reviewers yet.</p>
-          )}
-        </aside>
-
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_224px] overflow-hidden">
         <main className="flex min-h-0 min-w-0 flex-col overflow-hidden">
           <div
             ref={transcriptScrollRef}
             aria-label="Implementor reviewer conversation"
-            className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 pb-6"
+            className="tiller-reviewer-transcript min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 pb-6"
             onScroll={(event) => {
               const transcript = event.currentTarget;
               transcriptFollowingRef.current = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight
@@ -1166,7 +1728,7 @@ export default function EnvReviewPanel({
           >
             {!activeTab ? (
               <div className="flex h-full items-center justify-center text-sm text-kumo-subtle">
-                Add a reviewer or run a Review skill.
+                Ask a code-aware question or type / to run a Review skill.
               </div>
             ) : (
               <>
@@ -1188,17 +1750,12 @@ export default function EnvReviewPanel({
                     onSend={() => void sendManualOverview()}
                   />
                 )}
-                {messages.length === 0 && !activeRun && !overviewSelected && (
+                {visibleMessages.length === 0 && !activeRun && !overviewSelected && (
                   <div className="py-8 text-center text-sm text-kumo-subtle">
                     Run a review or ask this reviewer a code-aware question.
                   </div>
                 )}
-              {activeRun && activePreparation && (
-                <div className="rounded border border-kumo-line bg-kumo-recessed px-3 py-2 text-xs text-kumo-subtle">
-                  {reviewBasisCopy(activeRun)}
-                </div>
-              )}
-                {messages.map((message) => {
+                {visibleMessages.map((message) => {
                   const role = messageRole(message);
                   const text = messageText(message);
                   const feedback = feedbackByMessageId.get(message.id) ?? null;
@@ -1206,7 +1763,8 @@ export default function EnvReviewPanel({
                   const overviewEligible = role === "assistant"
                     && reportRun?.threadId === activeTab?.threadId
                     && reportRun.status === "ready"
-                    && (reportRun.skillRunRole === "child_initial" || reportRun.skillRunRole === "child_followup");
+                    && reportRun.preparationOpId === invocationDetail?.invocation.preparationOpId
+                    && (reportRun.skillRunRole === "report_initial" || reportRun.skillRunRole === "report_followup");
                   if (!text.trim()) return null;
                   return (
                     <div key={message.id} className={`flex ${role === "user" ? "justify-end" : "justify-start"}`}>
@@ -1223,6 +1781,7 @@ export default function EnvReviewPanel({
                           <div className="whitespace-pre-wrap break-words">{text}</div>
                         )}
                         {overviewEligible
+                          && !directSkillInvocation
                           && activeTab?.skillInvocationId === invocationDetail?.invocation.invocationId
                           && !invocationDetail.invocation.overviewRunId
                           && invocationDetail.invocation.status === "active" && (
@@ -1240,31 +1799,6 @@ export default function EnvReviewPanel({
                     </div>
                   );
                 })}
-                {activeRun && activeRunLabel && (
-                  <div className="flex justify-start">
-                    <div className="max-w-[80%] rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-subtle">
-                      <div className="animate-pulse">{activeRunLabel}</div>
-                      {latestActivity && (
-                        <div className="mt-1 whitespace-pre-wrap break-words text-xs text-kumo-default">{latestActivity}</div>
-                      )}
-                      {visibleRunEvents.length > 1 && (
-                        <details className="mt-2 text-xs">
-                          <summary className="cursor-pointer font-medium text-kumo-info">Activity</summary>
-                          <div className="mt-1 max-h-40 space-y-1 overflow-auto">
-                            {visibleRunEvents.map((event) => (
-                              <div
-                                key={`${event.runId}:${event.seq}`}
-                                className="whitespace-pre-wrap break-words rounded border border-kumo-line bg-kumo-base p-1.5 text-[10px] text-kumo-default"
-                              >
-                                {event.message}
-                              </div>
-                            ))}
-                          </div>
-                        </details>
-                      )}
-                    </div>
-                  </div>
-                )}
                 {(activeRun?.status === "failed" || activeRun?.status === "cancelled") && (
                   <div className="flex justify-start">
                     <div className="max-w-[80%] rounded-lg border border-kumo-danger/40 bg-kumo-danger/10 px-3 py-2 text-sm text-kumo-danger">
@@ -1277,19 +1811,246 @@ export default function EnvReviewPanel({
                     {renderFeedbackActions(feedback)}
                   </div>
                 ))}
+                {(activeRunLabel || activeParentLocked) && (
+                  <div className="flex justify-start" data-testid="reviewer-run-status">
+                    <div className="max-w-[80%] rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-subtle">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="animate-pulse">
+                          {activeParentLocked ? "Reviewers are working…" : activeRunLabel}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label="Stop review"
+                          title="Stop review"
+                          disabled={loading || (activeSkillRootThreadId ? !activeSkillInvocation : !activeRun)}
+                          onClick={() => {
+                            const invocationId = activeSkillInvocation?.invocationId;
+                            if (typeof invocationId === "string") void cancelSkillInvocation(invocationId);
+                            else if (!activeSkillRootThreadId && activeRun) void cancelRun(activeRun);
+                          }}
+                          className="grid size-7 shrink-0 place-items-center border border-kumo-line bg-kumo-base text-kumo-default hover:bg-kumo-tint disabled:opacity-50"
+                        >
+                          <StopIcon aria-hidden="true" size={13} weight="fill" />
+                        </button>
+                      </div>
+                      <ReviewerActivityDetails messages={commentaryMessages} />
+                    </div>
+                  </div>
+                )}
               </>
             )}
           </div>
-          <div className="bg-kumo-base pb-2">
+          <div className="min-h-[57px] bg-kumo-base">
             <PlanChatInput
               disabled={composerDisabled}
               placeholder={composerPlaceholder}
               onSend={(message) => sendReviewerChatMessage(message)}
               skills={!overviewSelected && !activeTab?.skillInvocationId ? reviewSkills : []}
               onInvokeSkill={!overviewSelected && !activeTab?.skillInvocationId ? invokeSkill : undefined}
+              compact
+              showSkillTrigger
             />
           </div>
         </main>
+        <aside className="tiller-agent-switcher tiller-implementation-reviewer-switcher flex min-h-0 flex-col border-l border-kumo-line bg-kumo-base" aria-label="Reviewers">
+          <div className="tiller-agent-switcher-header tiller-workspace-sidebar-header flex h-12 shrink-0 items-center gap-1 border-b border-kumo-line px-3">
+            <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-kumo-default">
+              Reviewers
+            </span>
+            <button
+              type="button"
+              aria-label="Reviewer skill settings"
+              onClick={() => setSkillsOpen(true)}
+              className="flex size-8 items-center justify-center text-xs text-kumo-default hover:bg-kumo-tint"
+            >
+              <GearSixIcon className="size-3.5" weight="bold" aria-hidden="true" />
+            </button>
+            <AddReviewerMenu
+              activeReviewerCount={topLevelTabs.filter((tab) => tab.nodeKind === "generic").length}
+              providers={providers}
+              disabled={loading}
+              compact
+              iconOnly
+              onAdd={(input) => void addReviewer(input)}
+              skills={reviewSkills}
+              onInvokeSkill={(skill) => void invokeSkill(skill)}
+            />
+          </div>
+          <div
+            role="tree"
+            aria-label="Reviewer conversations"
+            className="tiller-agent-card-stack grid min-h-0 flex-1 content-start gap-0 overflow-y-auto p-2"
+          >
+            {railTabs.map((tab) => {
+              const active = activeTab?.threadId === tab.threadId;
+              const hasReports = tab.nodeKind === "skill_root" && tabs.some(
+                (candidate) =>
+                  candidate.nodeKind === "report" &&
+                  candidate.skillRootThreadId === tab.threadId,
+              );
+              const latestRun = runForTab(combinedState, tab);
+              const activeInvocation = active && tab.nodeKind === "skill_root"
+                ? activeSkillInvocation
+                : null;
+              const rootDetail = active && invocationDetail?.invocation.parentThreadId === tab.threadId
+                ? invocationDetail
+                : null;
+              const rowWorking = tab.nodeKind === "skill_root"
+                ? Boolean(activeInvocation)
+                : Boolean(latestRun && isActiveStatus(latestRun.status));
+              const rowActionLabel = rowWorking
+                ? tab.nodeKind === "skill_root" ? "Stop review" : "Stop reviewer"
+                : tab.nodeKind === "skill_root" ? "Remove review" : "Remove reviewer";
+              const rowActionDisabled = loading
+                || (tab.nodeKind === "skill_root"
+                  ? rowWorking
+                    ? typeof activeInvocation?.invocationId !== "string"
+                    : !rootDetail
+                  : rowWorking && !latestRun);
+              const performRowAction = () => {
+                setReviewerActionsOpen(null);
+                if (tab.nodeKind === "skill_root") {
+                  if (rowWorking && typeof activeInvocation?.invocationId === "string") {
+                    void cancelSkillInvocation(activeInvocation.invocationId);
+                  } else if (rootDetail) {
+                    void removeSkillRound(rootDetail);
+                  }
+                } else if (tab.nodeKind === "generic") {
+                  if (rowWorking && latestRun) void cancelRun(latestRun);
+                  else void removeTab(tab.threadId);
+                }
+              };
+              const status = tab.nodeKind === "skill_root" && overviewSelected && active
+                ? overviewTabStatus
+                : envReviewTabStatus({
+                    tab,
+                    latestRun,
+                    acknowledgedRunId: viewedRunIds[tab.threadId] ?? null,
+                    modelLabel: formatModelLabel(
+                      providers,
+                      latestRun?.provider ?? tab.provider,
+                      latestRun?.model ?? tab.model,
+                    ),
+                    effortLabel: formatEffortLabel(
+                      providers,
+                      latestRun?.provider ?? tab.provider,
+                      latestRun?.effort ?? tab.effort,
+                    ),
+                  });
+              return (
+                <Popover
+                  key={tab.threadId}
+                  open={reviewerActionsOpen === tab.threadId}
+                  onOpenChange={(open) => setReviewerActionsOpen(open ? tab.threadId : null)}
+                >
+                  <div
+                    role="presentation"
+                    className={`tiller-plan-agent-list-item flex h-11 min-w-0 items-stretch ${tab.nodeKind === "report" ? "tiller-plan-agent-list-item--report pl-4" : ""} ${active ? "tiller-plan-agent-row-selected" : ""}`}
+                    title={`${formatModelLabel(providers, tab.provider, tab.model)} · ${formatEffortLabel(providers, tab.provider, tab.effort)} effort`}
+                  >
+                    {hasReports && (
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      aria-label={`${expandedSkillRoots.has(tab.threadId) ? "Collapse" : "Expand"} ${tab.roleLabel} Reports`}
+                      className="flex w-6 shrink-0 items-center justify-center text-kumo-subtle hover:text-kumo-default"
+                      onClick={() =>
+                        setExpandedSkillRoots((current) => {
+                          const next = new Set(current);
+                          if (next.has(tab.threadId)) next.delete(tab.threadId);
+                          else next.add(tab.threadId);
+                          return next;
+                        })
+                      }
+                    >
+                      <CaretRightIcon
+                        className={`size-3 transition-transform ${expandedSkillRoots.has(tab.threadId) ? "rotate-90" : ""}`}
+                        weight="bold"
+                        aria-hidden="true"
+                      />
+                    </button>
+                    )}
+                    <button
+                    type="button"
+                    ref={(node) => {
+                      if (node) railTabRefs.current.set(tab.threadId, node);
+                      else railTabRefs.current.delete(tab.threadId);
+                    }}
+                    role="treeitem"
+                    aria-label={tab.roleLabel}
+                    aria-description={`${status.label}. ${status.detail}`}
+                    aria-level={tab.nodeKind === "report" ? 2 : 1}
+                    aria-expanded={hasReports ? expandedSkillRoots.has(tab.threadId) : undefined}
+                    aria-current={active ? "page" : undefined}
+                    tabIndex={active || (!activeThreadId && railTabs[0]?.threadId === tab.threadId) ? 0 : -1}
+                    className="tiller-plan-agent-row flex min-w-0 flex-1 items-center gap-2 px-3 text-left text-xs text-kumo-default hover:bg-kumo-tint"
+                    onClick={() => selectRailTab(tab)}
+                    onKeyDown={(event) => {
+                      if (
+                        event.key === "Delete" &&
+                        active &&
+                        tab.nodeKind !== "report" &&
+                        !rowActionDisabled
+                      ) {
+                        event.preventDefault();
+                        performRowAction();
+                        return;
+                      }
+                      handleRailKeyDown(event, tab);
+                    }}
+                  >
+                      <AgentTabStatusIndicator status={status} card />
+                      <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{tab.roleLabel}</span>
+                      <span className="tiller-workspace-sidebar-meta shrink-0 truncate text-[10px] text-kumo-subtle">
+                        {status.label}
+                      </span>
+                    </button>
+                    {active && tab.nodeKind !== "report" && (
+                      <button
+                        ref={(node) => {
+                          if (node) reviewerActionRefs.current.set(tab.threadId, node);
+                          else reviewerActionRefs.current.delete(tab.threadId);
+                        }}
+                        type="button"
+                        tabIndex={-1}
+                        aria-label={`Actions for ${tab.roleLabel}`}
+                        aria-expanded={reviewerActionsOpen === tab.threadId}
+                        onClick={() => setReviewerActionsOpen((current) => (
+                          current === tab.threadId ? null : tab.threadId
+                        ))}
+                        className="tiller-plan-agent-action flex h-11 w-10 shrink-0 items-center justify-center text-current hover:bg-white/10"
+                      >
+                        <DotsThreeIcon className="size-4" weight="bold" aria-hidden="true" />
+                      </button>
+                    )}
+                  </div>
+                  {active && tab.nodeKind !== "report" && (
+                    <Popover.Content
+                      anchor={reviewerActionRefs.current.get(tab.threadId) ?? null}
+                      side="left"
+                      align="start"
+                      sideOffset={6}
+                      positionMethod="fixed"
+                      className="w-44 p-1"
+                    >
+                      <div className="tiller-plan-agent-actions-menu" role="menu" aria-label={`${tab.roleLabel} actions`}>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          disabled={rowActionDisabled}
+                          onClick={performRowAction}
+                          className="flex w-full px-2 py-1.5 text-left text-[13px] text-kumo-danger hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          {rowActionLabel}
+                        </button>
+                      </div>
+                    </Popover.Content>
+                  )}
+                </Popover>
+              );
+            })}
+          </div>
+        </aside>
       </div>
 
       <SkillEditorDialog
@@ -1312,25 +2073,36 @@ export default function EnvReviewPanel({
               <textarea
                 value={preview.text}
                 onChange={(event) => setPreview({ ...preview, text: event.target.value })}
+                disabled={feedbackDeliveryInFlightIds.has(preview.feedback.feedbackId)}
                 className="h-72 w-full resize-none rounded border border-kumo-line bg-kumo-base p-3 font-mono text-xs text-kumo-default"
               />
             </div>
             <div className="flex justify-end gap-2 border-t border-kumo-line px-4 py-3">
-              <button type="button" onClick={() => setPreview(null)} className="rounded border border-kumo-line px-3 py-1.5 text-sm">
+              <button
+                type="button"
+                onClick={() => setPreview(null)}
+                disabled={feedbackDeliveryInFlightIds.has(preview.feedback.feedbackId)}
+                className="rounded border border-kumo-line px-3 py-1.5 text-sm disabled:opacity-50"
+              >
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={() => void confirmSend()}
-                disabled={!harnessInputReady || !preview.text.trim()}
+                disabled={
+                  !harnessInputReady
+                  || !preview.text.trim()
+                  || feedbackDeliveryInFlightIds.has(preview.feedback.feedbackId)
+                }
                 className="rounded bg-kumo-brand px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
               >
-                Send
+                {feedbackDeliveryInFlightIds.has(preview.feedback.feedbackId) ? "Sending…" : "Send"}
               </button>
             </div>
           </div>
         </div>
       )}
-    </section>
+      </div>
+    </>
   );
 }

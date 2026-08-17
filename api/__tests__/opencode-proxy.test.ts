@@ -11,6 +11,10 @@ import { OPENCODE_PROXY_TOKEN_KEY } from "../env/container-auth";
 
 function createApp() {
   const app = new Hono<HonoEnv>();
+  app.use("*", async (c, next) => {
+    c.set("authorization", { kind: "specialized" });
+    return next();
+  });
   app.route("/", opencodeRoutes);
   return app;
 }

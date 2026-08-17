@@ -6,7 +6,7 @@ interface MarkdownContentProps {
   className?: string;
 }
 
-export default function MarkdownContent({ children, className = "" }: MarkdownContentProps) {
+function MarkdownContent({ children, className = "" }: MarkdownContentProps) {
   return (
     <div className={`space-y-3 text-sm leading-6 text-kumo-default ${className}`}>
       <ReactMarkdown
@@ -46,12 +46,12 @@ export default function MarkdownContent({ children, className = "" }: MarkdownCo
             </a>
           ),
           code: ({ children, className }) => (
-            <code className={`${className ?? ""} rounded border border-kumo-line bg-kumo-recessed px-1 py-0.5 font-mono text-[0.85em] text-kumo-strong`}>
+            <code className={`${className ?? ""} tiller-markdown-code rounded border border-kumo-line bg-kumo-recessed px-1 py-0.5 font-mono text-[0.85em] text-kumo-strong`}>
               {children}
             </code>
           ),
           pre: ({ children }) => (
-            <pre className="my-3 overflow-x-auto rounded border border-kumo-line bg-kumo-recessed p-3 text-xs leading-5">
+            <pre className="tiller-markdown-pre my-3 overflow-x-auto rounded border border-kumo-line bg-kumo-recessed p-3 text-xs leading-5">
               {children}
             </pre>
           ),
@@ -63,3 +63,8 @@ export default function MarkdownContent({ children, className = "" }: MarkdownCo
     </div>
   );
 }
+
+// ReactMarkdown recreates its component tree when this component renders. Live
+// plan metadata refreshes should not replace unchanged document text because
+// doing so clears the user's browser selection.
+export default React.memo(MarkdownContent);

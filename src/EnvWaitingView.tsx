@@ -2,13 +2,130 @@ import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@cloudflare/kumo/components/button";
 import type {
   EnvMeta,
-  StartupDiagnosticLogTails,
-  StartupDiagnosticsSnapshot,
   StartupDiagnosticsState,
 } from "../api/types";
-import { fetchEnvStartupDiagnostics } from "./api";
-import SailingScene from "./SailingScene";
+import { fetchEnvStartupDiagnostics, startEnv } from "./api";
 import { getEnvWaitingPresentation } from "./env-waiting-presentation";
+import { getBackendBadgeLabel } from "./env-display";
+import { getEnvAuthBadge, getEnvModelLabel, getHarnessBadgeLabel } from "./env-harness";
+
+const WAVE_WIDTH = 76;
+const WAVE_HEIGHT = 18;
+const WAVE_FRAME_MS = 33;
+const WAVE_SPEED = 1.35;
+
+export function renderAsciiWaveFrame(
+  phase: number,
+  width = WAVE_WIDTH,
+  height = WAVE_HEIGHT,
+): string {
+  const grid = Array.from({ length: height }, () => Array.from({ length: width }, () => " "));
+  for (let x = 0; x < width; x += 1) {
+    const primaryCenter = height * 0.45
+      + Math.sin(x * 0.14 + phase) * 2.8
+      + Math.sin(x * 0.055 - phase * 0.65) * 1.7;
+    const primaryThickness = 2.4 + (Math.sin(x * 0.1 - phase * 0.35) + 1) * 0.9;
+    const secondaryCenter = height * 0.68
+      + Math.sin(x * 0.105 - phase * 0.8) * 2.1
+      + Math.sin(x * 0.24 + phase * 0.45) * 0.7;
+
+    for (let y = 0; y < height; y += 1) {
+      const primaryDistance = Math.abs(y - primaryCenter);
+      const secondaryDistance = Math.abs(y - secondaryCenter);
+      const texture = Math.sin(x * 0.73 + y * 1.31 + phase * 1.9);
+      const drift = Math.sin(x * 0.19 - y * 0.42 - phase);
+      if (primaryDistance <= primaryThickness) {
+        const edge = primaryDistance / primaryThickness;
+        grid[y]![x] = edge > 0.8
+          ? texture > 0.05 ? "." : "'"
+          : texture > 0.56 ? "+"
+            : drift > 0.2 ? "/"
+              : drift < -0.2 ? "\\" : ",";
+      }
+      if (secondaryDistance <= 1.15 && (grid[y]![x] === " " || texture > 0.25)) {
+        grid[y]![x] = texture > 0.4 ? "+" : texture < -0.45 ? "." : "~";
+      }
+    }
+  }
+  return grid.map((row) => row.join("").trimEnd()).join("\n");
+}
+
+export function EnvironmentLaunchIllustration({
+  compact = false,
+  animated = true,
+}: {
+  compact?: boolean;
+  animated?: boolean;
+} = {}) {
+  const waveRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    if (!animated) return undefined;
+    const reduceMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    const requestFrame = globalThis.requestAnimationFrame?.bind(globalThis);
+    const cancelFrame = globalThis.cancelAnimationFrame?.bind(globalThis);
+    if (reduceMotion || !requestFrame || !cancelFrame) return undefined;
+
+    let frameRequest = 0;
+    let lastFrameAt: number | null = null;
+    let phase = 0;
+
+    const animate = (now: number) => {
+      if (lastFrameAt === null) lastFrameAt = now;
+      const elapsedMs = now - lastFrameAt;
+      if (elapsedMs >= WAVE_FRAME_MS) {
+        phase += (elapsedMs / 1000) * WAVE_SPEED;
+        if (waveRef.current) waveRef.current.textContent = renderAsciiWaveFrame(phase);
+        lastFrameAt = now;
+      }
+      frameRequest = requestFrame(animate);
+    };
+
+    frameRequest = requestFrame(animate);
+    return () => cancelFrame(frameRequest);
+  }, [animated]);
+
+  return (
+    <div
+      className={`tiller-launch-illustration ${compact ? "tiller-launch-illustration--compact" : ""}`}
+      role="img"
+      aria-label={animated ? "Animated ASCII ocean waves" : "ASCII ocean waves"}
+    >
+      <pre ref={waveRef} className="tiller-launch-waves" aria-hidden="true">{renderAsciiWaveFrame(0)}</pre>
+    </div>
+  );
+}
+
+function EnvironmentLaunchMetadata({
+  env,
+  implementationMode,
+}: {
+  env: EnvMeta;
+  implementationMode?: "fresh" | "plan" | null;
+}) {
+  const authLabel = getEnvAuthBadge(env)?.label ?? "Global settings";
+  const planLabel = implementationMode === "plan"
+    ? "Fixed plan"
+    : implementationMode === "fresh"
+      ? "No plan"
+      : "Launch mode pending";
+  const fullText = [
+    `Harness: ${getHarnessBadgeLabel(env.harness)}`,
+    `Model: ${getEnvModelLabel(env) ?? "Default model"}`,
+    env.harnessSettings?.effort ?? "Default effort",
+    authLabel,
+    getBackendBadgeLabel(env.backend),
+    planLabel,
+  ].join(" · ");
+  return (
+    <div className="tiller-launch-runtime-viewport" aria-label={fullText}>
+      <div className="tiller-launch-runtime-line">
+        <span>{fullText}</span>
+        <span className="tiller-launch-runtime-caret" aria-hidden="true" />
+      </div>
+    </div>
+  );
+}
 
 const EMPTY_DIAGNOSTICS: StartupDiagnosticsState = {
   active: null,
@@ -29,7 +146,6 @@ interface EnvWaitingViewProps {
   env: EnvMeta;
   hubUrl: string;
   onRecoverEnv?: (slug: string, status?: string) => void;
-  onStartRequest?: (slug: string) => void;
 }
 
 interface DiagnosticsResult {
@@ -37,31 +153,9 @@ interface DiagnosticsResult {
   value: StartupDiagnosticsState;
 }
 
-interface DetailsState {
-  operationKey: string;
-  open: boolean;
-}
-
-interface CopyStatus {
-  opId: string | null;
-  state: "idle" | "copied" | "failed";
-}
-
 function formatStepLabel(stepId?: string | null): string | null {
   if (!stepId) return null;
   return STEP_LABELS[stepId] ?? stepId;
-}
-
-function formatTimestamp(value?: string | null): string | null {
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) return value;
-  return new Date(parsed).toLocaleTimeString("en-US", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
 }
 
 function formatElapsedTime(elapsedMs: number): string {
@@ -75,172 +169,22 @@ function formatElapsedTime(elapsedMs: number): string {
   return `${seconds}s`;
 }
 
-function hasLogTail(logTails?: StartupDiagnosticLogTails | null): boolean {
-  return Boolean(logTails?.harness || logTails?.stopControl || logTails?.bootstrap);
-}
-
-function renderLogTail(title: string, value: string | null) {
-  if (!value) return null;
-  return (
-    <div className="rounded-lg border border-kumo-line bg-kumo-contrast">
-      <div className="border-b border-kumo-line px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-kumo-inverse opacity-70">
-        {title}
-      </div>
-      <pre className="overflow-x-auto whitespace-pre-wrap px-3 py-2 font-mono text-xs leading-5 text-kumo-inverse">
-        {value}
-      </pre>
-    </div>
-  );
-}
-
-function DiagnosticsPanel({
-  snapshot,
-  copyStatus,
-  onCopy,
-}: {
-  snapshot: StartupDiagnosticsSnapshot;
-  copyStatus: CopyStatus;
-  onCopy: (snapshot: StartupDiagnosticsSnapshot) => void;
-}) {
-  const copyLabel = copyStatus.opId === snapshot.opId
-    ? copyStatus.state === "copied"
-      ? "Copied"
-      : copyStatus.state === "failed"
-        ? "Copy Failed"
-        : "Copy Diagnostics"
-    : "Copy Diagnostics";
-
-  return (
-    <section
-      aria-label={`Startup diagnostics for operation ${snapshot.opId}`}
-      className="overflow-hidden rounded-lg border border-kumo-line bg-kumo-elevated"
-    >
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-kumo-line bg-kumo-recessed px-4 py-3">
-        <div>
-          <h3 className="text-sm font-semibold text-kumo-strong">Startup diagnostics</h3>
-          <p className="mt-0.5 text-[11px] text-kumo-subtle">
-            Operation {snapshot.opId} · {snapshot.backend.toUpperCase()} · started {formatTimestamp(snapshot.startedAt) ?? snapshot.startedAt} · updated {formatTimestamp(snapshot.updatedAt) ?? snapshot.updatedAt}
-          </p>
-        </div>
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          onClick={() => onCopy(snapshot)}
-        >
-          {copyLabel}
-        </Button>
-      </div>
-
-      <div className="grid gap-4 p-4 md:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)]">
-        <div className="space-y-4">
-          <div className="rounded border border-kumo-line">
-            <div className="border-b border-kumo-line px-3 py-2 text-xs font-medium uppercase tracking-wide text-kumo-subtle">
-              Timeline
-            </div>
-            <div className="max-h-80 overflow-y-auto px-3 py-2 font-mono text-xs">
-              {snapshot.events.length === 0 ? (
-                <p className="text-kumo-subtle">No events reported yet.</p>
-              ) : (
-                snapshot.events.map((event, index) => (
-                  <div
-                    key={`${event.at}-${index}`}
-                    className="border-b border-kumo-hairline py-2 last:border-b-0"
-                  >
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-kumo-subtle">{formatTimestamp(event.at) ?? event.at}</span>
-                      <span className="rounded bg-kumo-recessed px-1.5 py-0.5 text-[10px] font-medium text-kumo-subtle">
-                        {formatStepLabel(event.stepId)}
-                      </span>
-                      <span
-                        className={`text-[10px] font-semibold uppercase tracking-wide ${
-                          event.severity === "error"
-                            ? "text-kumo-danger"
-                            : event.severity === "warn"
-                              ? "text-kumo-warning"
-                              : "text-kumo-subtle"
-                        }`}
-                      >
-                        {event.severity}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-kumo-default">{event.message}</p>
-                    {event.detail && (
-                      <p className="mt-1 whitespace-pre-wrap text-kumo-subtle">{event.detail}</p>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          {hasLogTail(snapshot.logTails) && (
-            <div className="space-y-3">
-              {renderLogTail("Harness Log Tail", snapshot.logTails.harness)}
-              {renderLogTail("Stop-Control Log Tail", snapshot.logTails.stopControl)}
-              {renderLogTail("Bootstrap Log Tail", snapshot.logTails.bootstrap)}
-            </div>
-          )}
-        </div>
-
-        <div className="space-y-4">
-          <div className="rounded border border-kumo-line bg-kumo-recessed p-3">
-            <p className="text-xs font-medium uppercase tracking-wide text-kumo-subtle">Current step</p>
-            <p className="mt-2 text-sm font-medium text-kumo-default">
-              {formatStepLabel(snapshot.currentStepId) ?? "Waiting for diagnostics"}
-            </p>
-            <p className="mt-1 whitespace-pre-wrap text-sm text-kumo-subtle">
-              {snapshot.currentStepMessage ?? "No step message yet."}
-            </p>
-          </div>
-
-          <div className="rounded border border-kumo-line bg-kumo-recessed p-3">
-            <p className="text-xs font-medium uppercase tracking-wide text-kumo-subtle">Failure</p>
-            <p className="mt-2 whitespace-pre-wrap text-sm text-kumo-default">
-              {snapshot.failure?.message ?? "No startup failure recorded."}
-            </p>
-            {snapshot.failure?.lastStepId && (
-              <p className="mt-1 text-xs text-kumo-subtle">
-                Last step: {formatStepLabel(snapshot.failure.lastStepId)}
-              </p>
-            )}
-            {(snapshot.failure?.exitCode != null || snapshot.failure?.signal) && (
-              <p className="mt-1 text-xs text-kumo-subtle">
-                exit={snapshot.failure?.exitCode ?? "n/a"} signal={snapshot.failure?.signal ?? "n/a"}
-              </p>
-            )}
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaitingViewProps) {
+export default function EnvWaitingView({ env, hubUrl, onRecoverEnv }: EnvWaitingViewProps) {
   const envIdentity = env.incarnationId ?? env.slug;
   const operationKey = `${envIdentity}:${env.lifecycleOpId ?? "no-operation"}`;
   const [diagnosticsResult, setDiagnosticsResult] = useState<DiagnosticsResult>(() => ({
     envIdentity,
     value: EMPTY_DIAGNOSTICS,
   }));
-  const [detailsState, setDetailsState] = useState<DetailsState>(() => ({
-    operationKey,
-    open: false,
-  }));
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
-  const [copyStatus, setCopyStatus] = useState<CopyStatus>({ opId: null, state: "idle" });
-  const autoOpenedOperationKeysRef = useRef(new Set<string>());
-  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [startingMode, setStartingMode] = useState<"fresh" | "plan" | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const diagnostics = diagnosticsResult.envIdentity === envIdentity
     ? diagnosticsResult.value
     : EMPTY_DIAGNOSTICS;
   const presentation = getEnvWaitingPresentation(env, diagnostics);
-  const detailsOpen = detailsState.operationKey === operationKey && detailsState.open;
   const activeDiagnostics = diagnostics.active;
-  const previousFailure = diagnostics.lastFailed?.opId === activeDiagnostics?.opId
-    ? null
-    : diagnostics.lastFailed;
 
   const matchingStartedAt = presentation.elapsedTimeEligible
     && Boolean(env.lifecycleOpId)
@@ -251,7 +195,6 @@ export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaiti
 
   useEffect(() => {
     let cancelled = false;
-    setCopyStatus({ opId: null, state: "idle" });
 
     fetchEnvStartupDiagnostics(hubUrl, env.slug)
       .then((next) => {
@@ -269,14 +212,6 @@ export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaiti
       cancelled = true;
     };
   }, [envIdentity, env.lifecycleOpId, env.slug, env.status, env.updatedAt, hubUrl]);
-
-  useEffect(() => {
-    if (presentation.displayState !== "startup-failure") return;
-    if (autoOpenedOperationKeysRef.current.has(operationKey)) return;
-
-    autoOpenedOperationKeysRef.current.add(operationKey);
-    setDetailsState({ operationKey, open: true });
-  }, [operationKey, presentation.displayState]);
 
   useEffect(() => {
     if (!matchingStartedAt) {
@@ -299,39 +234,30 @@ export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaiti
     return () => clearInterval(timer);
   }, [matchingStartedAt, operationKey]);
 
-  useEffect(() => () => {
-    if (copyResetTimerRef.current) {
-      clearTimeout(copyResetTimerRef.current);
-    }
-  }, []);
-
-  const copyDiagnostics = async (snapshot: StartupDiagnosticsSnapshot) => {
-    if (copyResetTimerRef.current) {
-      clearTimeout(copyResetTimerRef.current);
-      copyResetTimerRef.current = null;
-    }
-
+  const canStart = presentation.primaryAction === "start" || presentation.primaryAction === "retry";
+  const showProgressWave = presentation.displayState === "preparing"
+    || presentation.displayState === "saving"
+    || presentation.displayState === "stopping";
+  const progressStepLabel = presentation.displayState === "preparing"
+    ? formatStepLabel(env.bootStepId ?? activeDiagnostics?.currentStepId ?? null) ?? "Preparing"
+    : presentation.displayState === "saving"
+      ? formatStepLabel(env.bootStepId) ?? "Workspace Sync"
+      : "Stopping";
+  const progressMessage = presentation.displayState === "preparing"
+    ? activeDiagnostics?.currentStepMessage ?? env.bootMessage ?? presentation.actionText
+    : env.bootMessage ?? presentation.actionText;
+  const handleStart = async (implementationMode: "fresh" | "plan") => {
+    setStartingMode(implementationMode);
+    setStartError(null);
     try {
-      if (!globalThis.navigator?.clipboard?.writeText) {
-        throw new Error("Clipboard API unavailable");
-      }
-      await globalThis.navigator.clipboard.writeText(JSON.stringify(snapshot, null, 2));
-      setCopyStatus({ opId: snapshot.opId, state: "copied" });
-      copyResetTimerRef.current = setTimeout(() => {
-        setCopyStatus({ opId: null, state: "idle" });
-        copyResetTimerRef.current = null;
-      }, 1200);
+      const result = await startEnv(hubUrl, env.slug, { implementationMode });
+      onRecoverEnv?.(env.slug, result.status);
     } catch (error) {
-      console.error("[tiller] Failed to copy diagnostics:", error);
-      setCopyStatus({ opId: snapshot.opId, state: "failed" });
+      setStartError(error instanceof Error ? error.message : "Failed to start environment");
+    } finally {
+      setStartingMode(null);
     }
   };
-
-  const primaryActionLabel = presentation.primaryAction === "start"
-    ? "Start environment"
-    : presentation.primaryAction === "retry"
-      ? "Try again"
-      : null;
 
   return (
     <div className="flex flex-1 flex-col">
@@ -351,108 +277,62 @@ export default function EnvWaitingView({ env, hubUrl, onStartRequest }: EnvWaiti
               )}
             </p>
 
-            <div className="mt-7 flex w-full justify-center sm:mt-9">
-              <SailingScene motionVariant={presentation.motionVariant} />
+            <div className="mt-7 flex w-full flex-col sm:mt-9">
+              {showProgressWave ? (
+                <>
+                  {presentation.displayState === "preparing" && (
+                    <EnvironmentLaunchMetadata
+                      env={env}
+                      implementationMode={activeDiagnostics?.implementationMode}
+                    />
+                  )}
+                  <EnvironmentLaunchIllustration compact />
+                  <div className="tiller-launch-current-step border-t border-kumo-line pt-3 text-left">
+                    <span className="tiller-launch-current-step-label">
+                      {progressStepLabel}
+                    </span>
+                    <span className="min-w-0 truncate text-[12px] text-kumo-subtle">
+                      Current: {progressMessage}
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <EnvironmentLaunchIllustration animated={false} />
+              )}
             </div>
 
-            {primaryActionLabel && (
-              <Button
-                type="button"
-                variant="primary"
-                size="lg"
-                className="mt-7"
-                onClick={() => onStartRequest?.(env.slug)}
-              >
-                {primaryActionLabel}
-              </Button>
+            {canStart && (
+              <div className="mt-7 flex flex-col items-center gap-3">
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="lg"
+                    loading={startingMode === "fresh"}
+                    disabled={startingMode !== null}
+                    onClick={() => void handleStart("fresh")}
+                  >
+                    Start fresh
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="lg"
+                    loading={startingMode === "plan"}
+                    disabled={startingMode !== null || !env.startupPlanId}
+                    title={env.startupPlanId ? "Implement the environment's saved plan" : "This environment has no saved plan"}
+                    onClick={() => void handleStart("plan")}
+                  >
+                    Start with plan
+                  </Button>
+                </div>
+                <p className="max-w-xl text-xs leading-5 text-kumo-subtle">
+                  Start fresh for an interactive session, or start with plan to have the implementor execute the saved plan automatically.
+                </p>
+                {startError && <p role="alert" className="text-xs text-kumo-danger">{startError}</p>}
+              </div>
             )}
 
-            <details
-              key={operationKey}
-              open={detailsOpen}
-              onToggle={(event) => {
-                setDetailsState({
-                  operationKey,
-                  open: event.currentTarget.open,
-                });
-              }}
-              className="mt-8 w-full rounded-xl border border-kumo-line bg-kumo-elevated text-left shadow-sm"
-            >
-              <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-kumo-default sm:px-5">
-                Technical details
-              </summary>
-
-              <div className="space-y-4 border-t border-kumo-line p-4 sm:p-5">
-                <section aria-labelledby="environment-metadata-heading">
-                  <h2 id="environment-metadata-heading" className="text-xs font-semibold uppercase tracking-wide text-kumo-subtle">
-                    Environment metadata
-                  </h2>
-                  <dl className="mt-2 grid gap-2 rounded-lg border border-kumo-line bg-kumo-recessed p-3 text-xs sm:grid-cols-2">
-                    <div>
-                      <dt className="font-medium text-kumo-subtle">Status</dt>
-                      <dd className="mt-0.5 font-mono text-kumo-default">{env.status}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-medium text-kumo-subtle">Operation ID</dt>
-                      <dd className="mt-0.5 break-all font-mono text-kumo-default">{env.lifecycleOpId ?? "Not reported"}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-medium text-kumo-subtle">Lifecycle operation</dt>
-                      <dd className="mt-0.5 font-mono text-kumo-default">{env.lifecycleOperation ?? "Not reported"}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-medium text-kumo-subtle">Desired state</dt>
-                      <dd className="mt-0.5 font-mono text-kumo-default">{env.lifecycleDesiredState ?? "Not reported"}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-medium text-kumo-subtle">Startup step</dt>
-                      <dd className="mt-0.5 font-mono text-kumo-default">{env.bootStepId ?? "Not reported"}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-medium text-kumo-subtle">Last updated</dt>
-                      <dd className="mt-0.5 font-mono text-kumo-default">{formatTimestamp(env.updatedAt) ?? env.updatedAt}</dd>
-                    </div>
-                  </dl>
-                  {(env.bootMessage || env.error) && (
-                    <div className="mt-2 rounded-lg border border-kumo-line bg-kumo-recessed p-3 text-xs">
-                      <p className="font-medium text-kumo-subtle">Raw environment message</p>
-                      {env.bootMessage && <p className="mt-1 whitespace-pre-wrap text-kumo-default">{env.bootMessage}</p>}
-                      {env.error && <p className="mt-1 whitespace-pre-wrap text-kumo-danger">{env.error}</p>}
-                    </div>
-                  )}
-                </section>
-
-                {activeDiagnostics ? (
-                  <DiagnosticsPanel
-                    snapshot={activeDiagnostics}
-                    copyStatus={copyStatus}
-                    onCopy={(snapshot) => void copyDiagnostics(snapshot)}
-                  />
-                ) : (
-                  <p className="rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-xs text-kumo-subtle">
-                    No active startup diagnostics are available.
-                  </p>
-                )}
-
-                {previousFailure && (
-                  <details
-                    key={`${envIdentity}:last-failed:${previousFailure.opId}`}
-                    className="rounded-lg border border-kumo-line bg-kumo-base"
-                  >
-                    <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-kumo-default">
-                      Previous startup failure
-                    </summary>
-                    <div className="border-t border-kumo-line p-3">
-                      <DiagnosticsPanel
-                        snapshot={previousFailure}
-                        copyStatus={copyStatus}
-                        onCopy={(snapshot) => void copyDiagnostics(snapshot)}
-                      />
-                    </div>
-                  </details>
-                )}
-              </div>
-            </details>
           </div>
         </main>
       </div>

@@ -6,6 +6,17 @@ import { installedAccessBindings } from "./access-binding-fixture";
 
 vi.mock("../setup/config", () => ({
   getSecret: async (env: Record<string, unknown>, key: string) => env[key] || undefined,
+  getOrCreateSecret: async (
+    env: Record<string, unknown>,
+    key: string,
+    createValue: () => string,
+  ) => {
+    const existing = env[key];
+    if (typeof existing === "string" && existing) return existing;
+    const generated = createValue();
+    env[key] = generated;
+    return generated;
+  },
 }));
 
 import cliRoutes from "../cli/routes";
@@ -115,13 +126,31 @@ describe("POST /api/cli/connect-package", () => {
       enc: "A256GCM",
       typ: "tiller-connect+jwe",
     });
-    expect(JSON.parse(new TextDecoder().decode(decrypted.plaintext))).toMatchObject({
+    const connection = JSON.parse(new TextDecoder().decode(decrypted.plaintext));
+    expect(connection).toMatchObject({
       hubUrl: "https://tiller.preview.workers.dev",
       clientId: "client-id.access",
       clientSecret: "client-secret",
       tokenExpiresAt: "2027-07-16T00:00:00.000Z",
       state: "state-1",
     });
+    expect(connection.controlSecret).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(body.envelope).not.toContain(connection.controlSecret);
+
+    const nextKeys = await generateKeyPair("ECDH-ES", { crv: "P-256" });
+    const nextResponse = await app.request(
+      "https://tiller.preview.workers.dev/api/cli/connect-package",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ publicKeyJwk: await exportJWK(nextKeys.publicKey), state: "state-2" }),
+      },
+      env,
+    );
+    const nextBody = await nextResponse.json() as { envelope: string };
+    const nextDecrypted = await compactDecrypt(nextBody.envelope, nextKeys.privateKey);
+    const nextConnection = JSON.parse(new TextDecoder().decode(nextDecrypted.plaintext));
+    expect(nextConnection.controlSecret).toBe(connection.controlSecret);
   });
 
   it("rejects an oversized streamed package request before reading credentials", async () => {
