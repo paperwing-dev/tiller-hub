@@ -56,7 +56,7 @@ export function planWriterTabStatus(
     return status("error", "Error", withConfiguration(localError, configuration));
   }
   if (options.operation === "stopping") {
-    return status("stopping", "Abandoning", withConfiguration("Detaching the live Scribe from this plan.", configuration));
+    return status("stopping", "Stopping", withConfiguration("Stopping the live Scribe.", configuration));
   }
   if (options.operation === "starting") {
     return status("starting", "Starting", withConfiguration("Starting the live Scribe.", configuration));

@@ -229,7 +229,7 @@ function SkillLaunchList({
 }) {
   return (
     <div className="mt-4 border-t border-kumo-line pt-3">
-      <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-kumo-subtle">
+      <div className="tiller-interface-label mb-1 text-[10px] font-medium text-kumo-default">
         Saved skills
       </div>
       <div className="grid gap-1">

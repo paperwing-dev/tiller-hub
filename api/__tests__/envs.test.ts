@@ -629,6 +629,7 @@ function createLifecycleStub() {
     requestStop: vi.fn().mockResolvedValue(null),
     ensureStopDispatchScheduled: vi.fn().mockResolvedValue(true),
     resumeStopRetry: vi.fn().mockResolvedValue(null),
+    noteWorkspacePreparationUnavailable: vi.fn().mockResolvedValue(null),
     reconcile: vi.fn().mockResolvedValue(null),
     clearLeadHarnessState: vi.fn().mockResolvedValue(current),
     beginStartupDiagnostics: vi.fn().mockResolvedValue(current),
@@ -994,6 +995,30 @@ describe("Cloudflare Stop durability", () => {
     expect(fixture.sandbox.prepareWorkspaceStop).not.toHaveBeenCalled();
     expect(fixture.lifecycleStub.acceptStopWorkspaceSynced).not.toHaveBeenCalled();
     expect(fixture.sandbox.schedulePreparedTermination).toHaveBeenCalledWith(fixture.stopScope);
+  });
+
+  it("records an absent unprepared Cloudflare runner without requeueing it as a transient dispatch error", async () => {
+    const fixture = createCloudflareStopFixture();
+    fixture.sandbox.prepareWorkspaceStop.mockResolvedValue({
+      status: "absent-unprepared",
+    });
+
+    const result = await stopEnvAction({
+      env: fixture.env,
+      executionCtx: createExecutionCtx() as any,
+      slug: "my-env",
+      lifecycleStub: fixture.lifecycleStub as any,
+      cachedMeta: fixture.runningMeta as any,
+      awaitRunnerDispatch: true,
+    });
+
+    expect(result).toMatchObject({ status: 200, operationId: fixture.stopOpId });
+    expect(fixture.lifecycleStub.noteWorkspacePreparationUnavailable).toHaveBeenCalledWith(
+      fixture.stopOpId,
+      "Cloudflare runner stopped before producing a durable workspace receipt.",
+    );
+    expect(fixture.lifecycleStub.noteStopDispatchFailed).not.toHaveBeenCalled();
+    expect(fixture.sandbox.schedulePreparedTermination).not.toHaveBeenCalled();
   });
 
   it("does not schedule termination when LifecycleDO rejects the workspace receipt", async () => {

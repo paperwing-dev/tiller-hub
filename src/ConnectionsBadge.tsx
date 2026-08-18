@@ -168,7 +168,7 @@ export default function ConnectionsBadge({
         type="button"
         aria-label={title}
         aria-expanded={open}
-        className="tiller-connections-trigger inline-flex h-7 items-center gap-1.5 rounded px-1 text-[10px] font-medium uppercase tracking-wide text-kumo-subtle hover:bg-kumo-tint"
+        className="tiller-connections-trigger tiller-interface-label inline-flex h-7 items-center gap-1.5 px-2 text-[11px] font-medium text-kumo-default"
       >
         <span className="inline-flex items-center gap-1">
           <span

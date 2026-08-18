@@ -462,7 +462,7 @@ export function AuthConnectPanel({
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">
+          <p className="tiller-interface-label text-xs font-semibold text-kumo-subtle">
             Subscription connection
           </p>
           <h3
@@ -1281,9 +1281,7 @@ function OpenCodeInfoRow() {
             account.
           </p>
           <div className="mt-2 flex items-center gap-2">
-            <Badge variant="success" appearance="dot">
-              Built in
-            </Badge>
+            <span className="tiller-interface-metadata text-xs">Built in</span>
             <span className="text-xs text-kumo-subtle">
               Pinned to {KIMI_K2_7_CODE.label}
             </span>
@@ -1845,7 +1843,7 @@ export default function SettingsPage({
                 Scribe runtimes remain pinned until recreated.
               </p>
               <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">
+                <p className="tiller-interface-label text-xs font-semibold text-kumo-subtle">
                   API Keys
                 </p>
                 <div className="mt-3 grid gap-3">
@@ -1870,7 +1868,7 @@ export default function SettingsPage({
 
               <div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">
+                  <p className="tiller-interface-label text-xs font-semibold text-kumo-subtle">
                     Subscriptions
                   </p>
                   <span className="text-xs text-kumo-subtle">
@@ -1928,7 +1926,7 @@ export default function SettingsPage({
             <div className="mt-4 grid gap-3">
               {shouldShowInstallationRegion(status) && (
                 <div>
-                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">
+                  <p className="tiller-interface-label text-xs font-semibold text-kumo-subtle">
                     Installation
                   </p>
                   <div className="mt-3 grid gap-3">
@@ -1937,7 +1935,7 @@ export default function SettingsPage({
                 </div>
               )}
               <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-kumo-subtle">
+                <p className="tiller-interface-label text-xs font-semibold text-kumo-subtle">
                   Cloudflare auto-stop
                 </p>
                 <div className="mt-3 grid gap-3">

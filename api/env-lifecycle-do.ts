@@ -109,6 +109,7 @@ interface StopRetryRecord {
   attempt: number;
   nextAttemptAtMs: number;
   idleClaimId?: string;
+  workspacePreparationUnavailable?: boolean;
 }
 
 function stopRetryDelayMs(attempt: number): number {
@@ -4263,6 +4264,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
   async recordWorkspaceSyncFailed(
     opId: string | null | undefined,
     error: string,
+    options?: { workspacePreparationUnavailable?: boolean },
   ): Promise<EnvMutableState | null> {
     const resolvedOpId = this.resolveLifecycleOpId(opId);
     const result = await this.ctx.storage.transaction(async (txn) => {
@@ -4289,12 +4291,16 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       const acknowledged = current.lifecycleLastWorkspaceSyncedAckOpId === resolvedOpId
         && (current.lifecyclePhase === "stopping" || current.lifecyclePhase === "stopped");
       const updatedAt = nowIso();
+      // A retry is progress for the mutable-state projection, not a new
+      // lifecycle transition. Preserve the original phase deadline so retry
+      // intervals cannot push the hard Saving or Stopping timeout forward.
+      const lifecycleUpdatedAt = current.lifecycleUpdatedAt ?? current.updatedAt;
       const next = acknowledged
         ? normalizeMutableState({
             ...current,
             error: null,
             errorAt: null,
-            lifecycleUpdatedAt: updatedAt,
+            lifecycleUpdatedAt,
             updatedAt,
           })
         : normalizeMutableState({
@@ -4309,12 +4315,13 @@ export class EnvLifecycleDO extends DurableObject<Env> {
               runtimeReady: false,
               lastError: null,
               lastErrorAt: null,
-              updatedAt,
+              updatedAt: lifecycleUpdatedAt,
             }),
             bootMessage: stopRetryProgressMessage(error),
             bootStepId: "workspace-sync",
             error: null,
             errorAt: null,
+            updatedAt,
           });
       const nextScheduledRun = scheduledRun?.kind === "active" && scheduledRun.stopOpId === resolvedOpId
         ? {
@@ -4325,6 +4332,8 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         : scheduledRun ?? null;
       const existingRetry = await txn.get<StopRetryRecord>(STOP_RETRY_KEY);
       const attempt = existingRetry?.opId === resolvedOpId ? existingRetry.attempt : 0;
+      const workspacePreparationUnavailable = options?.workspacePreparationUnavailable === true
+        || (existingRetry?.opId === resolvedOpId && existingRetry.workspacePreparationUnavailable === true);
       await txn.put(STOP_RETRY_KEY, {
         opId: resolvedOpId!,
         attempt,
@@ -4332,6 +4341,7 @@ export class EnvLifecycleDO extends DurableObject<Env> {
         ...(existingRetry?.opId === resolvedOpId && existingRetry.idleClaimId
           ? { idleClaimId: existingRetry.idleClaimId }
           : {}),
+        ...(workspacePreparationUnavailable ? { workspacePreparationUnavailable: true } : {}),
       } satisfies StopRetryRecord);
       const projected = await this.writeScheduledRunInTransaction(txn, next, nextScheduledRun);
       return { mutable: projected, scheduledRun: nextScheduledRun, changed: true };
@@ -4353,6 +4363,17 @@ export class EnvLifecycleDO extends DurableObject<Env> {
     error: string,
   ): Promise<EnvLifecycleState | null> {
     const next = await this.recordWorkspaceSyncFailed(opId, error);
+    return buildLifecycleState(next);
+  }
+
+  async noteWorkspacePreparationUnavailable(
+    opId: string | null | undefined,
+    error: string,
+  ): Promise<EnvLifecycleState | null> {
+    await this.noteRunnerStopped(opId, null);
+    const next = await this.recordWorkspaceSyncFailed(opId, error, {
+      workspacePreparationUnavailable: true,
+    });
     return buildLifecycleState(next);
   }
 
@@ -4976,6 +4997,17 @@ export class EnvLifecycleDO extends DurableObject<Env> {
       );
       if (!retry || !current || !exactStop) {
         if (retry) await txn.delete(STOP_RETRY_KEY);
+        return { owned: false, due: false, retry: null as StopRetryRecord | null };
+      }
+      // An absent Cloudflare container cannot produce a workspace receipt.
+      // Keep retrying through the original save window in case a concurrent
+      // Start is still allocating, but leave the timed-out failure stable once
+      // that window closes so the user can explicitly recover from WorkspaceDO.
+      if (
+        current.lifecyclePhase === "failed"
+        && retry.workspacePreparationUnavailable === true
+      ) {
+        await txn.delete(STOP_RETRY_KEY);
         return { owned: false, due: false, retry: null as StopRetryRecord | null };
       }
       if (now < retry.nextAttemptAtMs) {

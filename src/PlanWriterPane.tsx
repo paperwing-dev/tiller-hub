@@ -92,7 +92,7 @@ export interface PlanWriterHandoff {
 const RECOVERING_TERMINAL_STATE: TerminalRecoveryState = { status: "recovering" };
 
 function syntheticTerminalSession(writer: PlanWriterState): StoredSession | null {
-  if (!writer.terminalId || !writer.generation) return null;
+  if (writer.lifecycle === "not_running" || !writer.terminalId || !writer.generation) return null;
   const now = new Date().toISOString();
   return {
     id: writer.terminalId,
@@ -102,12 +102,12 @@ function syntheticTerminalSession(writer: PlanWriterState): StoredSession | null
     agent_state: "{}",
     todos: "[]",
     allowed_tools: "[]",
-    active: writer.lifecycle === "running" ? 1 : 0,
+    active: 1,
     metadata_version: 1,
     agent_state_version: 1,
     todos_version: 1,
     seq: 0,
-    ended_at: writer.lifecycle === "not_running" ? now : null,
+    ended_at: null,
     created_at: now,
     updated_at: now,
   };
@@ -646,7 +646,7 @@ export default function PlanWriterPane({
       setOwnerRecoveryError(null);
       setTerminalError(null);
       if (next.cleanupPending) {
-        setOperationNotice(next.cleanupWarning ?? "Scribe abandoned. Workload cleanup is continuing in the background.");
+        setOperationNotice(next.cleanupWarning ?? "Scribe stopped. Runtime cleanup is continuing in the background; you can restart it now.");
       }
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
@@ -816,7 +816,7 @@ export default function PlanWriterPane({
       ? "Connecting"
       : "Requesting";
   const launchStepMessage = operation === "stopping"
-    ? "Abandoning this Scribe start and cleaning up its runtime…"
+    ? "Cancelling this Scribe start and cleaning up its runtime…"
     : writer.startup?.stage === "launching"
       ? `Waiting for ${launchHarness ? getHarnessBadgeLabel(launchHarness) : "the Scribe"} to open its terminal…`
       : "Reserving a Scribe session for this plan…";
@@ -834,7 +834,6 @@ export default function PlanWriterPane({
       replay: false,
     });
   }, [connected, hidden, showTerminal, terminalFastLane, writer.terminalId, wsRef]);
-  const needsAbandon = writer.lifecycle === "not_running" && Boolean(writer.cleanupError && writer.generation);
   const errorNotice = activeTerminalOwnerIssue
     ? null
     : operationError
@@ -844,10 +843,12 @@ export default function PlanWriterPane({
     ?? (writer.synchronization.state === "sync_failed"
       ? `Sync failed: ${writer.synchronization.error ?? "retry the last plan publication"}`
       : null);
+  const restarting = writer.lifecycle === "not_running" && writer.generation !== null;
+  const startVerb = restarting ? "Restart" : "Start";
   const startControl = (
     <button
       type="button"
-      aria-label={compact ? `Start ${PLAN_AGENT_LABEL}` : undefined}
+      aria-label={compact ? `${startVerb} ${PLAN_AGENT_LABEL}` : undefined}
       disabled={operationPending || !writer.editable || !selectionUsable}
       onClick={() => void start()}
       className={compact
@@ -857,11 +858,13 @@ export default function PlanWriterPane({
       {compact ? (
         <>
           <PlayIcon className="size-3.5" weight="fill" aria-hidden="true" />
-          <span>Start {PLAN_AGENT_LABEL}</span>
+          <span>{startVerb} {PLAN_AGENT_LABEL}</span>
         </>
       ) : pendingContributions.length > 0
-        ? `Start Scribe and share ${pendingContributions.length} ${pendingContributions.length === 1 ? "item" : "items"}`
-        : "Start Scribe in Plan Mode"}
+        ? `${startVerb} Scribe and share ${pendingContributions.length} ${pendingContributions.length === 1 ? "item" : "items"}`
+        : restarting
+          ? "Restart Scribe"
+          : "Start Scribe in Plan Mode"}
     </button>
   );
   return (
@@ -890,27 +893,16 @@ export default function PlanWriterPane({
                 Scribe Settings
               </button>
             )}
-            {writer.lifecycle === "not_running" && showTerminal && !needsAbandon ? (
-              <button
-                type="button"
-                disabled={operationPending || !writer.editable || !selectionUsable}
-                onClick={() => void start()}
-                className="rounded bg-kumo-brand px-3 py-1 text-xs font-medium text-white disabled:opacity-50"
-              >
-                {pendingContributions.length > 0
-                  ? `Start Scribe and share ${pendingContributions.length}`
-                  : "Start Scribe"}
-              </button>
-            ) : writer.lifecycle !== "not_running" || needsAbandon ? (
+            {writer.lifecycle !== "not_running" ? (
               <Tooltip
-                content="Abandons this Scribe generation immediately. The saved plan and terminal history remain, and workload cleanup continues in the background."
+                content="Stops this Scribe immediately. The saved plan remains, and runtime cleanup continues in the background."
                 side="bottom"
                 align="end"
                 delay={250}
                 render={(
                   <button
                     type="button"
-                    aria-label="Abandon Scribe"
+                    aria-label="Stop Scribe"
                     disabled={operationPending || !writer.generation}
                     onClick={() => void stop()}
                     className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded bg-kumo-danger text-white transition-colors hover:bg-kumo-danger/85 disabled:cursor-not-allowed disabled:opacity-40"
@@ -1070,13 +1062,13 @@ export default function PlanWriterPane({
                 onClick={() => void stop()}
                 className="tiller-launch-current-step-action rounded border border-kumo-danger/40 bg-kumo-base px-2.5 py-1.5 text-[12px] font-medium text-kumo-danger disabled:cursor-not-allowed disabled:opacity-40"
               >
-                {operation === "stopping" ? "Abandoning…" : "Abandon start"}
+                {operation === "stopping" ? "Cancelling…" : "Cancel start"}
               </button>
             )}
           </div>
           {slowStartup && operation !== "stopping" && (
             <p role="status" className="mt-3 shrink-0 text-[12px] leading-5 text-kumo-subtle">
-              The Scribe has not connected yet. You can keep waiting or abandon this start.
+              The Scribe has not connected yet. You can keep waiting or cancel this start.
             </p>
           )}
         </div>
@@ -1134,7 +1126,13 @@ export default function PlanWriterPane({
       {!showTerminal && writer.lifecycle === "not_running" && !showLaunchAnimation && (
         <div className="flex min-h-0 flex-1 items-center justify-center px-6 py-8 text-center">
           <div className={compact ? "w-fit max-w-sm text-left" : "max-w-lg"}>
-            <div className="text-sm font-medium text-kumo-default">{compact ? `Start ${PLAN_AGENT_LABEL}` : "Start an interactive Scribe session"}</div>
+            <div className="text-sm font-medium text-kumo-default">
+              {compact
+                ? `${startVerb} ${PLAN_AGENT_LABEL}`
+                : restarting
+                  ? "Restart the interactive Scribe session"
+                  : "Start an interactive Scribe session"}
+            </div>
             <p className="mt-1 text-xs leading-5 text-kumo-subtle">
               {compact
                 ? `${PLAN_AGENT_LABEL} reads this plan and helps refine it.`
@@ -1153,22 +1151,6 @@ export default function PlanWriterPane({
               )}
             </div>
           </div>
-        </div>
-      )}
-      {compact && showTerminal && writer.lifecycle === "not_running" && (
-        <div className="flex shrink-0 items-center border-t border-kumo-line bg-kumo-base px-3 py-2">
-          {needsAbandon ? (
-            <button
-              type="button"
-              aria-label="Abandon Scribe"
-              disabled={operationPending || !writer.generation}
-              onClick={() => void stop()}
-              className="tiller-square-button tiller-square-button--secondary tiller-square-button--icon-label text-kumo-danger disabled:opacity-50"
-            >
-              <StopIcon className="size-3.5" weight="fill" aria-hidden="true" />
-              <span>Abandon {PLAN_AGENT_LABEL}</span>
-            </button>
-          ) : startControl}
         </div>
       )}
     </div>

@@ -119,7 +119,10 @@ describe("planWriterTabStatus", () => {
       label: "Connecting",
       detail: expect.stringContaining("Hub connection is offline"),
     });
-    expect(planWriterTabStatus(writer("running"), { operation: "stopping" }).kind).toBe("stopping");
+    expect(planWriterTabStatus(writer("running"), { operation: "stopping" })).toMatchObject({
+      kind: "stopping",
+      label: "Stopping",
+    });
     expect(planWriterTabStatus({ ...writer("running"), synchronization: { state: "saving" } }).kind).toBe("saving");
     expect(planWriterTabStatus({ ...writer("not_running"), generation: 1, stopReason: "user" })).toMatchObject({
       kind: "stopped",

@@ -308,7 +308,7 @@ export default function RepoSettingsPage({
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <h4 className="text-sm font-semibold text-kumo-default">Cloudflare API</h4>
-                    <span className="border border-kumo-line px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-kumo-subtle">
+                    <span className="tiller-interface-metadata text-[10px] text-kumo-subtle">
                       Unavailable
                     </span>
                   </div>

@@ -249,20 +249,21 @@ describe("PlanWriterPane", () => {
     expect(screen.queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
   });
 
-  it("keeps Start Scribe for a stopped generation without visible lifecycle text", () => {
+  it("shows a restart surface for a stopped generation without the old terminal", () => {
     renderPane({ initialWriter: { ...stoppedWriter(), stopReason: "idle" } });
 
     expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
     expect(screen.queryByText("Writer stopped after inactivity")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Abandon Scribe" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("terminal")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop Scribe" })).not.toBeInTheDocument();
   });
 
-  it("keeps restart available below compact terminal history", () => {
+  it("replaces compact terminal history with the restart surface after stopping", () => {
     renderPane({ initialWriter: stoppedWriter(), compact: true });
 
-    expect(screen.getByTestId("terminal")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument();
   });
 
   it("keeps an obvious Stop Scribe control below a live compact terminal", async () => {
@@ -313,9 +314,9 @@ describe("PlanWriterPane", () => {
     expect(screen.queryByRole("button", { name: "Check connection" })).not.toBeInTheDocument();
 
     const launchStatus = screen.getByTestId("scribe-launch-status");
-    const abandonStart = within(launchStatus).getByRole("button", { name: "Abandon start" });
-    expect(abandonStart).toBeEnabled();
-    fireEvent.click(abandonStart);
+    const cancelStart = within(launchStatus).getByRole("button", { name: "Cancel start" });
+    expect(cancelStart).toBeEnabled();
+    fireEvent.click(cancelStart);
     await waitFor(() => expect(mocks.stopWriter).toHaveBeenCalledWith(
       "http://localhost",
       "repo-1",
@@ -333,8 +334,8 @@ describe("PlanWriterPane", () => {
       ],
     });
 
-    expect(screen.queryByRole("button", { name: /Start without/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Scribe and share 2" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Restart without/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart Scribe and share 2 items" })).toBeInTheDocument();
   });
 
   it("uses the compact terminal and control row as the only live writer input", async () => {
@@ -437,11 +438,11 @@ describe("PlanWriterPane", () => {
     expect(mocks.terminalProps?.onPaste).toBeUndefined();
   });
 
-  it("renders an icon-only danger abandon control with its hover and focus tooltip", async () => {
+  it("renders an icon-only danger stop control with its hover and focus tooltip", async () => {
     const user = userEvent.setup();
     renderPane();
-    const stopControl = screen.getByRole("button", { name: "Abandon Scribe" });
-    const tooltip = "Abandons this Scribe generation immediately. The saved plan and terminal history remain, and workload cleanup continues in the background.";
+    const stopControl = screen.getByRole("button", { name: "Stop Scribe" });
+    const tooltip = "Stops this Scribe immediately. The saved plan remains, and runtime cleanup continues in the background.";
 
     expect(stopControl).toHaveClass("h-6", "w-6", "bg-kumo-danger");
     expect(stopControl).not.toHaveTextContent(/\S/);
@@ -456,12 +457,12 @@ describe("PlanWriterPane", () => {
     expect(await screen.findByText(tooltip)).toBeInTheDocument();
   });
 
-  it("abandons the current generation once and disables duplicate activation while pending", async () => {
+  it("stops the current generation once and disables duplicate activation while pending", async () => {
     let resolveStop!: (value: PlanWriterState) => void;
     mocks.stopWriter.mockReturnValue(new Promise((resolve) => { resolveStop = resolve; }));
     renderPane();
 
-    const stopControl = screen.getByRole("button", { name: "Abandon Scribe" });
+    const stopControl = screen.getByRole("button", { name: "Stop Scribe" });
     fireEvent.click(stopControl);
 
     expect(mocks.stopWriter).toHaveBeenCalledWith("http://localhost", "repo-1", "plan-1", 1);
@@ -470,24 +471,25 @@ describe("PlanWriterPane", () => {
     expect(mocks.stopWriter).toHaveBeenCalledTimes(1);
 
     act(() => resolveStop(stoppedWriter()));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument());
   });
 
-  it("shows that an abandoned offline workload will be cleaned up in the background", async () => {
+  it("shows that stopped offline runtime cleanup will finish in the background", async () => {
     mocks.stopWriter.mockResolvedValue({
       ...stoppedWriter(),
       cleanupPending: true,
       cleanupCode: "runtime_cleanup_deferred",
-      cleanupWarning: "Scribe abandoned. Its workload will be cleaned up when the execution backend is available.",
+      cleanupWarning: "Scribe stopped. Runtime cleanup will finish when the execution backend is available; you can restart it now.",
     });
     renderPane();
 
-    fireEvent.click(screen.getByRole("button", { name: "Abandon Scribe" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop Scribe" }));
 
     expect(await screen.findByRole("status")).toHaveTextContent(
-      "Scribe abandoned. Its workload will be cleaned up when the execution backend is available.",
+      "Scribe stopped. Runtime cleanup will finish when the execution backend is available; you can restart it now.",
     );
-    expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument();
   });
 
   it("renders only the highest-precedence durable error notice", () => {
@@ -501,8 +503,8 @@ describe("PlanWriterPane", () => {
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent("Cleanup failed: cleanup failed");
-    expect(screen.getByRole("button", { name: "Abandon Scribe" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start Scribe" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop Scribe" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("alert")).toHaveLength(1);
     expect(screen.queryByText(/Startup failed:/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Sync failed:/)).not.toBeInTheDocument();
@@ -510,7 +512,7 @@ describe("PlanWriterPane", () => {
 
   it("keeps a live writer status while surfacing local operation errors", async () => {
     mocks.wsSend.mockReturnValue(false);
-    mocks.stopWriter.mockRejectedValue(new Error("Abandon failed"));
+    mocks.stopWriter.mockRejectedValue(new Error("Stop failed"));
     const onTabStatusChange = vi.fn();
     renderPane({ onTabStatusChange });
 
@@ -520,8 +522,8 @@ describe("PlanWriterPane", () => {
     expect(screen.getAllByRole("alert")).toHaveLength(1);
     expect(onTabStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "running", label: "Live" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Abandon Scribe" }));
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Abandon failed"));
+    fireEvent.click(screen.getByRole("button", { name: "Stop Scribe" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Stop failed"));
     expect(screen.getAllByRole("alert")).toHaveLength(1);
     expect(onTabStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "running", label: "Live" }));
   });
@@ -716,8 +718,9 @@ describe("PlanWriterPane", () => {
 
     act(() => mocks.terminalProps?.onInput?.("Update the plan"));
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument());
-    expect(screen.queryByRole("button", { name: "Abandon Scribe" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Stop Scribe" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("terminal")).not.toBeInTheDocument();
   });
 
   it("never stops a running writer during refresh or unmount", async () => {
@@ -742,14 +745,14 @@ describe("PlanWriterPane", () => {
     mocks.fetchWriter.mockReturnValueOnce(new Promise((resolve) => { resolveRefresh = resolve; }));
 
     act(() => mocks.planWriterRefreshHintRef.current?.("repo-1", "plan-1"));
-    fireEvent.click(screen.getByRole("button", { name: "Abandon Scribe" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Stop Scribe" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument());
 
     act(() => resolveRefresh(writer("running")));
     await act(async () => {});
 
-    expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Abandon Scribe" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop Scribe" })).not.toBeInTheDocument();
   });
 
   it("does not publish a refresh result after the pane unmounts", async () => {
@@ -786,7 +789,7 @@ describe("PlanWriterPane", () => {
 
     await act(async () => resolveRefresh(stoppedWriter()));
     await waitFor(() => expect(mocks.fetchWriter).toHaveBeenCalledTimes(initialRefreshes + 2));
-    expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument();
   });
 
   it("refreshes writer state when a refresh hint arrives", async () => {
@@ -798,7 +801,7 @@ describe("PlanWriterPane", () => {
     act(() => mocks.planWriterRefreshHintRef.current?.("repo-1", "plan-1"));
 
     await waitFor(() => expect(mocks.fetchWriter).toHaveBeenCalledTimes(initialRefreshes + 1));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Scribe" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Restart Scribe" })).toBeInTheDocument());
   });
 
   it("keeps the Scribe live while a generic refresh is in flight", async () => {

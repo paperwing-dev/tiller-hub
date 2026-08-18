@@ -3171,7 +3171,7 @@ export async function stopPlanWriter(
     },
   );
   if (!res.ok)
-    throw await parseApiError(res, `Failed to abandon Scribe: ${res.status}`);
+    throw await parseApiError(res, `Failed to stop Scribe: ${res.status}`);
   const body = await res.json().catch(() => null);
   const writer = isRecord(body) ? normalizePlanWriterState(body.writer) : null;
   if (!writer) throw new Error("Malformed Scribe response");

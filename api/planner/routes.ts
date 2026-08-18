@@ -1551,7 +1551,7 @@ plannerRoutes.post(
             cleanupPending: true,
             cleanupCode: "runtime_cleanup_deferred",
             cleanupWarning:
-              "Scribe abandoned. Its workload will be cleaned up when the execution backend is available.",
+              "Scribe stopped. Runtime cleanup will finish when the execution backend is available; you can restart it now.",
           }
         : {}),
     });

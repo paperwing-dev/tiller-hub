@@ -270,6 +270,7 @@ describe("NewRepoDialog", () => {
     expect(link).toHaveAttribute("href", "/api/github/manage");
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noreferrer");
+    expect(link).toHaveClass("tiller-github-access-button");
 
     await act(async () => {
       await userEvent.setup({ pointerEventsCheck: 0 }).click(link!);

@@ -240,7 +240,7 @@ export default function PlanChatTabs({
           aria-orientation="vertical"
           className="tiller-agent-card-stack grid min-h-0 content-start gap-0 overflow-y-auto p-2"
         >
-          <div role="presentation" className="px-2 pb-1 pt-1 text-[9px] font-semibold uppercase tracking-[0.08em] text-kumo-subtle">
+          <div role="presentation" className="tiller-interface-label px-2 pb-1 pt-1 text-[10px] font-medium text-kumo-default">
             Edits the plan
           </div>
           <Popover open={writerActionsOpen} onOpenChange={setWriterActionsOpen}>
@@ -357,7 +357,7 @@ export default function PlanChatTabs({
             role="presentation"
             className="mt-2 flex h-8 items-center justify-between border-t border-kumo-line pl-2"
           >
-            <span className="text-[9px] font-semibold uppercase tracking-[0.08em] text-kumo-subtle">
+            <span className="tiller-interface-label text-[10px] font-medium text-kumo-default">
               Advises on this plan
             </span>
           </div>
@@ -531,7 +531,7 @@ export default function PlanChatTabs({
     <div className="flex items-end justify-between gap-3 border-b border-kumo-line bg-kumo-recessed px-3 py-2">
       <div className="flex min-w-0 flex-1 items-stretch gap-3" aria-label="Plan collaborators">
         <div role="group" aria-label="Edits the plan" className="flex shrink-0 flex-col justify-end gap-0.5">
-          <span className="px-2 text-[9px] font-semibold uppercase tracking-wide text-kumo-subtle">
+          <span className="tiller-interface-label px-2 text-[10px] font-medium text-kumo-default">
             Edits the plan
           </span>
           <AgentTabButton
@@ -545,7 +545,7 @@ export default function PlanChatTabs({
         </div>
         <span role="separator" aria-orientation="vertical" className="h-10 w-px shrink-0 self-end bg-kumo-line" />
         <div role="group" aria-label="Advises on this plan" className="flex min-w-0 flex-1 flex-col justify-end gap-0.5">
-          <span className="px-2 text-[9px] font-semibold uppercase tracking-wide text-kumo-subtle">
+          <span className="tiller-interface-label px-2 text-[10px] font-medium text-kumo-default">
             Advises on this plan
           </span>
           <div className="flex min-w-0 items-center gap-1 overflow-x-auto pr-1">

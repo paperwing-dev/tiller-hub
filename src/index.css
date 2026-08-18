@@ -2539,14 +2539,33 @@ body {
   button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher {
   height: 32px;
   min-height: 32px;
+  position: relative;
+  justify-content: center !important;
   border: 0 !important;
   border-radius: 0 !important;
   background-color: transparent !important;
   box-shadow: none !important;
   width: calc(100% + 16px) !important;
   margin-left: -8px;
-  padding: 0 8px !important;
+  padding: 0 28px !important;
   font-size: 12px;
+  text-align: center;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher
+  > :first-child {
+  min-width: 0;
+  max-width: 100%;
+}
+
+:root
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher
+  > :last-child {
+  position: absolute;
+  right: 8px;
 }
 
 :root
@@ -4404,10 +4423,396 @@ body {
   color: var(--tiller-theme-on-action) !important;
 }
 
+/* Paperwing controls use one flat material: warm paper at rest, a navy frame,
+   and a navy field with paper copy for hover, focus, and selected states. Kumo
+   primary buttons include a gradient overlay as a direct child, so neutralize
+   that layer instead of allowing component variants to change the material. */
+:root[data-theme="paperwing"] body button[data-kumo-component="Button"],
+:root[data-theme="paperwing"] body a[data-kumo-component="LinkButton"],
+:root[data-theme="paperwing"] body button.tiller-square-button,
+:root[data-theme="paperwing"] body button.tiller-dialog-button,
+:root[data-theme="paperwing"]
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"] {
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-radius: 0 !important;
+  background: var(--tiller-theme-fixed-paper) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root[data-theme="paperwing"] body button[data-kumo-component="Button"] *,
+:root[data-theme="paperwing"] body a[data-kumo-component="LinkButton"] *,
+:root[data-theme="paperwing"] body button.tiller-square-button *,
+:root[data-theme="paperwing"] body button.tiller-dialog-button *,
+:root[data-theme="paperwing"]
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]
+  * {
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Button"]
+  > span[aria-hidden="true"],
+:root[data-theme="paperwing"]
+  body
+  a[data-kumo-component="LinkButton"]
+  > span[aria-hidden="true"] {
+  background: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Button"]:not(:disabled):is(
+    :hover,
+    :focus-visible,
+    [aria-pressed="true"],
+    [aria-selected="true"],
+    [aria-current],
+    [aria-checked="true"],
+    [data-selected="true"]
+  ),
+:root[data-theme="paperwing"]
+  body
+  a[data-kumo-component="LinkButton"]:is(
+    :hover,
+    :focus-visible,
+    [aria-pressed="true"],
+    [aria-selected="true"],
+    [aria-current],
+    [aria-checked="true"],
+    [data-selected="true"]
+  ),
+:root[data-theme="paperwing"]
+  body
+  button.tiller-square-button:not(:disabled):is(:hover, :focus-visible),
+:root[data-theme="paperwing"]
+  body
+  button.tiller-dialog-button:not(:disabled):is(:hover, :focus-visible),
+:root[data-theme="paperwing"]
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]:not(:disabled):is(
+    :hover,
+    :focus-visible
+  ) {
+  border-color: var(--tiller-theme-fixed-action) !important;
+  background: var(--tiller-theme-fixed-action) !important;
+  background-image: none !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Button"]:not(:disabled):is(
+    :hover,
+    :focus-visible,
+    [aria-pressed="true"],
+    [aria-selected="true"],
+    [aria-current],
+    [aria-checked="true"],
+    [data-selected="true"]
+  )
+  *,
+:root[data-theme="paperwing"]
+  body
+  a[data-kumo-component="LinkButton"]:is(
+    :hover,
+    :focus-visible,
+    [aria-pressed="true"],
+    [aria-selected="true"],
+    [aria-current],
+    [aria-checked="true"],
+    [data-selected="true"]
+  )
+  *,
+:root[data-theme="paperwing"]
+  body
+  button.tiller-square-button:not(:disabled):is(:hover, :focus-visible)
+  *,
+:root[data-theme="paperwing"]
+  body
+  button.tiller-dialog-button:not(:disabled):is(:hover, :focus-visible)
+  *,
+:root[data-theme="paperwing"]
+  body
+  [role="dialog"][style*="--toast-index"]
+  button[data-kumo-component="Button"]:not(:disabled):is(:hover, :focus-visible)
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* The GitHub installation action is a link because it opens a new tab, but in
+   Paperwing it belongs to the dialog's button row and should read like one. */
+:root[data-theme="paperwing"] body a.tiller-github-access-button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-radius: 0 !important;
+  padding-inline: 14px;
+  background: var(--tiller-theme-fixed-paper) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+  text-decoration: none !important;
+  transition-duration: 120ms;
+  transition-property: background-color, color;
+  transition-timing-function: ease-out;
+}
+
+:root[data-theme="paperwing"]
+  body
+  a.tiller-github-access-button:is(:hover, :focus-visible) {
+  border-color: var(--tiller-theme-fixed-action) !important;
+  background: var(--tiller-theme-fixed-action) !important;
+  background-image: none !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+  text-decoration: none !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  a.tiller-github-access-button:focus-visible {
+  outline: 2px solid var(--tiller-theme-fixed-action) !important;
+  outline-offset: 2px;
+}
+
+/* The header owns one continuous baseline. Inactive tabs stay transparent so
+   that line reads as their underline; the active tab masks it with an open-
+   bottom frame. Hover/focus can still invert temporarily. */
+:root[data-theme="paperwing"] body button.tiller-project-tab:not(:disabled) {
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button.tiller-project-tab[aria-current="page"]:not(:disabled) {
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-bottom: 0 !important;
+  background: var(--tiller-theme-fixed-paper) !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button.tiller-project-tab:not(:disabled):is(:hover, :focus-visible) {
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-bottom: 0 !important;
+  background: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button.tiller-project-tab:not(:disabled):is(:hover, :focus-visible)
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* Plans sits directly against the project-area divider. Reuse that divider as
+   the first tab's left edge instead of drawing a second adjacent stroke. */
+:root[data-theme="paperwing"]
+  body
+  button.tiller-project-tab:first-child:not(:disabled):is(
+    [aria-current="page"],
+    :hover,
+    :focus-visible
+  ) {
+  border-left: 0 !important;
+}
+
+/* Select triggers, native selects, and their floating menus share the exact
+   square geometry and navy frame used by buttons. */
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"],
+:root[data-theme="paperwing"] body select {
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-radius: 0 !important;
+  background-color: var(--tiller-theme-fixed-paper) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):is(:hover, :focus-visible, [aria-expanded="true"]),
+:root[data-theme="paperwing"]
+  body
+  select:not(:disabled):is(:hover, :focus-visible) {
+  border-color: var(--tiller-theme-fixed-action) !important;
+  background-color: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"]:not(
+    :disabled
+  ):is(:hover, :focus-visible, [aria-expanded="true"])
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root[data-theme="paperwing"] body [role="menu"],
+:root[data-theme="paperwing"]
+  body
+  [role="presentation"]:has(> [role="listbox"]),
+:root[data-theme="paperwing"] body .tiller-dropdown-panel,
+:root[data-theme="paperwing"] body .kumo-popover-popup {
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-radius: 0 !important;
+  background-color: var(--tiller-theme-fixed-paper) !important;
+  background-image: none !important;
+}
+
+/* The project switcher uses its surrounding chrome as the boundary. Compact
+   reviewer action popovers are intentionally borderless destructive menus.
+   Both remain exceptions to the generic framed dropdown treatment above. */
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher {
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button[data-kumo-component="Select"][data-kumo-part="trigger"].tiller-project-switcher:not(
+    :hover
+  ):not(:focus-visible):not([aria-expanded="true"]) {
+  background: transparent !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  .tiller-plan-agent-actions-menu[role="menu"] {
+  border: 0 !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  .kumo-popover-popup:has(.tiller-plan-agent-actions-menu) {
+  border: 0 !important;
+}
+
 a[href],
 button:not(:disabled),
 [role="button"]:not([aria-disabled="true"]) {
   cursor: pointer;
+}
+
+/* Interface labels are ordinary Helvetica copy, never shouty status chips.
+   Metadata uses the same casing and ink without a capsule or colored fill. */
+.tiller-interface-label,
+.tiller-interface-metadata,
+.tiller-workflow-metadata {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+
+:root body .tiller-interface-label,
+:root body .tiller-interface-metadata,
+:root body .tiller-workflow-metadata {
+  color: var(--paperwing-ink) !important;
+}
+
+:root body .tiller-interface-metadata,
+:root body .tiller-workflow-metadata {
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  padding: 0 !important;
+  font-size: 10px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  line-height: 14px;
+}
+
+:root body .tiller-workflow-reviewer-index {
+  display: inline-flex;
+  min-width: 1rem;
+  align-items: center;
+  justify-content: flex-start;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--paperwing-ink) !important;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 11px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  line-height: 16px;
+}
+
+/* The connection control is a real Hub button, so it follows the same flat
+   outlined Paperwing behavior as Kumo and dialog controls. */
+:root[data-theme="paperwing"] body button.tiller-connections-trigger {
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-radius: 0 !important;
+  background: var(--tiller-theme-fixed-paper) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  color: var(--tiller-theme-fixed-ink) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button.tiller-connections-trigger:not(:disabled):is(
+    :hover,
+    :focus-visible,
+    [aria-expanded="true"]
+  ) {
+  border-color: var(--tiller-theme-fixed-action) !important;
+  background: var(--tiller-theme-fixed-action) !important;
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button.tiller-connections-trigger:not(:disabled):is(
+    :hover,
+    :focus-visible,
+    [aria-expanded="true"]
+  )
+  * {
+  color: var(--tiller-theme-fixed-paper) !important;
+}
+
+/* Automation switches remain recognizable switches while sharing the square
+   navy frame and flat selected fill of the rest of the control system. */
+:root[data-theme="paperwing"] body button.tiller-skill-automation-switch {
+  --tiller-button-radius: 0;
+  border: 1px solid var(--tiller-theme-fixed-action) !important;
+  border-radius: 0 !important;
+  background: var(--tiller-theme-fixed-paper) !important;
+  background-image: none !important;
+}
+
+:root[data-theme="paperwing"]
+  body
+  button.tiller-skill-automation-switch:not(:disabled):hover,
+:root[data-theme="paperwing"]
+  body
+  button.tiller-skill-automation-switch[aria-checked="true"] {
+  background: var(--tiller-theme-fixed-action) !important;
 }
 
 .tiller-sidebar-wrap {

@@ -47,6 +47,28 @@ describe("ProjectWorkspaceChrome", () => {
       .toBe(screen.getByRole("button", { name: "Implementations" }));
   });
 
+  it("shows the repository name without its owner in the project switcher", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter>
+        <ProjectWorkspaceChrome
+          repoId="repo-1"
+          activeView="plans"
+          planCount={0}
+          implementationCount={0}
+        />
+      </MemoryRouter>,
+    );
+
+    const switcher = screen.getByRole("combobox", { name: "Switch project" });
+    expect(switcher).toHaveTextContent("repo");
+    expect(switcher).not.toHaveTextContent("example/repo");
+
+    await user.click(switcher);
+    expect(await screen.findByRole("option", { name: "repo" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "example/repo" })).not.toBeInTheDocument();
+  });
+
   it("offers Add Project from the project switcher", async () => {
     const user = userEvent.setup();
     render(

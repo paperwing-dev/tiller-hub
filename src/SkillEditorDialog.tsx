@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Badge } from "@cloudflare/kumo/components/badge";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Dialog } from "@cloudflare/kumo/components/dialog";
 import { Field } from "@cloudflare/kumo/components/field";
@@ -227,15 +226,13 @@ export default function SkillEditorDialog({
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-mono text-xs font-semibold text-kumo-info">/{skill.command || "new-skill"}</span>
-                  <span className="flex items-center gap-1">
+                  <span className="flex items-center gap-2">
                     {"origin" in skill && skill.origin === "builtin" && (
-                      <Badge variant="outline" className="text-[9px] uppercase text-kumo-subtle">
-                        Built-in
-                      </Badge>
+                      <span className="tiller-workflow-metadata">Built in</span>
                     )}
-                    <Badge variant="outline" className="text-[9px] uppercase">
+                    <span className="tiller-workflow-metadata">
                       {skill.agents.length} agent{skill.agents.length === 1 ? "" : "s"}
-                    </Badge>
+                    </span>
                   </span>
                 </div>
                 <div className="mt-1 truncate text-xs font-medium text-kumo-default">{skill.label || "Untitled skill"}</div>
@@ -346,7 +343,7 @@ export default function SkillEditorDialog({
                       <LayerCard key={agent.id} className="tiller-card-surface tiller-workflow-reviewer bg-kumo-recessed p-4">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                           <div className="flex min-w-0 items-center gap-2">
-                            <span className="flex h-6 w-6 items-center justify-center rounded-full bg-kumo-info/15 text-[10px] font-bold text-kumo-info">{index + 1}</span>
+                            <span className="tiller-workflow-reviewer-index">{index + 1}</span>
                             <span className="truncate text-xs font-semibold text-kumo-strong">{agent.label || "Untitled agent"}</span>
                           </div>
                           <div className="flex items-center gap-1">

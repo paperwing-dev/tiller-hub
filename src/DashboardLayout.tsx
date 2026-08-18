@@ -213,7 +213,7 @@ export function WorkspaceLayout() {
               <button
                 type="button"
                 onClick={() => navigate('/')}
-                className="flex min-w-0 cursor-pointer items-center gap-2 text-xs font-semibold uppercase tracking-widest text-kumo-subtle hover:text-kumo-default group-data-[state=collapsed]/sidebar:mx-auto group-data-[state=collapsed]/sidebar:h-10 group-data-[state=collapsed]/sidebar:w-10 group-data-[state=collapsed]/sidebar:min-w-10 group-data-[state=collapsed]/sidebar:justify-center"
+                className="tiller-interface-label flex min-w-0 cursor-pointer items-center gap-2 text-xs font-semibold text-kumo-default group-data-[state=collapsed]/sidebar:mx-auto group-data-[state=collapsed]/sidebar:h-10 group-data-[state=collapsed]/sidebar:w-10 group-data-[state=collapsed]/sidebar:min-w-10 group-data-[state=collapsed]/sidebar:justify-center"
                 title="Tiller"
                 aria-label="Tiller"
               >

@@ -252,7 +252,7 @@ export function NewRepoDialog({
               target="_blank"
               rel="noreferrer"
               onClick={onClose}
-              className="text-xs font-medium text-kumo-link hover:underline"
+              className="tiller-github-access-button text-xs font-medium text-kumo-link hover:underline"
             >
               {githubAppConfigured ? "Manage GitHub access" : "Set up GitHub access"}
             </a>

@@ -464,10 +464,18 @@ async function dispatchStopAndFinalizeIfNoCallback(args: {
   }
   if (stopScope) {
     if (stopDispatch.workspacePreparationUnavailable) {
-      await lifecycleStub.noteRunnerStopped(args.stopOpId, null);
-      throw new Error(
+      await lifecycleStub.noteWorkspacePreparationUnavailable(
+        args.stopOpId,
         "Cloudflare runner stopped before producing a durable workspace receipt.",
       );
+      await (args.projectSummary?.() ?? projectAndPersistEnvSummary(args.env, args.hub, args.slug))
+        .catch((error) => {
+          console.warn(
+            `[envs] Failed to project unavailable workspace preparation for ${args.slug}; lifecycle remains authoritative:`,
+            error,
+          );
+        });
+      return;
     }
     const receipt = stopDispatch.workspaceStopReceipt;
     if (

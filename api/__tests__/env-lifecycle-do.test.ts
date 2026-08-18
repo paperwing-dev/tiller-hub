@@ -1819,6 +1819,92 @@ describe("EnvLifecycleDO", () => {
     });
   });
 
+  it("does not let persistence retries extend the saving timeout", async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.parse("2026-04-10T00:00:00.000Z");
+    vi.setSystemTime(new Date(startedAt));
+    try {
+      const subject = createSubject();
+      const initial = await subject.requestStop();
+
+      vi.setSystemTime(new Date(Date.now() + 2_000));
+      await subject.noteWorkspaceSyncFailed(initial.activeOpId, "save failed");
+
+      vi.setSystemTime(new Date(startedAt + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
+      await expect(subject.getState()).resolves.toMatchObject({
+        phase: "failed",
+        activeOpId: initial.activeOpId,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let termination retries extend the stopping timeout", async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.parse("2026-04-10T00:00:00.000Z");
+    vi.setSystemTime(new Date(startedAt));
+    try {
+      const subject = createSubject();
+      const initial = await subject.requestStop();
+      await subject.acceptStopWorkspaceSynced(initial.activeOpId);
+
+      vi.setSystemTime(new Date(Date.now() + 2_000));
+      await subject.noteWorkspaceSyncFailed(initial.activeOpId, "termination failed");
+
+      vi.setSystemTime(new Date(startedAt + ENV_LIFECYCLE_STOP_TIMEOUT_MS + 1_000));
+      await expect(subject.getState()).resolves.toMatchObject({
+        phase: "failed",
+        activeOpId: initial.activeOpId,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops retrying an unavailable Cloudflare workspace after the original save deadline", async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.parse("2026-04-10T00:00:00.000Z");
+    vi.setSystemTime(new Date(startedAt));
+    try {
+      const storage = createMemoryStorage();
+      const subject = createSubject({}, storage);
+      const initial = await subject.requestStop();
+      await subject.ensureStopDispatchScheduled(initial.activeOpId);
+
+      await expect(subject.noteWorkspacePreparationUnavailable(
+        initial.activeOpId,
+        "runner is absent",
+      )).resolves.toMatchObject({
+        phase: "saving",
+        activeOpId: initial.activeOpId,
+        lastRunnerState: "stopped",
+        infraState: "stopped",
+      });
+      await expect(storage.get("stop-retry-v1")).resolves.toMatchObject({
+        opId: initial.activeOpId,
+        workspacePreparationUnavailable: true,
+      });
+
+      vi.setSystemTime(new Date(startedAt + ENV_LIFECYCLE_SAVE_TIMEOUT_MS + 1_000));
+      await expect(subject.getState()).resolves.toMatchObject({
+        phase: "failed",
+        activeOpId: initial.activeOpId,
+      });
+      const runStopRetryEffect = (
+        subject as unknown as { runStopRetryEffect: () => Promise<boolean> }
+      ).runStopRetryEffect.bind(subject);
+      await expect(runStopRetryEffect()).resolves.toBe(false);
+      await expect(storage.get("stop-retry-v1")).resolves.toBeNull();
+      await expect(subject.getState()).resolves.toMatchObject({
+        phase: "failed",
+        activeOpId: initial.activeOpId,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("schedules capped same-operation retry state until the exact save ack succeeds", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-10T00:00:00.000Z"));

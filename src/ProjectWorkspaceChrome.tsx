@@ -21,6 +21,14 @@ interface ProjectWorkspaceChromeProps {
 
 const ADD_PROJECT_VALUE = "__tiller_add_project__";
 
+function getProjectSwitcherLabel(
+  githubFullName: string,
+  repoUrl: string,
+): string {
+  const fullName = githubFullName || getRepoLabel(repoUrl);
+  return fullName.slice(fullName.lastIndexOf("/") + 1);
+}
+
 export default function ProjectWorkspaceChrome({
   repoId,
   activeView,
@@ -63,7 +71,7 @@ export default function ProjectWorkspaceChrome({
           }}
           items={[
             ...(data.repos ?? []).map((repo) => ({
-              label: repo.githubFullName || getRepoLabel(repo.repoUrl),
+              label: getProjectSwitcherLabel(repo.githubFullName, repo.repoUrl),
               value: repo.repoId,
             })),
             { label: "Add project…", value: ADD_PROJECT_VALUE },
@@ -132,10 +140,10 @@ function ProjectTab({
       onClick={onClick}
       disabled={disabled}
       aria-current={active ? "page" : undefined}
-      className={`tiller-hover-count-metadata tiller-project-tab relative -mb-px flex h-8 items-center gap-2 border px-3 text-[12px] transition-colors disabled:cursor-default disabled:opacity-50 ${
+      className={`tiller-hover-count-metadata tiller-project-tab relative -mb-px flex h-8 items-center gap-2 border border-b-0 border-kumo-line bg-kumo-base px-3 text-[12px] text-kumo-default transition-colors disabled:cursor-default disabled:opacity-50 ${
         active
-          ? "border-kumo-line border-b-kumo-base bg-kumo-base font-semibold text-kumo-default"
-          : "border-transparent font-medium text-kumo-subtle hover:bg-kumo-tint hover:text-kumo-default"
+          ? "font-semibold"
+          : "font-medium"
       }`}
     >
       <span>{label}</span>

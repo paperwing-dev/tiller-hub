@@ -2411,6 +2411,8 @@ describe("planner routes", () => {
       writer: { lifecycle: "not_running", generation: 1, stopReason: "user" },
       cleanupPending: true,
       cleanupCode: "runtime_cleanup_deferred",
+      cleanupWarning:
+        "Scribe stopped. Runtime cleanup will finish when the execution backend is available; you can restart it now.",
     });
     expect(hub.revokePlanWriterTerminal).not.toHaveBeenCalled();
     expect(mocks.destroyPlanWriterRuntime).not.toHaveBeenCalled();
@@ -2488,7 +2490,7 @@ describe("planner routes", () => {
     expect(mocks.destroyPlanWriterRuntime).toHaveBeenCalledTimes(1);
   });
 
-  it("abandons an offline Scribe immediately and starts a replacement generation", async () => {
+  it("stops an offline Scribe immediately and starts a replacement generation", async () => {
     const plan = artifactStore.createArtifact({
       repoId: "repo-1",
       type: "plan",

@@ -355,7 +355,7 @@ describe("fetchRepoArtifacts", () => {
     });
   });
 
-  it("preserves deferred cleanup metadata when abandoning a Scribe", async () => {
+  it("preserves deferred cleanup metadata when stopping a Scribe", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       writer: {
         lifecycle: "not_running",
@@ -371,7 +371,7 @@ describe("fetchRepoArtifacts", () => {
       },
       cleanupPending: true,
       cleanupCode: "runtime_cleanup_deferred",
-      cleanupWarning: "Scribe abandoned. Its workload will be cleaned up when the execution backend is available.",
+      cleanupWarning: "Scribe stopped. Runtime cleanup will finish when the execution backend is available; you can restart it now.",
     }), { status: 200 }));
 
     await expect(stopPlanWriter("https://example.com", "repo-1", "plan-1", 3)).resolves.toMatchObject({
@@ -379,7 +379,7 @@ describe("fetchRepoArtifacts", () => {
       generation: 3,
       cleanupPending: true,
       cleanupCode: "runtime_cleanup_deferred",
-      cleanupWarning: "Scribe abandoned. Its workload will be cleaned up when the execution backend is available.",
+      cleanupWarning: "Scribe stopped. Runtime cleanup will finish when the execution backend is available; you can restart it now.",
     });
   });
 

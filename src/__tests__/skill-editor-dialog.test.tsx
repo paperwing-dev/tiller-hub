@@ -112,7 +112,12 @@ describe("SkillEditorDialog Plan Health controls", () => {
     );
     const healthRow = screen.getByText("/health").closest("button");
     expect(healthRow).not.toBeNull();
-    expect(within(healthRow!).getByText("Built-in")).toBeInTheDocument();
+    expect(within(healthRow!).getByText("Built in")).toHaveClass(
+      "tiller-workflow-metadata",
+    );
+    expect(within(healthRow!).getByText("1 agent")).toHaveClass(
+      "tiller-workflow-metadata",
+    );
     expect(screen.getByLabelText("Command")).toBeDisabled();
     expect(screen.getByLabelText("Command").closest('[data-slot="input-group"]'))
       .toHaveClass("tiller-workflow-command");
@@ -174,7 +179,7 @@ describe("SkillEditorDialog review automation controls", () => {
     const toggle = await screen.findByRole("switch", {
       name: "Security reviewer default report mode",
     });
-    expect(screen.queryByText("Built-in")).not.toBeInTheDocument();
+    expect(screen.queryByText("Built in")).not.toBeInTheDocument();
     expect(toggle).toHaveClass("tiller-skill-automation-switch");
     expect(toggle).toHaveAttribute("aria-checked", "false");
 
